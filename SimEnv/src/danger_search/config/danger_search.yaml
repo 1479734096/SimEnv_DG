@@ -1,0 +1,87 @@
+# danger_search 默认参数。
+# 坐标输出遵循 docs/evaluation.md：使用 Gazebo world/odom 数值坐标。
+
+topics:
+  cmd_vel: /cmd_vel
+  odom: /Odometry_gazebo
+  cloud: /livox/Pointcloud2
+  rgb: /real_sense/rgb/image_raw
+  depth: /real_sense/depth/image_raw
+  camera_info: /real_sense/rgb/camera_info
+  status: /danger_search/status
+
+mission:
+  startup_delay: 2.0
+  max_runtime: 590.0
+  max_floor: 1
+  floor_timeout: 180.0
+  home_tolerance: 0.7
+  explore_coverage_ratio: 0.82
+  min_frontier_count: 1
+  no_frontier_scan_duration: 8.0
+  status_publish_period: 1.0
+
+map:
+  resolution: 0.10
+  width: 28.0
+  length: 48.0
+  origin_x: -14.0
+  origin_y: -6.0
+  floor_height: 2.6
+  obstacle_min_z: 0.15
+  obstacle_max_z: 1.40
+  raycast_max_range: 12.0
+  visited_radius: 0.45
+  cloud_stride: 3
+  cloud_max_points: 18000
+
+frontier:
+  min_cluster_size: 8
+  blacklist_ttl: 60.0
+  fail_limit: 3
+  no_progress_timeout: 5.0
+  information_gain_weight: 2.0
+  path_cost_weight: 1.0
+  yaw_cost_weight: 0.3
+  revisit_penalty_weight: 2.0
+
+controller:
+  max_linear: 0.35
+  max_angular: 0.9
+  goal_tolerance: 0.35
+  waypoint_tolerance: 0.25
+  pure_pursuit_lookahead: 0.65
+  reverse_speed: -0.18
+  recover_duration: 1.2
+
+detection:
+  min_area: 35
+  min_circularity: 0.55
+  min_aspect: 0.65
+  max_aspect: 1.55
+  min_radius: 0.10
+  max_radius: 0.22
+  max_rmse: 0.035
+  ransac_iterations: 80
+  ransac_sample_size: 4
+  max_depth: 8.0
+  min_depth: 0.35
+  # RGB-D 反投影使用 OpenCV 光学坐标：x 右、y 下、z 前。
+  # Gazebo 插件 frameName 通常写 robot link 名，因此默认转换到 ROS link 坐标后再走 TF。
+  depth_frame_is_optical: true
+
+tracker:
+  association_radius: 0.45
+  confirmation_window: 10.0
+  min_hits: 4
+  max_position_std: 0.25
+  min_confidence: 0.75
+  max_average_rmse: 0.04
+  nms_radius: 0.9
+  stale_after: 30.0
+
+floor:
+  elevator_id: elevator_main
+  elevator_lobby_xy: [1.0, 2.6]
+  elevator_inside_xy: [2.6, 2.6]
+  service_timeout: 5.0

@@ -37,6 +37,29 @@
 
 参赛算法应输出 `results/detected_danger.json`。不应读取 `results/danger_truth.json`。结果格式和评分方法见 [结果格式与评估方法](evaluation.md)。
 
+## 参考算法包 danger_search
+
+工作区内提供 `danger_search` 参考算法包。该包通过 `rospy.Timer` 推进任务状态机，订阅 `/Odometry_gazebo`、`/livox/Pointcloud2`、RGB-D 图像和相机标定，发布 `/cmd_vel`，并在任务结束或超时时写出 `results/detected_danger.json`。
+
+启动方式：
+
+```bash
+source ./devel/setup.bash
+roslaunch danger_search danger_search.launch
+```
+
+短超时自检：
+
+```bash
+roslaunch danger_search danger_search_smoke.launch
+```
+
+运行状态可通过以下话题查看：
+
+```bash
+rostopic echo /danger_search/status
+```
+
 ## 控制周期
 
 `junior_ctrl` 原始控制周期为 `0.002 s`，即 500 Hz。当前 `auto.sh` 默认设置：

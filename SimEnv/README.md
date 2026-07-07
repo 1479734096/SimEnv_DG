@@ -50,6 +50,24 @@ source ./devel/setup.bash
 
 `junior_ctrl` 默认以前台方式启动。终端输入 `2` 进入站立状态，输入 `6` 切换到 RL 模式，随后控制器接收 `/cmd_vel`。完整接口见 [算法接入接口](docs/algorithm-interfaces.md)。
 
+## 参考算法包
+
+当前工作区包含 `danger_search` 参考算法包，用于自主探索、红色球形危险源识别、返航和结果输出。环境启动且 `junior_ctrl` 进入 RL 模式后，可在新终端运行：
+
+```bash
+source ./devel/setup.bash
+roslaunch danger_search danger_search.launch
+```
+
+短超时自检入口：
+
+```bash
+source ./devel/setup.bash
+roslaunch danger_search danger_search_smoke.launch
+```
+
+该包只使用公开传感器、控制和门/电梯接口，不读取 `results/danger_truth.json`。详细说明见 `src/danger_search/README.md`。
+
 ## 结果文件
 
 参赛算法完成探索后应生成：

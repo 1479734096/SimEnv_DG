@@ -1,0 +1,20 @@
+<launch>
+  <!--
+    短超时自检入口：用于验证节点能启动、发布安全停止、超时写出结果文件。
+    不依赖 Gazebo 传感器必须在线，也不读取裁判真值。
+  -->
+  <arg name="config" default="$(find danger_search)/config/danger_search.yaml"/>
+  <arg name="result_file" default="/tmp/danger_search_smoke_detected.json"/>
+  <arg name="max_runtime" default="3.0"/>
+
+  <rosparam command="load" file="$(arg config)"/>
+
+  <node pkg="danger_search"
+        type="danger_search_node"
+        name="danger_search_smoke"
+        output="screen">
+    <param name="mission/max_runtime" value="$(arg max_runtime)"/>
+    <param name="mission/max_floor" value="1"/>
+    <param name="result_file" value="$(arg result_file)"/>
+  </node>
+</launch>
