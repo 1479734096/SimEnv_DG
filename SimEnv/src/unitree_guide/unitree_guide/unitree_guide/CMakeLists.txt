@@ -20,6 +20,26 @@ if(NOT LIBTORCH_ROOT)
     message(FATAL_ERROR "未找到 libtorch，请设置 -DLIBTORCH_ROOT=/path/to/libtorch 或导出环境变量 LIBTORCH_ROOT")
 endif()
 message(STATUS "Using libtorch: ${LIBTORCH_ROOT}")
+set(_LIBTORCH_RUNTIME_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../scripts/prepare_libtorch_runtime.sh")
+if(EXISTS "${_LIBTORCH_RUNTIME_SCRIPT}")
+    execute_process(
+        COMMAND bash "${_LIBTORCH_RUNTIME_SCRIPT}" "${LIBTORCH_ROOT}"
+        RESULT_VARIABLE _LIBTORCH_RUNTIME_RESULT
+        OUTPUT_VARIABLE _LIBTORCH_RUNTIME_OUTPUT
+        ERROR_VARIABLE _LIBTORCH_RUNTIME_ERROR
+    )
+    if(NOT _LIBTORCH_RUNTIME_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "准备 libtorch 运行库失败：${_LIBTORCH_RUNTIME_ERROR}"
+            "请确认 LIBTORCH_ROOT 可写，或手动检查 libtorch/lib 下的 SONAME 软链接。")
+    endif()
+    if(_LIBTORCH_RUNTIME_OUTPUT)
+        string(STRIP "${_LIBTORCH_RUNTIME_OUTPUT}" _LIBTORCH_RUNTIME_OUTPUT)
+        message(STATUS "${_LIBTORCH_RUNTIME_OUTPUT}")
+    endif()
+else()
+    message(WARNING "未找到 libtorch 运行库准备脚本：${_LIBTORCH_RUNTIME_SCRIPT}")
+endif()
 list(APPEND CMAKE_MODULE_PATH "${LIBTORCH_ROOT}/share/cmake/Caffe2/public")
 list(APPEND CMAKE_MODULE_PATH "${LIBTORCH_ROOT}/share/cmake")
 

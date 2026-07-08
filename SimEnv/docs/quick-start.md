@@ -20,6 +20,12 @@ cd /home/ros/Guoyulun/Competition/SimEnv
 
 libtorch、CUDA 和 cuDNN 路径在 `src/unitree_guide/unitree_guide/unitree_guide/CMakeLists.txt` 中配置。工程会优先使用 `-DLIBTORCH_ROOT` 或环境变量 `LIBTORCH_ROOT`，未设置时依次尝试 `/home/xbh/third_party/libtorch` 和 `/home/ros/Guoyulun/Download/libtorch`。如 cuDNN 不在系统默认路径，可设置 `CUDNN_ROOT`、`CUDNN_INCLUDE_DIR` 或 `CUDNN_LIBRARY`。
 
+GPU 版 libtorch 可能把 CUDA 运行库打包成带哈希的文件名，例如 `libcudart-xxxx.so.11.0`，但 `junior_ctrl` 运行期会按标准 SONAME 查找 `libcudart.so.11.0`。编译和 `auto.sh` 启动前会自动运行 `scripts/prepare_libtorch_runtime.sh`，在 libtorch 的 `lib` 目录内补齐缺失的同目录软链接。把工程复制到其他电脑后，如果 libtorch 不在默认路径，请先设置：
+
+```bash
+export LIBTORCH_ROOT=/path/to/libtorch
+```
+
 ## 编译
 
 ```bash

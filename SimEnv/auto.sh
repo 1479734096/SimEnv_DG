@@ -58,6 +58,33 @@ ROBOT_Z="${ROBOT_Z:-0.6}"
 ROBOT_YAW="${ROBOT_YAW:-1.5708}"
 
 # ==============================
+# 检查 libtorch 运行库
+# ==============================
+# junior_ctrl 链接 GPU 版 libtorch。部分 libtorch 包内 CUDA 库文件名带哈希，
+# 但可执行文件运行期按标准 SONAME 查找，因此启动前先补齐安全的同目录软链接。
+if [ "$START_CONTROLLER" = "1" ]; then
+  LIBTORCH_RUNTIME_SCRIPT="$WORKSPACE_DIR/scripts/prepare_libtorch_runtime.sh"
+  JUNIOR_CTRL_BIN="$WORKSPACE_DIR/devel/lib/unitree_guide/junior_ctrl"
+  DETECTED_LIBTORCH_ROOT="${LIBTORCH_ROOT:-}"
+
+  if [ -z "$DETECTED_LIBTORCH_ROOT" ] && [ -f "$JUNIOR_CTRL_BIN" ] && command -v readelf >/dev/null 2>&1; then
+    DETECTED_LIBTORCH_ROOT="$(
+      readelf -d "$JUNIOR_CTRL_BIN" 2>/dev/null \
+        | sed -n 's/.*Library runpath: \[\(.*\)\].*/\1/p' \
+        | tr ':' '\n' \
+        | sed -n 's#^\(.*\)/libtorch/lib$#\1/libtorch#p' \
+        | head -n 1
+    )"
+  fi
+
+  if [ -n "$DETECTED_LIBTORCH_ROOT" ]; then
+    bash "$LIBTORCH_RUNTIME_SCRIPT" "$DETECTED_LIBTORCH_ROOT"
+  else
+    bash "$LIBTORCH_RUNTIME_SCRIPT"
+  fi
+fi
+
+# ==============================
 # 清理旧进程
 # ==============================
 # 一键启动前先终止上一次残留的 Gazebo、roslaunch、控制器和辅助服务。
