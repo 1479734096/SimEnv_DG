@@ -5,8 +5,10 @@
   -->
   <arg name="config" default="$(find danger_search)/config/danger_search.yaml"/>
   <arg name="result_file" default="/tmp/danger_search_smoke_detected.json"/>
+  <arg name="mission_summary_file" default="/tmp/danger_search_smoke_summary.json"/>
   <arg name="max_runtime" default="3.0"/>
 
+  <param name="/use_sim_time" value="false"/>
   <rosparam command="load" file="$(arg config)"/>
 
   <node pkg="danger_search"
@@ -16,5 +18,6 @@
     <param name="mission/max_runtime" value="$(arg max_runtime)"/>
     <param name="mission/max_floor" value="1"/>
     <param name="result_file" value="$(arg result_file)"/>
+    <param name="mission_summary_file" value="$(arg mission_summary_file)"/>
   </node>
 </launch>

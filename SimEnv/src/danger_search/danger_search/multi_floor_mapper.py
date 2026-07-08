@@ -55,6 +55,23 @@ class FloorGrid:
         if 0 <= gx < self.size_x and 0 <= gy < self.size_y:
             self.data[gy, gx] = OCC
 
+    def mark_occupied_radius(self, x: float, y: float, radius: float) -> None:
+        center = self.world_to_grid(x, y)
+        if center is None:
+            return
+        if radius <= 0.0:
+            self.mark_occupied(*center)
+            return
+        cx, cy = center
+        cells = int(math.ceil(radius / self.resolution))
+        for gy in range(cy - cells, cy + cells + 1):
+            for gx in range(cx - cells, cx + cells + 1):
+                if not (0 <= gx < self.size_x and 0 <= gy < self.size_y):
+                    continue
+                wx, wy = self.grid_to_world(gx, gy)
+                if math.hypot(wx - x, wy - y) <= radius:
+                    self.data[gy, gx] = OCC
+
     def mark_visited_radius(self, x: float, y: float, radius: float) -> None:
         center = self.world_to_grid(x, y)
         if center is None:
@@ -91,6 +108,7 @@ class MultiFloorGridMap:
         floor_height: float = 2.6,
         obstacle_min_z: float = 0.15,
         obstacle_max_z: float = 1.40,
+        obstacle_inflation_radius: float = 0.25,
         raycast_max_range: float = 12.0,
         visited_radius: float = 0.45,
     ):
@@ -102,6 +120,7 @@ class MultiFloorGridMap:
         self.floor_height = float(floor_height)
         self.obstacle_min_z = float(obstacle_min_z)
         self.obstacle_max_z = float(obstacle_max_z)
+        self.obstacle_inflation_radius = float(obstacle_inflation_radius)
         self.raycast_max_range = float(raycast_max_range)
         self.visited_radius = float(visited_radius)
         self._floors: dict[int, FloorGrid] = {}
@@ -144,7 +163,7 @@ class MultiFloorGridMap:
                 continue
             self._raycast_free(grid, robot_cell, target_cell)
             if self.obstacle_min_z <= z_rel <= self.obstacle_max_z:
-                grid.mark_occupied(*target_cell)
+                grid.mark_occupied_radius(px, py, self.obstacle_inflation_radius)
 
     def mark_black(self, floor_index: int, x: float, y: float, radius: float) -> None:
         grid = self.floor(floor_index)

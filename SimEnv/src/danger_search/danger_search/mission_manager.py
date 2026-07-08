@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import os
+from pathlib import Path
 import time
 
 import numpy as np
@@ -32,6 +33,7 @@ CHANGE_FLOOR = "CHANGE_FLOOR"
 RETURN_HOME = "RETURN_HOME"
 WRITE_RESULT = "WRITE_RESULT"
 FINISH = "FINISH"
+PROBE_LATERAL_OFFSETS = (0.0, -1.0, 1.0, -2.0, 2.0)
 
 
 class MissionManager:
@@ -53,8 +55,16 @@ class MissionManager:
         self._change_phase: str | None = None
         self._no_frontier_scan_until = 0.0
         self._last_status_publish = 0.0
+        self._probe_attempt = 0
         self._timer = None
         self._finished = False
+        self._shutdown_requested = False
+        self._return_home_success = False
+        self._elevator_success: bool | None = None
+        self._timeout_triggered = False
+        self._failure_reasons: list[str] = []
+        self._last_pose: tuple[float, float, float] | None = None
+        self._max_home_distance = 0.0
 
         self._load_params()
         self._status_publisher = None
@@ -76,14 +86,15 @@ class MissionManager:
     def start(self) -> None:
         self.sensor_buffer.start()
         self.controller.start()
-        self.floor_manager.start()
+        if self.max_floor > 1:
+            self.floor_manager.start()
         self._status_publisher = rospy.Publisher(self.status_topic, String, queue_size=1)
         self._timer = rospy.Timer(rospy.Duration(0.1), self._on_timer)
         rospy.on_shutdown(self.shutdown)
         rospy.loginfo("danger_search 已启动，等待传感器数据")
 
     def shutdown(self) -> None:
-        self.controller.stop()
+        self.controller.stop(repeat=5)
         if not self._finished:
             self._write_result()
 
@@ -100,12 +111,17 @@ class MissionManager:
         self.max_runtime = float(_param("mission/max_runtime", 590.0))
         self.max_floor = int(_param("mission/max_floor", 1))
         self.floor_timeout = float(_param("mission/floor_timeout", 180.0))
+        self.min_floor_explore_time = float(_param("mission/min_floor_explore_time", 20.0))
+        self.min_floor_travel_distance = float(_param("mission/min_floor_travel_distance", 6.0))
         self.home_tolerance = float(_param("mission/home_tolerance", 0.7))
         self.explore_coverage_ratio = float(_param("mission/explore_coverage_ratio", 0.82))
         self.min_frontier_count = int(_param("mission/min_frontier_count", 1))
         self.no_frontier_scan_duration = float(_param("mission/no_frontier_scan_duration", 8.0))
+        self.probe_distance = float(_param("mission/probe_distance", 1.2))
+        self.probe_yaw = float(_param("mission/probe_yaw", math.pi / 2.0))
         self.status_publish_period = float(_param("mission/status_publish_period", 1.0))
         self.result_file = str(_param("result_file", os.path.join(os.getcwd(), "results", "detected_danger.json")))
+        self.mission_summary_file = str(_param("mission_summary_file", ""))
 
         self.map_params = {
             "resolution": float(_param("map/resolution", 0.10)),
@@ -116,6 +132,7 @@ class MissionManager:
             "floor_height": float(_param("map/floor_height", 2.6)),
             "obstacle_min_z": float(_param("map/obstacle_min_z", 0.15)),
             "obstacle_max_z": float(_param("map/obstacle_max_z", 1.40)),
+            "obstacle_inflation_radius": float(_param("map/obstacle_inflation_radius", 0.25)),
             "raycast_max_range": float(_param("map/raycast_max_range", 12.0)),
             "visited_radius": float(_param("map/visited_radius", 0.45)),
         }
@@ -131,14 +148,16 @@ class MissionManager:
             "revisit_penalty_weight": float(_param("frontier/revisit_penalty_weight", 2.0)),
         }
         self.controller_params = {
-            "max_linear": float(_param("controller/max_linear", 0.35)),
-            "max_angular": float(_param("controller/max_angular", 0.9)),
+            "max_linear": float(_param("controller/max_linear", 0.60)),
+            "max_lateral": float(_param("controller/max_lateral", 0.0)),
+            "max_angular": float(_param("controller/max_angular", 0.0)),
+            "min_linear_fraction": float(_param("controller/min_linear_fraction", 1.0)),
             "goal_tolerance": float(_param("controller/goal_tolerance", 0.35)),
             "waypoint_tolerance": float(_param("controller/waypoint_tolerance", 0.25)),
             "pure_pursuit_lookahead": float(_param("controller/pure_pursuit_lookahead", 0.65)),
             "reverse_speed": float(_param("controller/reverse_speed", -0.18)),
-            "recover_duration": float(_param("controller/recover_duration", 1.2)),
-            "no_progress_timeout": float(_param("frontier/no_progress_timeout", 5.0)),
+            "recover_duration": float(_param("controller/recover_duration", 0.6)),
+            "no_progress_timeout": float(_param("frontier/no_progress_timeout", 12.0)),
         }
         self.detection_params = {
             "min_area": int(_param("detection/min_area", 35)),
@@ -176,19 +195,24 @@ class MissionManager:
             self.tick()
         except Exception as exc:
             rospy.logerr("danger_search 状态机异常：%s", exc)
+            self._record_failure(f"状态机异常: {exc}")
             self.controller.stop()
 
     def tick(self) -> None:
         self._publish_status()
         if self.state == FINISH:
             self.controller.stop()
+            self._request_shutdown("danger_search mission finished")
             return
         if self._elapsed() >= self.max_runtime:
             rospy.logwarn("接近时间预算，写出当前检测结果")
+            self._timeout_triggered = True
+            self._record_failure("探索超时")
             self.state = WRITE_RESULT
         if self.state == WRITE_RESULT:
             self._write_result()
             self.state = FINISH
+            self._request_shutdown("danger_search mission finished")
             return
 
         snapshot = self.sensor_buffer.snapshot()
@@ -208,6 +232,7 @@ class MissionManager:
             self.controller.stop()
             return
 
+        self._update_pose_progress(pose)
         self._update_mapping_and_detection(snapshot, pose, xyz)
 
         if self.state == WAIT_CONTROLLER_READY:
@@ -257,7 +282,12 @@ class MissionManager:
         floor_elapsed = time.time() - self.floor_start_time
         if (
             floor_elapsed >= self.floor_timeout
-            or (grid.coverage_ratio() >= self.explore_coverage_ratio and len(frontiers) <= self.min_frontier_count)
+            or (
+                floor_elapsed >= self.min_floor_explore_time
+                and self._max_home_distance >= self.min_floor_travel_distance
+                and grid.coverage_ratio() >= self.explore_coverage_ratio
+                and len(frontiers) <= self.min_frontier_count
+            )
         ):
             self._finish_current_floor()
             return
@@ -265,12 +295,22 @@ class MissionManager:
         if not self.controller.has_path():
             frontier, path = self.explorer.select_frontier(grid, pose)
             if frontier is None or not path:
+                if not frontiers and self._try_probe_unknown_space(pose):
+                    return
                 if self._tick_no_frontier_scan(frontiers):
-                    self._finish_current_floor()
+                    if floor_elapsed >= self.min_floor_explore_time:
+                        self._finish_current_floor()
+                    else:
+                        rospy.loginfo(
+                            "楼层探索时间 %.1f 秒，小于最小值 %.1f 秒，继续扫描",
+                            floor_elapsed,
+                            self.min_floor_explore_time,
+                        )
                 return
             self.current_frontier = frontier
             self.controller.set_path(path)
             self._no_frontier_scan_until = 0.0
+            self._probe_attempt = 0
             rospy.loginfo("选择前沿：floor=%d score=%.2f target=(%.2f, %.2f)",
                           self.current_floor, frontier.score, frontier.centroid[0], frontier.centroid[1])
 
@@ -284,19 +324,41 @@ class MissionManager:
         elif status in (DONE, IDLE):
             self.current_frontier = None
 
+    def _try_probe_unknown_space(self, pose: tuple[float, float, float]) -> bool:
+        grid = self.mapper.floor(self.current_floor)
+        home_or_pose = self.home_pose or pose
+        base_pose = (home_or_pose[0], home_or_pose[1], self.probe_yaw)
+        for _ in range(12):
+            target = probe_target_for_attempt(base_pose, self.probe_distance, self._probe_attempt)
+            self._probe_attempt += 1
+            target_cell = grid.world_to_grid(target[0], target[1])
+            if target_cell is None:
+                continue
+            cell_value = int(grid.data[target_cell[1], target_cell[0]])
+            if cell_value in (80, 100):
+                continue
+            self.current_frontier = None
+            self.controller.set_path([(pose[0], pose[1]), target])
+            rospy.loginfo("无前沿，执行短距离探测目标：target=(%.2f, %.2f)", target[0], target[1])
+            return True
+        return False
+
     def _tick_no_frontier_scan(self, frontiers: list[Frontier]) -> bool:
         now = time.time()
-        if frontiers:
-            self._no_frontier_scan_until = 0.0
-            return True
         if self._no_frontier_scan_until <= 0.0:
             self._no_frontier_scan_until = now + self.no_frontier_scan_duration
-            rospy.loginfo("当前无前沿，原地扫描 %.1f 秒后再判断", self.no_frontier_scan_duration)
+            if frontiers:
+                rospy.loginfo("当前无可达前沿，原地扫描 %.1f 秒后再判断", self.no_frontier_scan_duration)
+            else:
+                rospy.loginfo("当前无前沿，原地扫描 %.1f 秒后再判断", self.no_frontier_scan_duration)
         if now < self._no_frontier_scan_until:
             self.controller.rotate_in_place(0.45)
             return False
         self.controller.stop()
         self._no_frontier_scan_until = 0.0
+        if frontiers:
+            self._record_failure("无可达前沿")
+            rospy.logwarn("扫描后仍无可达前沿，结束当前楼层")
         return True
 
     def _finish_current_floor(self) -> None:
@@ -308,6 +370,7 @@ class MissionManager:
 
     def _tick_return_home(self, pose: tuple[float, float, float]) -> None:
         if self.home_pose is None:
+            self._record_failure("缺少返航起点")
             self.state = WRITE_RESULT
             return
         if self.current_floor != 0 and self.max_floor > 1:
@@ -315,6 +378,7 @@ class MissionManager:
             return
         distance = math.hypot(self.home_pose[0] - pose[0], self.home_pose[1] - pose[1])
         if distance <= self.home_tolerance:
+            self._return_home_success = True
             self.state = WRITE_RESULT
             return
         if not self.controller.has_path():
@@ -330,8 +394,12 @@ class MissionManager:
     def _begin_floor_change(self, target_floor: int, *, return_after: bool) -> None:
         if not self.floor_manager.services_ready():
             rospy.logwarn("门/电梯服务不可用，停止探索并写出已有结果")
+            self._elevator_success = False
+            self._record_failure("门/电梯服务不可用")
             self.state = WRITE_RESULT
             return
+        if self._elevator_success is None:
+            self._elevator_success = True
         self.target_floor = int(target_floor)
         self.return_after_floor_change = bool(return_after)
         self._change_phase = "GO_LOBBY"
@@ -374,6 +442,7 @@ class MissionManager:
             return
         if self._change_phase == "EXIT":
             if self._navigate_to(pose, self.floor_manager.targets.lobby_xy):
+                self._elevator_success = True
                 self._service_task = None
                 self._change_phase = None
                 self.target_floor = None
@@ -405,6 +474,8 @@ class MissionManager:
         message = self._service_task.message()
         if not ok:
             rospy.logwarn("换层服务失败：%s", message)
+            self._elevator_success = False
+            self._record_failure(f"换层服务失败: {message}")
             self.state = WRITE_RESULT
             return False
         self._service_task = None
@@ -413,8 +484,9 @@ class MissionManager:
     def _write_result(self) -> None:
         positions = self.tracker.confirmed_positions(now=time.time())
         path = self.result_writer.write(self._elapsed(), positions)
-        self.controller.stop()
+        self.controller.stop(repeat=5)
         self._finished = True
+        self._write_mission_summary(path, len(positions))
         rospy.loginfo("已写出危险源检测结果：%s，数量=%d", path, len(positions))
 
     def _publish_status(self) -> None:
@@ -439,15 +511,81 @@ class MissionManager:
     def _elapsed(self) -> float:
         return time.time() - self.start_time
 
+    def _record_failure(self, reason: str) -> None:
+        if reason and reason not in self._failure_reasons:
+            self._failure_reasons.append(reason)
+
+    def _update_pose_progress(self, pose: tuple[float, float, float]) -> None:
+        self._last_pose = pose
+        if self.home_pose is None:
+            return
+        self._max_home_distance = max(
+            self._max_home_distance,
+            math.hypot(pose[0] - self.home_pose[0], pose[1] - self.home_pose[1]),
+        )
+
+    def _request_shutdown(self, reason: str) -> None:
+        if self._shutdown_requested:
+            return
+        self._shutdown_requested = True
+        rospy.signal_shutdown(reason)
+
+    def _write_mission_summary(self, result_path: Path, detected_count: int) -> None:
+        if not self.mission_summary_file:
+            return
+        summary_path = Path(self.mission_summary_file)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "exploration_time": round(self._elapsed(), 2),
+            "state": FINISH if self._finished else self.state,
+            "current_floor": self.current_floor,
+            "max_floor": self.max_floor,
+            "return_home_success": self._return_home_success,
+            "elevator_success": self._elevator_success,
+            "timeout_triggered": self._timeout_triggered,
+            "failure_reason": list(self._failure_reasons),
+            "detected_count": int(detected_count),
+            "track_count": len(self.tracker.tracks),
+            "confirmed_count": int(detected_count),
+            "final_pose": list(self._last_pose) if self._last_pose is not None else None,
+            "max_home_distance": round(self._max_home_distance, 3),
+            "controller_debug": self.controller.command_debug_summary(),
+            "result_file": str(result_path),
+        }
+        summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
 
 def _param(path: str, default):
-    private_name = "~" + path
-    global_name = "/" + path
-    if rospy.has_param(private_name):
-        return rospy.get_param(private_name)
-    if rospy.has_param(global_name):
-        return rospy.get_param(global_name)
+    node_name = rospy.get_name().rstrip("/")
+    candidate_names = [
+        f"{node_name}/{path}",
+        "~" + path,
+        "/" + path,
+    ]
+    for name in candidate_names:
+        if rospy.has_param(name):
+            return rospy.get_param(name)
     return default
+
+
+def probe_target_for_attempt(
+    base_pose: tuple[float, float, float],
+    probe_distance: float,
+    attempt: int,
+) -> tuple[float, float]:
+    """按固定走廊扫描序列生成短距离探测目标，避免无前沿时只在起点附近抖动。"""
+    distance = max(float(probe_distance), 0.05)
+    attempt_index = max(int(attempt), 0)
+    lane_index = attempt_index % len(PROBE_LATERAL_OFFSETS)
+    forward_step = attempt_index // len(PROBE_LATERAL_OFFSETS) + 1
+    forward = (math.cos(base_pose[2]), math.sin(base_pose[2]))
+    lateral = (math.cos(base_pose[2] + math.pi / 2.0), math.sin(base_pose[2] + math.pi / 2.0))
+    lateral_offset = PROBE_LATERAL_OFFSETS[lane_index] * distance
+    forward_distance = forward_step * distance
+    return (
+        base_pose[0] + forward_distance * forward[0] + lateral_offset * lateral[0],
+        base_pose[1] + forward_distance * forward[1] + lateral_offset * lateral[1],
+    )
 
 
 def _ros_link_from_optical_matrix() -> np.ndarray:

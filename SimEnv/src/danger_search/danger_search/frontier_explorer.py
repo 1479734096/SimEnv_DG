@@ -55,22 +55,25 @@ class FrontierExplorer:
         best_path: list[tuple[float, float]] = []
         best_score = -math.inf
         for frontier in frontiers:
-            if self._is_blacklisted(grid, frontier.centroid):
+            target_xy = _frontier_goal_for_robot(grid, frontier, (robot_pose[0], robot_pose[1]))
+            if self._is_blacklisted(grid, target_xy):
                 continue
-            path = astar_path(grid, (robot_pose[0], robot_pose[1]), frontier.centroid)
+            path = astar_path(grid, (robot_pose[0], robot_pose[1]), target_xy)
             if not path:
-                self.record_failure(grid, frontier.centroid)
+                self.record_failure(grid, target_xy)
                 continue
             score = self._score_frontier(frontier, path, robot_pose)
             if score > best_score:
                 best_score = score
                 best_frontier = Frontier(
                     cells=frontier.cells,
-                    centroid=frontier.centroid,
+                    centroid=target_xy,
                     information_gain=frontier.information_gain,
                     score=score,
                 )
                 best_path = path
+        if best_frontier is None:
+            return self._select_free_space_goal(grid, robot_pose)
         return best_frontier, best_path
 
     def extract_frontiers(self, grid: FloorGrid) -> list[Frontier]:
@@ -96,8 +99,13 @@ class FrontierExplorer:
         for cluster in clusters:
             xs = [cell[0] for cell in cluster]
             ys = [cell[1] for cell in cluster]
-            centroid_cell = (int(round(sum(xs) / len(xs))), int(round(sum(ys) / len(ys))))
-            centroid = grid.grid_to_world(*centroid_cell)
+            mean_x = sum(xs) / len(xs)
+            mean_y = sum(ys) / len(ys)
+            target_cell = min(
+                cluster,
+                key=lambda cell: (cell[0] - mean_x) * (cell[0] - mean_x) + (cell[1] - mean_y) * (cell[1] - mean_y),
+            )
+            centroid = grid.grid_to_world(*target_cell)
             frontiers.append(
                 Frontier(
                     cells=tuple(cluster),
@@ -145,6 +153,33 @@ class FrontierExplorer:
             - self.revisit_penalty_weight * revisit_penalty
         )
 
+    def _select_free_space_goal(
+        self,
+        grid: FloorGrid,
+        robot_pose: tuple[float, float, float],
+    ) -> tuple[Frontier | None, list[tuple[float, float]]]:
+        robot_xy = (robot_pose[0], robot_pose[1])
+        stride = max(1, int(round(0.4 / grid.resolution)))
+        candidates: list[tuple[float, tuple[int, int]]] = []
+        for gy in range(0, grid.size_y, stride):
+            for gx in range(0, grid.size_x, stride):
+                if int(grid.data[gy, gx]) != FREE:
+                    continue
+                wx, wy = grid.grid_to_world(gx, gy)
+                distance = math.hypot(wx - robot_xy[0], wy - robot_xy[1])
+                if distance < 1.0 or self._is_blacklisted(grid, (wx, wy)):
+                    continue
+                candidates.append((distance, (gx, gy)))
+        candidates.sort(reverse=True)
+        for _, cell in candidates[:30]:
+            goal = grid.grid_to_world(*cell)
+            path = astar_path(grid, robot_xy, goal)
+            if path:
+                frontier = Frontier(cells=(cell,), centroid=goal, information_gain=0.0, score=-_path_length(path))
+                return frontier, path
+            self.record_failure(grid, goal)
+        return None, []
+
 
 def astar_path(grid: FloorGrid, start_xy: tuple[float, float], goal_xy: tuple[float, float]) -> list[tuple[float, float]]:
     start = grid.world_to_grid(start_xy[0], start_xy[1])
@@ -187,6 +222,19 @@ def _has_unknown_neighbor(grid: FloorGrid, gx: int, gy: int) -> bool:
             if int(grid.data[ny, nx]) == UNKNOWN:
                 return True
     return False
+
+
+def _frontier_goal_for_robot(
+    grid: FloorGrid,
+    frontier: Frontier,
+    robot_xy: tuple[float, float],
+) -> tuple[float, float]:
+    def distance_sq(cell: tuple[int, int]) -> float:
+        wx, wy = grid.grid_to_world(cell[0], cell[1])
+        return (wx - robot_xy[0]) * (wx - robot_xy[0]) + (wy - robot_xy[1]) * (wy - robot_xy[1])
+
+    target_cell = max(frontier.cells, key=distance_sq)
+    return grid.grid_to_world(*target_cell)
 
 
 def _flood_fill(mask: np.ndarray, visited: np.ndarray, start_x: int, start_y: int) -> list[tuple[int, int]]:

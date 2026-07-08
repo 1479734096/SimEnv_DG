@@ -32,3 +32,22 @@ Makefile
 # 本地编辑器配置
 .idea/
 .vscode/
+*.swp
+*~
+
+# Python 环境与测试
+venv/
+.venv/
+.env
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 操作系统自动生成文件
+.DS_Store
+Thumbs.db
+
+# CMake 补充
+install_manifest.txt
+Testing/
+CMakeScripts/

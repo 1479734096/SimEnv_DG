@@ -43,7 +43,71 @@ roslaunch danger_search danger_search_smoke.launch
 ## 关键约束
 
 - 检测结果使用多帧确认后才输出，优先降低虚警率。
+- 楼层探索至少持续 `mission/min_floor_explore_time`，避免启动后已知区域过小却被误判为覆盖完成。
+- 楼层结束还要求最大离家距离达到 `mission/min_floor_travel_distance`，避免机器人只在起点附近抖动就结束任务。
+- 无前沿且无远处 FREE 目标时，会按 `mission/probe_distance` 做短距离探测前进，再重新建图；默认 `mission/probe_yaw=1.5708`，沿比赛入口到房间的全局 +Y 方向探测，避免起立后的机体 yaw 抖动把探测方向带反。
+- 路径跟踪默认采用纯前进优先配置：`controller/min_linear_fraction=1.0`、`controller/max_angular=0.0`、`controller/max_lateral=0.0`，先保证 A1 RL 能稳定进入房间；需要更精细绕障时再逐步打开侧向和角速度。
+- 卡住恢复默认等待 `frontier/no_progress_timeout=12.0` 秒，避免 A1 刚起步就被频繁判定为卡住并后退。
 - 默认使用 `/livox/Pointcloud2` 做 2.5D 栅格建图。
+- 点云命中障碍会按 `map/obstacle_inflation_radius` 做栅格膨胀，给 A1 留出安全余量。
 - 默认使用 `/real_sense/rgb/image_raw` 和 `/real_sense/depth/image_raw` 做红球识别。
 - 输出坐标使用 Gazebo `world/odom` 数值坐标。
 - RGB-D 反投影默认按 OpenCV 光学坐标计算，再转换到 ROS link 坐标后使用 TF。若实际相机 TF 已经是光学坐标，可把 `detection/depth_frame_is_optical` 设为 `false`。
+
+## 批量评测与调参
+
+单个 seed 运行并归档：
+
+```bash
+python3 src/danger_search/tools/run_seed.py --seed 42 --timeout 620 --max-floor 3
+```
+
+批量 seed 评测：
+
+```bash
+python3 src/danger_search/scripts/batch_evaluate.py --seeds 10 42 100 --timeout 620 --max-floor 3
+```
+
+网格搜索参数：
+
+```bash
+python3 src/danger_search/tools/tune_params.py --seeds 10 42 100 --timeout 620 --max-floor 3
+```
+
+每次运行会创建独立目录：
+
+```text
+results/runs/<时间戳>_seed_<seed>/
+├── detected_danger.json
+├── evaluation.json
+├── params.yaml
+├── mission_summary.json
+├── mission_runtime_summary.json
+├── detection_debug.json
+├── planner_debug.json
+└── logs/
+```
+
+如果外层 `run_seed.py` 达到 `--timeout` 后中断算法，归档中的 `mission_summary.json` 会写入 `external_timeout=true`、`completed=false`，并用 `result_written` 单独表示是否已经落盘 `detected_danger.json`。
+
+汇总和报告文件：
+
+```text
+results/summary.csv
+results/best_params.yaml
+results/optimization_report.md
+```
+
+参数覆盖文件支持扁平 key，例如：
+
+```yaml
+tracker/nms_radius: 0.95
+tracker/min_hits: 4
+detection/max_rmse: 0.035
+controller/max_linear: 0.35
+map/obstacle_inflation_radius: 0.25
+```
+
+也兼容计划里的旧 key，例如 `detection.confirm_hits`、`mission.total_timeout`、`controller.max_linear_vel`，工具会映射到当前配置结构。
+
+注意：`danger_search_node` 运行期间不会读取 `danger_truth.json`。`run_seed.py` 只在算法退出后调用 `evaluate_danger.py` 做离线评测，此阶段才读取真值并写入 `evaluation.json`。

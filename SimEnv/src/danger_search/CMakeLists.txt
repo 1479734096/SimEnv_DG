@@ -29,7 +29,12 @@ catkin_package(
 )
 
 catkin_install_python(PROGRAMS
+  scripts/batch_evaluate.py
   scripts/danger_search_node
+  tools/generate_optimization_report.py
+  tools/run_seed.py
+  tools/summarize_results.py
+  tools/tune_params.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

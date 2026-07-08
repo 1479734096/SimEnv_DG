@@ -15,10 +15,14 @@ mission:
   max_runtime: 590.0
   max_floor: 1
   floor_timeout: 180.0
+  min_floor_explore_time: 20.0
+  min_floor_travel_distance: 6.0
   home_tolerance: 0.7
   explore_coverage_ratio: 0.82
   min_frontier_count: 1
   no_frontier_scan_duration: 8.0
+  probe_distance: 1.2
+  probe_yaw: 1.5708
   status_publish_period: 1.0
 
 map:
@@ -30,6 +34,7 @@ map:
   floor_height: 2.6
   obstacle_min_z: 0.15
   obstacle_max_z: 1.40
+  obstacle_inflation_radius: 0.25
   raycast_max_range: 12.0
   visited_radius: 0.45
   cloud_stride: 3
@@ -39,20 +44,22 @@ frontier:
   min_cluster_size: 8
   blacklist_ttl: 60.0
   fail_limit: 3
-  no_progress_timeout: 5.0
+  no_progress_timeout: 12.0
   information_gain_weight: 2.0
   path_cost_weight: 1.0
   yaw_cost_weight: 0.3
   revisit_penalty_weight: 2.0
 
 controller:
-  max_linear: 0.35
-  max_angular: 0.9
+  max_linear: 0.60
+  max_lateral: 0.0
+  max_angular: 0.0
+  min_linear_fraction: 1.0
   goal_tolerance: 0.35
   waypoint_tolerance: 0.25
   pure_pursuit_lookahead: 0.65
   reverse_speed: -0.18
-  recover_duration: 1.2
+  recover_duration: 0.6
 
 detection:
   min_area: 35
