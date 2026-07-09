@@ -3,9 +3,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from danger_search.building_control_client import DoorInfo
+from danger_search.local_semantic_detector import DoorCandidate
 from danger_search.mapper import MultiFloorGridMap
 import danger_search.mission_manager as mission_manager_module
+from danger_search.mission_manager import EXPLORE_FLOOR
 from danger_search.mission_manager import MissionManager
 from danger_search.mission_manager import probe_target_for_attempt
 
@@ -30,33 +31,80 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         self.assertEqual(target, (0.05, 0.0))
 
-    def test_setup_floor_doors_only_tracks_non_elevator_doors_on_current_floor(self):
+    def test_should_open_door_accepts_visible_dynamic_candidate(self):
         manager = MissionManager.__new__(MissionManager)
-        manager.current_floor = 0
-        manager.unvisited_doors = set()
+        manager.state = EXPLORE_FLOOR
+        manager.current_task = None
+        manager.opened_doors = set()
+        manager.failed_doors = set()
+        manager.active_door = None
+        manager.local_detector = SimpleNamespace(max_distance=3.0)
         manager.building_client = SimpleNamespace(
-            doors={
-                "main_entrance": DoorInfo("main_entrance", "main_entrance", 0, 0.0, 0.0, math.pi / 2.0),
-                "elevator_floor_0": DoorInfo("elevator_floor_0", "elevator", 0, 1.65, 2.6, math.pi),
-                "floor_1_gate": DoorInfo("floor_1_gate", "main_entrance", 1, 0.0, 0.0, math.pi / 2.0),
-            }
+            is_elevator_door=lambda door_id: False,
+            door_service_ready=lambda: True,
+        )
+        candidate = DoorCandidate(
+            door_id="main_entrance",
+            distance=1.2,
+            visible=True,
+            kind="dynamic_door",
+            floor_index=0,
+            world_xy=(0.0, 0.0),
+            source="local_pointcloud",
+            evidence_count=8,
         )
 
-        manager._setup_floor_doors()
+        self.assertTrue(manager._should_open_door(candidate))
 
-        self.assertEqual(manager.unvisited_doors, {"main_entrance"})
-
-    def test_nearest_unvisited_door_chooses_closest_metadata_pose(self):
+    def test_should_open_door_rejects_elevator_candidate(self):
         manager = MissionManager.__new__(MissionManager)
-        manager.unvisited_doors = {"far_gate", "near_gate"}
+        manager.state = EXPLORE_FLOOR
+        manager.current_task = None
+        manager.opened_doors = set()
+        manager.failed_doors = set()
+        manager.active_door = None
+        manager.local_detector = SimpleNamespace(max_distance=3.0)
         manager.building_client = SimpleNamespace(
-            doors={
-                "far_gate": DoorInfo("far_gate", "main_entrance", 0, 5.0, 0.0, 0.0),
-                "near_gate": DoorInfo("near_gate", "main_entrance", 0, 1.0, 0.0, 0.0),
-            }
+            is_elevator_door=lambda door_id: True,
+            door_service_ready=lambda: True,
+        )
+        candidate = DoorCandidate(
+            door_id="elevator_floor_0",
+            distance=1.2,
+            visible=True,
+            kind="elevator",
+            floor_index=0,
+            world_xy=(1.0, 2.6),
+            source="local_pointcloud",
+            evidence_count=8,
         )
 
-        self.assertEqual(manager._nearest_unvisited_door((0.0, 0.0, 0.0)), "near_gate")
+        self.assertFalse(manager._should_open_door(candidate))
+
+    def test_should_open_door_does_not_interrupt_current_task(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.state = EXPLORE_FLOOR
+        manager.current_task = object()
+        manager.opened_doors = set()
+        manager.failed_doors = set()
+        manager.active_door = None
+        manager.local_detector = SimpleNamespace(max_distance=3.0)
+        manager.building_client = SimpleNamespace(
+            is_elevator_door=lambda door_id: False,
+            door_service_ready=lambda: True,
+        )
+        candidate = DoorCandidate(
+            door_id="main_entrance",
+            distance=1.2,
+            visible=True,
+            kind="dynamic_door",
+            floor_index=0,
+            world_xy=(0.0, 0.0),
+            source="local_pointcloud",
+            evidence_count=8,
+        )
+
+        self.assertFalse(manager._should_open_door(candidate))
 
     def test_probe_unknown_space_starts_from_current_pose_after_passing_door(self):
         recorded_paths = []

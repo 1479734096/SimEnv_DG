@@ -77,6 +77,16 @@ detection:
   # Gazebo 插件 frameName 通常写 robot link 名，因此默认转换到 ROS link 坐标后再走 TF。
   depth_frame_is_optical: true
 
+local_semantic:
+  max_door_distance: 3.0
+  door_fov_half_angle: 0.85
+  door_evidence_radius: 0.75
+  min_door_evidence_points: 6
+  min_door_evidence_height: 0.15
+  max_door_evidence_height: 1.80
+  # 仅用于调试：关闭时必须有局部传感器证据，不能只靠 metadata 近距判断开门。
+  use_truth_proximity_detector: false
+
 tracker:
   association_radius: 0.45
   confirmation_window: 10.0

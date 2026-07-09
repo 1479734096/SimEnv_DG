@@ -24,6 +24,7 @@ from danger_search.detection_tracker import DetectionTracker
 from danger_search.building_control_client import BuildingControlClient
 from danger_search.navigation_tasks import NavigationTask, TakeElevator, OpenDoorAndPass, NavigateToPose, FAILED
 from danger_search.frontier import Frontier, FrontierExplorer
+from danger_search.local_semantic_detector import DoorCandidate, LocalSemanticDetector
 from danger_search.navigator import DONE, IDLE, STUCK, PathFollower
 from danger_search.planner import astar_path
 from danger_search.mapper import MultiFloorGridMap
@@ -74,7 +75,10 @@ class MissionManager:
         self.manual_goal: tuple[float, float] | None = None
         self.manual_mode = False
         self.current_task: NavigationTask | None = None
-        self.unvisited_doors: set[str] = set()
+        self.opened_doors: set[str] = set()
+        self.failed_doors: set[str] = set()
+        self.active_door: str | None = None
+        self._latest_cloud_points: list[tuple[float, float, float]] = []
 
         self._load_params()
         self._status_publisher = None
@@ -89,6 +93,7 @@ class MissionManager:
         self.explorer = FrontierExplorer(**self.frontier_params)
         self.controller = PathFollower(cmd_vel_topic=self.cmd_vel_topic, **self.controller_params)
         self.detector = RedSphereDetector(**self.detection_params)
+        self.local_detector = LocalSemanticDetector(**self.local_detection_params)
         self.tracker = DetectionTracker(**self.tracker_params)
         metadata_file = os.path.abspath(os.path.join(os.path.dirname(self.result_file), "../generated_building/layout_metadata.json"))
         self.building_client = BuildingControlClient(
@@ -100,7 +105,7 @@ class MissionManager:
     def start(self) -> None:
         self.sensor_buffer.start()
         self.controller.start()
-        if self.max_floor > 1 or self.building_client.has_door_targets():
+        if self.max_floor > 1 or self.building_client.has_controllable_doors():
             self.building_client.start(connect_elevator=self.max_floor > 1)
         self._status_publisher = rospy.Publisher(self.status_topic, String, queue_size=1)
         if OccupancyGrid is not None:
@@ -116,21 +121,7 @@ class MissionManager:
     def _goal_callback(self, msg) -> None:
         self.manual_mode = True
         self.manual_goal = (msg.pose.position.x, msg.pose.position.y)
-
-        nearest_door = None
-        min_dist = float("inf")
-        for door_id, door in self.building_client.doors.items():
-            if door.floor_index == self.current_floor and door.kind != "elevator":
-                d = math.hypot(door.x - self.manual_goal[0], door.y - self.manual_goal[1])
-                if d < min_dist:
-                    min_dist = d
-                    nearest_door = door_id
-
-        if nearest_door and min_dist < 1.5:
-            self.current_task = OpenDoorAndPass(nearest_door)
-            rospy.loginfo("手动目标点距离门 %s 仅 %.2f 米，自动转换为穿门任务！", nearest_door, min_dist)
-        else:
-            self.current_task = NavigateToPose(self.manual_goal)
+        self.current_task = NavigateToPose(self.manual_goal)
 
         self.controller.clear_path()
         self.current_frontier = None
@@ -218,6 +209,15 @@ class MissionManager:
             "max_depth": float(_param("detection/max_depth", 8.0)),
         }
         self.depth_frame_is_optical = bool(_param("detection/depth_frame_is_optical", True))
+        self.local_detection_params = {
+            "max_distance": float(_param("local_semantic/max_door_distance", 3.0)),
+            "fov_half_angle": float(_param("local_semantic/door_fov_half_angle", 0.85)),
+            "evidence_radius": float(_param("local_semantic/door_evidence_radius", 0.75)),
+            "min_evidence_points": int(_param("local_semantic/min_door_evidence_points", 6)),
+            "min_evidence_height": float(_param("local_semantic/min_door_evidence_height", 0.15)),
+            "max_evidence_height": float(_param("local_semantic/max_door_evidence_height", 1.80)),
+            "use_truth_proximity_detector": bool(_param("local_semantic/use_truth_proximity_detector", False)),
+        }
         self.tracker_params = {
             "association_radius": float(_param("tracker/association_radius", 0.45)),
             "confirmation_window": float(_param("tracker/confirmation_window", 10.0)),
@@ -274,15 +274,23 @@ class MissionManager:
             status = self.current_task.tick(self, pose)
             if status in (DONE, FAILED):
                 if isinstance(self.current_task, OpenDoorAndPass):
-                    self.unvisited_doors.discard(self.current_task.door_id)
+                    if status == DONE:
+                        self.opened_doors.add(self.current_task.door_id)
+                    else:
+                        self.failed_doors.add(self.current_task.door_id)
+                    self.active_door = None
                 if status == FAILED:
                     rospy.logwarn("当前任务 %s 失败，放弃该门/任务", self.current_task.name)
+
+                if isinstance(self.current_task, TakeElevator) and status == DONE:
+                    self.current_floor = self.current_task.target_floor
+                    self.controller.clear_path()
+                    self.floor_start_time = time.time()
+
                 self.current_task = None
 
                 if self.state == CHANGE_FLOOR:
                     self.state = RETURN_HOME if self.return_after_floor_change else EXPLORE_FLOOR
-                    if self.state == EXPLORE_FLOOR:
-                        self._setup_floor_doors()
             return
 
         if self.state == INIT:
@@ -291,7 +299,6 @@ class MissionManager:
             self.home_pose = pose
             self.current_floor = self.mapper.estimate_floor_from_z(xyz[2])
             self.floor_start_time = time.time()
-            self._setup_floor_doors()
             self.state = WAIT_CONTROLLER_READY
             rospy.loginfo("记录起点：x=%.2f y=%.2f floor=%d", pose[0], pose[1], self.current_floor)
             return
@@ -313,6 +320,7 @@ class MissionManager:
             max_points=self.cloud_max_points,
             stride=self.cloud_stride,
         )
+        self._latest_cloud_points = points
         self.mapper.update_from_cloud(floor_index=self.current_floor, robot_xyz=xyz, points=points)
 
         bundle = snapshot.image_bundle
@@ -352,24 +360,35 @@ class MissionManager:
                 and self._max_home_distance >= self.min_floor_travel_distance
                 and grid.coverage_ratio() >= self.explore_coverage_ratio
                 and len(frontiers) <= self.min_frontier_count
-                and len(self.unvisited_doors) == 0
             )
         ):
             self._finish_current_floor()
             return
 
-        if not self.controller.has_path():
-            door_id = self._nearest_unvisited_door(pose)
-            if door_id is not None:
-                if not self.building_client.door_service_ready():
-                    rospy.logwarn("门服务不可用，跳过本层动态门任务")
-                    self._record_failure("门服务不可用")
-                    self.unvisited_doors.clear()
-                else:
-                    rospy.loginfo("准备通过本层动态门: %s", door_id)
-                    self.current_task = OpenDoorAndPass(door_id)
-                    return
+        candidate = self.local_detector.detect_controllable_door(
+            robot_pose=pose,
+            floor_index=self.current_floor,
+            cloud_points=self._latest_cloud_points,
+            building_client=self.building_client,
+            floor_height=self.mapper.floor_height,
+            allow_elevator=False,
+        )
+        if self._should_open_door(candidate):
+            assert candidate is not None
+            self.controller.clear_path()
+            self.current_frontier = None
+            self.active_door = candidate.door_id
+            self.current_task = OpenDoorAndPass(candidate.door_id)
+            rospy.loginfo(
+                "局部检测到可控动态门：door_id=%s distance=%.2f source=%s evidence=%d",
+                candidate.door_id,
+                candidate.distance,
+                candidate.source,
+                candidate.evidence_count,
+            )
+            return
 
+        if not self.controller.has_path():
             frontier, path = self.explorer.select_frontier(grid, pose)
             if frontier is None or not path:
                 if not frontiers and self._try_probe_unknown_space(pose):
@@ -439,26 +458,31 @@ class MissionManager:
             rospy.logwarn("扫描后仍无可达前沿，结束当前楼层")
         return True
 
-    def _setup_floor_doors(self) -> None:
-        self.unvisited_doors.clear()
-        for door_id, door in self.building_client.doors.items():
-            if door.floor_index == self.current_floor and door.kind != "elevator":
-                self.unvisited_doors.add(door_id)
-        if self.unvisited_doors and rospy is not None:
-            rospy.loginfo("本层有 %d 个未访问的门", len(self.unvisited_doors))
-
-    def _nearest_unvisited_door(self, pose: tuple[float, float, float]) -> str | None:
-        nearest_door = None
-        min_dist = float("inf")
-        for door_id in self.unvisited_doors:
-            door = self.building_client.doors.get(door_id)
-            if door is None:
-                continue
-            distance = math.hypot(door.x - pose[0], door.y - pose[1])
-            if distance < min_dist:
-                min_dist = distance
-                nearest_door = door_id
-        return nearest_door
+    def _should_open_door(self, candidate: DoorCandidate | None) -> bool:
+        if candidate is None:
+            return False
+        if self.state != EXPLORE_FLOOR:
+            return False
+        if self.current_task is not None:
+            return False
+        if candidate.kind != "dynamic_door":
+            return False
+        if candidate.door_id in self.opened_doors:
+            return False
+        if candidate.door_id in self.failed_doors:
+            return False
+        if candidate.door_id == self.active_door:
+            return False
+        if self.building_client.is_elevator_door(candidate.door_id):
+            return False
+        if candidate.distance >= self.local_detector.max_distance:
+            return False
+        if not candidate.visible:
+            return False
+        if not self.building_client.door_service_ready():
+            self._record_failure("门服务不可用")
+            return False
+        return True
 
     def _finish_current_floor(self) -> None:
         self.controller.clear_path()

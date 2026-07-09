@@ -56,16 +56,20 @@ class BuildingControlClientTest(unittest.TestCase):
         self.assertNotIn("static_room_door", client.doors)
         self.assertIn("elevator_floor_0", client.doors)
         self.assertIn("elevator_main", client.elevators)
-        self.assertTrue(client.has_door_targets())
+        self.assertTrue(client.has_controllable_doors())
         self.assertEqual(client.doors["main_entrance"].floor_index, 0)
         self.assertAlmostEqual(client.elevators["elevator_main"].lobby_poses[0][2], math.pi)
+        self.assertEqual(
+            [door.door_id for door in client.controllable_doors(floor_index=0, include_elevators=False)],
+            ["main_entrance"],
+        )
 
     def test_missing_metadata_keeps_empty_targets(self):
         client = BuildingControlClient(metadata_path="/tmp/not_existing_layout_metadata.json")
 
         self.assertEqual(client.doors, {})
         self.assertEqual(client.elevators, {})
-        self.assertFalse(client.has_door_targets())
+        self.assertFalse(client.has_controllable_doors())
 
     def test_door_points_choose_current_side_as_wait_point(self):
         with tempfile.TemporaryDirectory() as tmpdir:

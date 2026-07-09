@@ -54,3 +54,7 @@ CMakeScripts/
 
 # 自动生成的场景和建筑配置
 SimEnv/generated_building/
+
+# 其他
+*.zip
+temp.md

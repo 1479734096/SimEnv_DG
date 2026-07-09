@@ -143,8 +143,22 @@ class BuildingControlClient:
     def door_service_ready(self) -> bool:
         return self._set_door is not None
 
-    def has_door_targets(self) -> bool:
-        return any(door.kind != "elevator" for door in self.doors.values())
+    def has_controllable_doors(self) -> bool:
+        return bool(self.doors)
+
+    def controllable_doors(self, *, floor_index: int | None = None, include_elevators: bool = True) -> list[DoorInfo]:
+        doors = []
+        for door in self.doors.values():
+            if floor_index is not None and door.floor_index != floor_index:
+                continue
+            if door.kind == "elevator" and not include_elevators:
+                continue
+            doors.append(door)
+        return doors
+
+    def is_elevator_door(self, door_id: str) -> bool:
+        door = self.doors.get(door_id)
+        return door is not None and door.kind == "elevator"
 
     def open_door(self, door_id: str) -> AsyncServiceCall:
         def call():

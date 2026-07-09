@@ -51,6 +51,11 @@ roslaunch danger_search danger_search_smoke.launch
 - 默认使用 `/livox/Pointcloud2` 做 2.5D 栅格建图。
 - 点云命中障碍会按 `map/obstacle_inflation_radius` 做栅格膨胀，给 A1 留出安全余量。
 - 默认使用 `/real_sense/rgb/image_raw` 和 `/real_sense/depth/image_raw` 做红球识别。
+- Mapper 只维护 free / occupied / unknown 占据栅格，不编码门、电梯或房间入口语义。
+- 动态门只在局部传感器检测到近距离可见门候选后才匹配服务 ID 并执行 `OpenDoorAndPass`；不会把 `layout_metadata.json` 中的门坐标作为探索目标。
+- 房间入口不视为动态门，不调用 `/set_door_state`；普通探索依靠 Frontier 自然进入。
+- 电梯门不走普通开门逻辑，只在 `CHANGE_FLOOR` 状态下由 `TakeElevator` 状态机处理。
+- `local_semantic/use_truth_proximity_detector` 仅用于调试，默认关闭。
 - 输出坐标使用 Gazebo `world/odom` 数值坐标。
 - RGB-D 反投影默认按 OpenCV 光学坐标计算，再转换到 ROS link 坐标后使用 TF。若实际相机 TF 已经是光学坐标，可把 `detection/depth_frame_is_optical` 设为 `false`。
 
