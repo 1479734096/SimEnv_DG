@@ -23,10 +23,11 @@ except ImportError:  # pragma: no cover - 离线环境可能没有 ROS
 from danger_search.detection_tracker import DetectionTracker
 from danger_search.building_control_client import BuildingControlClient
 from danger_search.navigation_tasks import NavigationTask, TakeElevator, OpenDoorAndPass, NavigateToPose, FAILED
-from danger_search.frontier import Frontier, FrontierExplorer
+from danger_search.frontier import Frontier, FrontierExplorer, FrontierSelectionContext
+from .time_utils import get_time
 from danger_search.local_semantic_detector import DoorCandidate, LocalSemanticDetector
 from danger_search.navigator import DONE, IDLE, STUCK, PathFollower
-from danger_search.planner import astar_path
+from danger_search.planner import astar_path, path_length
 from danger_search.mapper import MultiFloorGridMap
 from danger_search.red_sphere_detector import RedSphereDetector
 from danger_search.result_writer import ResultWriter
@@ -50,7 +51,7 @@ class MissionManager:
         if rospy is None:
             raise RuntimeError("当前环境没有 rospy，无法运行 mission_manager")
         self.state = INIT
-        self.start_time = time.time()
+        self.start_time = get_time()
         self.floor_start_time = self.start_time
         self.home_pose: tuple[float, float, float] | None = None
         self.current_floor = 0
@@ -79,6 +80,11 @@ class MissionManager:
         self.failed_doors: set[str] = set()
         self.active_door: str | None = None
         self._latest_cloud_points: list[tuple[float, float, float]] = []
+        self._post_door_frontier_debug: dict[str, object] | None = None
+        self.last_door_id: str | None = None
+        self.last_door_xy: tuple[float, float] | None = None
+        self.last_door_pass_vector: tuple[float, float] | None = None
+        self.last_door_transition_until: float = 0.0
 
         self._load_params()
         self._status_publisher = None
@@ -95,9 +101,9 @@ class MissionManager:
         self.detector = RedSphereDetector(**self.detection_params)
         self.local_detector = LocalSemanticDetector(**self.local_detection_params)
         self.tracker = DetectionTracker(**self.tracker_params)
-        metadata_file = os.path.abspath(os.path.join(os.path.dirname(self.result_file), "../generated_building/layout_metadata.json"))
+        metadata_abs_path = str(Path(__file__).resolve().parents[3] / "generated_building" / "layout_metadata.json")
         self.building_client = BuildingControlClient(
-            metadata_path=metadata_file,
+            metadata_path=metadata_abs_path,
             service_timeout=self.floor_params.get("service_timeout", 5.0),
         )
         self.result_writer = ResultWriter(self.result_file)
@@ -155,6 +161,11 @@ class MissionManager:
         self.no_frontier_scan_duration = float(_param("mission/no_frontier_scan_duration", 8.0))
         self.probe_distance = float(_param("mission/probe_distance", 1.2))
         self.probe_yaw = float(_param("mission/probe_yaw", math.pi / 2.0))
+        self.door_pass_offset = float(_param("mission/door_pass_offset", 0.8))
+        self.door_commit_distance = float(_param("mission/door_commit_distance", 1.8))
+        self.door_clear_radius = float(_param("mission/door_clear_radius", 0.9))
+        self.door_transition_duration = float(_param("mission/door_transition_duration", 3.0))
+        self.door_transition_hold_distance = float(_param("mission/door_transition_hold_distance", 2.5))
         self.status_publish_period = float(_param("mission/status_publish_period", 1.0))
         self.result_file = str(_param("result_file", os.path.join(os.getcwd(), "results", "detected_danger.json")))
         self.mission_summary_file = str(_param("mission_summary_file", ""))
@@ -171,6 +182,11 @@ class MissionManager:
             "obstacle_inflation_radius": float(_param("map/obstacle_inflation_radius", 0.25)),
             "raycast_max_range": float(_param("map/raycast_max_range", 12.0)),
             "visited_radius": float(_param("map/visited_radius", 0.45)),
+            "free_clear_enabled": bool(_param("map/free_clear_enabled", True)),
+            "free_clear_max_range": float(_param("map/free_clear_max_range", 8.0)),
+            "free_clear_angle_step": float(_param("map/free_clear_angle_step", 0.1745)),
+            "free_clear_obstacle_margin": float(_param("map/free_clear_obstacle_margin", 0.25)),
+            "free_clear_min_points_per_bin": int(_param("map/free_clear_min_points_per_bin", 2)),
         }
         self.cloud_stride = int(_param("map/cloud_stride", 3))
         self.cloud_max_points = int(_param("map/cloud_max_points", 18000))
@@ -182,6 +198,12 @@ class MissionManager:
             "path_cost_weight": float(_param("frontier/path_cost_weight", 1.0)),
             "yaw_cost_weight": float(_param("frontier/yaw_cost_weight", 0.3)),
             "revisit_penalty_weight": float(_param("frontier/revisit_penalty_weight", 2.0)),
+            "frontier_obstacle_clearance": float(_param("frontier/frontier_obstacle_clearance", 0.25)),
+            "frontier_unknown_standoff": float(_param("frontier/frontier_unknown_standoff", 0.20)),
+            "frontier_min_information_gain": float(_param("frontier/frontier_min_information_gain", 1.0)),
+            "door_front_half_plane_penalty": float(_param("frontier/door_front_half_plane_penalty", 6.0)),
+            "door_front_half_plane_radius": float(_param("frontier/door_front_half_plane_radius", 1.5)),
+            "door_preferred_direction_bonus": float(_param("frontier/door_preferred_direction_bonus", 1.5)),
         }
         self.controller_params = {
             "max_linear": float(_param("controller/max_linear", 0.60)),
@@ -276,6 +298,7 @@ class MissionManager:
                 if isinstance(self.current_task, OpenDoorAndPass):
                     if status == DONE:
                         self.opened_doors.add(self.current_task.door_id)
+                        self._remember_completed_door(self.current_task, pose)
                     else:
                         self.failed_doors.add(self.current_task.door_id)
                     self.active_door = None
@@ -285,7 +308,7 @@ class MissionManager:
                 if isinstance(self.current_task, TakeElevator) and status == DONE:
                     self.current_floor = self.current_task.target_floor
                     self.controller.clear_path()
-                    self.floor_start_time = time.time()
+                    self.floor_start_time = get_time()
 
                 self.current_task = None
 
@@ -298,7 +321,7 @@ class MissionManager:
                 return
             self.home_pose = pose
             self.current_floor = self.mapper.estimate_floor_from_z(xyz[2])
-            self.floor_start_time = time.time()
+            self.floor_start_time = get_time()
             self.state = WAIT_CONTROLLER_READY
             rospy.loginfo("记录起点：x=%.2f y=%.2f floor=%d", pose[0], pose[1], self.current_floor)
             return
@@ -342,7 +365,7 @@ class MissionManager:
             require_world_transform=True,
         )
         if candidates:
-            self.tracker.update(candidates, now=time.time())
+            self.tracker.update(candidates, now=get_time())
 
     def _tick_explore(self, pose: tuple[float, float, float]) -> None:
         grid = self.mapper.floor(self.current_floor)
@@ -352,7 +375,7 @@ class MissionManager:
             return
 
         frontiers = self.explorer.extract_frontiers(grid)
-        floor_elapsed = time.time() - self.floor_start_time
+        floor_elapsed = get_time() - self.floor_start_time
         if (
             floor_elapsed >= self.floor_timeout
             or (
@@ -378,7 +401,11 @@ class MissionManager:
             self.controller.clear_path()
             self.current_frontier = None
             self.active_door = candidate.door_id
-            self.current_task = OpenDoorAndPass(candidate.door_id)
+            self.current_task = OpenDoorAndPass(
+                candidate.door_id,
+                pass_offset=self.door_pass_offset,
+                commit_distance=self.door_commit_distance,
+            )
             rospy.loginfo(
                 "局部检测到可控动态门：door_id=%s distance=%.2f source=%s evidence=%d",
                 candidate.door_id,
@@ -389,7 +416,9 @@ class MissionManager:
             return
 
         if not self.controller.has_path():
-            frontier, path = self.explorer.select_frontier(grid, pose)
+            selection_context = self._frontier_selection_context(pose)
+            frontier, path = self.explorer.select_frontier(grid, pose, selection_context=selection_context)
+            self._log_post_door_frontier_debug(frontier, path, pose)
             if frontier is None or not path:
                 if not frontiers and self._try_probe_unknown_space(pose):
                     return
@@ -420,6 +449,131 @@ class MissionManager:
         elif status in (DONE, IDLE):
             self.current_frontier = None
 
+    def _frontier_selection_context(
+        self,
+        pose: tuple[float, float, float],
+    ) -> FrontierSelectionContext | None:
+        if self.last_door_xy is None or self.last_door_pass_vector is None:
+            return None
+        if get_time() > self.last_door_transition_until:
+            return None
+        if self.door_transition_hold_distance > 0.0:
+            distance_to_door = math.hypot(pose[0] - self.last_door_xy[0], pose[1] - self.last_door_xy[1])
+            if distance_to_door > self.door_transition_hold_distance:
+                return None
+        return FrontierSelectionContext(
+            forbidden_half_plane_origin=self.last_door_xy,
+            forbidden_half_plane_normal=self.last_door_pass_vector,
+            forbidden_radius=self.explorer.door_front_half_plane_radius,
+            skip_in_forbidden_half_plane=True,
+            preferred_origin=self.last_door_xy,
+            preferred_direction=self.last_door_pass_vector,
+            temporary_revisit_penalty=self.explorer.door_front_half_plane_penalty,
+        )
+
+    def clear_opened_door_area(self, door_id: str) -> None:
+        door = self.building_client.doors.get(door_id)
+        if door is None:
+            return
+        radius = max(self.door_clear_radius, self.mapper.obstacle_inflation_radius + self.mapper.resolution)
+        self.mapper.clear_dynamic_obstacle_radius(door.floor_index, door.x, door.y, radius)
+        rospy.loginfo(
+            "已清理开门后的动态障碍残留：door_id=%s floor=%d center=(%.2f, %.2f) radius=%.2f",
+            door_id,
+            door.floor_index,
+            door.x,
+            door.y,
+            radius,
+        )
+
+    def _remember_completed_door(self, task: OpenDoorAndPass, pose: tuple[float, float, float]) -> None:
+        if task.wait_point is None or task.pass_point is None:
+            self._post_door_frontier_debug = None
+            return
+        center_xy = (
+            0.5 * (task.wait_point[0] + task.pass_point[0]),
+            0.5 * (task.wait_point[1] + task.pass_point[1]),
+        )
+        pass_vec_x = task.pass_point[0] - center_xy[0]
+        pass_vec_y = task.pass_point[1] - center_xy[1]
+        pass_norm = math.hypot(pass_vec_x, pass_vec_y)
+        if pass_norm > 1e-6:
+            self.last_door_pass_vector = (pass_vec_x / pass_norm, pass_vec_y / pass_norm)
+        else:
+            self.last_door_pass_vector = None
+        self.last_door_id = task.door_id
+        self.last_door_xy = center_xy
+        self.last_door_transition_until = get_time() + self.door_transition_duration
+        self._post_door_frontier_debug = {
+            "door_id": task.door_id,
+            "wait_point": task.wait_point,
+            "pass_point": task.pass_point,
+            "commit_point": task.commit_point,
+            "completion_pose": pose,
+        }
+
+    def _log_post_door_frontier_debug(
+        self,
+        frontier: Frontier | None,
+        path: list[tuple[float, float]],
+        pose: tuple[float, float, float],
+    ) -> None:
+        debug = self._post_door_frontier_debug
+        if debug is None or rospy is None:
+            return
+        door_id = str(debug["door_id"])
+        wait_point = debug["wait_point"]
+        pass_point = debug["pass_point"]
+        commit_point = debug["commit_point"]
+        completion_pose = debug["completion_pose"]
+        side = "未选择目标"
+        target_text = "None"
+        score = 0.0
+        path_len = 0.0
+        if frontier is not None:
+            target_text = f"({frontier.centroid[0]:.2f}, {frontier.centroid[1]:.2f})"
+            score = frontier.score
+            path_len = path_length(path) if path else 0.0
+            if isinstance(wait_point, tuple) and isinstance(pass_point, tuple):
+                side = self._classify_goal_side(wait_point, pass_point, frontier.centroid)
+        rospy.loginfo(
+            "过门后首次前沿选择：door_id=%s frontier_target=%s score=%.2f path_length=%.2f relative_side=%s commit_point=(%.2f, %.2f) current_pose=(%.2f, %.2f, %.2f) completion_pose=(%.2f, %.2f, %.2f)",
+            door_id,
+            target_text,
+            score,
+            path_len,
+            side,
+            commit_point[0] if isinstance(commit_point, tuple) else float("nan"),
+            commit_point[1] if isinstance(commit_point, tuple) else float("nan"),
+            pose[0],
+            pose[1],
+            pose[2],
+            completion_pose[0],
+            completion_pose[1],
+            completion_pose[2],
+        )
+        self._post_door_frontier_debug = None
+
+    @staticmethod
+    def _classify_goal_side(
+        wait_point: tuple[float, float],
+        pass_point: tuple[float, float],
+        target_xy: tuple[float, float],
+    ) -> str:
+        center_x = 0.5 * (wait_point[0] + pass_point[0])
+        center_y = 0.5 * (wait_point[1] + pass_point[1])
+        dir_x = pass_point[0] - wait_point[0]
+        dir_y = pass_point[1] - wait_point[1]
+        norm = math.hypot(dir_x, dir_y)
+        if norm <= 1e-6:
+            return "无法判断"
+        signed_distance = ((target_xy[0] - center_x) * dir_x + (target_xy[1] - center_y) * dir_y) / norm
+        if signed_distance > 0.05:
+            return "门后侧(通过点一侧)"
+        if signed_distance < -0.05:
+            return "门前侧(等待点一侧)"
+        return "门中线附近"
+
     def _try_probe_unknown_space(self, pose: tuple[float, float, float]) -> bool:
         grid = self.mapper.floor(self.current_floor)
         base_pose = (pose[0], pose[1], self.probe_yaw)
@@ -441,7 +595,7 @@ class MissionManager:
         return False
 
     def _tick_no_frontier_scan(self, frontiers: list[Frontier]) -> bool:
-        now = time.time()
+        now = get_time()
         if self._no_frontier_scan_until <= 0.0:
             self._no_frontier_scan_until = now + self.no_frontier_scan_duration
             if frontiers:
@@ -531,7 +685,7 @@ class MissionManager:
         rospy.loginfo("准备换层：%d -> %d", self.current_floor, self.target_floor)
 
     def _write_result(self) -> None:
-        positions = self.tracker.confirmed_positions(now=time.time())
+        positions = self.tracker.confirmed_positions(now=get_time())
         path = self.result_writer.write(self._elapsed(), positions)
         self.controller.stop(repeat=5)
         self._finished = True
@@ -541,7 +695,7 @@ class MissionManager:
     def _publish_status(self) -> None:
         if self._status_publisher is None or String is None:
             return
-        now = time.time()
+        now = get_time()
         if now - self._last_status_publish < self.status_publish_period:
             return
         self._last_status_publish = now
@@ -578,7 +732,7 @@ class MissionManager:
         self._status_publisher.publish(String(data=json.dumps(payload, ensure_ascii=False, sort_keys=True)))
 
     def _elapsed(self) -> float:
-        return time.time() - self.start_time
+        return get_time() - self.start_time
 
     def _record_failure(self, reason: str) -> None:
         if reason and reason not in self._failure_reasons:

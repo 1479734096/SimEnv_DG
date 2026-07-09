@@ -99,6 +99,39 @@ class BuildingControlClientTest(unittest.TestCase):
         self.assertAlmostEqual(pass_point[0], 0.0, places=6)
         self.assertAlmostEqual(pass_point[1], 0.8, places=6)
 
+    def test_door_path_points_extend_deeper_into_pass_side(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metadata_path = Path(tmpdir) / "layout_metadata.json"
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "door_specs": [
+                            {
+                                "id": "main_entrance",
+                                "kind": "main_entrance",
+                                "floor_index": 0,
+                                "dynamic": True,
+                                "pose": [0.0, 0.0, 1.2, 0.0, 0.0, math.pi / 2.0],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            client = BuildingControlClient(metadata_path=str(metadata_path))
+            wait_point, pass_point, commit_point = client.get_door_path_points(
+                "main_entrance",
+                (0.0, -1.0),
+                pass_offset=0.8,
+                commit_distance=1.8,
+            )
+
+        self.assertAlmostEqual(wait_point[1], -0.8, places=6)
+        self.assertAlmostEqual(pass_point[1], 0.8, places=6)
+        self.assertAlmostEqual(commit_point[0], 0.0, places=6)
+        self.assertAlmostEqual(commit_point[1], 1.8, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,6 +7,7 @@ import time
 from typing import Iterable, Sequence
 
 import numpy as np
+from .time_utils import get_time
 
 
 TENTATIVE = "Tentative"
@@ -120,13 +121,13 @@ class DetectionTracker:
         return list(self._tracks)
 
     def update(self, candidates: Iterable[DetectionCandidate], now: float | None = None) -> None:
-        timestamp = float(now if now is not None else time.time())
+        timestamp = float(now if now is not None else get_time())
         for candidate in candidates:
             self._update_one(candidate, timestamp)
         self._refresh_status(timestamp)
 
     def confirmed_positions(self, now: float | None = None) -> list[list[float]]:
-        timestamp = float(now if now is not None else time.time())
+        timestamp = float(now if now is not None else get_time())
         self._refresh_status(timestamp)
         confirmed = [track for track in self._tracks if track.status == CONFIRMED]
         confirmed.sort(

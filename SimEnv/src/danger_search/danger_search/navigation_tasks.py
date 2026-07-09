@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import math
-import time
 from typing import TYPE_CHECKING
 
 try:
@@ -12,6 +11,7 @@ except ImportError:
 
 from danger_search.navigator import DONE, IDLE, RUNNING, STUCK
 from danger_search.planner import astar_path
+from .time_utils import get_time
 
 if TYPE_CHECKING:
     from danger_search.mission_manager import MissionManager
@@ -56,21 +56,41 @@ class NavigateToPose(NavigationTask):
 
 
 class OpenDoorAndPass(NavigationTask):
-    def __init__(self, door_id: str):
+    def __init__(self, door_id: str, *, pass_offset: float = 0.8, commit_distance: float = 1.8):
         super().__init__(f"OpenDoorAndPass({door_id})")
         self.door_id = door_id
+        self.pass_offset = float(pass_offset)
+        self.commit_distance = float(commit_distance)
         self.phase = "GO_WAIT_POINT"
         self._wait_point: tuple[float, float] | None = None
         self._pass_point: tuple[float, float] | None = None
+        self._commit_point: tuple[float, float] | None = None
         self._service_task: AsyncServiceCall | None = None
         self._retry_count = 0
+
+    @property
+    def wait_point(self) -> tuple[float, float] | None:
+        return self._wait_point
+
+    @property
+    def pass_point(self) -> tuple[float, float] | None:
+        return self._pass_point
+
+    @property
+    def commit_point(self) -> tuple[float, float] | None:
+        return self._commit_point
 
     def tick(self, manager: MissionManager, pose: tuple[float, float, float]) -> str:
         client = manager.building_client
         
-        if self._wait_point is None or self._pass_point is None:
+        if self._wait_point is None or self._pass_point is None or self._commit_point is None:
             try:
-                self._wait_point, self._pass_point = client.get_door_points(self.door_id, (pose[0], pose[1]))
+                self._wait_point, self._pass_point, self._commit_point = client.get_door_path_points(
+                    self.door_id,
+                    (pose[0], pose[1]),
+                    pass_offset=self.pass_offset,
+                    commit_distance=self.commit_distance,
+                )
             except ValueError as e:
                 rospy.logerr(f"OpenDoorAndPass 失败: {e}")
                 return FAILED
@@ -82,18 +102,54 @@ class OpenDoorAndPass(NavigationTask):
 
         if self.phase == "CALL_OPEN":
             if self._run_service(manager, lambda: client.open_door(self.door_id)):
+                _clear_opened_door_area(manager, self.door_id)
                 self.phase = "GO_PASS_POINT"
             return RUNNING
 
         if self.phase == "GO_PASS_POINT":
             if self._navigate_to(manager, pose, self._pass_point):
+                self.phase = "GO_COMMIT_POINT"
+            return RUNNING
+
+        if self.phase == "GO_COMMIT_POINT":
+            advanced = self._navigate_to(
+                manager,
+                pose,
+                self._commit_point,
+                allow_direct_fallback=True,
+                complete_if_blocked=True,
+            )
+            if advanced:
+                if rospy is not None and self._wait_point is not None and self._pass_point is not None:
+                    rospy.loginfo(
+                        "[%s] 完成过门：door_id=%s wait_point=(%.2f, %.2f) pass_point=(%.2f, %.2f) commit_point=(%.2f, %.2f) pose=(%.2f, %.2f, %.2f)",
+                        self.name,
+                        self.door_id,
+                        self._wait_point[0],
+                        self._wait_point[1],
+                        self._pass_point[0],
+                        self._pass_point[1],
+                        self._commit_point[0],
+                        self._commit_point[1],
+                        pose[0],
+                        pose[1],
+                        pose[2],
+                    )
                 self.phase = "DONE"
                 return DONE
             return RUNNING
 
         return DONE
 
-    def _navigate_to(self, manager: MissionManager, pose: tuple[float, float, float], target_xy: tuple[float, float]) -> bool:
+    def _navigate_to(
+        self,
+        manager: MissionManager,
+        pose: tuple[float, float, float],
+        target_xy: tuple[float, float],
+        *,
+        allow_direct_fallback: bool = False,
+        complete_if_blocked: bool = False,
+    ) -> bool:
         if math.hypot(target_xy[0] - pose[0], target_xy[1] - pose[1]) <= manager.controller.goal_tolerance:
             manager.controller.clear_path()
             return True
@@ -102,7 +158,13 @@ class OpenDoorAndPass(NavigationTask):
             grid = manager.mapper.floor(manager.current_floor)
             path = astar_path(grid, (pose[0], pose[1]), target_xy)
             if not path:
-                path = [(pose[0], pose[1]), target_xy]
+                if allow_direct_fallback and not _segment_crosses_blocked_cell(grid, (pose[0], pose[1]), target_xy):
+                    path = [(pose[0], pose[1]), target_xy]
+                elif complete_if_blocked:
+                    manager.controller.clear_path()
+                    return True
+                else:
+                    return False
             manager.controller.set_path(path)
 
         status = manager.controller.tick(pose)
@@ -133,6 +195,36 @@ class OpenDoorAndPass(NavigationTask):
 
         self._service_task = None
         return True
+
+
+def _segment_crosses_blocked_cell(
+    grid,
+    start_xy: tuple[float, float],
+    end_xy: tuple[float, float],
+) -> bool:
+    start_cell = grid.world_to_grid(start_xy[0], start_xy[1])
+    end_cell = grid.world_to_grid(end_xy[0], end_xy[1])
+    if start_cell is None or end_cell is None:
+        return True
+    distance = math.hypot(end_xy[0] - start_xy[0], end_xy[1] - start_xy[1])
+    step_count = max(1, int(math.ceil(distance / max(grid.resolution * 0.5, 1e-6))))
+    for index in range(1, step_count + 1):
+        ratio = index / step_count
+        x = start_xy[0] + (end_xy[0] - start_xy[0]) * ratio
+        y = start_xy[1] + (end_xy[1] - start_xy[1]) * ratio
+        cell = grid.world_to_grid(x, y)
+        if cell is None:
+            return True
+        gx, gy = cell
+        if int(grid.data[gy, gx]) in (80, 100):
+            return True
+    return False
+
+
+def _clear_opened_door_area(manager: MissionManager, door_id: str) -> None:
+    clear_fn = getattr(manager, "clear_opened_door_area", None)
+    if callable(clear_fn):
+        clear_fn(door_id)
 
 
 class TakeElevator(NavigationTask):
@@ -170,7 +262,22 @@ class TakeElevator(NavigationTask):
 
         if self.phase == "OPEN_CURRENT_FLOOR_DOOR":
             if self._run_service(manager, lambda: client.open_door(current_door_id)):
+                _clear_opened_door_area(manager, current_door_id)
+                self.phase = "WAIT_CURRENT_DOOR_OPEN"
+                self._wait_start_time = get_time()
+            return RUNNING
+
+        if self.phase == "WAIT_CURRENT_DOOR_OPEN":
+            manager.controller.stop()
+            grid = manager.mapper.floor(manager.current_floor)
+            path = astar_path(grid, (pose[0], pose[1]), cabin_center)
+            if path:
                 self.phase = "ENTER_CABIN"
+            elif get_time() - self._wait_start_time > 10.0:
+                if rospy is not None:
+                    rospy.logwarn("[%s] 等待当前楼层电梯门可通行超时，继续等待地图连通", self.name)
+                _clear_opened_door_area(manager, current_door_id)
+                self._wait_start_time = get_time()
             return RUNNING
 
         if self.phase == "ENTER_CABIN":
@@ -196,22 +303,37 @@ class TakeElevator(NavigationTask):
         if self.phase == "CALL_ELEVATOR_TO_TARGET_FLOOR":
             if self._run_service(manager, lambda: client.call_elevator(self.elevator_id, self.target_floor, False)):
                 self.phase = "WAIT_FOR_ODOM_STABLE"
-                self._wait_start_time = time.time()
+                self._wait_start_time = get_time()
             return RUNNING
 
         if self.phase == "WAIT_FOR_ODOM_STABLE":
             # 电梯到目标楼层后定位跳变：等待稳定后再继续
             manager.controller.stop()
-            if time.time() - self._wait_start_time > 2.0:
+            if get_time() - self._wait_start_time > 2.0:
                 self.phase = "OPEN_TARGET_FLOOR_DOOR"
                 # 更新当前楼层
                 manager.current_floor = self.target_floor
-                manager.floor_start_time = time.time()
+                manager.floor_start_time = get_time()
             return RUNNING
 
         if self.phase == "OPEN_TARGET_FLOOR_DOOR":
             if self._run_service(manager, lambda: client.open_door(target_door_id)):
+                _clear_opened_door_area(manager, target_door_id)
+                self.phase = "WAIT_TARGET_DOOR_OPEN"
+                self._wait_start_time = get_time()
+            return RUNNING
+
+        if self.phase == "WAIT_TARGET_DOOR_OPEN":
+            manager.controller.stop()
+            grid = manager.mapper.floor(manager.target_floor if hasattr(manager, 'target_floor') and manager.target_floor is not None else self.target_floor)
+            path = astar_path(grid, (pose[0], pose[1]), target_wait)
+            if path:
                 self.phase = "EXIT_CABIN"
+            elif get_time() - self._wait_start_time > 10.0:
+                if rospy is not None:
+                    rospy.logwarn("[%s] 等待目标楼层电梯门可通行超时，继续等待地图连通", self.name)
+                _clear_opened_door_area(manager, target_door_id)
+                self._wait_start_time = get_time()
             return RUNNING
 
         if self.phase == "EXIT_CABIN":
@@ -246,7 +368,8 @@ class TakeElevator(NavigationTask):
             grid = manager.mapper.floor(manager.current_floor)
             path = astar_path(grid, (pose[0], pose[1]), target_xy)
             if not path:
-                path = [(pose[0], pose[1]), target_xy]
+                manager.controller.stop()
+                return RUNNING
             manager.controller.set_path(path)
 
         return manager.controller.tick(pose)

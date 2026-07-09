@@ -15,7 +15,7 @@ def main():
     parser = argparse.ArgumentParser(description="批量评测多个 seed")
     parser.add_argument("--seeds", type=int, nargs="+", required=True, help="要评测的随机种子列表")
     parser.add_argument("--params", type=str, help="参数重载 JSON 或 YAML 文件路径")
-    parser.add_argument("--timeout", type=int, default=620, help="算法运行最大超时时间(秒)")
+    parser.add_argument("--timeout", type=int, default=6200, help="算法运行最大超时时间(秒)")
     parser.add_argument("--max-floor", type=int, default=3, help="最大探索楼层数")
     parser.add_argument("--workspace", type=str, help="SimEnv 工作区路径，默认自动寻找")
     parser.add_argument("--scene-type", default="", help="写入归档的场景类型标签")

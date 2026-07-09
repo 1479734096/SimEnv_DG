@@ -23,6 +23,13 @@ mission:
   no_frontier_scan_duration: 8.0
   probe_distance: 1.2
   probe_yaw: 1.5708
+  # 过门后先深入到门后，避免刚过门就把 frontier 选择权交回门口。
+  door_pass_offset: 0.8
+  door_commit_distance: 1.8
+  door_clear_radius: 0.9
+  # 仅在过门后的短时间、且机器人仍在门口附近时抑制回头目标。
+  door_transition_duration: 3.0
+  door_transition_hold_distance: 2.5
   status_publish_period: 1.0
 
 map:
@@ -34,9 +41,15 @@ map:
   floor_height: 2.6
   obstacle_min_z: 0.15
   obstacle_max_z: 1.40
-  obstacle_inflation_radius: 0.25
+  obstacle_inflation_radius: 0.35
   raycast_max_range: 12.0
   visited_radius: 0.45
+  # 可视扇区自由空间清空：默认偏保守，优先避免穿过已知障碍或凭空穿墙。
+  free_clear_enabled: true
+  free_clear_max_range: 8.0
+  free_clear_angle_step: 0.1745
+  free_clear_obstacle_margin: 0.25
+  free_clear_min_points_per_bin: 2
   cloud_stride: 3
   cloud_max_points: 18000
 
@@ -45,10 +58,18 @@ frontier:
   blacklist_ttl: 60.0
   fail_limit: 3
   no_progress_timeout: 12.0
-  information_gain_weight: 2.0
-  path_cost_weight: 1.0
+  information_gain_weight: 1.0
+  path_cost_weight: 3.0
   yaw_cost_weight: 0.3
   revisit_penalty_weight: 2.0
+  # frontier 目标优先落在更安全的 free cell，不贴障碍和 unknown 边缘。
+  frontier_obstacle_clearance: 0.25
+  frontier_unknown_standoff: 0.20
+  frontier_min_information_gain: 1.0
+  # 过门后的临时回头抑制：只在门转换保持期内生效，不是永久黑名单。
+  door_front_half_plane_penalty: 6.0
+  door_front_half_plane_radius: 1.5
+  door_preferred_direction_bonus: 1.5
 
 controller:
   max_linear: 0.60
@@ -57,9 +78,9 @@ controller:
   min_linear_fraction: 0.15
   goal_tolerance: 0.35
   waypoint_tolerance: 0.25
-  pure_pursuit_lookahead: 0.65
+  pure_pursuit_lookahead: 0.45
   reverse_speed: -0.18
-  recover_duration: 0.6
+  recover_duration: 1.0
 
 detection:
   min_area: 35

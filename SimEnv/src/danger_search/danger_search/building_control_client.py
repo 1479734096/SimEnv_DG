@@ -191,25 +191,51 @@ class BuildingControlClient:
         task.start()
         return task
 
-    def get_door_points(self, door_id: str, robot_pose: tuple[float, float], offset: float = 0.8) -> tuple[tuple[float, float], tuple[float, float]]:
-        """计算过门的等待点和通过点。"""
+    def get_door_path_points(
+        self,
+        door_id: str,
+        robot_pose: tuple[float, float],
+        pass_offset: float = 0.8,
+        commit_distance: float = 1.8,
+    ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+        """计算过门的等待点、通过点和门后深入点。"""
         if door_id not in self.doors:
             raise ValueError(f"Unknown door_id: {door_id}")
         door = self.doors[door_id]
+        offset = max(float(pass_offset), 0.05)
+        commit = max(float(commit_distance), offset)
         dx = math.cos(door.yaw) * offset
         dy = math.sin(door.yaw) * offset
 
         p1 = (door.x + dx, door.y + dy)
         p2 = (door.x - dx, door.y - dy)
 
-        # 判断 robot_pose 离 p1 近还是 p2 近
         d1 = math.hypot(robot_pose[0] - p1[0], robot_pose[1] - p1[1])
         d2 = math.hypot(robot_pose[0] - p2[0], robot_pose[1] - p2[1])
 
         if d1 < d2:
-            return p1, p2
+            wait_point, pass_point = p1, p2
         else:
-            return p2, p1
+            wait_point, pass_point = p2, p1
+        pass_dir_x = pass_point[0] - door.x
+        pass_dir_y = pass_point[1] - door.y
+        norm = math.hypot(pass_dir_x, pass_dir_y)
+        if norm <= 1e-6:
+            commit_point = pass_point
+        else:
+            scale = commit / norm
+            commit_point = (door.x + pass_dir_x * scale, door.y + pass_dir_y * scale)
+        return wait_point, pass_point, commit_point
+
+    def get_door_points(self, door_id: str, robot_pose: tuple[float, float], offset: float = 0.8) -> tuple[tuple[float, float], tuple[float, float]]:
+        """计算过门的等待点和通过点。"""
+        wait_point, pass_point, _ = self.get_door_path_points(
+            door_id,
+            robot_pose,
+            pass_offset=offset,
+            commit_distance=offset,
+        )
+        return wait_point, pass_point
 
     def get_elevator_points(self, elevator_id: str, floor: int, offset_out: float = 0.8, offset_in: float = 0.95) -> tuple[tuple[float, float], tuple[float, float]]:
         """计算乘电梯的等待点（厅外）和轿厢中心点。"""

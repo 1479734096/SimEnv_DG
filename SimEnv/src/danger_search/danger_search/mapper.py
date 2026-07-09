@@ -16,6 +16,12 @@ OCC = 100
 
 
 @dataclass
+class _AngleBinObservation:
+    point_count: int = 0
+    nearest_obstacle_distance: float = math.inf
+
+
+@dataclass
 class FloorGrid:
     floor_index: int
     resolution: float
@@ -111,6 +117,11 @@ class MultiFloorGridMap:
         obstacle_inflation_radius: float = 0.25,
         raycast_max_range: float = 12.0,
         visited_radius: float = 0.45,
+        free_clear_enabled: bool = True,
+        free_clear_max_range: float = 8.0,
+        free_clear_angle_step: float = 0.1745,
+        free_clear_obstacle_margin: float = 0.25,
+        free_clear_min_points_per_bin: int = 2,
     ):
         self.resolution = float(resolution)
         self.width = float(width)
@@ -123,6 +134,11 @@ class MultiFloorGridMap:
         self.obstacle_inflation_radius = float(obstacle_inflation_radius)
         self.raycast_max_range = float(raycast_max_range)
         self.visited_radius = float(visited_radius)
+        self.free_clear_enabled = bool(free_clear_enabled)
+        self.free_clear_max_range = float(free_clear_max_range)
+        self.free_clear_angle_step = float(free_clear_angle_step)
+        self.free_clear_obstacle_margin = float(free_clear_obstacle_margin)
+        self.free_clear_min_points_per_bin = max(1, int(free_clear_min_points_per_bin))
         self._floors: dict[int, FloorGrid] = {}
 
     def floor(self, floor_index: int) -> FloorGrid:
@@ -153,17 +169,30 @@ class MultiFloorGridMap:
             return
         grid.mark_visited_radius(robot_xyz[0], robot_xyz[1], self.visited_radius)
         floor_base_z = floor_index * self.floor_height
+        angle_bins: dict[int, _AngleBinObservation] = {}
         for point in points:
             px, py, pz = point
-            if math.hypot(px - robot_xyz[0], py - robot_xyz[1]) > self.raycast_max_range:
+            distance = math.hypot(px - robot_xyz[0], py - robot_xyz[1])
+            if distance > self.raycast_max_range:
                 continue
             z_rel = pz - floor_base_z
+            is_obstacle_point = self.obstacle_min_z <= z_rel <= self.obstacle_max_z
             target_cell = grid.world_to_grid(px, py)
             if target_cell is None:
                 continue
-            self._raycast_free(grid, robot_cell, target_cell)
-            if self.obstacle_min_z <= z_rel <= self.obstacle_max_z:
+            self._raycast_free(grid, robot_cell, target_cell, stop_at_blocked=True)
+            self._record_angle_bin(
+                angle_bins,
+                robot_xyz,
+                px,
+                py,
+                distance,
+                is_obstacle_point=is_obstacle_point,
+            )
+            if is_obstacle_point:
                 grid.mark_occupied_radius(px, py, self.obstacle_inflation_radius)
+        if self.free_clear_enabled:
+            self._clear_visible_sectors(grid, robot_xyz, robot_cell, angle_bins)
 
     def mark_black(self, floor_index: int, x: float, y: float, radius: float) -> None:
         grid = self.floor(floor_index)
@@ -177,8 +206,93 @@ class MultiFloorGridMap:
                 if 0 <= gx < grid.size_x and 0 <= gy < grid.size_y and grid.data[gy, gx] != OCC:
                     grid.data[gy, gx] = BLACK
 
-    def _raycast_free(self, grid: FloorGrid, start: tuple[int, int], end: tuple[int, int]) -> None:
+    def clear_dynamic_obstacle_radius(self, floor_index: int, x: float, y: float, radius: float) -> None:
+        """开门后只清理门附近的动态障碍残留，避免普通射线误擦静态墙。"""
+        grid = self.floor(floor_index)
+        center = grid.world_to_grid(x, y)
+        if center is None:
+            return
+        cx, cy = center
+        cells = int(math.ceil(max(0.0, float(radius)) / grid.resolution))
+        for gy in range(cy - cells, cy + cells + 1):
+            for gx in range(cx - cells, cx + cells + 1):
+                if not (0 <= gx < grid.size_x and 0 <= gy < grid.size_y):
+                    continue
+                wx, wy = grid.grid_to_world(gx, gy)
+                if math.hypot(wx - x, wy - y) <= radius:
+                    grid.data[gy, gx] = FREE
+
+    def _raycast_free(
+        self,
+        grid: FloorGrid,
+        start: tuple[int, int],
+        end: tuple[int, int],
+        *,
+        stop_at_blocked: bool = False,
+    ) -> None:
         for gx, gy in _bresenham(start[0], start[1], end[0], end[1])[:-1]:
+            if stop_at_blocked and int(grid.data[gy, gx]) in (OCC, BLACK):
+                break
+            grid.mark_free(gx, gy)
+
+    def _record_angle_bin(
+        self,
+        angle_bins: dict[int, _AngleBinObservation],
+        robot_xyz: tuple[float, float, float],
+        px: float,
+        py: float,
+        distance: float,
+        *,
+        is_obstacle_point: bool,
+    ) -> None:
+        if self.free_clear_angle_step <= 0.0:
+            return
+        angle = math.atan2(py - robot_xyz[1], px - robot_xyz[0])
+        bucket = int(math.floor((angle + math.pi) / self.free_clear_angle_step))
+        observation = angle_bins.setdefault(bucket, _AngleBinObservation())
+        observation.point_count += 1
+        if is_obstacle_point and distance < observation.nearest_obstacle_distance:
+            observation.nearest_obstacle_distance = distance
+
+    def _clear_visible_sectors(
+        self,
+        grid: FloorGrid,
+        robot_xyz: tuple[float, float, float],
+        robot_cell: tuple[int, int],
+        angle_bins: dict[int, _AngleBinObservation],
+    ) -> None:
+        if self.free_clear_angle_step <= 0.0 or self.free_clear_max_range <= 0.0:
+            return
+        for bucket, observation in angle_bins.items():
+            if observation.point_count < self.free_clear_min_points_per_bin:
+                continue
+            if math.isfinite(observation.nearest_obstacle_distance):
+                clear_distance = min(
+                    observation.nearest_obstacle_distance - self.free_clear_obstacle_margin,
+                    self.free_clear_max_range,
+                )
+            else:
+                clear_distance = self.free_clear_max_range
+            if clear_distance <= 0.0:
+                continue
+            angle = -math.pi + (bucket + 0.5) * self.free_clear_angle_step
+            target_x = robot_xyz[0] + clear_distance * math.cos(angle)
+            target_y = robot_xyz[1] + clear_distance * math.sin(angle)
+            target_cell = grid.world_to_grid(target_x, target_y)
+            if target_cell is None:
+                continue
+            self._clear_free_until_blocked(grid, robot_cell, target_cell)
+
+    def _clear_free_until_blocked(
+        self,
+        grid: FloorGrid,
+        start: tuple[int, int],
+        end: tuple[int, int],
+    ) -> None:
+        for gx, gy in _bresenham(start[0], start[1], end[0], end[1])[1:]:
+            cell_value = int(grid.data[gy, gx])
+            if cell_value in (OCC, BLACK):
+                break
             grid.mark_free(gx, gy)
 
 

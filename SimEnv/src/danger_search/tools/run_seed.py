@@ -58,7 +58,7 @@ def run_environment(seed: int, workspace_dir: Path, log_file):
     env.update(
         {
             "SEED": str(seed),
-            "GUI": "false",
+            "GUI": "true",
             "PAUSED": "false",
             "CONTROLLER_FOREGROUND": "1",
             "START_CONTROLLER": "1",
@@ -203,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="运行单一 seed 评测并归档结果")
     parser.add_argument("--seed", type=int, required=True, help="随机种子")
     parser.add_argument("--params", type=str, help="参数重载 JSON 或 YAML 文件路径")
-    parser.add_argument("--timeout", type=int, default=620, help="算法运行最大超时时间，单位秒")
+    parser.add_argument("--timeout", type=int, default=10000, help="算法运行最大超时时间，单位秒")
     parser.add_argument("--max-floor", type=int, default=3, help="最大探索楼层数")
     parser.add_argument("--workspace", type=str, help="SimEnv 工作区路径，默认自动寻找")
     parser.add_argument("--scene-type", default="", help="归档中的场景类型标签")

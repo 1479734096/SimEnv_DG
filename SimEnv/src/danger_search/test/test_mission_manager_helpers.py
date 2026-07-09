@@ -9,6 +9,7 @@ import danger_search.mission_manager as mission_manager_module
 from danger_search.mission_manager import EXPLORE_FLOOR
 from danger_search.mission_manager import MissionManager
 from danger_search.mission_manager import probe_target_for_attempt
+from danger_search.navigation_tasks import OpenDoorAndPass
 
 
 class MissionManagerHelperTest(unittest.TestCase):
@@ -156,6 +157,57 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         self.assertEqual(len(recorded_paths), 1)
         self.assertNotAlmostEqual(recorded_paths[0][-1][0], 0.0, places=6)
+
+    def test_remember_completed_door_records_transition_context(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.door_transition_duration = 3.0
+        manager._post_door_frontier_debug = None
+        manager.last_door_id = None
+        manager.last_door_xy = None
+        manager.last_door_pass_vector = None
+        manager.last_door_transition_until = 0.0
+        task = OpenDoorAndPass("main_entrance")
+        task._wait_point = (0.0, -0.8)
+        task._pass_point = (0.0, 0.8)
+        task._commit_point = (0.0, 1.8)
+
+        before = mission_manager_module.time.time()
+        manager._remember_completed_door(task, (0.0, 1.75, math.pi / 2.0))
+
+        self.assertEqual(manager.last_door_id, "main_entrance")
+        self.assertEqual(manager.last_door_xy, (0.0, 0.0))
+        self.assertEqual(manager.last_door_pass_vector, (0.0, 1.0))
+        self.assertGreater(manager.last_door_transition_until, before)
+        self.assertEqual(manager._post_door_frontier_debug["commit_point"], (0.0, 1.8))
+
+    def test_frontier_selection_context_only_active_near_door_and_before_timeout(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.last_door_xy = (0.0, 0.0)
+        manager.last_door_pass_vector = (0.0, 1.0)
+        manager.last_door_transition_until = 105.0
+        manager.door_transition_hold_distance = 2.5
+        manager.explorer = SimpleNamespace(
+            door_front_half_plane_radius=1.5,
+            door_front_half_plane_penalty=6.0,
+        )
+
+        with patch.object(mission_manager_module, "get_time", return_value=103.0):
+            context = manager._frontier_selection_context((0.0, 1.0, math.pi / 2.0))
+            far_context = manager._frontier_selection_context((0.0, 3.0, math.pi / 2.0))
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context.forbidden_half_plane_origin, (0.0, 0.0))
+        self.assertEqual(context.forbidden_half_plane_normal, (0.0, 1.0))
+        self.assertEqual(context.forbidden_radius, 1.5)
+        self.assertTrue(context.skip_in_forbidden_half_plane)
+        self.assertEqual(context.temporary_revisit_penalty, 6.0)
+        self.assertIsNone(far_context)
+
+        with patch.object(mission_manager_module, "get_time", return_value=106.0):
+            expired_context = manager._frontier_selection_context((0.0, 1.0, math.pi / 2.0))
+
+        self.assertIsNone(expired_context)
 
 
 if __name__ == "__main__":

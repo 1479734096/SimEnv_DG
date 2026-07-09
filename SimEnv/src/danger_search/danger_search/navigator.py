@@ -1,5 +1,8 @@
 """局部路径跟踪控制器。"""
 from __future__ import annotations
+from typing import Iterator
+
+from .time_utils import get_time
 
 from dataclasses import dataclass, field
 import math
@@ -53,7 +56,7 @@ class PathFollower:
     def set_path(self, path: list[tuple[float, float]]) -> None:
         self._path = list(path)
         self._waypoint_index = 0
-        self._last_progress_time = time.time()
+        self._last_progress_time = get_time()
         self._last_goal_distance = math.inf
 
     def has_path(self) -> bool:
@@ -65,7 +68,7 @@ class PathFollower:
         self.stop()
 
     def tick(self, pose_xy_yaw: tuple[float, float, float]) -> str:
-        now = time.time()
+        now = get_time()
         if self._recover_until > now:
             self._publish(self.reverse_speed, 0.0)
             return RUNNING
@@ -101,7 +104,7 @@ class PathFollower:
         return RUNNING
 
     def recover(self) -> None:
-        self._recover_until = time.time() + self.recover_duration
+        self._recover_until = get_time() + self.recover_duration
         self._publish(self.reverse_speed, 0.0)
 
     def rotate_in_place(self, angular_z: float) -> None:
