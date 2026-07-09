@@ -6,6 +6,7 @@
 
 #include <string>
 #include <iostream>
+#include <mutex>
 #include <unistd.h>
 #include "control/CtrlComponents.h"
 #include "message/LowlevelCmd.h"
@@ -23,15 +24,18 @@
 #define  OVERTIME 200000
 class FSMState{
 
+public:
 struct CmdVel {
     double linear_x = 0.0;
     double linear_y = 0.0;
     double angular_z = 0.0;
     bool valid = false;
+    bool timed_out = false;
+    bool clamped = false;
     ros::Time stamp;
+    std::string source = "none";
 };
 
-public:
     FSMState(CtrlComponents *ctrlComp, FSMStateName stateName, std::string stateNameString);
 
     virtual void enter() = 0;
@@ -46,6 +50,17 @@ public:
     long long getTime();
     void rosAbsoluteWait(long long startTime, long long waitTime);
     void wait(long long startTime, long long waitTime);
+    void setVelocityCommand(const CmdVel &cmd);
+    void setVelocityCommand(double linear_x,
+                            double linear_y,
+                            double angular_z,
+                            const std::string &source,
+                            const ros::Time &stamp = ros::Time::now());
+    CmdVel getVelocityCommand();
+    void configureVelocityCommandLimits(double max_linear_x,
+                                        double max_linear_y,
+                                        double max_angular_z,
+                                        double timeout_sec);
 
 
 protected:
@@ -68,6 +83,11 @@ public:
     //声明订阅节点与发布节点
     ros::Subscriber Sub_;
     ros::Publisher Pub_;
+    std::mutex cmd_vel_mutex_;
+    double cmd_vel_max_linear_x_ = 0.6;
+    double cmd_vel_max_linear_y_ = 0.4;
+    double cmd_vel_max_angular_z_ = 1.0;
+    double cmd_vel_timeout_sec_ = 0.5;
 
 };
 

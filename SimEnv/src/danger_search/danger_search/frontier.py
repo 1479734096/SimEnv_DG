@@ -1,15 +1,14 @@
-"""前沿探索与栅格 A* 规划。"""
+"""前沿探索。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
-import heapq
 import math
 import time
-from typing import Iterable
 
 import numpy as np
 
-from danger_search.multi_floor_mapper import BLACK, FREE, FloorGrid, OCC, UNKNOWN, VISITED
+from danger_search.mapper import FREE, FloorGrid, UNKNOWN, VISITED
+from danger_search.planner import astar_path, path_length
 
 
 @dataclass(frozen=True)
@@ -21,7 +20,7 @@ class Frontier:
 
 
 class FrontierExplorer:
-    """负责提取前沿、评分、黑名单和 A* 规划。"""
+    """负责提取前沿、评分、黑名单管理。"""
 
     def __init__(
         self,
@@ -142,13 +141,13 @@ class FrontierExplorer:
         path: list[tuple[float, float]],
         robot_pose: tuple[float, float, float],
     ) -> float:
-        path_cost = _path_length(path)
+        cost = path_length(path)
         target_yaw = math.atan2(frontier.centroid[1] - robot_pose[1], frontier.centroid[0] - robot_pose[0])
         yaw_cost = abs(_angle_wrap(target_yaw - robot_pose[2]))
-        revisit_penalty = 1.0 if path_cost < 0.8 else 0.0
+        revisit_penalty = 1.0 if cost < 0.8 else 0.0
         return (
             self.information_gain_weight * frontier.information_gain
-            - self.path_cost_weight * path_cost
+            - self.path_cost_weight * cost
             - self.yaw_cost_weight * yaw_cost
             - self.revisit_penalty_weight * revisit_penalty
         )
@@ -175,43 +174,10 @@ class FrontierExplorer:
             goal = grid.grid_to_world(*cell)
             path = astar_path(grid, robot_xy, goal)
             if path:
-                frontier = Frontier(cells=(cell,), centroid=goal, information_gain=0.0, score=-_path_length(path))
+                frontier = Frontier(cells=(cell,), centroid=goal, information_gain=0.0, score=-path_length(path))
                 return frontier, path
             self.record_failure(grid, goal)
         return None, []
-
-
-def astar_path(grid: FloorGrid, start_xy: tuple[float, float], goal_xy: tuple[float, float]) -> list[tuple[float, float]]:
-    start = grid.world_to_grid(start_xy[0], start_xy[1])
-    goal = grid.world_to_grid(goal_xy[0], goal_xy[1])
-    if start is None or goal is None:
-        return []
-    if not grid.is_traversable(*start):
-        grid.mark_free(*start)
-    if not grid.is_traversable(*goal):
-        nearest = _nearest_traversable(grid, goal)
-        if nearest is None:
-            return []
-        goal = nearest
-
-    open_heap: list[tuple[float, tuple[int, int]]] = []
-    heapq.heappush(open_heap, (0.0, start))
-    came_from: dict[tuple[int, int], tuple[int, int]] = {}
-    cost_so_far: dict[tuple[int, int], float] = {start: 0.0}
-
-    while open_heap:
-        _, current = heapq.heappop(open_heap)
-        if current == goal:
-            return [grid.grid_to_world(gx, gy) for gx, gy in _reconstruct_path(came_from, current)]
-        for neighbor in _neighbors8(grid, current):
-            step_cost = math.hypot(neighbor[0] - current[0], neighbor[1] - current[1])
-            new_cost = cost_so_far[current] + step_cost
-            if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
-                cost_so_far[neighbor] = new_cost
-                priority = new_cost + _heuristic(neighbor, goal)
-                heapq.heappush(open_heap, (priority, neighbor))
-                came_from[neighbor] = current
-    return []
 
 
 def _has_unknown_neighbor(grid: FloorGrid, gx: int, gy: int) -> bool:
@@ -249,48 +215,6 @@ def _flood_fill(mask: np.ndarray, visited: np.ndarray, start_x: int, start_y: in
                 visited[ny, nx] = True
                 stack.append((nx, ny))
     return cluster
-
-
-def _neighbors8(grid: FloorGrid, cell: tuple[int, int]) -> Iterable[tuple[int, int]]:
-    gx, gy = cell
-    for ny in range(gy - 1, gy + 2):
-        for nx in range(gx - 1, gx + 2):
-            if nx == gx and ny == gy:
-                continue
-            if grid.is_traversable(nx, ny):
-                yield (nx, ny)
-
-
-def _nearest_traversable(grid: FloorGrid, goal: tuple[int, int], max_radius: int = 8) -> tuple[int, int] | None:
-    gx, gy = goal
-    for radius in range(1, max_radius + 1):
-        for ny in range(gy - radius, gy + radius + 1):
-            for nx in range(gx - radius, gx + radius + 1):
-                if grid.is_traversable(nx, ny):
-                    return (nx, ny)
-    return None
-
-
-def _heuristic(a: tuple[int, int], b: tuple[int, int]) -> float:
-    return math.hypot(a[0] - b[0], a[1] - b[1])
-
-
-def _reconstruct_path(
-    came_from: dict[tuple[int, int], tuple[int, int]],
-    current: tuple[int, int],
-) -> list[tuple[int, int]]:
-    path = [current]
-    while current in came_from:
-        current = came_from[current]
-        path.append(current)
-    path.reverse()
-    return path
-
-
-def _path_length(path: list[tuple[float, float]]) -> float:
-    if len(path) < 2:
-        return 0.0
-    return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(path, path[1:]))
 
 
 def _angle_wrap(angle: float) -> float:

@@ -1,6 +1,6 @@
 import unittest
 
-from danger_search.local_controller import compute_tracking_command
+from danger_search.navigator import compute_tracking_command
 
 
 class LocalControllerTest(unittest.TestCase):

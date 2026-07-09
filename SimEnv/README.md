@@ -48,7 +48,17 @@ source ./devel/setup.bash
 | `/camera/image_raw` | `sensor_msgs/Image` | 前视 RGB 图像 |
 | `/real_sense/depth/points` | `sensor_msgs/PointCloud2` | 深度相机点云 |
 
-`junior_ctrl` 默认以前台方式启动。终端输入 `2` 进入站立状态，输入 `6` 切换到 RL 模式，随后控制器接收 `/cmd_vel`。完整接口见 [算法接入接口](docs/algorithm-interfaces.md)。
+`junior_ctrl` 默认以前台方式启动。终端仍需先输入 `2` 进入站立状态，再输入 `6` 切换到 RL 模式；只有满足这两个前置条件后，控制器才会接收 `/cmd_vel`。
+
+当前 `/cmd_vel` 行为约定如下：
+
+- 仅使用 `linear.x`、`linear.y`、`angular.z` 三个分量作为速度入口。
+- 控制器会对这三个分量做限幅，默认参数分别为 `rl_cmd_vel/max_linear_x=0.6`、`rl_cmd_vel/max_linear_y=0.4`、`rl_cmd_vel/max_angular_z=1.0`。
+- 一段时间未收到新 `/cmd_vel` 时会自动归零，默认超时参数为 `rl_cmd_vel/timeout=0.5` 秒。
+- 可通过只读话题 `/junior_ctrl/rl_status` 查看当前是否在 RL、策略是否加载成功、推理线程是否运行，以及最近一次 `/cmd_vel` 的状态。
+- 后续如果接入“目标模式”或其他上层控制器，应继续复用同一速度命令缓存接口，不需要修改 RL 策略输入。
+
+完整接口和诊断说明见 [算法接入接口](docs/algorithm-interfaces.md)。
 
 ## 参考算法包
 

@@ -1,7 +1,7 @@
 import unittest
 
-from danger_search.frontier_explorer import astar_path
-from danger_search.multi_floor_mapper import MultiFloorGridMap, OCC
+from danger_search.planner import astar_path
+from danger_search.mapper import MultiFloorGridMap, OCC
 
 
 class MultiFloorMapperTest(unittest.TestCase):

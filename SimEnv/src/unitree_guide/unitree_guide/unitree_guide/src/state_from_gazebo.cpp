@@ -23,6 +23,10 @@ void callback_BASE(const gazebo_msgs::LinkStates::ConstPtr &msg) {
             break;
         ++index;
     }
+    if (index >= static_cast<int>(msg->name.size())) {
+        ROS_WARN_THROTTLE(1.0, "未在 /gazebo/link_states 中找到 %s_gazebo::base，跳过本次里程计发布。", robot_name.c_str());
+        return;
+    }
     ros::Rate rate(500);//延迟至100hz发布，避免重复发布
 
     //map到odom的tf变换
@@ -90,13 +94,13 @@ void callback_BASE(const gazebo_msgs::LinkStates::ConstPtr &msg) {
 
     // set the velocity
     Odom.twist.twist.linear.x= transformed_linear_vel.x();
-    Odom.twist.twist.linear.x= transformed_linear_vel.y();
-    Odom.twist.twist.linear.x= transformed_linear_vel.z();
+    Odom.twist.twist.linear.y= transformed_linear_vel.y();
+    Odom.twist.twist.linear.z= transformed_linear_vel.z();
 
 
     Odom.twist.twist.angular.x = transformed_angular_vel.x();
-    Odom.twist.twist.angular.x = transformed_angular_vel.y();
-    Odom.twist.twist.angular.x = transformed_angular_vel.z();
+    Odom.twist.twist.angular.y = transformed_angular_vel.y();
+    Odom.twist.twist.angular.z = transformed_angular_vel.z();
 
 
     robotVelocity_BASE_frame_pub.publish(Odom);
@@ -133,6 +137,5 @@ int main(int argc, char **argv) {
     ros::spin();
     return 0;
 }
-
 
 

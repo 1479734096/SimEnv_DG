@@ -247,6 +247,10 @@ fi
 # - 2：进入站立状态
 # - 6：进入 RL 模式
 # 进入 RL 模式后，算法发布 geometry_msgs/Twist 到 /cmd_vel 才会生效。
+# 等待 ROS Master 和 Gazebo 核心完全启动，防止 junior_ctrl 报 Connection refused 和触发 SIGTRAP。
+echo "Waiting for ROS and Gazebo to initialize..."
+sleep 5
+
 if [ "$START_CONTROLLER" = "1" ]; then
   if [ "$CONTROLLER_FOREGROUND" = "1" ]; then
     echo "Starting junior_ctrl controller in the foreground."

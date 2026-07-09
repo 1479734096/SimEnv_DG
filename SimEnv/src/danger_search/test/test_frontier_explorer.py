@@ -1,8 +1,8 @@
 import math
 import unittest
 
-from danger_search.frontier_explorer import FrontierExplorer
-from danger_search.multi_floor_mapper import FloorGrid
+from danger_search.frontier import FrontierExplorer
+from danger_search.mapper import FloorGrid
 
 
 class FrontierExplorerTest(unittest.TestCase):

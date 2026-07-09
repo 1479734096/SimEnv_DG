@@ -12,15 +12,21 @@ import numpy as np
 try:
     import rospy
     from std_msgs.msg import String
+    from geometry_msgs.msg import PoseStamped
+    from nav_msgs.msg import OccupancyGrid
 except ImportError:  # pragma: no cover - 离线环境可能没有 ROS
     rospy = None
     String = None
+    PoseStamped = None
+    OccupancyGrid = None
 
 from danger_search.detection_tracker import DetectionTracker
-from danger_search.floor_manager import FloorManager
-from danger_search.frontier_explorer import Frontier, FrontierExplorer, astar_path
-from danger_search.local_controller import DONE, IDLE, STUCK, PathFollower
-from danger_search.multi_floor_mapper import MultiFloorGridMap
+from danger_search.building_control_client import BuildingControlClient
+from danger_search.navigation_tasks import NavigationTask, TakeElevator, OpenDoorAndPass, NavigateToPose, FAILED
+from danger_search.frontier import Frontier, FrontierExplorer
+from danger_search.navigator import DONE, IDLE, STUCK, PathFollower
+from danger_search.planner import astar_path
+from danger_search.mapper import MultiFloorGridMap
 from danger_search.red_sphere_detector import RedSphereDetector
 from danger_search.result_writer import ResultWriter
 from danger_search.sensor_buffer import SensorBuffer, odom_pose_xy_yaw, odom_xyz
@@ -65,6 +71,10 @@ class MissionManager:
         self._failure_reasons: list[str] = []
         self._last_pose: tuple[float, float, float] | None = None
         self._max_home_distance = 0.0
+        self.manual_goal: tuple[float, float] | None = None
+        self.manual_mode = False
+        self.current_task: NavigationTask | None = None
+        self.unvisited_doors: set[str] = set()
 
         self._load_params()
         self._status_publisher = None
@@ -80,18 +90,48 @@ class MissionManager:
         self.controller = PathFollower(cmd_vel_topic=self.cmd_vel_topic, **self.controller_params)
         self.detector = RedSphereDetector(**self.detection_params)
         self.tracker = DetectionTracker(**self.tracker_params)
-        self.floor_manager = FloorManager(**self.floor_params)
+        metadata_file = os.path.abspath(os.path.join(os.path.dirname(self.result_file), "../generated_building/layout_metadata.json"))
+        self.building_client = BuildingControlClient(metadata_path=metadata_file, service_timeout=self.floor_params.get("service_timeout", 5.0))
         self.result_writer = ResultWriter(self.result_file)
 
     def start(self) -> None:
         self.sensor_buffer.start()
         self.controller.start()
         if self.max_floor > 1:
-            self.floor_manager.start()
+            self.building_client.start()
         self._status_publisher = rospy.Publisher(self.status_topic, String, queue_size=1)
+        if OccupancyGrid is not None:
+            self._map_publisher = rospy.Publisher(self.map_topic, OccupancyGrid, queue_size=1, latch=True)
+        else:
+            self._map_publisher = None
+        if PoseStamped is not None:
+            self._goal_subscriber = rospy.Subscriber(self.goal_topic, PoseStamped, self._goal_callback)
         self._timer = rospy.Timer(rospy.Duration(0.1), self._on_timer)
         rospy.on_shutdown(self.shutdown)
         rospy.loginfo("danger_search 已启动，等待传感器数据")
+
+    def _goal_callback(self, msg) -> None:
+        self.manual_mode = True
+        self.manual_goal = (msg.pose.position.x, msg.pose.position.y)
+        
+        nearest_door = None
+        min_dist = float("inf")
+        for door_id, door in self.building_client.doors.items():
+            if door.floor_index == self.current_floor and door.kind != "elevator":
+                d = math.hypot(door.x - self.manual_goal[0], door.y - self.manual_goal[1])
+                if d < min_dist:
+                    min_dist = d
+                    nearest_door = door_id
+
+        if nearest_door and min_dist < 1.5:
+            self.current_task = OpenDoorAndPass(nearest_door)
+            rospy.loginfo("手动目标点距离门 %s 仅 %.2f 米，自动转换为穿门任务！", nearest_door, min_dist)
+        else:
+            self.current_task = NavigateToPose(self.manual_goal)
+
+        self.controller.clear_path()
+        self.current_frontier = None
+        rospy.loginfo("收到新的手动导航目标点: (%.2f, %.2f)，已切换到手动目标模式！", self.manual_goal[0], self.manual_goal[1])
 
     def shutdown(self) -> None:
         self.controller.stop(repeat=5)
@@ -105,7 +145,9 @@ class MissionManager:
         self.rgb_topic = _param("topics/rgb", "/real_sense/rgb/image_raw")
         self.depth_topic = _param("topics/depth", "/real_sense/depth/image_raw")
         self.camera_info_topic = _param("topics/camera_info", "/real_sense/rgb/camera_info")
-        self.status_topic = _param("topics/status", "/danger_search/status")
+        self.status_topic = _param("topics/status", "/nav/status")
+        self.goal_topic = _param("topics/goal", "/nav/goal")
+        self.map_topic = _param("topics/map", "/nav/map_debug")
 
         self.startup_delay = float(_param("mission/startup_delay", 2.0))
         self.max_runtime = float(_param("mission/max_runtime", 590.0))
@@ -218,22 +260,37 @@ class MissionManager:
         snapshot = self.sensor_buffer.snapshot()
         pose = odom_pose_xy_yaw(snapshot.odom_msg)
         xyz = odom_xyz(snapshot.odom_msg)
-        if self.state == INIT:
-            if pose is None or xyz is None:
-                return
-            self.home_pose = pose
-            self.current_floor = self.mapper.estimate_floor_from_z(xyz[2])
-            self.floor_start_time = time.time()
-            self.state = WAIT_CONTROLLER_READY
-            rospy.loginfo("记录起点：x=%.2f y=%.2f floor=%d", pose[0], pose[1], self.current_floor)
-            return
-
         if pose is None or xyz is None:
             self.controller.stop()
             return
 
         self._update_pose_progress(pose)
         self._update_mapping_and_detection(snapshot, pose, xyz)
+
+        if self.current_task is not None:
+            status = self.current_task.tick(self, pose)
+            if status in (DONE, FAILED):
+                if isinstance(self.current_task, OpenDoorAndPass):
+                    self.unvisited_doors.discard(self.current_task.door_id)
+                if status == FAILED:
+                    rospy.logwarn("当前任务 %s 失败，放弃该门/任务", self.current_task.name)
+                self.current_task = None
+                if self.state == CHANGE_FLOOR:
+                    self.state = RETURN_HOME if self.return_after_floor_change else EXPLORE_FLOOR
+                    if self.state == EXPLORE_FLOOR:
+                        self._setup_floor_doors()
+            return
+
+        if self.state == INIT:
+            if pose is None or xyz is None:
+                return
+            self.home_pose = pose
+            self.current_floor = self.mapper.estimate_floor_from_z(xyz[2])
+            self.floor_start_time = time.time()
+            self._setup_floor_doors()
+            self.state = WAIT_CONTROLLER_READY
+            rospy.loginfo("记录起点：x=%.2f y=%.2f floor=%d", pose[0], pose[1], self.current_floor)
+            return
 
         if self.state == WAIT_CONTROLLER_READY:
             self.controller.stop()
@@ -242,8 +299,7 @@ class MissionManager:
             return
         if self.state == EXPLORE_FLOOR:
             self._tick_explore(pose)
-        elif self.state == CHANGE_FLOOR:
-            self._tick_change_floor(pose)
+
         elif self.state == RETURN_HOME:
             self._tick_return_home(pose)
 
@@ -278,6 +334,11 @@ class MissionManager:
 
     def _tick_explore(self, pose: tuple[float, float, float]) -> None:
         grid = self.mapper.floor(self.current_floor)
+        if self.manual_mode:
+            if self.current_task is None:
+                self.controller.stop()
+            return
+
         frontiers = self.explorer.extract_frontiers(grid)
         floor_elapsed = time.time() - self.floor_start_time
         if (
@@ -287,6 +348,7 @@ class MissionManager:
                 and self._max_home_distance >= self.min_floor_travel_distance
                 and grid.coverage_ratio() >= self.explore_coverage_ratio
                 and len(frontiers) <= self.min_frontier_count
+                and len(self.unvisited_doors) == 0
             )
         ):
             self._finish_current_floor()
@@ -295,6 +357,12 @@ class MissionManager:
         if not self.controller.has_path():
             frontier, path = self.explorer.select_frontier(grid, pose)
             if frontier is None or not path:
+                if self.unvisited_doors:
+                    door_id = next(iter(self.unvisited_doors))
+                    rospy.loginfo("常规前沿耗尽/不可达，尝试通过门: %s", door_id)
+                    self.current_task = OpenDoorAndPass(door_id)
+                    return
+
                 if not frontiers and self._try_probe_unknown_space(pose):
                     return
                 if self._tick_no_frontier_scan(frontiers):
@@ -361,6 +429,14 @@ class MissionManager:
             rospy.logwarn("扫描后仍无可达前沿，结束当前楼层")
         return True
 
+    def _setup_floor_doors(self) -> None:
+        self.unvisited_doors.clear()
+        for door_id, door in self.building_client.doors.items():
+            if door.floor_index == self.current_floor and door.kind != "elevator":
+                self.unvisited_doors.add(door_id)
+        if self.unvisited_doors:
+            rospy.loginfo("本层有 %d 个未访问的门", len(self.unvisited_doors))
+
     def _finish_current_floor(self) -> None:
         self.controller.clear_path()
         if self.current_floor + 1 < self.max_floor:
@@ -392,7 +468,7 @@ class MissionManager:
             self.controller.recover()
 
     def _begin_floor_change(self, target_floor: int, *, return_after: bool) -> None:
-        if not self.floor_manager.services_ready():
+        if not self.building_client.services_ready():
             rospy.logwarn("门/电梯服务不可用，停止探索并写出已有结果")
             self._elevator_success = False
             self._record_failure("门/电梯服务不可用")
@@ -402,84 +478,10 @@ class MissionManager:
             self._elevator_success = True
         self.target_floor = int(target_floor)
         self.return_after_floor_change = bool(return_after)
-        self._change_phase = "GO_LOBBY"
-        self._service_task = None
         self.controller.clear_path()
         self.state = CHANGE_FLOOR
+        self.current_task = TakeElevator(self.current_floor, target_floor, elevator_id=self.floor_params.get("elevator_id", "elevator_main"))
         rospy.loginfo("准备换层：%d -> %d", self.current_floor, self.target_floor)
-
-    def _tick_change_floor(self, pose: tuple[float, float, float]) -> None:
-        if self.target_floor is None or self._change_phase is None:
-            self.state = RETURN_HOME if self.return_after_floor_change else EXPLORE_FLOOR
-            return
-
-        if self._change_phase == "GO_LOBBY":
-            if self._navigate_to(pose, self.floor_manager.targets.lobby_xy):
-                self._change_phase = "OPEN_CURRENT"
-            return
-        if self._change_phase == "OPEN_CURRENT":
-            if self._run_service_once(lambda: self.floor_manager.set_door_async(self.current_floor, True)):
-                self._change_phase = "ENTER"
-            return
-        if self._change_phase == "ENTER":
-            if self._navigate_to(pose, self.floor_manager.targets.inside_xy):
-                self._change_phase = "CLOSE_CURRENT"
-            return
-        if self._change_phase == "CLOSE_CURRENT":
-            if self._run_service_once(lambda: self.floor_manager.set_door_async(self.current_floor, False)):
-                self._change_phase = "CALL_ELEVATOR"
-            return
-        if self._change_phase == "CALL_ELEVATOR":
-            if self._run_service_once(lambda: self.floor_manager.call_elevator_async(self.target_floor, False)):
-                self._change_phase = "OPEN_TARGET"
-            return
-        if self._change_phase == "OPEN_TARGET":
-            if self._run_service_once(lambda: self.floor_manager.set_door_async(self.target_floor, True)):
-                self.current_floor = self.target_floor
-                self.floor_start_time = time.time()
-                self.controller.clear_path()
-                self._change_phase = "EXIT"
-            return
-        if self._change_phase == "EXIT":
-            if self._navigate_to(pose, self.floor_manager.targets.lobby_xy):
-                self._elevator_success = True
-                self._service_task = None
-                self._change_phase = None
-                self.target_floor = None
-                self.state = RETURN_HOME if self.return_after_floor_change else EXPLORE_FLOOR
-
-    def _navigate_to(self, pose: tuple[float, float, float], target_xy: tuple[float, float]) -> bool:
-        if math.hypot(target_xy[0] - pose[0], target_xy[1] - pose[1]) <= self.controller.goal_tolerance:
-            self.controller.clear_path()
-            return True
-        if not self.controller.has_path():
-            grid = self.mapper.floor(self.current_floor)
-            path = astar_path(grid, (pose[0], pose[1]), target_xy)
-            if not path:
-                path = [(pose[0], pose[1]), target_xy]
-            self.controller.set_path(path)
-        status = self.controller.tick(pose)
-        if status == STUCK:
-            self.controller.recover()
-        return status == DONE
-
-    def _run_service_once(self, task_factory) -> bool:
-        if self._service_task is None:
-            self._service_task = task_factory()
-            return False
-        if not self._service_task.done():
-            self.controller.stop()
-            return False
-        ok = self._service_task.ok()
-        message = self._service_task.message()
-        if not ok:
-            rospy.logwarn("换层服务失败：%s", message)
-            self._elevator_success = False
-            self._record_failure(f"换层服务失败: {message}")
-            self.state = WRITE_RESULT
-            return False
-        self._service_task = None
-        return True
 
     def _write_result(self) -> None:
         positions = self.tracker.confirmed_positions(now=time.time())
@@ -496,6 +498,22 @@ class MissionManager:
         if now - self._last_status_publish < self.status_publish_period:
             return
         self._last_status_publish = now
+
+        grid = self.mapper.floor(self.current_floor)
+        if self._map_publisher is not None:
+            msg = OccupancyGrid()
+            msg.header.stamp = rospy.Time.now()
+            msg.header.frame_id = "odom"
+            msg.info.resolution = grid.resolution
+            msg.info.width = grid.size_x
+            msg.info.height = grid.size_y
+            msg.info.origin.position.x = grid.origin_x
+            msg.info.origin.position.y = grid.origin_y
+            msg.info.origin.position.z = self.current_floor * self.mapper.floor_height
+            msg.info.origin.orientation.w = 1.0
+            msg.data = grid.data.flatten().tolist()
+            self._map_publisher.publish(msg)
+
         confirmed_count = len(self.tracker.confirmed_positions(now=now))
         payload = {
             "state": self.state,
@@ -503,8 +521,12 @@ class MissionManager:
             "elapsed": round(self._elapsed(), 2),
             "confirmed_count": confirmed_count,
             "track_count": len(self.tracker.tracks),
-            "has_path": self.controller.has_path(),
-            "change_phase": self._change_phase,
+            "current_task": self.current_task.name if self.current_task else None,
+            "task_phase": getattr(self.current_task, "phase", None) if self.current_task else None,
+            "coverage_ratio": round(grid.coverage_ratio(), 3),
+            "current_goal": [round(self.manual_goal[0], 2), round(self.manual_goal[1], 2)] if self.manual_goal else None,
+            "path_length": round(self.controller._last_goal_distance, 2) if self.controller.has_path() else 0.0,
+            "is_stuck": self.controller._recover_until > now,
         }
         self._status_publisher.publish(String(data=json.dumps(payload, ensure_ascii=False, sort_keys=True)))
 
