@@ -1,6 +1,6 @@
 import unittest
 
-from danger_search.navigator import compute_tracking_command
+from danger_search.navigator import PathFollower, compute_tracking_command
 
 
 class LocalControllerTest(unittest.TestCase):
@@ -40,6 +40,26 @@ class LocalControllerTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(linear_x, 0.4)
+
+    def test_large_yaw_error_does_not_drive_full_speed_straight(self):
+        linear_x, linear_y, angular = compute_tracking_command(
+            3.14,
+            max_linear=0.60,
+            max_lateral=0.25,
+            max_angular=0.8,
+            min_linear_fraction=0.15,
+        )
+
+        self.assertLess(linear_x, 0.20)
+        self.assertAlmostEqual(linear_y, 0.0, places=3)
+        self.assertAlmostEqual(angular, 0.8)
+
+    def test_default_path_follower_can_turn_while_tracking(self):
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+
+        self.assertGreater(follower.max_angular, 0.0)
+        self.assertGreater(follower.max_lateral, 0.0)
+        self.assertLess(follower.min_linear_fraction, 1.0)
 
 
 if __name__ == "__main__":

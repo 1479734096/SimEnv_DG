@@ -106,33 +106,45 @@ class BuildingControlClient:
             self.doors[door_id] = DoorInfo(
                 door_id=door_id,
                 kind=door_spec.get("kind", ""),
-                floor_index=door_spec.get("floor_index", 0),
-                x=pose[0],
-                y=pose[1],
-                yaw=pose[5],
+                floor_index=int(door_spec.get("floor_index", 0)),
+                x=float(pose[0]),
+                y=float(pose[1]),
+                yaw=float(pose[5]),
             )
 
         for el_spec in data.get("elevator_specs", []):
             el_id = el_spec["id"]
             lobby_poses = {}
             for floor_str, pose in el_spec.get("lobby_positions", {}).items():
-                lobby_poses[int(floor_str)] = (pose[0], pose[1], pose[5])
+                lobby_poses[int(floor_str)] = (float(pose[0]), float(pose[1]), float(pose[5]))
             self.elevators[el_id] = ElevatorInfo(elevator_id=el_id, lobby_poses=lobby_poses)
 
-    def start(self) -> None:
+    def start(self, *, connect_elevator: bool = True) -> None:
         if rospy is None:
             raise RuntimeError("没有 rospy 环境")
         try:
             rospy.wait_for_service("/set_door_state", timeout=self.service_timeout)
-            rospy.wait_for_service("/call_elevator", timeout=self.service_timeout)
             self._set_door = rospy.ServiceProxy("/set_door_state", SetDoorState)
-            self._call_elevator = rospy.ServiceProxy("/call_elevator", CallElevator)
-            rospy.loginfo("门/电梯服务客户端初始化成功。")
         except Exception as exc:
-            rospy.logwarn("门/电梯服务初始化失败/超时：%s", exc)
+            rospy.logwarn("开关门服务初始化失败/超时：%s", exc)
+        if connect_elevator:
+            try:
+                rospy.wait_for_service("/call_elevator", timeout=self.service_timeout)
+                self._call_elevator = rospy.ServiceProxy("/call_elevator", CallElevator)
+            except Exception as exc:
+                rospy.logwarn("电梯服务初始化失败/超时：%s", exc)
+
+        if self._set_door is not None or self._call_elevator is not None:
+            rospy.loginfo("门/电梯服务客户端初始化成功。")
 
     def services_ready(self) -> bool:
         return self._set_door is not None and self._call_elevator is not None
+
+    def door_service_ready(self) -> bool:
+        return self._set_door is not None
+
+    def has_door_targets(self) -> bool:
+        return any(door.kind != "elevator" for door in self.doors.values())
 
     def open_door(self, door_id: str) -> AsyncServiceCall:
         def call():

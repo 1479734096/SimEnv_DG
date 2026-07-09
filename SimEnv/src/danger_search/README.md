@@ -45,8 +45,8 @@ roslaunch danger_search danger_search_smoke.launch
 - 检测结果使用多帧确认后才输出，优先降低虚警率。
 - 楼层探索至少持续 `mission/min_floor_explore_time`，避免启动后已知区域过小却被误判为覆盖完成。
 - 楼层结束还要求最大离家距离达到 `mission/min_floor_travel_distance`，避免机器人只在起点附近抖动就结束任务。
-- 无前沿且无远处 FREE 目标时，会按 `mission/probe_distance` 做短距离探测前进，再重新建图；默认 `mission/probe_yaw=1.5708`，沿比赛入口到房间的全局 +Y 方向探测，避免起立后的机体 yaw 抖动把探测方向带反。
-- 路径跟踪默认采用纯前进优先配置：`controller/min_linear_fraction=1.0`、`controller/max_angular=0.0`、`controller/max_lateral=0.0`，先保证 A1 RL 能稳定进入房间；需要更精细绕障时再逐步打开侧向和角速度。
+- 无前沿且无远处 FREE 目标时，会从机器人当前位置按 `mission/probe_distance` 做短距离探测前进，再重新建图；默认 `mission/probe_yaw=1.5708`，沿比赛入口到房间的全局 +Y 方向探测，避免起立后的机体 yaw 抖动把探测方向带反。探测段如果穿过已知障碍或黑名单栅格，会跳过该目标。
+- 路径跟踪默认允许有限转向和侧移：`controller/min_linear_fraction=0.15`、`controller/max_angular=0.8`、`controller/max_lateral=0.25`，目标偏角较大时会降低前进速度，避免目标在侧后方时仍满速直顶墙体。
 - 卡住恢复默认等待 `frontier/no_progress_timeout=12.0` 秒，避免 A1 刚起步就被频繁判定为卡住并后退。
 - 默认使用 `/livox/Pointcloud2` 做 2.5D 栅格建图。
 - 点云命中障碍会按 `map/obstacle_inflation_radius` 做栅格膨胀，给 A1 留出安全余量。

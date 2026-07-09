@@ -23,9 +23,9 @@ IDLE = "idle"
 class PathFollower:
     cmd_vel_topic: str
     max_linear: float = 0.60
-    max_lateral: float = 0.0
-    max_angular: float = 0.0
-    min_linear_fraction: float = 1.0
+    max_lateral: float = 0.25
+    max_angular: float = 0.8
+    min_linear_fraction: float = 0.15
     goal_tolerance: float = 0.35
     waypoint_tolerance: float = 0.25
     pure_pursuit_lookahead: float = 0.65

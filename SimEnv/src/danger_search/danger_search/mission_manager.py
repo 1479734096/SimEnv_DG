@@ -91,14 +91,17 @@ class MissionManager:
         self.detector = RedSphereDetector(**self.detection_params)
         self.tracker = DetectionTracker(**self.tracker_params)
         metadata_file = os.path.abspath(os.path.join(os.path.dirname(self.result_file), "../generated_building/layout_metadata.json"))
-        self.building_client = BuildingControlClient(metadata_path=metadata_file, service_timeout=self.floor_params.get("service_timeout", 5.0))
+        self.building_client = BuildingControlClient(
+            metadata_path=metadata_file,
+            service_timeout=self.floor_params.get("service_timeout", 5.0),
+        )
         self.result_writer = ResultWriter(self.result_file)
 
     def start(self) -> None:
         self.sensor_buffer.start()
         self.controller.start()
-        if self.max_floor > 1:
-            self.building_client.start()
+        if self.max_floor > 1 or self.building_client.has_door_targets():
+            self.building_client.start(connect_elevator=self.max_floor > 1)
         self._status_publisher = rospy.Publisher(self.status_topic, String, queue_size=1)
         if OccupancyGrid is not None:
             self._map_publisher = rospy.Publisher(self.map_topic, OccupancyGrid, queue_size=1, latch=True)
@@ -113,7 +116,7 @@ class MissionManager:
     def _goal_callback(self, msg) -> None:
         self.manual_mode = True
         self.manual_goal = (msg.pose.position.x, msg.pose.position.y)
-        
+
         nearest_door = None
         min_dist = float("inf")
         for door_id, door in self.building_client.doors.items():
@@ -191,9 +194,9 @@ class MissionManager:
         }
         self.controller_params = {
             "max_linear": float(_param("controller/max_linear", 0.60)),
-            "max_lateral": float(_param("controller/max_lateral", 0.0)),
-            "max_angular": float(_param("controller/max_angular", 0.0)),
-            "min_linear_fraction": float(_param("controller/min_linear_fraction", 1.0)),
+            "max_lateral": float(_param("controller/max_lateral", 0.25)),
+            "max_angular": float(_param("controller/max_angular", 0.8)),
+            "min_linear_fraction": float(_param("controller/min_linear_fraction", 0.15)),
             "goal_tolerance": float(_param("controller/goal_tolerance", 0.35)),
             "waypoint_tolerance": float(_param("controller/waypoint_tolerance", 0.25)),
             "pure_pursuit_lookahead": float(_param("controller/pure_pursuit_lookahead", 0.65)),
@@ -275,6 +278,7 @@ class MissionManager:
                 if status == FAILED:
                     rospy.logwarn("当前任务 %s 失败，放弃该门/任务", self.current_task.name)
                 self.current_task = None
+
                 if self.state == CHANGE_FLOOR:
                     self.state = RETURN_HOME if self.return_after_floor_change else EXPLORE_FLOOR
                     if self.state == EXPLORE_FLOOR:
@@ -355,14 +359,19 @@ class MissionManager:
             return
 
         if not self.controller.has_path():
-            frontier, path = self.explorer.select_frontier(grid, pose)
-            if frontier is None or not path:
-                if self.unvisited_doors:
-                    door_id = next(iter(self.unvisited_doors))
-                    rospy.loginfo("常规前沿耗尽/不可达，尝试通过门: %s", door_id)
+            door_id = self._nearest_unvisited_door(pose)
+            if door_id is not None:
+                if not self.building_client.door_service_ready():
+                    rospy.logwarn("门服务不可用，跳过本层动态门任务")
+                    self._record_failure("门服务不可用")
+                    self.unvisited_doors.clear()
+                else:
+                    rospy.loginfo("准备通过本层动态门: %s", door_id)
                     self.current_task = OpenDoorAndPass(door_id)
                     return
 
+            frontier, path = self.explorer.select_frontier(grid, pose)
+            if frontier is None or not path:
                 if not frontiers and self._try_probe_unknown_space(pose):
                     return
                 if self._tick_no_frontier_scan(frontiers):
@@ -394,8 +403,7 @@ class MissionManager:
 
     def _try_probe_unknown_space(self, pose: tuple[float, float, float]) -> bool:
         grid = self.mapper.floor(self.current_floor)
-        home_or_pose = self.home_pose or pose
-        base_pose = (home_or_pose[0], home_or_pose[1], self.probe_yaw)
+        base_pose = (pose[0], pose[1], self.probe_yaw)
         for _ in range(12):
             target = probe_target_for_attempt(base_pose, self.probe_distance, self._probe_attempt)
             self._probe_attempt += 1
@@ -404,6 +412,8 @@ class MissionManager:
                 continue
             cell_value = int(grid.data[target_cell[1], target_cell[0]])
             if cell_value in (80, 100):
+                continue
+            if segment_crosses_blocked_cell(grid, (pose[0], pose[1]), target):
                 continue
             self.current_frontier = None
             self.controller.set_path([(pose[0], pose[1]), target])
@@ -434,8 +444,21 @@ class MissionManager:
         for door_id, door in self.building_client.doors.items():
             if door.floor_index == self.current_floor and door.kind != "elevator":
                 self.unvisited_doors.add(door_id)
-        if self.unvisited_doors:
+        if self.unvisited_doors and rospy is not None:
             rospy.loginfo("本层有 %d 个未访问的门", len(self.unvisited_doors))
+
+    def _nearest_unvisited_door(self, pose: tuple[float, float, float]) -> str | None:
+        nearest_door = None
+        min_dist = float("inf")
+        for door_id in self.unvisited_doors:
+            door = self.building_client.doors.get(door_id)
+            if door is None:
+                continue
+            distance = math.hypot(door.x - pose[0], door.y - pose[1])
+            if distance < min_dist:
+                min_dist = distance
+                nearest_door = door_id
+        return nearest_door
 
     def _finish_current_floor(self) -> None:
         self.controller.clear_path()
@@ -608,6 +631,30 @@ def probe_target_for_attempt(
         base_pose[0] + forward_distance * forward[0] + lateral_offset * lateral[0],
         base_pose[1] + forward_distance * forward[1] + lateral_offset * lateral[1],
     )
+
+
+def segment_crosses_blocked_cell(
+    grid,
+    start_xy: tuple[float, float],
+    end_xy: tuple[float, float],
+) -> bool:
+    start_cell = grid.world_to_grid(start_xy[0], start_xy[1])
+    end_cell = grid.world_to_grid(end_xy[0], end_xy[1])
+    if start_cell is None or end_cell is None:
+        return True
+    distance = math.hypot(end_xy[0] - start_xy[0], end_xy[1] - start_xy[1])
+    step_count = max(1, int(math.ceil(distance / max(grid.resolution * 0.5, 1e-6))))
+    for index in range(1, step_count + 1):
+        ratio = index / step_count
+        x = start_xy[0] + (end_xy[0] - start_xy[0]) * ratio
+        y = start_xy[1] + (end_xy[1] - start_xy[1]) * ratio
+        cell = grid.world_to_grid(x, y)
+        if cell is None:
+            return True
+        gx, gy = cell
+        if int(grid.data[gy, gx]) in (80, 100):
+            return True
+    return False
 
 
 def _ros_link_from_optical_matrix() -> np.ndarray:
