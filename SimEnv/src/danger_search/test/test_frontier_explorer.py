@@ -6,6 +6,7 @@ from danger_search.frontier import FrontierExplorer
 from danger_search.frontier import Frontier
 from danger_search.frontier import FrontierSelectionContext
 from danger_search.mapper import BLACK, FloorGrid, OCC
+from danger_search.planner import PlanResult, REACHED, BUDGET_EXHAUSTED, UNREACHABLE
 
 
 class FrontierExplorerTest(unittest.TestCase):
@@ -298,10 +299,10 @@ class FrontierExplorerTest(unittest.TestCase):
             switch_score_margin=20.0,
         )
 
-        def fake_astar(_grid, start, goal):
-            return [start, goal]
+        def fake_astar(_grid, start, goal, max_iterations=None):
+            return PlanResult(path=[start, goal], status=REACHED)
 
-        with patch("danger_search.frontier.astar_path", side_effect=fake_astar):
+        with patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
             frontier, path = explorer.select_frontier(grid, (0.0, 0.0, 0.0), selection_context=context)
 
         self.assertIsNotNone(frontier)
@@ -310,6 +311,69 @@ class FrontierExplorerTest(unittest.TestCase):
         self.assertIsNotNone(explorer.last_selection_debug)
         assert explorer.last_selection_debug is not None
         self.assertTrue(explorer.last_selection_debug.retained_by_inertia)
+
+    def test_budget_exhausted_frontier_does_not_record_failure(self):
+        """前沿规划预算耗尽时不应累计失败，避免误黑名单可能可达的目标。"""
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=10.0,
+            length=10.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        # 只标记一小块 free，其余保持 unknown，确保能提取到前沿。
+        self._mark_free_rect(grid, 0, 2, 0, 2)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            information_gain_weight=1.0,
+            path_cost_weight=0.0,
+            yaw_cost_weight=0.0,
+            revisit_penalty_weight=0.0,
+        )
+        recorded_failures: list[tuple[float, float]] = []
+        explorer.record_failure = lambda g, xy: recorded_failures.append(xy)
+
+        def fake_astar(_grid, start, goal, max_iterations=None):
+            return PlanResult(status=BUDGET_EXHAUSTED)
+
+        with patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+            frontier, path = explorer.select_frontier(grid, (1.0, 1.0, 0.0))
+
+        # 预算耗尽：不选择该前沿，也不累计失败。
+        self.assertEqual(recorded_failures, [])
+        debug = explorer.last_selection_debug
+        assert debug is not None
+        self.assertGreater(debug.budget_exhausted_count, 0)
+
+    def test_unreachable_frontier_records_failure(self):
+        """真正不可达的前沿应累计失败，以便后续换目标。"""
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=10.0,
+            length=10.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        self._mark_free_rect(grid, 0, 9, 0, 9)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            information_gain_weight=1.0,
+            path_cost_weight=0.0,
+            yaw_cost_weight=0.0,
+            revisit_penalty_weight=0.0,
+        )
+        recorded_failures: list[tuple[float, float]] = []
+        explorer.record_failure = lambda g, xy: recorded_failures.append(xy)
+
+        def fake_astar(_grid, start, goal, max_iterations=None):
+            return PlanResult(status=UNREACHABLE)
+
+        with patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+            frontier, path = explorer.select_frontier(grid, (1.0, 1.0, 0.0))
+
+        self.assertGreater(len(recorded_failures), 0)
 
 
 if __name__ == "__main__":

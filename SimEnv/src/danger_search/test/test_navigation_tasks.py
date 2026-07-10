@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from danger_search.navigation_tasks import DONE, FAILED, OpenDoorAndPass, RUNNING, TakeElevator
 from danger_search.mapper import MultiFloorGridMap
+from danger_search.planner import PlanResult, UNREACHABLE
 
 
 class _DoneService:
@@ -106,7 +107,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
             clear_opened_door_area=lambda door_id: cleared_doors.append(door_id),
         )
 
-        with patch("danger_search.navigation_tasks.astar_path", return_value=[]):
+        with patch("danger_search.navigation_tasks.astar_plan", return_value=PlanResult(status=UNREACHABLE)):
             status = task.tick(manager, (0.0, 0.8, math.pi / 2.0))
 
         self.assertEqual(status, RUNNING)
@@ -158,7 +159,7 @@ class TakeElevatorTest(unittest.TestCase):
             clear_opened_door_area=lambda door_id: cleared.append(door_id),
         )
 
-        with patch("danger_search.navigation_tasks.astar_path", return_value=[]), patch(
+        with patch("danger_search.navigation_tasks.astar_plan", return_value=PlanResult(status=UNREACHABLE)), patch(
             "danger_search.navigation_tasks.get_time",
             return_value=11.0,
         ):

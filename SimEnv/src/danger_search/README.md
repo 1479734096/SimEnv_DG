@@ -48,8 +48,8 @@ roslaunch danger_search danger_search_smoke.launch
 - 无前沿且无远处 FREE 目标时，会从机器人当前位置按 `mission/probe_distance` 做短距离探测前进，再重新建图；默认 `mission/probe_yaw=1.5708`，沿比赛入口到房间的全局 +Y 方向探测，避免起立后的机体 yaw 抖动把探测方向带反。探测段如果穿过已知障碍或黑名单栅格，会跳过该目标。
 - Frontier 选择带短期惯性：当前区域仍可达时，新目标分数需要高出 `frontier/switch_score_margin` 才会切换；日志会记录每次选择的分数、距离、门侧、fallback 和切换原因。
 - 过门后除了短时间抑制回头，还会在门后推进距离和门后侧已知面积达到 `mission/post_door_min_distance`、`mission/post_door_min_known_area` 前持续优先门后侧目标，减少刚进门又回头。
-- 路径跟踪默认允许有限转向和侧移：`controller/min_linear_fraction=0.15`、`controller/max_angular=0.8`、`controller/max_lateral=0.25`，目标偏角较大时会降低前进速度，避免目标在侧后方时仍满速直顶墙体。
-- 卡住恢复默认等待 `frontier/no_progress_timeout=12.0` 秒，避免 A1 刚起步就被频繁判定为卡住并后退。
+- 路径跟踪默认允许有限转向和侧移：`controller/min_linear_fraction=0.35`、`controller/max_angular=1.2`、`controller/max_lateral=0.25`，目标偏角较大时会降低前进速度，避免目标在侧后方时仍满速直顶墙体；转角处使用 `controller/corner_tolerance=0.10` 限制提前切换到下一段，防止在 U 型/平行走廊中切角或跳到未来折返段。
+- 卡住恢复默认等待 `frontier/no_progress_timeout=8.0` 秒，避免 A1 刚起步就被频繁判定为卡住并后退。
 - 默认使用 `/livox/Pointcloud2` 做 2.5D 栅格建图。
 - 点云命中障碍会按 `map/obstacle_inflation_radius` 做栅格膨胀，给 A1 留出安全余量。
 - 建图默认启用可视扇区自由空间清空：`map/free_clear_*` 会按角度桶聚合可见方向，只在该方向点数足够时把机器人到最近障碍前的连续区域标成 FREE；遇到已知 `OCC/BLACK` 会停止，避免把静态墙体后方擦成可通行。

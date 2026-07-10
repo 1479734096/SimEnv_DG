@@ -26,7 +26,7 @@ mission:
   post_door_min_known_area: 8.0
   home_tolerance: 0.7
   explore_coverage_ratio: 0.82
-  no_frontier_scan_duration: 8.0
+  no_frontier_scan_duration: 4.0
   probe_distance: 1.2
   probe_yaw: 1.5708
   # 过门后先深入到门后，避免刚过门就把 frontier 选择权交回门口。
@@ -61,10 +61,10 @@ map:
   cloud_max_points: 18000
 
 frontier:
-  min_cluster_size: 8
+  min_cluster_size: 4
   blacklist_ttl: 60.0
   fail_limit: 3
-  no_progress_timeout: 12.0
+  no_progress_timeout: 8.0
   information_gain_weight: 1.0
   path_cost_weight: 3.0
   yaw_cost_weight: 0.3
@@ -78,19 +78,21 @@ frontier:
   door_front_half_plane_radius: 1.5
   door_preferred_direction_bonus: 1.5
   # 短期选择惯性：当前区域仍可达时，新目标分数需要至少高出该 margin 才切换。
-  switch_score_margin: 2.0
-  current_region_radius: 1.2
+  switch_score_margin: 5.0
+  current_region_radius: 2.0
 
 controller:
   max_linear: 0.60
   max_lateral: 0.25
-  max_angular: 0.8
-  min_linear_fraction: 0.15
+  max_angular: 1.2
+  min_linear_fraction: 0.35
   goal_tolerance: 0.35
   waypoint_tolerance: 0.25
+  corner_tolerance: 0.10
   pure_pursuit_lookahead: 0.45
-  reverse_speed: -0.18
-  recover_duration: 1.0
+  reverse_speed: -0.25
+  recover_duration: 1.5
+  progress_distance: 0.25
 
 detection:
   min_area: 35

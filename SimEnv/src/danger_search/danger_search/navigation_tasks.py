@@ -10,7 +10,7 @@ except ImportError:
     rospy = None
 
 from danger_search.navigator import DONE, IDLE, RUNNING, STUCK
-from danger_search.planner import astar_path
+from danger_search.planner import UNREACHABLE, astar_plan
 from .time_utils import get_time
 
 if TYPE_CHECKING:
@@ -43,10 +43,13 @@ class NavigateToPose(NavigationTask):
 
         if not manager.controller.has_path():
             grid = manager.mapper.floor(manager.current_floor)
-            path = astar_path(grid, (pose[0], pose[1]), self.target_xy)
-            if not path:
+            result = astar_plan(grid, (pose[0], pose[1]), self.target_xy)
+            if result.reached:
+                manager.controller.set_path(result.path)
+            else:
+                # 不可达或预算耗尽都退化为直连，由后续 STUCK/障碍检测兜底。
                 path = [(pose[0], pose[1]), self.target_xy]
-            manager.controller.set_path(path)
+                manager.controller.set_path(path)
 
         status = manager.controller.tick(pose)
         if status == STUCK:
@@ -167,14 +170,18 @@ class OpenDoorAndPass(NavigationTask):
 
         if not manager.controller.has_path():
             grid = manager.mapper.floor(manager.current_floor)
-            path = astar_path(grid, (pose[0], pose[1]), target_xy)
-            if not path:
+            result = astar_plan(grid, (pose[0], pose[1]), target_xy)
+            if result.reached:
+                manager.controller.set_path(result.path)
+            elif result.unreachable:
                 if allow_direct_fallback and not _segment_crosses_blocked_cell(grid, (pose[0], pose[1]), target_xy):
-                    path = [(pose[0], pose[1]), target_xy]
+                    manager.controller.set_path([(pose[0], pose[1]), target_xy])
                 else:
                     self._last_navigation_blocked = True
                     return False
-            manager.controller.set_path(path)
+            else:
+                # 预算耗尽：可能可达，不退化为直连也不标记阻塞，等下轮重新规划。
+                return False
 
         status = manager.controller.tick(pose)
         if status == STUCK:
@@ -312,8 +319,8 @@ class TakeElevator(NavigationTask):
         if self.phase == "WAIT_CURRENT_DOOR_OPEN":
             manager.controller.stop()
             grid = manager.mapper.floor(manager.current_floor)
-            path = astar_path(grid, (pose[0], pose[1]), cabin_center)
-            if path:
+            cabin_result = astar_plan(grid, (pose[0], pose[1]), cabin_center)
+            if cabin_result.reached:
                 self.phase = "ENTER_CABIN"
             elif get_time() - self._wait_start_time > 10.0:
                 if rospy is not None:
@@ -377,8 +384,8 @@ class TakeElevator(NavigationTask):
         if self.phase == "WAIT_TARGET_DOOR_OPEN":
             manager.controller.stop()
             grid = manager.mapper.floor(manager.target_floor if hasattr(manager, 'target_floor') and manager.target_floor is not None else self.target_floor)
-            path = astar_path(grid, (pose[0], pose[1]), target_wait)
-            if path:
+            wait_result = astar_plan(grid, (pose[0], pose[1]), target_wait)
+            if wait_result.reached:
                 self.phase = "EXIT_CABIN"
             elif get_time() - self._wait_start_time > 10.0:
                 if rospy is not None:
@@ -420,11 +427,13 @@ class TakeElevator(NavigationTask):
 
         if not manager.controller.has_path():
             grid = manager.mapper.floor(manager.current_floor)
-            path = astar_path(grid, (pose[0], pose[1]), target_xy)
-            if not path:
+            result = astar_plan(grid, (pose[0], pose[1]), target_xy)
+            if result.reached:
+                manager.controller.set_path(result.path)
+            else:
+                # 不可达或预算耗尽：停止并等待下轮重新规划。
                 manager.controller.stop()
                 return RUNNING
-            manager.controller.set_path(path)
 
         return manager.controller.tick(pose)
 

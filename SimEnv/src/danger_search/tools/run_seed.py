@@ -64,7 +64,15 @@ def resolve_gui_enabled(args: argparse.Namespace) -> bool:
     return bool(os.environ.get("DISPLAY"))
 
 
-def run_environment(seed: int, workspace_dir: Path, log_file, *, gui_enabled: bool, health_log_path: Path):
+def run_environment(
+    seed: int,
+    workspace_dir: Path,
+    log_file,
+    *,
+    gui_enabled: bool,
+    health_log_path: Path,
+    max_floor: int = 3,
+):
     try:
         import pexpect
     except ImportError as exc:
@@ -79,6 +87,7 @@ def run_environment(seed: int, workspace_dir: Path, log_file, *, gui_enabled: bo
             "CONTROLLER_FOREGROUND": "1",
             "START_CONTROLLER": "1",
             "START_BUILDING_CONTROL": "1",
+            "FLOOR_COUNT": str(max_floor),
         }
     )
 
@@ -263,7 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, required=True, help="随机种子")
     parser.add_argument("--params", type=str, help="参数重载 JSON 或 YAML 文件路径")
     parser.add_argument("--timeout", type=int, default=10000, help="算法运行最大超时时间，单位秒")
-    parser.add_argument("--max-floor", type=int, default=3, help="最大探索楼层数")
+    parser.add_argument("--max-floor", type=int, default=1, help="最大探索楼层数")
     parser.add_argument("--workspace", type=str, help="SimEnv 工作区路径，默认自动寻找")
     parser.add_argument("--scene-type", default="", help="归档中的场景类型标签")
     parser.add_argument("--param-version", default="", help="归档中的参数版本标签")
@@ -316,6 +325,7 @@ def main() -> int:
                 env_log,
                 gui_enabled=gui_enabled,
                 health_log_path=logs_dir / "health_check.log",
+                max_floor=args.max_floor,
             )
             algo_return_code, external_timeout = run_danger_search(
                 workspace_dir=workspace_dir,

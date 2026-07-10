@@ -14,7 +14,7 @@ except ImportError:
     rospy = None
 
 from danger_search.mapper import BLACK, FREE, FloorGrid, OCC, UNKNOWN, VISITED
-from danger_search.planner import astar_path, path_length
+from danger_search.planner import UNREACHABLE, astar_plan, path_length
 from danger_search.time_utils import get_time
 
 
@@ -32,6 +32,8 @@ class FrontierSelectionContext:
     forbidden_half_plane_normal: tuple[float, float] | None = None
     forbidden_radius: float = 0.0
     skip_in_forbidden_half_plane: bool = False
+    permanent_forbidden_half_plane_origin: tuple[float, float] | None = None
+    permanent_forbidden_half_plane_normal: tuple[float, float] | None = None
     preferred_origin: tuple[float, float] | None = None
     preferred_direction: tuple[float, float] | None = None
     temporary_revisit_penalty: float = 0.0
@@ -52,6 +54,7 @@ class FrontierSelectionDebug:
     final_target: tuple[float, float] | None
     final_score: float
     path_length: float
+    budget_exhausted_count: int = 0
     retained_by_inertia: bool = False
     inertia_reason: str = ""
     previous_target: tuple[float, float] | None = None
@@ -115,8 +118,9 @@ class FrontierExplorer:
         unreachable_count = 0
         reachable_count = 0
         context_filtered_count = 0
+        budget_exhausted_count = 0
         for frontier in frontiers:
-            target_xy, path, blacklisted_only, context_adjustment, context_filtered_only = self._resolve_frontier_target(
+            target_xy, path, blacklisted_only, context_adjustment, context_filtered_only, budget_exhausted = self._resolve_frontier_target(
                 grid,
                 frontier,
                 robot_pose,
@@ -127,6 +131,9 @@ class FrontierExplorer:
                     blacklisted_count += 1
                 elif context_filtered_only:
                     context_filtered_count += 1
+                elif budget_exhausted:
+                    # 预算耗尽：可能可达，不累计失败，留待下轮地图更新后重试。
+                    budget_exhausted_count += 1
                 else:
                     unreachable_count += 1
                     self.record_failure(grid, frontier.centroid)
@@ -170,6 +177,7 @@ class FrontierExplorer:
                 blacklisted_count=blacklisted_count,
                 unreachable_count=unreachable_count,
                 context_filtered_count=context_filtered_count,
+                budget_exhausted_count=budget_exhausted_count,
                 used_fallback=True,
                 frontier=fallback_frontier,
                 path=fallback_path,
@@ -179,6 +187,7 @@ class FrontierExplorer:
                     blacklisted_count=blacklisted_count,
                     unreachable_count=unreachable_count,
                     context_filtered_count=context_filtered_count,
+                    budget_exhausted_count=budget_exhausted_count,
                     used_fallback=True,
                     final_target=fallback_frontier.centroid if fallback_frontier is not None else None,
                     final_score=fallback_frontier.score if fallback_frontier is not None else 0.0,
@@ -212,6 +221,7 @@ class FrontierExplorer:
             blacklisted_count=blacklisted_count,
             unreachable_count=unreachable_count,
             context_filtered_count=context_filtered_count,
+            budget_exhausted_count=budget_exhausted_count,
             used_fallback=False,
             frontier=best_frontier,
             path=best_path,
@@ -221,6 +231,7 @@ class FrontierExplorer:
                 blacklisted_count=blacklisted_count,
                 unreachable_count=unreachable_count,
                 context_filtered_count=context_filtered_count,
+                budget_exhausted_count=budget_exhausted_count,
                 used_fallback=False,
                 final_target=best_frontier.centroid,
                 final_score=best_frontier.score,
@@ -344,13 +355,14 @@ class FrontierExplorer:
             context_adjustment, skip_target = self._selection_context_adjustment(goal, selection_context)
             if skip_target:
                 continue
-            path = astar_path(grid, robot_xy, goal)
-            if path:
-                score = -path_length(path) + context_adjustment
+            result = astar_plan(grid, robot_xy, goal)
+            if result.reached:
+                score = -path_length(result.path) + context_adjustment
                 frontier = Frontier(cells=(cell,), centroid=goal, information_gain=0.0, score=score)
                 if best_choice is None or score > best_choice[2]:
-                    best_choice = (frontier, path, score)
-            else:
+                    best_choice = (frontier, result.path, score)
+            elif result.unreachable:
+                # 确实不可达才累计失败；预算耗尽留待重试。
                 self.record_failure(grid, goal)
         if best_choice is not None:
             return best_choice[0], best_choice[1]
@@ -363,13 +375,14 @@ class FrontierExplorer:
         robot_pose: tuple[float, float, float],
         *,
         selection_context: FrontierSelectionContext | None = None,
-    ) -> tuple[tuple[float, float] | None, list[tuple[float, float]], bool, float, bool]:
+    ) -> tuple[tuple[float, float] | None, list[tuple[float, float]], bool, float, bool, bool]:
         candidates = self._candidate_targets_for_frontier(grid, frontier, (robot_pose[0], robot_pose[1]))
         if not candidates:
-            return None, [], False, 0.0, False
+            return None, [], False, 0.0, False, False
         saw_non_blacklisted = False
         saw_context_skip = False
         saw_path_attempt = False
+        saw_budget_exhausted = False
         best_choice: tuple[tuple[float, float], list[tuple[float, float]], float, float] | None = None
         for target_xy in candidates:
             if self._is_blacklisted(grid, target_xy):
@@ -380,16 +393,20 @@ class FrontierExplorer:
                 saw_context_skip = True
                 continue
             saw_path_attempt = True
-            path = astar_path(grid, (robot_pose[0], robot_pose[1]), target_xy)
-            if path:
+            result = astar_plan(grid, (robot_pose[0], robot_pose[1]), target_xy)
+            if result.reached:
                 if selection_context is None:
-                    return target_xy, path, False, 0.0, False
-                candidate_score = context_adjustment - path_length(path)
+                    return target_xy, result.path, False, 0.0, False, False
+                candidate_score = context_adjustment - path_length(result.path)
                 if best_choice is None or candidate_score > best_choice[3]:
-                    best_choice = (target_xy, path, context_adjustment, candidate_score)
+                    best_choice = (target_xy, result.path, context_adjustment, candidate_score)
+            elif result.budget_exhausted:
+                # 预算耗尽：可能可达，不能黑名单，标记后跳过本轮。
+                saw_budget_exhausted = True
         if best_choice is not None:
-            return best_choice[0], best_choice[1], False, best_choice[2], False
-        return None, [], not saw_non_blacklisted, 0.0, saw_context_skip and not saw_path_attempt
+            return best_choice[0], best_choice[1], False, best_choice[2], False, False
+        # 没有可达候选：若全是预算耗尽，则不视为不可达，避免误黑名单。
+        return None, [], not saw_non_blacklisted, 0.0, saw_context_skip and not saw_path_attempt, saw_budget_exhausted
 
     def _candidate_targets_for_frontier(
         self,
@@ -505,6 +522,17 @@ class FrontierExplorer:
         if selection_context is None:
             return 0.0, False
         adjustment = 0.0
+
+        # 永久禁区：大门外侧等不可返回区域，直接跳过
+        permanent_signed = self._signed_half_plane_distance(
+            target_xy,
+            selection_context.permanent_forbidden_half_plane_origin,
+            selection_context.permanent_forbidden_half_plane_normal,
+        )
+        if permanent_signed is not None and permanent_signed < -0.05:
+            return 0.0, True
+
+        # 临时禁区：过门后短时间内的回头抑制
         signed_distance = self._signed_half_plane_distance(
             target_xy,
             selection_context.forbidden_half_plane_origin,
@@ -551,6 +579,7 @@ class FrontierExplorer:
         blacklisted_count: int,
         unreachable_count: int,
         context_filtered_count: int,
+        budget_exhausted_count: int,
         used_fallback: bool,
         frontier: Frontier | None,
         path: list[tuple[float, float]],
@@ -561,22 +590,24 @@ class FrontierExplorer:
             return
         if frontier is None:
             rospy.loginfo(
-                "[frontier_debug] 候选前沿=%d 可达=%d 黑名单=%d 不可达=%d 上下文过滤=%d fallback_far_free=%s final_target=None",
+                "[frontier_debug] 候选前沿=%d 可达=%d 黑名单=%d 不可达=%d 上下文过滤=%d 预算耗尽=%d fallback_far_free=%s final_target=None",
                 candidate_count,
                 reachable_count,
                 blacklisted_count,
                 unreachable_count,
                 context_filtered_count,
+                budget_exhausted_count,
                 used_fallback,
             )
             return
         rospy.loginfo(
-            "[frontier_debug] 候选前沿=%d 可达=%d 黑名单=%d 不可达=%d 上下文过滤=%d fallback_far_free=%s final_target=(%.2f, %.2f) score=%.2f path_length=%.2f",
+            "[frontier_debug] 候选前沿=%d 可达=%d 黑名单=%d 不可达=%d 上下文过滤=%d 预算耗尽=%d fallback_far_free=%s final_target=(%.2f, %.2f) score=%.2f path_length=%.2f",
             candidate_count,
             reachable_count,
             blacklisted_count,
             unreachable_count,
             context_filtered_count,
+            budget_exhausted_count,
             used_fallback,
             frontier.centroid[0],
             frontier.centroid[1],

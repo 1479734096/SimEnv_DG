@@ -9,7 +9,6 @@
 
 import json
 import numpy as np
-from scipy.spatial import KDTree, distance
 import sys
 import argparse
 from pathlib import Path
@@ -54,9 +53,11 @@ def compute_scene_diagonal(truth_positions):
     if len(truth_positions) < 2:
         # 如果只有一个点，假设场景尺寸为10米（默认）
         return 10.0
-    # 计算所有点之间的最大距离
-    distances = distance.pdist(truth_positions)
-    return np.max(distances)
+    # 真值点数量很小，直接用 NumPy 计算两两欧氏距离，避免依赖与系统
+    # NumPy 版本不兼容的旧版 SciPy。
+    offsets = truth_positions[:, np.newaxis, :] - truth_positions[np.newaxis, :, :]
+    distances = np.linalg.norm(offsets, axis=-1)
+    return float(np.max(distances))
 
 def evaluate_detection(truth_positions, detected_positions, threshold, verbose=False):
     """评估检测结果，返回正确数、漏报数、虚警数"""
@@ -138,7 +139,7 @@ def _build_parser():
     parser.add_argument("--output-file", default="./results/evaluation_result.json")
     parser.add_argument("--threshold", type=float, default=fixed_threshold)
     parser.add_argument("--scene-size", type=float)
-    parser.add_argument("--use-scene-ratio", action="store_true", help="Use 5% of scene size instead of fixed threshold.")
+    parser.add_argument("--use-scene-ratio", action="store_true", help="Use five percent of scene size instead of fixed threshold.")
     parser.add_argument("--verbose", action="store_true")
     return parser
 

@@ -27,19 +27,22 @@ class PathFollower:
     cmd_vel_topic: str
     max_linear: float = 0.60
     max_lateral: float = 0.25
-    max_angular: float = 0.8
-    min_linear_fraction: float = 0.15
+    max_angular: float = 1.2
+    min_linear_fraction: float = 0.35
     goal_tolerance: float = 0.35
     waypoint_tolerance: float = 0.25
-    pure_pursuit_lookahead: float = 0.65
-    reverse_speed: float = -0.18
-    recover_duration: float = 0.6
-    no_progress_timeout: float = 12.0
+    corner_tolerance: float = 0.10
+    pure_pursuit_lookahead: float = 0.45
+    reverse_speed: float = -0.25
+    recover_duration: float = 1.5
+    no_progress_timeout: float = 8.0
+    progress_distance: float = 0.25
     _publisher: object | None = field(default=None, init=False)
     _path: list[tuple[float, float]] = field(default_factory=list, init=False)
     _waypoint_index: int = field(default=0, init=False)
     _last_progress_time: float = field(default_factory=time.time, init=False)
     _last_goal_distance: float = field(default=math.inf, init=False)
+    _last_progress_pose: tuple[float, float, float] | None = field(default=None, init=False)
     _recover_until: float = field(default=0.0, init=False)
     command_count: int = field(default=0, init=False)
     nonzero_linear_count: int = field(default=0, init=False)
@@ -58,6 +61,7 @@ class PathFollower:
         self._waypoint_index = 0
         self._last_progress_time = get_time()
         self._last_goal_distance = math.inf
+        self._last_progress_pose = None
 
     def has_path(self) -> bool:
         return bool(self._path)
@@ -83,7 +87,16 @@ class PathFollower:
             self.clear_path()
             return DONE
 
-        if goal_distance + 0.05 < self._last_goal_distance:
+        # 进度判定：以机器人自身位移为主，防止绕弯时到终点欧氏距离不下降而误判 STUCK。
+        if self._last_progress_pose is None:
+            self._last_progress_pose = pose_xy_yaw
+        moved = math.hypot(
+            x - self._last_progress_pose[0],
+            y - self._last_progress_pose[1],
+        )
+        goal_approach = goal_distance + self.progress_distance < self._last_goal_distance
+        if moved > self.progress_distance or goal_approach:
+            self._last_progress_pose = pose_xy_yaw
             self._last_goal_distance = goal_distance
             self._last_progress_time = now
         elif now - self._last_progress_time > self.no_progress_timeout:
@@ -118,20 +131,47 @@ class PathFollower:
                 time.sleep(max(0.0, float(interval)))
 
     def _lookahead_target(self, x: float, y: float) -> tuple[float, float]:
-        while self._waypoint_index < len(self._path) - 1:
-            current = self._path[self._waypoint_index]
-            if math.hypot(current[0] - x, current[1] - y) > self.waypoint_tolerance:
+        # 推进 waypoint：直线段使用 waypoint_tolerance；遇到转角前缩小容忍，
+        # 确保机器人先贴近拐角再切换到下一段，防止提前切角或跳到未来折返段。
+        while self._waypoint_index < len(self._path) - 2:
+            next_point = self._path[self._waypoint_index + 1]
+            advance_tolerance = self.waypoint_tolerance
+            if self._is_turn_vertex(self._waypoint_index + 1):
+                advance_tolerance = min(self.waypoint_tolerance, self.corner_tolerance)
+            if math.hypot(next_point[0] - x, next_point[1] - y) <= advance_tolerance:
+                self._waypoint_index += 1
+            else:
                 break
-            self._waypoint_index += 1
 
-        target = self._path[self._waypoint_index]
-        for index in range(self._waypoint_index, len(self._path)):
-            candidate = self._path[index]
-            if math.hypot(candidate[0] - x, candidate[1] - y) >= self.pure_pursuit_lookahead:
-                target = candidate
-                self._waypoint_index = index
-                break
-        return target
+        # 只在当前路径段上做投影和 lookahead，禁止跳到未来折返段。
+        ax, ay = self._path[self._waypoint_index]
+        bx, by = self._path[self._waypoint_index + 1]
+        vx, vy = bx - ax, by - ay
+        seg_len = math.hypot(vx, vy)
+        if seg_len <= 1e-6:
+            return bx, by
+
+        t = _clamp(((x - ax) * vx + (y - ay) * vy) / (seg_len * seg_len), 0.0, 1.0)
+        px, py = ax + t * vx, ay + t * vy
+        distance = min(self.pure_pursuit_lookahead, seg_len * (1.0 - t))
+        return px + distance * vx / seg_len, py + distance * vy / seg_len
+
+    def _is_turn_vertex(self, vertex_index: int) -> bool:
+        """判断 path[vertex_index] 是否为转角顶点（入段与出段方向变化明显）。"""
+        if vertex_index <= 0 or vertex_index >= len(self._path) - 1:
+            return False
+        ax, ay = self._path[vertex_index - 1]
+        bx, by = self._path[vertex_index]
+        cx, cy = self._path[vertex_index + 1]
+        in_x, in_y = bx - ax, by - ay
+        out_x, out_y = cx - bx, cy - by
+        in_len = math.hypot(in_x, in_y)
+        out_len = math.hypot(out_x, out_y)
+        if in_len <= 1e-6 or out_len <= 1e-6:
+            return False
+        cos_angle = (in_x * out_x + in_y * out_y) / (in_len * out_len)
+        # 约 5 度以上方向变化视为转角。
+        return cos_angle < 0.996
 
     def _publish(self, linear_x: float, angular_z: float, *, linear_y: float = 0.0) -> None:
         if self._publisher is None or Twist is None:
