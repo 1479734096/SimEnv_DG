@@ -43,9 +43,11 @@ roslaunch danger_search danger_search_smoke.launch
 ## 关键约束
 
 - 检测结果使用多帧确认后才输出，优先降低虚警率。
-- 楼层探索至少持续 `mission/min_floor_explore_time`，避免启动后已知区域过小却被误判为覆盖完成。
-- 楼层结束还要求最大离家距离达到 `mission/min_floor_travel_distance`，避免机器人只在起点附近抖动就结束任务。
+- 楼层结束需要同时满足最小探索时间、最大离家距离、最小已知面积、覆盖率和连续无可达前沿确认次数；不会再因为 `len(frontiers) <= 1` 直接结束，避免启动后小已知区域 coverage 虚高导致没搜走廊/房间就返航。
+- 楼层探索至少持续 `mission/min_floor_explore_time`，最大离家距离至少达到 `mission/min_floor_travel_distance`，已知面积至少达到 `mission/min_known_area`；`mission/no_reachable_frontier_confirmations` 控制无可达前沿需连续确认的次数，`mission/min_corridor_progress_distance` 可选限制走廊主方向已知范围。
 - 无前沿且无远处 FREE 目标时，会从机器人当前位置按 `mission/probe_distance` 做短距离探测前进，再重新建图；默认 `mission/probe_yaw=1.5708`，沿比赛入口到房间的全局 +Y 方向探测，避免起立后的机体 yaw 抖动把探测方向带反。探测段如果穿过已知障碍或黑名单栅格，会跳过该目标。
+- Frontier 选择带短期惯性：当前区域仍可达时，新目标分数需要高出 `frontier/switch_score_margin` 才会切换；日志会记录每次选择的分数、距离、门侧、fallback 和切换原因。
+- 过门后除了短时间抑制回头，还会在门后推进距离和门后侧已知面积达到 `mission/post_door_min_distance`、`mission/post_door_min_known_area` 前持续优先门后侧目标，减少刚进门又回头。
 - 路径跟踪默认允许有限转向和侧移：`controller/min_linear_fraction=0.15`、`controller/max_angular=0.8`、`controller/max_lateral=0.25`，目标偏角较大时会降低前进速度，避免目标在侧后方时仍满速直顶墙体。
 - 卡住恢复默认等待 `frontier/no_progress_timeout=12.0` 秒，避免 A1 刚起步就被频繁判定为卡住并后退。
 - 默认使用 `/livox/Pointcloud2` 做 2.5D 栅格建图。
@@ -54,7 +56,7 @@ roslaunch danger_search danger_search_smoke.launch
 - 前沿目标默认先找更安全的内部 free cell，而不是直接贴着 frontier 边缘落点；`frontier/frontier_obstacle_clearance`、`frontier/frontier_unknown_standoff` 和 `frontier/frontier_min_information_gain` 分别控制离障碍余量、离 unknown 边缘退让和最小信息增益。
 - 默认使用 `/real_sense/rgb/image_raw` 和 `/real_sense/depth/image_raw` 做红球识别。
 - Mapper 只维护 free / occupied / unknown 占据栅格，不编码门、电梯或房间入口语义；普通点云射线不会擦除已知静态障碍。
-- 动态门只在局部传感器检测到近距离可见门候选后才匹配服务 ID 并执行 `OpenDoorAndPass`；开门成功后按 `mission/door_clear_radius` 清理门附近动态障碍残留，并按 `mission/door_pass_offset`、`mission/door_commit_distance` 继续深入门后，再在 `mission/door_transition_duration` 和 `mission/door_transition_hold_distance` 约束下短时抑制回头选回门前侧目标，不会把 `layout_metadata.json` 中的门坐标作为探索目标。
+- 动态门只在局部传感器检测到近距离可见门候选后才匹配服务 ID 并执行 `OpenDoorAndPass`；开门成功后按门 yaw、metadata 门宽和 `mission/door_clear_radius` 条带深度清理门洞内动态障碍残留，并按 `mission/door_pass_offset`、`mission/door_commit_distance` 继续深入门后，再在 `mission/door_transition_duration` 和 `mission/door_transition_hold_distance` 约束下短时抑制回头选回门前侧目标，不会把 `layout_metadata.json` 中的门坐标作为探索目标。
 - 房间入口不视为动态门，不调用 `/set_door_state`；普通探索依靠 Frontier 自然进入。
 - 电梯门不走普通开门逻辑，只在 `CHANGE_FLOOR` 状态下由 `TakeElevator` 状态机处理。
 - `local_semantic/use_truth_proximity_detector` 仅用于调试，默认关闭。
@@ -69,16 +71,29 @@ roslaunch danger_search danger_search_smoke.launch
 python3 src/danger_search/tools/run_seed.py --seed 42 --timeout 10000 --max-floor 3
 ```
 
+`run_seed.py` 默认使用 GUI auto 模式：检测到 `DISPLAY` 时启动 Gazebo GUI，否则自动使用 headless。也可以显式指定：
+
+```bash
+python3 src/danger_search/tools/run_seed.py --seed 42 --headless --timeout 10000 --max-floor 3
+python3 src/danger_search/tools/run_seed.py --seed 42 --gui --timeout 10000 --max-floor 3
+```
+
+无 `DISPLAY` 时不能使用 `--gui`，请改用 `--headless`，或通过虚拟显示运行：
+
+```bash
+xvfb-run -a python3 src/danger_search/tools/run_seed.py --seed 42 --gui --timeout 10000 --max-floor 3
+```
+
 批量 seed 评测：
 
 ```bash
-python3 src/danger_search/scripts/batch_evaluate.py --seeds 10 42 100 --timeout 10000 --max-floor 3
+python3 src/danger_search/scripts/batch_evaluate.py --seeds 10 42 100 --headless --timeout 10000 --max-floor 3
 ```
 
 网格搜索参数：
 
 ```bash
-python3 src/danger_search/tools/tune_params.py --seeds 10 42 100 --timeout 10000 --max-floor 3
+python3 src/danger_search/tools/tune_params.py --seeds 10 42 100 --headless --timeout 10000 --max-floor 3
 ```
 
 每次运行会创建独立目录：
@@ -93,7 +108,13 @@ results/runs/<时间戳>_seed_<seed>/
 ├── detection_debug.json
 ├── planner_debug.json
 └── logs/
+    ├── auto_sh.log
+    ├── danger_search.log
+    ├── health_check.log
+    └── competition_gazebo.log
 ```
+
+算法启动前会检查 `/Odometry_gazebo` 和 `/livox/Pointcloud2` 是否收到首帧数据；若没有点云，会提前失败并归档 `logs/health_check.log`、Gazebo 和控制器日志。
 
 如果外层 `run_seed.py` 达到 `--timeout` 后中断算法，归档中的 `mission_summary.json` 会写入 `external_timeout=true`、`completed=false`，并用 `result_written` 单独表示是否已经落盘 `detected_danger.json`。
 
@@ -112,6 +133,10 @@ tracker/nms_radius: 0.95
 tracker/min_hits: 4
 detection/max_rmse: 0.035
 controller/max_linear: 0.35
+mission/min_known_area: 45.0
+mission/no_reachable_frontier_confirmations: 2
+mission/post_door_min_distance: 2.0
+mission/post_door_min_known_area: 8.0
 mission/door_clear_radius: 0.9
 mission/door_transition_duration: 2.5
 mission/door_transition_hold_distance: 2.0
@@ -120,6 +145,8 @@ map/free_clear_max_range: 6.0
 map/free_clear_angle_step: 0.087
 frontier/frontier_obstacle_clearance: 0.3
 frontier/frontier_unknown_standoff: 0.25
+frontier/switch_score_margin: 2.0
+frontier/current_region_radius: 1.2
 ```
 
 也兼容计划里的旧 key，例如 `detection.confirm_hits`、`mission.total_timeout`、`controller.max_linear_vel`，工具会映射到当前配置结构。

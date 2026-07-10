@@ -158,6 +158,38 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertEqual(len(recorded_paths), 1)
         self.assertNotAlmostEqual(recorded_paths[0][-1][0], 0.0, places=6)
 
+    def test_return_home_does_not_direct_fallback_through_blocked_wall(self):
+        recorded_paths = []
+        manager = MissionManager.__new__(MissionManager)
+        manager.current_floor = 0
+        manager.max_floor = 1
+        manager.home_pose = (2.0, 0.0, 0.0)
+        manager.home_tolerance = 0.2
+        manager.mapper = MultiFloorGridMap(
+            resolution=1.0,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+        )
+        grid = manager.mapper.floor(0)
+        for gy in range(grid.size_y):
+            for gx in range(grid.size_x):
+                grid.mark_free(gx, gy)
+        wall_x, _ = grid.world_to_grid(0.0, 0.0)
+        for gy in range(grid.size_y):
+            grid.mark_occupied(wall_x, gy)
+        manager.controller = SimpleNamespace(
+            has_path=lambda: False,
+            set_path=lambda path: recorded_paths.append(path),
+            tick=lambda pose: "idle",
+            recover=lambda: None,
+        )
+
+        manager._tick_return_home((-2.0, 0.0, 0.0))
+
+        self.assertEqual(recorded_paths, [])
+
     def test_remember_completed_door_records_transition_context(self):
         manager = MissionManager.__new__(MissionManager)
         manager.door_transition_duration = 3.0
@@ -186,6 +218,9 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.last_door_pass_vector = (0.0, 1.0)
         manager.last_door_transition_until = 105.0
         manager.door_transition_hold_distance = 2.5
+        manager.post_door_min_distance = 0.0
+        manager.post_door_min_known_area = 0.0
+        manager._last_frontier_target = None
         manager.explorer = SimpleNamespace(
             door_front_half_plane_radius=1.5,
             door_front_half_plane_penalty=6.0,
@@ -208,6 +243,110 @@ class MissionManagerHelperTest(unittest.TestCase):
             expired_context = manager._frontier_selection_context((0.0, 1.0, math.pi / 2.0))
 
         self.assertIsNone(expired_context)
+
+    def test_frontier_selection_context_persists_after_door_timer_until_post_door_progress(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.current_floor = 0
+        manager.last_door_xy = (0.0, 0.0)
+        manager.last_door_pass_vector = (0.0, 1.0)
+        manager.last_door_transition_until = 100.0
+        manager.door_transition_hold_distance = 2.5
+        manager.post_door_min_distance = 2.0
+        manager.post_door_min_known_area = 4.0
+        manager._last_frontier_target = None
+        manager.frontier_current_region_radius = 1.2
+        manager.frontier_switch_score_margin = 2.0
+        manager.mapper = MultiFloorGridMap(
+            resolution=1.0,
+            width=8.0,
+            length=8.0,
+            origin_x=-4.0,
+            origin_y=-4.0,
+        )
+        manager.explorer = SimpleNamespace(
+            door_front_half_plane_radius=1.5,
+            door_front_half_plane_penalty=6.0,
+        )
+
+        with patch.object(mission_manager_module, "get_time", return_value=106.0):
+            context = manager._frontier_selection_context((0.0, 0.8, math.pi / 2.0))
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertTrue(context.skip_in_forbidden_half_plane)
+
+    def test_frontier_selection_context_keeps_post_door_progress_beyond_hold_distance(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.last_door_xy = (0.0, 0.0)
+        manager.last_door_pass_vector = (0.0, 1.0)
+        manager.last_door_transition_until = 105.0
+        manager.door_transition_hold_distance = 2.5
+        manager.post_door_min_distance = 4.0
+        manager.post_door_min_known_area = 0.0
+        manager._last_frontier_target = None
+        manager.explorer = SimpleNamespace(
+            door_front_half_plane_radius=1.5,
+            door_front_half_plane_penalty=6.0,
+        )
+
+        with patch.object(mission_manager_module, "get_time", return_value=103.0):
+            context = manager._frontier_selection_context((0.0, 3.0, math.pi / 2.0))
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertTrue(context.skip_in_forbidden_half_plane)
+
+    def test_small_known_area_with_high_coverage_does_not_complete_floor(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.min_floor_explore_time = 20.0
+        manager.min_floor_travel_distance = 6.0
+        manager.min_known_area = 45.0
+        manager.explore_coverage_ratio = 0.82
+        manager.no_reachable_frontier_confirmations = 2
+        manager._no_reachable_frontier_confirmations = 2
+        manager.min_corridor_progress_distance = 0.0
+        manager.probe_yaw = math.pi / 2.0
+        manager._max_home_distance = 8.0
+        grid = MultiFloorGridMap(
+            resolution=1.0,
+            width=10.0,
+            length=10.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        for gy in range(2):
+            for gx in range(2):
+                grid.mark_free(gx, gy)
+
+        self.assertEqual(grid.coverage_ratio(), 1.0)
+        self.assertLess(grid.known_area(), manager.min_known_area)
+        self.assertFalse(manager._floor_completion_ready(grid, 30.0))
+
+    def test_floor_completion_requires_repeated_no_reachable_confirmations(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.min_floor_explore_time = 20.0
+        manager.min_floor_travel_distance = 6.0
+        manager.min_known_area = 4.0
+        manager.explore_coverage_ratio = 0.82
+        manager.no_reachable_frontier_confirmations = 2
+        manager._no_reachable_frontier_confirmations = 1
+        manager.min_corridor_progress_distance = 0.0
+        manager.probe_yaw = math.pi / 2.0
+        manager._max_home_distance = 8.0
+        grid = MultiFloorGridMap(
+            resolution=1.0,
+            width=10.0,
+            length=10.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        for gy in range(3):
+            for gx in range(3):
+                grid.mark_free(gx, gy)
+
+        self.assertFalse(manager._floor_completion_ready(grid, 30.0))
+        manager._no_reachable_frontier_confirmations = 2
+        self.assertTrue(manager._floor_completion_ready(grid, 30.0))
 
 
 if __name__ == "__main__":

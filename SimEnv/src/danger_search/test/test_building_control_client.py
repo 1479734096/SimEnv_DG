@@ -21,6 +21,7 @@ class BuildingControlClientTest(unittest.TestCase):
                                 "floor_index": 0,
                                 "dynamic": True,
                                 "pose": [0.0, 0.0, 1.2, 0.0, 0.0, math.pi / 2.0],
+                                "width": 2.0,
                             },
                             {
                                 "id": "static_room_door",
@@ -58,6 +59,7 @@ class BuildingControlClientTest(unittest.TestCase):
         self.assertIn("elevator_main", client.elevators)
         self.assertTrue(client.has_controllable_doors())
         self.assertEqual(client.doors["main_entrance"].floor_index, 0)
+        self.assertAlmostEqual(client.doors["main_entrance"].width, 2.0)
         self.assertAlmostEqual(client.elevators["elevator_main"].lobby_poses[0][2], math.pi)
         self.assertEqual(
             [door.door_id for door in client.controllable_doors(floor_index=0, include_elevators=False)],

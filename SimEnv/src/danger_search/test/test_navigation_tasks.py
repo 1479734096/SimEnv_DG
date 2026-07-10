@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from danger_search.navigation_tasks import DONE, OpenDoorAndPass, RUNNING, TakeElevator
+from danger_search.navigation_tasks import DONE, FAILED, OpenDoorAndPass, RUNNING, TakeElevator
 from danger_search.mapper import MultiFloorGridMap
 
 
@@ -16,6 +16,20 @@ class _DoneService:
 
     def message(self):
         return ""
+
+
+class _FailedService:
+    def __init__(self, message="failed"):
+        self._message = message
+
+    def done(self):
+        return True
+
+    def ok(self):
+        return False
+
+    def message(self):
+        return self._message
 
 
 class OpenDoorAndPassTest(unittest.TestCase):
@@ -38,8 +52,30 @@ class OpenDoorAndPassTest(unittest.TestCase):
         self.assertEqual(task.phase, "GO_PASS_POINT")
         self.assertEqual(cleared, ["main_entrance"])
 
-    def test_commit_point_blocked_does_not_force_direct_path(self):
+    def test_open_door_service_failure_returns_failed(self):
+        failures = []
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "CALL_OPEN"
+        task._service_task = _FailedService("denied")
+        task._retry_count = 1
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(
+                get_door_path_points=lambda *args, **kwargs: ((0.0, -0.8), (0.0, 0.8), (0.0, 1.8)),
+                open_door=lambda door_id: _FailedService("denied"),
+            ),
+            controller=SimpleNamespace(stop=lambda: None),
+            _record_failure=lambda reason: failures.append(reason),
+        )
+
+        status = task.tick(manager, (0.0, -0.8, math.pi / 2.0))
+
+        self.assertEqual(status, FAILED)
+        self.assertEqual(failures, ["开门服务失败: denied"])
+
+    def test_commit_point_blocked_cleans_and_keeps_running(self):
         recorded_paths = []
+        cleared_paths = []
+        cleared_doors = []
         task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
         task.phase = "GO_COMMIT_POINT"
         task._wait_point = (0.0, -0.8)
@@ -63,20 +99,43 @@ class OpenDoorAndPassTest(unittest.TestCase):
                 goal_tolerance=0.35,
                 has_path=lambda: False,
                 set_path=lambda path: recorded_paths.append(path),
-                clear_path=lambda: None,
+                clear_path=lambda: cleared_paths.append(True),
                 tick=lambda pose: RUNNING,
                 recover=lambda: None,
             ),
+            clear_opened_door_area=lambda door_id: cleared_doors.append(door_id),
         )
 
         with patch("danger_search.navigation_tasks.astar_path", return_value=[]):
             status = task.tick(manager, (0.0, 0.8, math.pi / 2.0))
 
-        self.assertEqual(status, DONE)
+        self.assertEqual(status, RUNNING)
         self.assertEqual(recorded_paths, [])
+        self.assertEqual(cleared_paths, [True])
+        self.assertEqual(cleared_doors, ["main_entrance"])
 
 
 class TakeElevatorTest(unittest.TestCase):
+    def test_elevator_service_failure_returns_failed(self):
+        failures = []
+        task = TakeElevator(0, 1)
+        task.phase = "CLOSE_TARGET_FLOOR_DOOR"
+        task._service_task = _FailedService("jammed")
+        task._retry_count = 1
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(
+                get_elevator_points=lambda elevator_id, floor: ((0.0, 0.0), (0.0, 1.0)),
+                close_door=lambda door_id: _FailedService("jammed"),
+            ),
+            controller=SimpleNamespace(stop=lambda: None),
+            _record_failure=lambda reason: failures.append(reason),
+        )
+
+        status = task.tick(manager, (0.0, 0.0, math.pi / 2.0))
+
+        self.assertEqual(status, FAILED)
+        self.assertEqual(failures, ["电梯服务失败: jammed"])
+
     def test_wait_current_door_open_does_not_enter_without_path_after_timeout(self):
         cleared = []
         task = TakeElevator(0, 1)

@@ -1,5 +1,6 @@
 import math
 import unittest
+from unittest.mock import patch
 
 from danger_search.frontier import FrontierExplorer
 from danger_search.frontier import Frontier
@@ -157,6 +158,28 @@ class FrontierExplorerTest(unittest.TestCase):
         self.assertTrue(path)
         self.assertGreater(math.hypot(frontier.centroid[0], frontier.centroid[1]), 1.0)
 
+    def test_successful_free_space_fallback_does_not_record_failure(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.2,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        )
+        for gy in range(grid.size_y):
+            for gx in range(grid.size_x):
+                grid.mark_free(gx, gy)
+        grid.mark_visited_radius(0.0, 0.0, 0.4)
+        explorer = FrontierExplorer(min_cluster_size=1, fail_limit=1)
+
+        frontier, path = explorer.select_frontier(grid, (0.0, 0.0, 0.0))
+
+        self.assertIsNotNone(frontier)
+        self.assertTrue(path)
+        self.assertEqual(explorer._fail_counts, {})
+        self.assertEqual(explorer._blacklist, {})
+
     def test_falls_back_when_no_safe_frontier_goal_exists(self):
         grid = FloorGrid(
             floor_index=0,
@@ -247,6 +270,46 @@ class FrontierExplorerTest(unittest.TestCase):
         self.assertTrue(explicit_path)
         self.assertEqual(default_frontier.centroid, explicit_frontier.centroid)
         self.assertEqual(default_path, explicit_path)
+
+    def test_current_region_inertia_requires_clear_score_improvement_to_switch(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=20.0,
+            length=20.0,
+            origin_x=-10.0,
+            origin_y=-10.0,
+        )
+        self._mark_free_rect(grid, 2, 5, 2, 5)
+        self._mark_free_rect(grid, 13, 17, 13, 17)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            information_gain_weight=1.0,
+            path_cost_weight=0.0,
+            yaw_cost_weight=0.0,
+            revisit_penalty_weight=0.0,
+            frontier_obstacle_clearance=0.0,
+            frontier_unknown_standoff=0.0,
+        )
+        context = FrontierSelectionContext(
+            current_target=(-6.5, -6.5),
+            current_score=0.0,
+            current_region_radius=4.0,
+            switch_score_margin=20.0,
+        )
+
+        def fake_astar(_grid, start, goal):
+            return [start, goal]
+
+        with patch("danger_search.frontier.astar_path", side_effect=fake_astar):
+            frontier, path = explorer.select_frontier(grid, (0.0, 0.0, 0.0), selection_context=context)
+
+        self.assertIsNotNone(frontier)
+        self.assertTrue(path)
+        self.assertLess(frontier.centroid[0], 0.0)
+        self.assertIsNotNone(explorer.last_selection_debug)
+        assert explorer.last_selection_debug is not None
+        self.assertTrue(explorer.last_selection_debug.retained_by_inertia)
 
 
 if __name__ == "__main__":

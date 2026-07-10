@@ -70,6 +70,7 @@ class DoorInfo:
     x: float
     y: float
     yaw: float
+    width: float = 1.0
 
 @dataclass
 class ElevatorInfo:
@@ -110,6 +111,7 @@ class BuildingControlClient:
                 x=float(pose[0]),
                 y=float(pose[1]),
                 yaw=float(pose[5]),
+                width=float(door_spec.get("width", 1.0)),
             )
 
         for el_spec in data.get("elevator_specs", []):

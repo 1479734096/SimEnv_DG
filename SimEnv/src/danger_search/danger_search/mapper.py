@@ -99,6 +99,23 @@ class FloorGrid:
         visited_or_free = np.count_nonzero((self.data == VISITED) | (self.data == FREE))
         return float(visited_or_free / known)
 
+    def known_area(self) -> float:
+        return float(np.count_nonzero(self.data != UNKNOWN) * self.resolution * self.resolution)
+
+    def visited_area(self) -> float:
+        return float(np.count_nonzero(self.data == VISITED) * self.resolution * self.resolution)
+
+    def known_bbox_extent(self) -> tuple[float, float]:
+        known_cells = np.argwhere(self.data != UNKNOWN)
+        if known_cells.size == 0:
+            return (0.0, 0.0)
+        min_y, min_x = known_cells.min(axis=0)
+        max_y, max_x = known_cells.max(axis=0)
+        return (
+            float((int(max_x) - int(min_x) + 1) * self.resolution),
+            float((int(max_y) - int(min_y) + 1) * self.resolution),
+        )
+
 
 class MultiFloorGridMap:
     """为每个楼层维护一张占据栅格。"""
@@ -206,20 +223,43 @@ class MultiFloorGridMap:
                 if 0 <= gx < grid.size_x and 0 <= gy < grid.size_y and grid.data[gy, gx] != OCC:
                     grid.data[gy, gx] = BLACK
 
-    def clear_dynamic_obstacle_radius(self, floor_index: int, x: float, y: float, radius: float) -> None:
-        """开门后只清理门附近的动态障碍残留，避免普通射线误擦静态墙。"""
+    def clear_dynamic_door_strip(
+        self,
+        floor_index: int,
+        x: float,
+        y: float,
+        yaw: float,
+        width: float,
+        depth: float,
+    ) -> None:
+        """按门洞方向清理动态障碍残留，避免圆形清理擦掉门侧静态墙。"""
         grid = self.floor(floor_index)
         center = grid.world_to_grid(x, y)
         if center is None:
             return
         cx, cy = center
-        cells = int(math.ceil(max(0.0, float(radius)) / grid.resolution))
+        half_width = max(0.0, float(width)) * 0.5
+        half_depth = max(0.0, float(depth)) * 0.5
+        if half_width <= 0.0 or half_depth <= 0.0:
+            return
+        normal_x = math.cos(yaw)
+        normal_y = math.sin(yaw)
+        tangent_x = -normal_y
+        tangent_y = normal_x
+        search_radius = math.hypot(half_width, half_depth)
+        cells = int(math.ceil(search_radius / grid.resolution))
         for gy in range(cy - cells, cy + cells + 1):
             for gx in range(cx - cells, cx + cells + 1):
                 if not (0 <= gx < grid.size_x and 0 <= gy < grid.size_y):
                     continue
+                if int(grid.data[gy, gx]) != OCC:
+                    continue
                 wx, wy = grid.grid_to_world(gx, gy)
-                if math.hypot(wx - x, wy - y) <= radius:
+                dx = wx - x
+                dy = wy - y
+                along_normal = dx * normal_x + dy * normal_y
+                along_tangent = dx * tangent_x + dy * tangent_y
+                if abs(along_normal) <= half_depth and abs(along_tangent) <= half_width:
                     grid.data[gy, gx] = FREE
 
     def _raycast_free(
@@ -228,7 +268,7 @@ class MultiFloorGridMap:
         start: tuple[int, int],
         end: tuple[int, int],
         *,
-        stop_at_blocked: bool = False,
+        stop_at_blocked: bool = True,
     ) -> None:
         for gx, gy in _bresenham(start[0], start[1], end[0], end[1])[:-1]:
             if stop_at_blocked and int(grid.data[gy, gx]) in (OCC, BLACK):

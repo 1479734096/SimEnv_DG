@@ -35,6 +35,29 @@ class FrontierSelectionContext:
     preferred_origin: tuple[float, float] | None = None
     preferred_direction: tuple[float, float] | None = None
     temporary_revisit_penalty: float = 0.0
+    current_target: tuple[float, float] | None = None
+    current_score: float | None = None
+    current_region_radius: float = 0.0
+    switch_score_margin: float = 0.0
+
+
+@dataclass(frozen=True)
+class FrontierSelectionDebug:
+    candidate_count: int
+    reachable_count: int
+    blacklisted_count: int
+    unreachable_count: int
+    context_filtered_count: int
+    used_fallback: bool
+    final_target: tuple[float, float] | None
+    final_score: float
+    path_length: float
+    retained_by_inertia: bool = False
+    inertia_reason: str = ""
+    previous_target: tuple[float, float] | None = None
+    previous_score: float | None = None
+    current_region_score: float | None = None
+    switch_score_margin: float = 0.0
 
 
 class FrontierExplorer:
@@ -72,6 +95,7 @@ class FrontierExplorer:
         self.door_preferred_direction_bonus = float(door_preferred_direction_bonus)
         self._blacklist: dict[tuple[int, int], float] = {}
         self._fail_counts: dict[tuple[int, int], int] = {}
+        self.last_selection_debug: FrontierSelectionDebug | None = None
 
     def select_frontier(
         self,
@@ -84,6 +108,9 @@ class FrontierExplorer:
         best_frontier: Frontier | None = None
         best_path: list[tuple[float, float]] = []
         best_score = -math.inf
+        best_current_region_frontier: Frontier | None = None
+        best_current_region_path: list[tuple[float, float]] = []
+        best_current_region_score = -math.inf
         blacklisted_count = 0
         unreachable_count = 0
         reachable_count = 0
@@ -115,6 +142,22 @@ class FrontierExplorer:
                     score=score,
                 )
                 best_path = path
+            if (
+                selection_context is not None
+                and selection_context.current_target is not None
+                and selection_context.current_region_radius > 0.0
+                and _world_distance(target_xy, selection_context.current_target)
+                <= selection_context.current_region_radius
+                and score > best_current_region_score
+            ):
+                best_current_region_score = score
+                best_current_region_frontier = Frontier(
+                    cells=frontier.cells,
+                    centroid=target_xy,
+                    information_gain=frontier.information_gain,
+                    score=score,
+                )
+                best_current_region_path = path
         if best_frontier is None:
             fallback_frontier, fallback_path = self._select_free_space_goal(
                 grid,
@@ -130,8 +173,39 @@ class FrontierExplorer:
                 used_fallback=True,
                 frontier=fallback_frontier,
                 path=fallback_path,
+                debug=FrontierSelectionDebug(
+                    candidate_count=len(frontiers),
+                    reachable_count=reachable_count,
+                    blacklisted_count=blacklisted_count,
+                    unreachable_count=unreachable_count,
+                    context_filtered_count=context_filtered_count,
+                    used_fallback=True,
+                    final_target=fallback_frontier.centroid if fallback_frontier is not None else None,
+                    final_score=fallback_frontier.score if fallback_frontier is not None else 0.0,
+                    path_length=path_length(fallback_path) if fallback_path else 0.0,
+                    previous_target=selection_context.current_target if selection_context is not None else None,
+                    previous_score=selection_context.current_score if selection_context is not None else None,
+                    switch_score_margin=selection_context.switch_score_margin if selection_context is not None else 0.0,
+                ),
             )
             return fallback_frontier, fallback_path
+        retained_by_inertia = False
+        inertia_reason = ""
+        if (
+            selection_context is not None
+            and best_current_region_frontier is not None
+            and best_frontier.centroid != best_current_region_frontier.centroid
+        ):
+            margin = max(0.0, float(selection_context.switch_score_margin))
+            if best_score < best_current_region_score + margin:
+                retained_by_inertia = True
+                inertia_reason = (
+                    f"best_score={best_score:.2f} < current_region_score={best_current_region_score:.2f}"
+                    f" + margin={margin:.2f}"
+                )
+                best_frontier = best_current_region_frontier
+                best_path = best_current_region_path
+                best_score = best_current_region_score
         self._log_selection_debug(
             candidate_count=len(frontiers),
             reachable_count=reachable_count,
@@ -141,6 +215,23 @@ class FrontierExplorer:
             used_fallback=False,
             frontier=best_frontier,
             path=best_path,
+            debug=FrontierSelectionDebug(
+                candidate_count=len(frontiers),
+                reachable_count=reachable_count,
+                blacklisted_count=blacklisted_count,
+                unreachable_count=unreachable_count,
+                context_filtered_count=context_filtered_count,
+                used_fallback=False,
+                final_target=best_frontier.centroid,
+                final_score=best_frontier.score,
+                path_length=path_length(best_path) if best_path else 0.0,
+                retained_by_inertia=retained_by_inertia,
+                inertia_reason=inertia_reason,
+                previous_target=selection_context.current_target if selection_context is not None else None,
+                previous_score=selection_context.current_score if selection_context is not None else None,
+                current_region_score=best_current_region_score if best_current_region_frontier is not None else None,
+                switch_score_margin=selection_context.switch_score_margin if selection_context is not None else 0.0,
+            ),
         )
         return best_frontier, best_path
 
@@ -259,7 +350,8 @@ class FrontierExplorer:
                 frontier = Frontier(cells=(cell,), centroid=goal, information_gain=0.0, score=score)
                 if best_choice is None or score > best_choice[2]:
                     best_choice = (frontier, path, score)
-            self.record_failure(grid, goal)
+            else:
+                self.record_failure(grid, goal)
         if best_choice is not None:
             return best_choice[0], best_choice[1]
         return None, []
@@ -462,7 +554,9 @@ class FrontierExplorer:
         used_fallback: bool,
         frontier: Frontier | None,
         path: list[tuple[float, float]],
+        debug: FrontierSelectionDebug,
     ) -> None:
+        self.last_selection_debug = debug
         if rospy is None:
             return
         if frontier is None:
@@ -531,6 +625,10 @@ def _neighbors8_cells(cell: tuple[int, int]) -> list[tuple[int, int]]:
 def _world_distance_sq(grid: FloorGrid, cell: tuple[int, int], robot_xy: tuple[float, float]) -> float:
     wx, wy = grid.grid_to_world(cell[0], cell[1])
     return (wx - robot_xy[0]) * (wx - robot_xy[0]) + (wy - robot_xy[1]) * (wy - robot_xy[1])
+
+
+def _world_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
 def _flood_fill(mask: np.ndarray, visited: np.ndarray, start_x: int, start_y: int) -> list[tuple[int, int]]:

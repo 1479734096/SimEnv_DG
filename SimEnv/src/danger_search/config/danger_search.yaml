@@ -17,15 +17,22 @@ mission:
   floor_timeout: 180.0
   min_floor_explore_time: 20.0
   min_floor_travel_distance: 6.0
+  min_known_area: 45.0
+  no_reachable_frontier_confirmations: 2
+  # 走廊主方向最小已知范围，0 表示关闭；方向由 probe_yaw 判断。
+  min_corridor_progress_distance: 0.0
+  # 过门后至少推进到该距离、且门后侧已知面积足够前，持续优先门后侧目标。
+  post_door_min_distance: 2.0
+  post_door_min_known_area: 8.0
   home_tolerance: 0.7
   explore_coverage_ratio: 0.82
-  min_frontier_count: 1
   no_frontier_scan_duration: 8.0
   probe_distance: 1.2
   probe_yaw: 1.5708
   # 过门后先深入到门后，避免刚过门就把 frontier 选择权交回门口。
   door_pass_offset: 0.8
   door_commit_distance: 1.8
+  # 开门后沿门洞 yaw 清理动态障碍的条带深度，宽度来自 layout_metadata.json 的门 width。
   door_clear_radius: 0.9
   # 仅在过门后的短时间、且机器人仍在门口附近时抑制回头目标。
   door_transition_duration: 3.0
@@ -70,6 +77,9 @@ frontier:
   door_front_half_plane_penalty: 6.0
   door_front_half_plane_radius: 1.5
   door_preferred_direction_bonus: 1.5
+  # 短期选择惯性：当前区域仍可达时，新目标分数需要至少高出该 margin 才切换。
+  switch_score_margin: 2.0
+  current_region_radius: 1.2
 
 controller:
   max_linear: 0.60

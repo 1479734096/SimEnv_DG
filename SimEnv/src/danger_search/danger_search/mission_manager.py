@@ -62,6 +62,7 @@ class MissionManager:
         self._service_task = None
         self._change_phase: str | None = None
         self._no_frontier_scan_until = 0.0
+        self._no_reachable_frontier_confirmations = 0
         self._last_status_publish = 0.0
         self._probe_attempt = 0
         self._timer = None
@@ -85,6 +86,10 @@ class MissionManager:
         self.last_door_xy: tuple[float, float] | None = None
         self.last_door_pass_vector: tuple[float, float] | None = None
         self.last_door_transition_until: float = 0.0
+        self.last_door_completion_pose: tuple[float, float, float] | None = None
+        self._last_frontier_target: tuple[float, float] | None = None
+        self._last_frontier_score: float | None = None
+        self._last_frontier_used_fallback = False
 
         self._load_params()
         self._status_publisher = None
@@ -155,9 +160,13 @@ class MissionManager:
         self.floor_timeout = float(_param("mission/floor_timeout", 180.0))
         self.min_floor_explore_time = float(_param("mission/min_floor_explore_time", 20.0))
         self.min_floor_travel_distance = float(_param("mission/min_floor_travel_distance", 6.0))
+        self.min_known_area = float(_param("mission/min_known_area", 45.0))
+        self.no_reachable_frontier_confirmations = max(1, int(_param("mission/no_reachable_frontier_confirmations", 2)))
+        self.min_corridor_progress_distance = float(_param("mission/min_corridor_progress_distance", 0.0))
+        self.post_door_min_known_area = float(_param("mission/post_door_min_known_area", 8.0))
+        self.post_door_min_distance = float(_param("mission/post_door_min_distance", 2.0))
         self.home_tolerance = float(_param("mission/home_tolerance", 0.7))
         self.explore_coverage_ratio = float(_param("mission/explore_coverage_ratio", 0.82))
-        self.min_frontier_count = int(_param("mission/min_frontier_count", 1))
         self.no_frontier_scan_duration = float(_param("mission/no_frontier_scan_duration", 8.0))
         self.probe_distance = float(_param("mission/probe_distance", 1.2))
         self.probe_yaw = float(_param("mission/probe_yaw", math.pi / 2.0))
@@ -205,6 +214,8 @@ class MissionManager:
             "door_front_half_plane_radius": float(_param("frontier/door_front_half_plane_radius", 1.5)),
             "door_preferred_direction_bonus": float(_param("frontier/door_preferred_direction_bonus", 1.5)),
         }
+        self.frontier_switch_score_margin = float(_param("frontier/switch_score_margin", 2.0))
+        self.frontier_current_region_radius = float(_param("frontier/current_region_radius", 1.2))
         self.controller_params = {
             "max_linear": float(_param("controller/max_linear", 0.60)),
             "max_lateral": float(_param("controller/max_lateral", 0.25)),
@@ -376,15 +387,7 @@ class MissionManager:
 
         frontiers = self.explorer.extract_frontiers(grid)
         floor_elapsed = get_time() - self.floor_start_time
-        if (
-            floor_elapsed >= self.floor_timeout
-            or (
-                floor_elapsed >= self.min_floor_explore_time
-                and self._max_home_distance >= self.min_floor_travel_distance
-                and grid.coverage_ratio() >= self.explore_coverage_ratio
-                and len(frontiers) <= self.min_frontier_count
-            )
-        ):
+        if floor_elapsed >= self.floor_timeout:
             self._finish_current_floor()
             return
 
@@ -400,6 +403,9 @@ class MissionManager:
             assert candidate is not None
             self.controller.clear_path()
             self.current_frontier = None
+            self._last_frontier_target = None
+            self._last_frontier_score = None
+            self._last_frontier_used_fallback = False
             self.active_door = candidate.door_id
             self.current_task = OpenDoorAndPass(
                 candidate.door_id,
@@ -421,20 +427,34 @@ class MissionManager:
             self._log_post_door_frontier_debug(frontier, path, pose)
             if frontier is None or not path:
                 if not frontiers and self._try_probe_unknown_space(pose):
+                    self._no_reachable_frontier_confirmations = 0
                     return
                 if self._tick_no_frontier_scan(frontiers):
-                    if floor_elapsed >= self.min_floor_explore_time:
+                    self._no_reachable_frontier_confirmations += 1
+                    if self._floor_completion_ready(grid, floor_elapsed):
                         self._finish_current_floor()
                     else:
                         rospy.loginfo(
-                            "楼层探索时间 %.1f 秒，小于最小值 %.1f 秒，继续扫描",
+                            "楼层完成条件未满足，继续扫描：elapsed=%.1f/%.1f max_home=%.2f/%.2f known_area=%.2f/%.2f coverage=%.2f/%.2f no_reachable=%d/%d corridor_progress=%.2f/%.2f",
                             floor_elapsed,
                             self.min_floor_explore_time,
+                            self._max_home_distance,
+                            self.min_floor_travel_distance,
+                            grid.known_area(),
+                            self.min_known_area,
+                            grid.coverage_ratio(),
+                            self.explore_coverage_ratio,
+                            self._no_reachable_frontier_confirmations,
+                            self.no_reachable_frontier_confirmations,
+                            self._known_corridor_progress(grid),
+                            self.min_corridor_progress_distance,
                         )
                 return
+            self._log_frontier_switch(frontier, path, pose)
             self.current_frontier = frontier
             self.controller.set_path(path)
             self._no_frontier_scan_until = 0.0
+            self._no_reachable_frontier_confirmations = 0
             self._probe_attempt = 0
             rospy.loginfo("选择前沿：floor=%d score=%.2f target=(%.2f, %.2f)",
                           self.current_floor, frontier.score, frontier.centroid[0], frontier.centroid[1])
@@ -446,6 +466,9 @@ class MissionManager:
                 self.mapper.mark_black(self.current_floor, self.current_frontier.centroid[0], self.current_frontier.centroid[1], 0.6)
             self.controller.recover()
             self.current_frontier = None
+            self._last_frontier_target = None
+            self._last_frontier_score = None
+            self._last_frontier_used_fallback = False
         elif status in (DONE, IDLE):
             self.current_frontier = None
 
@@ -453,14 +476,17 @@ class MissionManager:
         self,
         pose: tuple[float, float, float],
     ) -> FrontierSelectionContext | None:
+        inertia_context = self._frontier_inertia_context()
         if self.last_door_xy is None or self.last_door_pass_vector is None:
-            return None
-        if get_time() > self.last_door_transition_until:
-            return None
-        if self.door_transition_hold_distance > 0.0:
+            return inertia_context
+        timer_active = get_time() <= self.last_door_transition_until
+        progress_active = not self._post_door_context_satisfied(pose)
+        if not timer_active and not progress_active:
+            return inertia_context
+        if timer_active and not progress_active and self.door_transition_hold_distance > 0.0:
             distance_to_door = math.hypot(pose[0] - self.last_door_xy[0], pose[1] - self.last_door_xy[1])
             if distance_to_door > self.door_transition_hold_distance:
-                return None
+                return inertia_context
         return FrontierSelectionContext(
             forbidden_half_plane_origin=self.last_door_xy,
             forbidden_half_plane_normal=self.last_door_pass_vector,
@@ -469,22 +495,147 @@ class MissionManager:
             preferred_origin=self.last_door_xy,
             preferred_direction=self.last_door_pass_vector,
             temporary_revisit_penalty=self.explorer.door_front_half_plane_penalty,
+            current_target=inertia_context.current_target if inertia_context is not None else None,
+            current_score=inertia_context.current_score if inertia_context is not None else None,
+            current_region_radius=inertia_context.current_region_radius if inertia_context is not None else 0.0,
+            switch_score_margin=inertia_context.switch_score_margin if inertia_context is not None else 0.0,
         )
+
+    def _frontier_inertia_context(self) -> FrontierSelectionContext | None:
+        if getattr(self, "_last_frontier_target", None) is None:
+            return None
+        return FrontierSelectionContext(
+            current_target=self._last_frontier_target,
+            current_score=self._last_frontier_score,
+            current_region_radius=self.frontier_current_region_radius,
+            switch_score_margin=self.frontier_switch_score_margin,
+        )
+
+    def _post_door_context_satisfied(self, pose: tuple[float, float, float]) -> bool:
+        if self.last_door_xy is None or self.last_door_pass_vector is None:
+            return True
+        progress = self._post_door_progress_distance(pose)
+        known_area = self._post_door_known_area() if self.post_door_min_known_area > 0.0 else 0.0
+        return progress >= self.post_door_min_distance and known_area >= self.post_door_min_known_area
+
+    def _post_door_progress_distance(self, pose: tuple[float, float, float]) -> float:
+        if self.last_door_xy is None or self.last_door_pass_vector is None:
+            return 0.0
+        dx = pose[0] - self.last_door_xy[0]
+        dy = pose[1] - self.last_door_xy[1]
+        progress = dx * self.last_door_pass_vector[0] + dy * self.last_door_pass_vector[1]
+        return max(0.0, progress)
+
+    def _post_door_known_area(self) -> float:
+        if self.last_door_xy is None or self.last_door_pass_vector is None:
+            return 0.0
+        grid = self.mapper.floor(self.current_floor)
+        known_count = 0
+        for gy in range(grid.size_y):
+            for gx in range(grid.size_x):
+                if int(grid.data[gy, gx]) == -1:
+                    continue
+                wx, wy = grid.grid_to_world(gx, gy)
+                side = (wx - self.last_door_xy[0]) * self.last_door_pass_vector[0] + (
+                    wy - self.last_door_xy[1]
+                ) * self.last_door_pass_vector[1]
+                if side >= -0.05:
+                    known_count += 1
+        return float(known_count * grid.resolution * grid.resolution)
+
+    def _log_frontier_switch(
+        self,
+        frontier: Frontier,
+        path: list[tuple[float, float]],
+        pose: tuple[float, float, float],
+    ) -> None:
+        debug = self.explorer.last_selection_debug
+        previous_target = self._last_frontier_target
+        previous_score = self._last_frontier_score
+        previous_distance = (
+            math.hypot(frontier.centroid[0] - previous_target[0], frontier.centroid[1] - previous_target[1])
+            if previous_target is not None
+            else 0.0
+        )
+        door_side = self._door_side_label(frontier.centroid)
+        used_fallback = bool(debug.used_fallback) if debug is not None else False
+        retained_by_inertia = bool(debug.retained_by_inertia) if debug is not None else False
+        reason = "首次选择"
+        if previous_target is not None:
+            if retained_by_inertia:
+                reason = f"保留当前区域：{debug.inertia_reason if debug is not None else ''}"
+            elif previous_distance <= self.frontier_current_region_radius:
+                reason = "同一区域延续"
+            else:
+                margin = debug.switch_score_margin if debug is not None else self.frontier_switch_score_margin
+                current_region_score = debug.current_region_score if debug is not None else None
+                if current_region_score is None:
+                    reason = "当前区域无可达候选，切换"
+                else:
+                    reason = f"新目标明显更优：current_region_score={current_region_score:.2f} margin={margin:.2f}"
+        if rospy is not None:
+            rospy.loginfo(
+                "frontier切换：reason=%s target=(%.2f, %.2f) score=%.2f path_length=%.2f previous=%s previous_score=%s switch_distance=%.2f door_side=%s fallback=%s retained_by_inertia=%s",
+                reason,
+                frontier.centroid[0],
+                frontier.centroid[1],
+                frontier.score,
+                path_length(path) if path else 0.0,
+                f"({previous_target[0]:.2f}, {previous_target[1]:.2f})" if previous_target is not None else "None",
+                f"{previous_score:.2f}" if previous_score is not None else "None",
+                previous_distance,
+                door_side,
+                used_fallback,
+                retained_by_inertia,
+            )
+        self._last_frontier_target = frontier.centroid
+        self._last_frontier_score = frontier.score
+        self._last_frontier_used_fallback = used_fallback
+
+    def _door_side_label(self, target_xy: tuple[float, float]) -> str:
+        if self.last_door_xy is None or self.last_door_pass_vector is None:
+            return "无门上下文"
+        signed_distance = (target_xy[0] - self.last_door_xy[0]) * self.last_door_pass_vector[0] + (
+            target_xy[1] - self.last_door_xy[1]
+        ) * self.last_door_pass_vector[1]
+        if signed_distance > 0.05:
+            return "门后侧"
+        if signed_distance < -0.05:
+            return "门前侧"
+        return "门中线附近"
 
     def clear_opened_door_area(self, door_id: str) -> None:
         door = self.building_client.doors.get(door_id)
         if door is None:
             return
-        radius = max(self.door_clear_radius, self.mapper.obstacle_inflation_radius + self.mapper.resolution)
-        self.mapper.clear_dynamic_obstacle_radius(door.floor_index, door.x, door.y, radius)
+        depth = max(self.door_clear_radius, self.mapper.obstacle_inflation_radius + self.mapper.resolution)
+        self.mapper.clear_dynamic_door_strip(door.floor_index, door.x, door.y, door.yaw, door.width, depth)
         rospy.loginfo(
-            "已清理开门后的动态障碍残留：door_id=%s floor=%d center=(%.2f, %.2f) radius=%.2f",
+            "已清理开门后的动态障碍残留：door_id=%s floor=%d center=(%.2f, %.2f) yaw=%.2f width=%.2f depth=%.2f",
             door_id,
             door.floor_index,
             door.x,
             door.y,
-            radius,
+            door.yaw,
+            door.width,
+            depth,
         )
+
+    def _floor_completion_ready(self, grid, floor_elapsed: float) -> bool:
+        return (
+            floor_elapsed >= self.min_floor_explore_time
+            and self._max_home_distance >= self.min_floor_travel_distance
+            and grid.known_area() >= self.min_known_area
+            and grid.coverage_ratio() >= self.explore_coverage_ratio
+            and self._no_reachable_frontier_confirmations >= self.no_reachable_frontier_confirmations
+            and self._known_corridor_progress(grid) >= self.min_corridor_progress_distance
+        )
+
+    def _known_corridor_progress(self, grid) -> float:
+        if self.min_corridor_progress_distance <= 0.0:
+            return 0.0
+        extent_x, extent_y = grid.known_bbox_extent()
+        return extent_y if abs(math.sin(self.probe_yaw)) >= abs(math.cos(self.probe_yaw)) else extent_x
 
     def _remember_completed_door(self, task: OpenDoorAndPass, pose: tuple[float, float, float]) -> None:
         if task.wait_point is None or task.pass_point is None:
@@ -503,6 +654,7 @@ class MissionManager:
             self.last_door_pass_vector = None
         self.last_door_id = task.door_id
         self.last_door_xy = center_xy
+        self.last_door_completion_pose = pose
         self.last_door_transition_until = get_time() + self.door_transition_duration
         self._post_door_frontier_debug = {
             "door_id": task.door_id,
@@ -589,6 +741,9 @@ class MissionManager:
             if segment_crosses_blocked_cell(grid, (pose[0], pose[1]), target):
                 continue
             self.current_frontier = None
+            self._last_frontier_target = None
+            self._last_frontier_score = None
+            self._last_frontier_used_fallback = False
             self.controller.set_path([(pose[0], pose[1]), target])
             rospy.loginfo("无前沿，执行短距离探测目标：target=(%.2f, %.2f)", target[0], target[1])
             return True
@@ -640,6 +795,8 @@ class MissionManager:
 
     def _finish_current_floor(self) -> None:
         self.controller.clear_path()
+        self._no_frontier_scan_until = 0.0
+        self._no_reachable_frontier_confirmations = 0
         if self.current_floor + 1 < self.max_floor:
             self._begin_floor_change(self.current_floor + 1, return_after=False)
         else:
@@ -662,7 +819,15 @@ class MissionManager:
             grid = self.mapper.floor(self.current_floor)
             path = astar_path(grid, (pose[0], pose[1]), (self.home_pose[0], self.home_pose[1]))
             if not path:
-                path = [(pose[0], pose[1]), (self.home_pose[0], self.home_pose[1])]
+                fallback_path = [(pose[0], pose[1]), (self.home_pose[0], self.home_pose[1])]
+                if segment_crosses_blocked_cell(grid, fallback_path[0], fallback_path[-1]):
+                    if rospy is not None:
+                        rospy.logwarn("返航暂无可达路径，且直线返航会穿过已知障碍；等待地图更新后重试")
+                    clear_path = getattr(self.controller, "clear_path", None)
+                    if callable(clear_path):
+                        clear_path()
+                    return
+                path = fallback_path
             self.controller.set_path(path)
         status = self.controller.tick(pose)
         if status == STUCK:

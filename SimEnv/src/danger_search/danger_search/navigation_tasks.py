@@ -67,6 +67,11 @@ class OpenDoorAndPass(NavigationTask):
         self._commit_point: tuple[float, float] | None = None
         self._service_task: AsyncServiceCall | None = None
         self._retry_count = 0
+        self._last_navigation_blocked = False
+        self._commit_retry_count = 0
+        self._commit_retry_start_time: float | None = None
+        self._commit_retry_limit = 30
+        self._commit_retry_timeout = 12.0
 
     @property
     def wait_point(self) -> tuple[float, float] | None:
@@ -101,7 +106,10 @@ class OpenDoorAndPass(NavigationTask):
             return RUNNING
 
         if self.phase == "CALL_OPEN":
-            if self._run_service(manager, lambda: client.open_door(self.door_id)):
+            status = self._run_service(manager, lambda: client.open_door(self.door_id))
+            if status == FAILED:
+                return FAILED
+            if status == DONE:
                 _clear_opened_door_area(manager, self.door_id)
                 self.phase = "GO_PASS_POINT"
             return RUNNING
@@ -117,7 +125,6 @@ class OpenDoorAndPass(NavigationTask):
                 pose,
                 self._commit_point,
                 allow_direct_fallback=True,
-                complete_if_blocked=True,
             )
             if advanced:
                 if rospy is not None and self._wait_point is not None and self._pass_point is not None:
@@ -137,6 +144,10 @@ class OpenDoorAndPass(NavigationTask):
                     )
                 self.phase = "DONE"
                 return DONE
+            if self._last_navigation_blocked:
+                return self._handle_commit_blocked(manager)
+            self._commit_retry_count = 0
+            self._commit_retry_start_time = None
             return RUNNING
 
         return DONE
@@ -148,8 +159,8 @@ class OpenDoorAndPass(NavigationTask):
         target_xy: tuple[float, float],
         *,
         allow_direct_fallback: bool = False,
-        complete_if_blocked: bool = False,
     ) -> bool:
+        self._last_navigation_blocked = False
         if math.hypot(target_xy[0] - pose[0], target_xy[1] - pose[1]) <= manager.controller.goal_tolerance:
             manager.controller.clear_path()
             return True
@@ -160,10 +171,8 @@ class OpenDoorAndPass(NavigationTask):
             if not path:
                 if allow_direct_fallback and not _segment_crosses_blocked_cell(grid, (pose[0], pose[1]), target_xy):
                     path = [(pose[0], pose[1]), target_xy]
-                elif complete_if_blocked:
-                    manager.controller.clear_path()
-                    return True
                 else:
+                    self._last_navigation_blocked = True
                     return False
             manager.controller.set_path(path)
 
@@ -172,29 +181,56 @@ class OpenDoorAndPass(NavigationTask):
             manager.controller.recover()
         return status == DONE
 
-    def _run_service(self, manager: MissionManager, task_factory) -> bool:
+    def _handle_commit_blocked(self, manager: MissionManager) -> str:
+        _clear_opened_door_area(manager, self.door_id)
+        manager.controller.clear_path()
+        now = get_time()
+        if self._commit_retry_start_time is None:
+            self._commit_retry_start_time = now
+        self._commit_retry_count += 1
+        if rospy is not None:
+            rospy.logwarn(
+                "[%s] 过门 commit 暂无可达路径，清理门区后重试 (%d/%d)",
+                self.name,
+                self._commit_retry_count,
+                self._commit_retry_limit,
+            )
+        if (
+            self._commit_retry_count >= self._commit_retry_limit
+            or now - self._commit_retry_start_time >= self._commit_retry_timeout
+        ):
+            record_failure = getattr(manager, "_record_failure", None)
+            if callable(record_failure):
+                record_failure("过门 commit 无可达路径")
+            return FAILED
+        return RUNNING
+
+    def _run_service(self, manager: MissionManager, task_factory) -> str:
         if self._service_task is None:
             self._service_task = task_factory()
-            return False
+            return RUNNING
 
         if not self._service_task.done():
             manager.controller.stop()
-            return False
+            return RUNNING
 
         ok = self._service_task.ok()
         message = self._service_task.message()
         if not ok:
-            rospy.logwarn(f"[{self.name}] 服务失败：{message}")
+            if rospy is not None:
+                rospy.logwarn(f"[{self.name}] 服务失败：{message}")
             if self._retry_count < 1:
                 self._retry_count += 1
-                rospy.loginfo(f"[{self.name}] 正在重试 ({self._retry_count}/1)...")
+                if rospy is not None:
+                    rospy.loginfo(f"[{self.name}] 正在重试 ({self._retry_count}/1)...")
                 self._service_task = None
-                return False
+                return RUNNING
             manager._record_failure(f"开门服务失败: {message}")
-            return False # 实际上应该是返回 FAILED，但这个帮助方法只返回 bool，我们可以在调用处处理
+            return FAILED
 
         self._service_task = None
-        return True
+        self._retry_count = 0
+        return DONE
 
 
 def _segment_crosses_blocked_cell(
@@ -256,12 +292,18 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         if self.phase == "CALL_ELEVATOR_TO_CURRENT_FLOOR":
-            if self._run_service(manager, lambda: client.call_elevator(self.elevator_id, self.current_floor, False)):
+            status = self._run_service(manager, lambda: client.call_elevator(self.elevator_id, self.current_floor, False))
+            if status == FAILED:
+                return FAILED
+            if status == DONE:
                 self.phase = "OPEN_CURRENT_FLOOR_DOOR"
             return RUNNING
 
         if self.phase == "OPEN_CURRENT_FLOOR_DOOR":
-            if self._run_service(manager, lambda: client.open_door(current_door_id)):
+            status = self._run_service(manager, lambda: client.open_door(current_door_id))
+            if status == FAILED:
+                return FAILED
+            if status == DONE:
                 _clear_opened_door_area(manager, current_door_id)
                 self.phase = "WAIT_CURRENT_DOOR_OPEN"
                 self._wait_start_time = get_time()
@@ -296,12 +338,18 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         if self.phase == "CLOSE_CURRENT_FLOOR_DOOR":
-            if self._run_service(manager, lambda: client.close_door(current_door_id)):
+            status = self._run_service(manager, lambda: client.close_door(current_door_id))
+            if status == FAILED:
+                return FAILED
+            if status == DONE:
                 self.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
             return RUNNING
 
         if self.phase == "CALL_ELEVATOR_TO_TARGET_FLOOR":
-            if self._run_service(manager, lambda: client.call_elevator(self.elevator_id, self.target_floor, False)):
+            status = self._run_service(manager, lambda: client.call_elevator(self.elevator_id, self.target_floor, False))
+            if status == FAILED:
+                return FAILED
+            if status == DONE:
                 self.phase = "WAIT_FOR_ODOM_STABLE"
                 self._wait_start_time = get_time()
             return RUNNING
@@ -317,7 +365,10 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         if self.phase == "OPEN_TARGET_FLOOR_DOOR":
-            if self._run_service(manager, lambda: client.open_door(target_door_id)):
+            status = self._run_service(manager, lambda: client.open_door(target_door_id))
+            if status == FAILED:
+                return FAILED
+            if status == DONE:
                 _clear_opened_door_area(manager, target_door_id)
                 self.phase = "WAIT_TARGET_DOOR_OPEN"
                 self._wait_start_time = get_time()
@@ -352,7 +403,10 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         if self.phase == "CLOSE_TARGET_FLOOR_DOOR":
-            if self._run_service(manager, lambda: client.close_door(target_door_id)):
+            status = self._run_service(manager, lambda: client.close_door(target_door_id))
+            if status == FAILED:
+                return FAILED
+            if status == DONE:
                 self.phase = "DONE"
                 return DONE
             return RUNNING
@@ -380,28 +434,30 @@ class TakeElevator(NavigationTask):
             manager.controller.recover()
         return status == DONE
 
-    def _run_service(self, manager: MissionManager, task_factory) -> bool:
+    def _run_service(self, manager: MissionManager, task_factory) -> str:
         if self._service_task is None:
             self._service_task = task_factory()
-            return False
+            return RUNNING
 
         if not self._service_task.done():
             manager.controller.stop()
-            return False
+            return RUNNING
 
         ok = self._service_task.ok()
         message = self._service_task.message()
         if not ok:
-            rospy.logwarn(f"[{self.name}] 服务失败：{message}")
+            if rospy is not None:
+                rospy.logwarn(f"[{self.name}] 服务失败：{message}")
             if self._retry_count < 1:
                 self._retry_count += 1
-                rospy.loginfo(f"[{self.name}] 正在重试 ({self._retry_count}/1)...")
+                if rospy is not None:
+                    rospy.loginfo(f"[{self.name}] 正在重试 ({self._retry_count}/1)...")
                 self._service_task = None
-                return False
+                return RUNNING
             # 重试失败
             manager._record_failure(f"电梯服务失败: {message}")
-            return False
+            return FAILED
 
         self._service_task = None
         self._retry_count = 0
-        return True
+        return DONE

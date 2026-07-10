@@ -3,7 +3,7 @@ import unittest
 from typing import Tuple
 
 from danger_search.planner import astar_path
-from danger_search.mapper import FREE, MultiFloorGridMap, OCC, UNKNOWN
+from danger_search.mapper import BLACK, FREE, MultiFloorGridMap, OCC, UNKNOWN, VISITED
 
 
 class MultiFloorMapperTest(unittest.TestCase):
@@ -61,6 +61,23 @@ class MultiFloorMapperTest(unittest.TestCase):
 
         self.assertTrue(path)
         self.assertTrue(blocked_cells.isdisjoint(path_cells))
+
+    def test_area_and_known_bbox_metrics(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.5,
+            width=4.0,
+            length=4.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        grid = mapper.floor(0)
+        grid.data[1, 1] = FREE
+        grid.data[1, 2] = VISITED
+        grid.data[3, 4] = OCC
+
+        self.assertAlmostEqual(grid.known_area(), 0.75)
+        self.assertAlmostEqual(grid.visited_area(), 0.25)
+        self.assertEqual(grid.known_bbox_extent(), (2.0, 1.5))
 
     def test_free_clear_marks_visible_sector_as_free(self):
         mapper = MultiFloorGridMap(
@@ -189,7 +206,7 @@ class MultiFloorMapperTest(unittest.TestCase):
         self.assertEqual(grid.data[wall_cell[1], wall_cell[0]], OCC)
         self.assertEqual(grid.data[after_wall[1], after_wall[0]], UNKNOWN)
 
-    def test_dynamic_obstacle_clear_radius_erases_opened_door_area(self):
+    def test_dynamic_door_strip_clears_only_door_area_obstacles(self):
         mapper = MultiFloorGridMap(
             resolution=0.1,
             width=4.0,
@@ -198,18 +215,22 @@ class MultiFloorMapperTest(unittest.TestCase):
             origin_y=-2.0,
         )
         grid = mapper.floor(0)
-        door_cell = grid.world_to_grid(0.0, 0.0)
-        outside_cell = grid.world_to_grid(1.0, 0.0)
+        inside_cell = grid.world_to_grid(0.2, 0.3)
+        outside_cell = grid.world_to_grid(0.2, 0.7)
+        black_cell = grid.world_to_grid(-0.2, 0.0)
 
-        self.assertIsNotNone(door_cell)
+        self.assertIsNotNone(inside_cell)
         self.assertIsNotNone(outside_cell)
-        grid.mark_occupied(*door_cell)
+        self.assertIsNotNone(black_cell)
+        grid.mark_occupied(*inside_cell)
         grid.mark_occupied(*outside_cell)
+        grid.data[black_cell[1], black_cell[0]] = BLACK
 
-        mapper.clear_dynamic_obstacle_radius(0, 0.0, 0.0, 0.25)
+        mapper.clear_dynamic_door_strip(0, 0.0, 0.0, 0.0, width=1.0, depth=0.8)
 
-        self.assertEqual(grid.data[door_cell[1], door_cell[0]], FREE)
+        self.assertEqual(grid.data[inside_cell[1], inside_cell[0]], FREE)
         self.assertEqual(grid.data[outside_cell[1], outside_cell[0]], OCC)
+        self.assertEqual(grid.data[black_cell[1], black_cell[0]], BLACK)
 
     def test_free_clear_skips_sector_when_points_are_insufficient(self):
         mapper = MultiFloorGridMap(

@@ -36,6 +36,9 @@ PROCESS_PATTERNS = [
 ]
 
 
+DEFAULT_HEALTH_CHECK_TIMEOUT = 120
+
+
 def cleanup() -> None:
     print("清理残留进程...")
     for pattern in PROCESS_PATTERNS:
@@ -48,7 +51,20 @@ def cleanup() -> None:
     time.sleep(2.0)
 
 
-def run_environment(seed: int, workspace_dir: Path, log_file):
+def resolve_gui_enabled(args: argparse.Namespace) -> bool:
+    if args.gui:
+        if not os.environ.get("DISPLAY"):
+            raise RuntimeError(
+                "当前环境没有 DISPLAY，不能使用 --gui 启动 Gazebo 图形界面；"
+                "请改用 --headless，或使用 xvfb-run -a python3 src/danger_search/tools/run_seed.py ..."
+            )
+        return True
+    if args.headless:
+        return False
+    return bool(os.environ.get("DISPLAY"))
+
+
+def run_environment(seed: int, workspace_dir: Path, log_file, *, gui_enabled: bool, health_log_path: Path):
     try:
         import pexpect
     except ImportError as exc:
@@ -58,7 +74,7 @@ def run_environment(seed: int, workspace_dir: Path, log_file):
     env.update(
         {
             "SEED": str(seed),
-            "GUI": "true",
+            "GUI": "true" if gui_enabled else "false",
             "PAUSED": "false",
             "CONTROLLER_FOREGROUND": "1",
             "START_CONTROLLER": "1",
@@ -85,8 +101,8 @@ def run_environment(seed: int, workspace_dir: Path, log_file):
         time.sleep(5.0)
         child.send("6")
         child.expect("Switched from fixed stand to RL", timeout=30)
-        print(f"[{datetime.datetime.now().time()}] 控制器已进入 RL，等待 /Odometry_gazebo 数据")
-        wait_for_ros_topic(workspace_dir, "/Odometry_gazebo", timeout=120)
+        print(f"[{datetime.datetime.now().time()}] 控制器已进入 RL，开始启动健康检查")
+        check_startup_health(workspace_dir, health_log_path)
         time.sleep(1.0)
         print(f"[{datetime.datetime.now().time()}] 仿真环境准备完毕，控制器已进入 RL 模式")
     except pexpect.TIMEOUT:
@@ -98,27 +114,70 @@ def run_environment(seed: int, workspace_dir: Path, log_file):
     return child
 
 
-def wait_for_ros_topic(workspace_dir: Path, topic: str, timeout: int = 30) -> None:
+def wait_for_ros_topic(
+    workspace_dir: Path,
+    topic: str,
+    timeout: int = 30,
+    log_file=None,
+    *,
+    field: str | None = None,
+) -> None:
+    echo_target = topic if field is None else f"{topic}/{field.lstrip('/')}"
     cmd = " ".join(
         [
             "source /opt/ros/noetic/setup.bash",
             "&&",
             f"source {shlex.quote(str(workspace_dir / 'devel' / 'setup.bash'))}",
             "&&",
-            f"rostopic echo -n 1 {shlex.quote(topic)}",
+            f"rostopic echo -n 1 {shlex.quote(echo_target)}",
         ]
     )
     try:
         subprocess.run(
             ["bash", "-lc", cmd],
             cwd=str(workspace_dir),
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_file if log_file is not None else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT if log_file is not None else subprocess.DEVNULL,
             timeout=timeout,
             check=True,
         )
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         raise RuntimeError(f"等待 {topic} 数据超时") from exc
+
+
+def check_startup_health(workspace_dir: Path, health_log_path: Path) -> None:
+    required_topics = (
+        ("/Odometry_gazebo", "里程计"),
+        ("/livox/Pointcloud2", "点云"),
+    )
+    health_log_path.parent.mkdir(parents=True, exist_ok=True)
+    with health_log_path.open("w", encoding="utf-8") as health_log:
+        health_log.write(f"启动健康检查开始: {datetime.datetime.now().isoformat()}\n")
+        for topic, label in required_topics:
+            health_log.write(f"\n检查 {label} 话题 {topic}\n")
+            health_log.flush()
+            try:
+                wait_for_ros_topic(
+                    workspace_dir,
+                    topic,
+                    timeout=DEFAULT_HEALTH_CHECK_TIMEOUT,
+                    log_file=health_log,
+                    field="header",
+                )
+                health_log.write(f"{topic} 已收到首帧数据\n")
+                health_log.flush()
+            except RuntimeError as exc:
+                health_log.write(f"{topic} 检查失败: {exc}\n")
+                health_log.flush()
+                if topic == "/livox/Pointcloud2":
+                    raise RuntimeError(
+                        "启动健康检查失败：未收到 /livox/Pointcloud2 点云；"
+                        "请检查 Gazebo/Livox 插件和 pointcloud2livox.py，详见 logs/health_check.log"
+                    ) from exc
+                raise RuntimeError(
+                    f"启动健康检查失败：未收到 {topic} 数据，详见 logs/health_check.log"
+                ) from exc
+        health_log.write(f"\n启动健康检查通过: {datetime.datetime.now().isoformat()}\n")
 
 
 def run_danger_search(
@@ -208,6 +267,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace", type=str, help="SimEnv 工作区路径，默认自动寻找")
     parser.add_argument("--scene-type", default="", help="归档中的场景类型标签")
     parser.add_argument("--param-version", default="", help="归档中的参数版本标签")
+    gui_group = parser.add_mutually_exclusive_group()
+    gui_group.add_argument("--gui", action="store_true", help="强制启动 Gazebo GUI；无 DISPLAY 时会报错")
+    gui_group.add_argument("--headless", action="store_true", help="强制关闭 Gazebo GUI")
     parser.add_argument("--skip-cleanup-before", action="store_true", help="启动前不清理旧仿真进程")
     parser.add_argument("--skip-cleanup-after", action="store_true", help="结束后不清理仿真进程")
     return parser
@@ -216,6 +278,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     workspace_dir = find_workspace_dir(args.workspace or Path(__file__))
+    try:
+        gui_enabled = resolve_gui_enabled(args)
+    except RuntimeError as exc:
+        print(f"参数错误: {exc}", file=sys.stderr)
+        return 2
     if not args.skip_cleanup_before:
         cleanup()
 
@@ -243,7 +310,13 @@ def main() -> int:
 
     try:
         with (logs_dir / "auto_sh.log").open("w", encoding="utf-8") as env_log:
-            env_process = run_environment(args.seed, workspace_dir, env_log)
+            env_process = run_environment(
+                args.seed,
+                workspace_dir,
+                env_log,
+                gui_enabled=gui_enabled,
+                health_log_path=logs_dir / "health_check.log",
+            )
             algo_return_code, external_timeout = run_danger_search(
                 workspace_dir=workspace_dir,
                 run_config_path=run_config_path,
@@ -289,6 +362,8 @@ def main() -> int:
         "param_version": args.param_version,
         "timeout": args.timeout,
         "max_floor": args.max_floor,
+        "gui": gui_enabled,
+        "gui_mode": "gui" if args.gui else "headless" if args.headless else "auto",
         "completed": mission_completed,
         "result_written": result_written,
         "external_timeout": external_timeout,

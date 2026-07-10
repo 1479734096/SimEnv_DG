@@ -47,8 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="网格搜索 danger_search 参数")
     parser.add_argument("--workspace", type=str, help="SimEnv 工作区路径，默认自动寻找")
     parser.add_argument("--seeds", type=int, nargs="+", default=[10, 42, 100], help="用于评测的 seed 集合")
-    parser.add_argument("--timeout", type=int, default=6200, help="单次运行超时，单位秒")
+    parser.add_argument("--timeout", type=int, default=10000, help="单次运行超时，单位秒")
     parser.add_argument("--max-floor", type=int, default=3, help="最大探索楼层数")
+    gui_group = parser.add_mutually_exclusive_group()
+    gui_group.add_argument("--gui", action="store_true", help="强制启动 Gazebo GUI；无 DISPLAY 时由 run_seed.py 报错")
+    gui_group.add_argument("--headless", action="store_true", help="强制关闭 Gazebo GUI")
     parser.add_argument("--test-mode", action="store_true", help="只跑 3 组轻量候选")
     parser.add_argument("--dry-run", action="store_true", help="只生成候选参数文件，不启动仿真")
     parser.add_argument("--max-candidates", type=int, help="最多评测多少组候选参数")
@@ -101,6 +104,10 @@ def main() -> int:
             "--param-version",
             param_file.stem,
         ]
+        if args.gui:
+            cmd.append("--gui")
+        elif args.headless:
+            cmd.append("--headless")
         try:
             subprocess.run(cmd, check=True, cwd=str(workspace_dir))
         except subprocess.CalledProcessError as exc:

@@ -15,11 +15,14 @@ def main():
     parser = argparse.ArgumentParser(description="批量评测多个 seed")
     parser.add_argument("--seeds", type=int, nargs="+", required=True, help="要评测的随机种子列表")
     parser.add_argument("--params", type=str, help="参数重载 JSON 或 YAML 文件路径")
-    parser.add_argument("--timeout", type=int, default=6200, help="算法运行最大超时时间(秒)")
+    parser.add_argument("--timeout", type=int, default=10000, help="算法运行最大超时时间(秒)")
     parser.add_argument("--max-floor", type=int, default=3, help="最大探索楼层数")
     parser.add_argument("--workspace", type=str, help="SimEnv 工作区路径，默认自动寻找")
     parser.add_argument("--scene-type", default="", help="写入归档的场景类型标签")
     parser.add_argument("--param-version", default="", help="写入归档的参数版本标签")
+    gui_group = parser.add_mutually_exclusive_group()
+    gui_group.add_argument("--gui", action="store_true", help="强制启动 Gazebo GUI；无 DISPLAY 时由 run_seed.py 报错")
+    gui_group.add_argument("--headless", action="store_true", help="强制关闭 Gazebo GUI")
     parser.add_argument("--no-report", action="store_true", help="只生成 summary.csv，不生成 optimization_report.md")
     args = parser.parse_args()
 
@@ -51,6 +54,10 @@ def main():
             cmd.extend(["--scene-type", args.scene_type])
         if args.param_version:
             cmd.extend(["--param-version", args.param_version])
+        if args.gui:
+            cmd.append("--gui")
+        elif args.headless:
+            cmd.append("--headless")
 
         try:
             subprocess.run(cmd, check=True)
