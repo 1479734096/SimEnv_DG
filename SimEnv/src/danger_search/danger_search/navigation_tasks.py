@@ -118,8 +118,18 @@ class OpenDoorAndPass(NavigationTask):
             return RUNNING
 
         if self.phase == "GO_PASS_POINT":
-            if self._navigate_to(manager, pose, self._pass_point):
+            if self._navigate_to(manager, pose, self._pass_point, allow_direct_fallback=True):
                 self.phase = "GO_COMMIT_POINT"
+                return RUNNING
+            # 门开后若规划失败（A* 不可达/预算耗尽/路径被清），主动清理门区并
+            # 尝试直连；直连也被栅格阻塞时触发原地恢复，避免永久停在门口。
+            if not manager.controller.has_path():
+                _clear_opened_door_area(manager, self.door_id)
+                grid = manager.mapper.floor(manager.current_floor)
+                if not _segment_crosses_blocked_cell(grid, (pose[0], pose[1]), self._pass_point):
+                    manager.controller.set_path([(pose[0], pose[1]), self._pass_point])
+                else:
+                    manager.controller.recover()
             return RUNNING
 
         if self.phase == "GO_COMMIT_POINT":

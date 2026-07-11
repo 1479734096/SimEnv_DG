@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+from dataclasses import dataclass
 import os
 import shutil
 import shlex
@@ -27,28 +28,163 @@ from danger_search.evaluation_tools import (
 )
 
 
-PROCESS_PATTERNS = [
+EXACT_CONFLICT_NAMES = {"rosmaster", "rosout", "gzserver", "gzclient", "junior_ctrl"}
+COMMAND_CONFLICT_MARKERS = (
     "roslaunch unitree_guide multi_floor_gazeboSim.launch",
     "building_generator_classic_control",
-    "gzserver|gzclient|gazebo",
-    "junior_ctrl",
     "danger_search_node",
-]
+)
+OWNED_ENVIRONMENT_NAMES = {
+    "rosmaster",
+    "rosout",
+    "gzserver",
+    "gzclient",
+    "junior_ctrl",
+}
 
 
 DEFAULT_HEALTH_CHECK_TIMEOUT = 120
 
 
-def cleanup() -> None:
-    print("清理残留进程...")
-    for pattern in PROCESS_PATTERNS:
-        subprocess.run(
-            ["pkill", "-f", pattern],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+@dataclass(frozen=True)
+class RunTermination:
+    return_code: int
+    kind: str
+    reason: str
+    component: str
+
+
+def _running_processes() -> list[tuple[int, str, str]]:
+    processes: list[tuple[int, str, str]] = []
+    proc_root = Path("/proc")
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            name = (entry / "comm").read_text(encoding="utf-8").strip()
+            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", errors="replace"
+            ).strip()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        processes.append((int(entry.name), name, command))
+    return processes
+
+
+def find_conflicting_processes() -> list[str]:
+    conflicts: list[str] = []
+    own_pid = os.getpid()
+    for pid, name, command in _running_processes():
+        if pid == own_pid:
+            continue
+        if name in EXACT_CONFLICT_NAMES or any(marker in command for marker in COMMAND_CONFLICT_MARKERS):
+            conflicts.append(f"pid={pid} name={name} command={command}")
+    return conflicts
+
+
+def process_name_is_running(name: str) -> bool:
+    return any(process_name == name for _, process_name, _ in _running_processes())
+
+
+def drain_environment_output(child) -> int:
+    """非阻塞排空 pexpect PTY，防止控制器因终端缓冲区写满而停转。"""
+    try:
+        import pexpect
+    except ImportError:
+        return 0
+    drained = 0
+    while True:
+        try:
+            chunk = child.read_nonblocking(size=4096, timeout=0)
+        except (pexpect.TIMEOUT, pexpect.EOF):
+            break
+        if not chunk:
+            break
+        drained += len(chunk)
+    return drained
+
+
+def capture_environment_processes(auto_pid: int) -> list[dict[str, object]]:
+    """在无冲突启动前提下快照本轮环境 PID/PGID，供结束时精确清理。"""
+    captured: list[dict[str, object]] = []
+    for pid, name, command in _running_processes():
+        if (
+            pid != auto_pid
+            and name not in OWNED_ENVIRONMENT_NAMES
+            and not any(marker in command for marker in COMMAND_CONFLICT_MARKERS[:2])
+        ):
+            continue
+        try:
+            process_group = os.getpgid(pid)
+        except ProcessLookupError:
+            continue
+        captured.append(
+            {
+                "pid": pid,
+                "pgid": process_group,
+                "name": name,
+                "command": command,
+            }
         )
-    time.sleep(2.0)
+    return captured
+
+
+def stop_owned_process(process: subprocess.Popen, *, label: str) -> None:
+    """按本轮创建的进程组温和退出，超时后逐级升级信号。"""
+    if process.poll() is not None:
+        return
+    try:
+        process_group = os.getpgid(process.pid)
+    except ProcessLookupError:
+        return
+    if process_group == os.getpgrp():
+        raise RuntimeError(f"拒绝终止共享进程组：{label} pgid={process_group}")
+    for sig, timeout in ((signal.SIGINT, 15.0), (signal.SIGTERM, 5.0), (signal.SIGKILL, 2.0)):
+        try:
+            os.killpg(process_group, sig)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def stop_environment(child) -> None:
+    """仅停止 pexpect 本轮启动的 auto.sh 进程组。"""
+    if child is None:
+        return
+    # pexpect 为 PTY 子进程建立独立会话。roslaunch/Gazebo 还会建立子进程组，
+    # 因此必须使用健康检查后保存的 PGID 快照，不能只依赖退出时的父子关系。
+    process_groups = {int(child.pid)}
+    for process in getattr(child, "owned_environment_processes", []):
+        process_groups.add(int(process["pgid"]))
+    process_groups.discard(os.getpgrp())
+    if not process_groups:
+        raise RuntimeError("拒绝清理：本轮没有可验证的独立仿真进程组")
+    for sig, delay in ((signal.SIGINT, 3.0), (signal.SIGTERM, 2.0), (signal.SIGKILL, 1.0)):
+        for process_group in sorted(process_groups):
+            try:
+                os.killpg(process_group, sig)
+            except ProcessLookupError:
+                continue
+        deadline = time.monotonic() + delay
+        while time.monotonic() < deadline:
+            alive_groups = []
+            for process_group in process_groups:
+                try:
+                    os.killpg(process_group, 0)
+                    alive_groups.append(process_group)
+                except ProcessLookupError:
+                    continue
+            if not alive_groups:
+                break
+            time.sleep(0.1)
+        process_groups = set(alive_groups)
+        if not process_groups:
+            break
+    child.close(force=True)
 
 
 def resolve_gui_enabled(args: argparse.Namespace) -> bool:
@@ -72,6 +208,7 @@ def run_environment(
     gui_enabled: bool,
     health_log_path: Path,
     max_floor: int = 3,
+    run_pid_dir: Path | None = None,
 ):
     try:
         import pexpect
@@ -88,6 +225,7 @@ def run_environment(
             "START_CONTROLLER": "1",
             "START_BUILDING_CONTROL": "1",
             "FLOOR_COUNT": str(max_floor),
+            "RUN_PID_DIR": str(run_pid_dir or (workspace_dir / "logs" / "run_pids")),
         }
     )
 
@@ -113,6 +251,12 @@ def run_environment(
         print(f"[{datetime.datetime.now().time()}] 控制器已进入 RL，开始启动健康检查")
         check_startup_health(workspace_dir, health_log_path)
         time.sleep(1.0)
+        child.owned_environment_processes = capture_environment_processes(child.pid)
+        if run_pid_dir is not None:
+            write_json(
+                run_pid_dir / "owned_environment_processes.json",
+                child.owned_environment_processes,
+            )
         print(f"[{datetime.datetime.now().time()}] 仿真环境准备完毕，控制器已进入 RL 模式")
     except pexpect.TIMEOUT:
         child.close(force=True)
@@ -197,7 +341,9 @@ def run_danger_search(
     max_floor: int,
     timeout: int,
     log_path: Path,
-) -> tuple[int, bool]:
+    environment_process,
+    gui_enabled: bool,
+) -> RunTermination:
     launch_cmd = " ".join(
         [
             "source /opt/ros/noetic/setup.bash",
@@ -217,21 +363,63 @@ def run_danger_search(
             stdout=log_file,
             stderr=subprocess.STDOUT,
             cwd=str(workspace_dir),
+            start_new_session=True,
         )
-        external_timeout = False
+        deadline = time.monotonic() + timeout
+        termination: RunTermination | None = None
         try:
-            process.wait(timeout=timeout)
+            while termination is None:
+                drain_environment_output(environment_process)
+                return_code = process.poll()
+                if return_code is not None:
+                    reason = "algorithm_exit" if return_code == 0 else "algorithm_exit_nonzero"
+                    termination = RunTermination(return_code, "algorithm_exit", reason, "danger_search")
+                    break
+                if not environment_process.isalive():
+                    termination = RunTermination(-1, "environment_exit", "auto_sh_exited", "auto.sh")
+                    break
+                if not process_name_is_running("gzserver"):
+                    termination = RunTermination(-1, "environment_exit", "gzserver_exited", "gzserver")
+                    break
+                if gui_enabled and not process_name_is_running("gzclient"):
+                    termination = RunTermination(-1, "environment_exit", "gui_exited", "gzclient")
+                    break
+                if time.monotonic() >= deadline:
+                    termination = RunTermination(-1, "runner_timeout", "wall_timeout", "run_seed.py")
+                    break
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            termination = RunTermination(-1, "runner_interrupt", "keyboard_interrupt", "run_seed.py")
+
+        assert termination is not None
+        if process.poll() is None:
+            print(
+                f"[{datetime.datetime.now().time()}] 本轮终止：kind={termination.kind} "
+                f"reason={termination.reason} component={termination.component}，停止算法"
+            )
+            stop_owned_process(process, label="danger_search")
+            termination = RunTermination(
+                int(process.returncode or 0),
+                termination.kind,
+                termination.reason,
+                termination.component,
+            )
+        else:
             print(f"[{datetime.datetime.now().time()}] danger_search 节点退出，返回码 {process.returncode}")
-        except subprocess.TimeoutExpired:
-            external_timeout = True
-            print(f"[{datetime.datetime.now().time()}] 达到超时限制 {timeout}s，发送 SIGINT")
-            process.send_signal(signal.SIGINT)
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-        return int(process.returncode or 0), external_timeout
+        return termination
+
+
+def runtime_completed_successfully(runtime_summary: dict) -> bool:
+    return bool(
+        runtime_summary.get("completed") is True
+        and runtime_summary.get("terminal_outcome") == "success"
+        and runtime_summary.get("terminal_state") == "FINISH"
+        and runtime_summary.get("terminal_reason") == "return_home_completed"
+        and runtime_summary.get("return_home_started") is True
+        and runtime_summary.get("return_home_completed") is True
+        and runtime_summary.get("return_home_success") is True
+        and runtime_summary.get("timeout_triggered") is False
+    )
 
 
 def evaluate_run(workspace_dir: Path, run_dir: Path, result_file: Path) -> bool:
@@ -279,8 +467,16 @@ def build_parser() -> argparse.ArgumentParser:
     gui_group = parser.add_mutually_exclusive_group()
     gui_group.add_argument("--gui", action="store_true", help="强制启动 Gazebo GUI；无 DISPLAY 时会报错")
     gui_group.add_argument("--headless", action="store_true", help="强制关闭 Gazebo GUI")
-    parser.add_argument("--skip-cleanup-before", action="store_true", help="启动前不清理旧仿真进程")
-    parser.add_argument("--skip-cleanup-after", action="store_true", help="结束后不清理仿真进程")
+    parser.add_argument(
+        "--skip-cleanup-before",
+        action="store_true",
+        help="兼容旧命令；当前版本不会主动清理未知进程",
+    )
+    parser.add_argument(
+        "--skip-cleanup-after",
+        action="store_true",
+        help="调试时保留本轮启动的仿真进程",
+    )
     return parser
 
 
@@ -292,8 +488,12 @@ def main() -> int:
     except RuntimeError as exc:
         print(f"参数错误: {exc}", file=sys.stderr)
         return 2
-    if not args.skip_cleanup_before:
-        cleanup()
+    conflicts = find_conflicting_processes()
+    if conflicts:
+        print("检测到已有 ROS/Gazebo 仿真进程，拒绝启动以避免实例冲突：", file=sys.stderr)
+        for conflict in conflicts:
+            print(f"  {conflict}", file=sys.stderr)
+        return 2
 
     run_dir = create_run_dir(workspace_dir, args.seed)
     print(f"运行归档目录: {run_dir}")
@@ -312,8 +512,7 @@ def main() -> int:
     runtime_summary_file = run_dir / "mission_runtime_summary.json"
     env_process = None
     failure_reason: list[str] = []
-    algo_return_code: int | None = None
-    external_timeout = False
+    termination: RunTermination | None = None
     evaluation_completed = False
     started_at = datetime.datetime.now()
 
@@ -326,8 +525,9 @@ def main() -> int:
                 gui_enabled=gui_enabled,
                 health_log_path=logs_dir / "health_check.log",
                 max_floor=args.max_floor,
+                run_pid_dir=logs_dir / "processes",
             )
-            algo_return_code, external_timeout = run_danger_search(
+            termination = run_danger_search(
                 workspace_dir=workspace_dir,
                 run_config_path=run_config_path,
                 result_file=result_file,
@@ -335,15 +535,15 @@ def main() -> int:
                 max_floor=args.max_floor,
                 timeout=args.timeout,
                 log_path=logs_dir / "danger_search.log",
+                environment_process=env_process,
+                gui_enabled=gui_enabled,
             )
     except Exception as exc:
         failure_reason.append(str(exc))
         print(f"运行失败: {exc}")
     finally:
-        if env_process is not None:
-            env_process.close(force=True)
-        if not args.skip_cleanup_after:
-            cleanup()
+        if env_process is not None and not args.skip_cleanup_after:
+            stop_environment(env_process)
         copy_runtime_logs(workspace_dir, run_dir)
 
     try:
@@ -359,11 +559,27 @@ def main() -> int:
     if isinstance(runtime_failures, str):
         runtime_failures = [runtime_failures]
     failure_reason.extend(str(item) for item in runtime_failures if item)
-    if external_timeout:
+    if termination is not None and termination.kind == "runner_timeout":
         failure_reason.append("外部超时")
+    if termination is not None and termination.kind not in ("algorithm_exit",):
+        failure_reason.append(
+            f"运行器终止: {termination.reason} ({termination.component})"
+        )
     failure_reason = list(dict.fromkeys(failure_reason))
     result_written = result_file.exists()
-    mission_completed = result_written and not external_timeout and algo_return_code == 0
+    normal_runtime_completion = runtime_completed_successfully(runtime_summary)
+    mission_completed = bool(
+        result_written
+        and termination is not None
+        and termination.kind == "algorithm_exit"
+        and termination.return_code == 0
+        and normal_runtime_completion
+    )
+    if result_written and not normal_runtime_completion:
+        failure_reason.append(
+            f"任务未正常完成: {runtime_summary.get('terminal_reason', 'missing_runtime_outcome')}"
+        )
+    failure_reason = list(dict.fromkeys(failure_reason))
 
     mission_summary = {
         "run_id": run_dir.name,
@@ -376,9 +592,16 @@ def main() -> int:
         "gui_mode": "gui" if args.gui else "headless" if args.headless else "auto",
         "completed": mission_completed,
         "result_written": result_written,
-        "external_timeout": external_timeout,
+        "external_timeout": bool(termination and termination.kind == "runner_timeout"),
+        "termination_kind": termination.kind if termination is not None else "startup_failure",
+        "termination_reason": termination.reason if termination is not None else "startup_failure",
+        "termination_component": termination.component if termination is not None else "run_seed.py",
         "evaluation_completed": evaluation_completed,
-        "algo_return_code": algo_return_code,
+        "algo_return_code": termination.return_code if termination is not None else None,
+        "runtime_completed": normal_runtime_completion,
+        "runtime_terminal_state": runtime_summary.get("terminal_state", ""),
+        "runtime_terminal_outcome": runtime_summary.get("terminal_outcome", ""),
+        "runtime_terminal_reason": runtime_summary.get("terminal_reason", ""),
         "return_home_success": runtime_summary.get("return_home_success", ""),
         "elevator_success": runtime_summary.get("elevator_success", ""),
         "exploration_time": runtime_summary.get("exploration_time", ""),
@@ -395,7 +618,7 @@ def main() -> int:
     }
     write_json(run_dir / "mission_summary.json", mission_summary)
     print(f"所有任务完成。归档保存在: {run_dir}")
-    return 0 if result_file.exists() else 1
+    return 0 if mission_completed else 1
 
 
 if __name__ == "__main__":

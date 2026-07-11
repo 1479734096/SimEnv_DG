@@ -9,6 +9,10 @@ topics:
   depth: /real_sense/depth/image_raw
   camera_info: /real_sense/rgb/camera_info
   status: /danger_search/status
+  map: /nav/map_debug
+  path_raw: /danger_search/path_raw
+  path_followed: /danger_search/path_followed
+  local_target: /danger_search/local_target
 
 mission:
   startup_delay: 2.0
@@ -37,7 +41,30 @@ mission:
   # 仅在过门后的短时间、且机器人仍在门口附近时抑制回头目标。
   door_transition_duration: 3.0
   door_transition_hold_distance: 2.5
+  # 即使推进/已知面积条件未满足，临时门禁也必须在该时限后退出。
+  post_door_context_max_duration: 12.0
+  # 永久入口禁回区按门宽缩放；远处只连续降分，不使用无限半平面硬过滤。
+  permanent_forbidden_radius_scale: 1.5
+  permanent_forbidden_penalty: 3.0
+  permanent_forbidden_decay_scale: 3.0
   status_publish_period: 1.0
+  # 方案 C：全局时间预算参数
+  # 返航安全缓冲（秒）：在 estimated_return_time 之外再预留的时间
+  return_safety_buffer: 30.0
+  # 返航保守速度估计（m/s），用于估算返航时间
+  return_speed_estimate: 0.35
+  # 换层基础时间估计（秒），包含电梯等待和移动
+  floor_change_time_estimate: 40.0
+  # 楼层结束软边界比例：floor_timeout * ratio 后可结合收益考虑结束
+  floor_finish_time_ratio: 0.75
+  # 探索收益评估窗口（秒）
+  exploration_progress_window: 15.0
+  # 窗口内至少新增多少已知/可通行栅格才算有进展
+  min_exploration_progress_cells: 30
+  # 剩余 frontier 少于该值时认为当前层接近穷尽
+  min_remaining_frontiers: 2
+  # 换层前要求剩余总时间的比例（相对于 max_runtime）
+  min_floor_change_remaining_ratio: 0.25
 
 map:
   resolution: 0.10
@@ -50,6 +77,8 @@ map:
   obstacle_max_z: 1.40
   obstacle_inflation_radius: 0.35
   raycast_max_range: 12.0
+  # 只有明确障碍命中可清到远端；地面/天花等非障碍回波只清近场。
+  point_free_clear_max_range: 1.5
   visited_radius: 0.45
   # 可视扇区自由空间清空：默认偏保守，优先避免穿过已知障碍或凭空穿墙。
   free_clear_enabled: true
@@ -64,6 +93,8 @@ frontier:
   min_cluster_size: 4
   blacklist_ttl: 60.0
   fail_limit: 3
+  # STUCK 后临时排除同一前沿簇附近目标，避免质心轻微漂移后立刻重试同一路线。
+  stuck_blacklist_radius: 1.20
   no_progress_timeout: 8.0
   information_gain_weight: 1.0
   path_cost_weight: 3.0
@@ -73,13 +104,17 @@ frontier:
   frontier_obstacle_clearance: 0.25
   frontier_unknown_standoff: 0.20
   frontier_min_information_gain: 1.0
-  # 过门后的临时回头抑制：只在门转换保持期内生效，不是永久黑名单。
-  door_front_half_plane_penalty: 6.0
+  # 过门后的临时回头抑制：只在门附近有限半径内生效，远处仅小幅降分。
+  door_front_half_plane_penalty: 3.0
   door_front_half_plane_radius: 1.5
   door_preferred_direction_bonus: 1.5
   # 短期选择惯性：当前区域仍可达时，新目标分数需要至少高出该 margin 才切换。
   switch_score_margin: 5.0
   current_region_radius: 2.0
+  # 先以可解释的乐观分数缩小精确 A* 集合，避免 Timer 回调长时间阻塞。
+  max_planning_candidates: 8
+  max_goal_candidates_per_frontier: 2
+  max_fallback_planning_candidates: 8
 
 controller:
   max_linear: 0.60
@@ -88,10 +123,17 @@ controller:
   min_linear_fraction: 0.35
   goal_tolerance: 0.35
   waypoint_tolerance: 0.25
-  corner_tolerance: 0.10
+  corner_tolerance: 0.15
   pure_pursuit_lookahead: 0.45
-  reverse_speed: -0.25
-  recover_duration: 1.5
+  reverse_speed: -0.15
+  recover_duration: 0.5
+  recover_turn_duration: 1.0
+  recover_angular_speed: 0.55
+  # 独立 Timer 重发最近的安全命令，周期必须小于 junior_ctrl 的 0.5 秒超时。
+  command_keepalive_period: 0.1
+  # A1 机身前缘需要留出停车余量；近于 stop 时只转向，slow 范围内连续减速。
+  obstacle_stop_distance: 0.50
+  obstacle_slow_distance: 1.00
   progress_distance: 0.25
 
 detection:

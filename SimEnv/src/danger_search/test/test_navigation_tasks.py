@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from danger_search.navigation_tasks import DONE, FAILED, OpenDoorAndPass, RUNNING, TakeElevator
 from danger_search.mapper import MultiFloorGridMap
-from danger_search.planner import PlanResult, UNREACHABLE
+from danger_search.planner import BUDGET_EXHAUSTED, PlanResult, UNREACHABLE
 
 
 class _DoneService:
@@ -113,6 +113,97 @@ class OpenDoorAndPassTest(unittest.TestCase):
         self.assertEqual(status, RUNNING)
         self.assertEqual(recorded_paths, [])
         self.assertEqual(cleared_paths, [True])
+        self.assertEqual(cleared_doors, ["main_entrance"])
+
+    def test_pass_point_budget_exhausted_falls_back_to_direct_path(self):
+        """GO_PASS_POINT A* 预算耗尽且未留路径时，应主动清理门区并直连 pass_point。"""
+        recorded_paths = []
+        cleared_doors = []
+        path_active = [False]
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "GO_PASS_POINT"
+        task._wait_point = (0.0, -0.8)
+        task._pass_point = (0.0, 0.8)
+        task._commit_point = (0.0, 1.8)
+
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+        )
+        grid = mapper.floor(0)
+
+        def set_path(path):
+            recorded_paths.append(path)
+            path_active[0] = True
+
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(),
+            mapper=SimpleNamespace(floor=lambda floor_index: grid),
+            current_floor=0,
+            controller=SimpleNamespace(
+                goal_tolerance=0.35,
+                has_path=lambda: path_active[0],
+                set_path=set_path,
+                clear_path=lambda: path_active.__setitem__(0, False),
+                tick=lambda pose: RUNNING,
+                recover=lambda: None,
+            ),
+            clear_opened_door_area=lambda door_id: cleared_doors.append(door_id),
+        )
+
+        with patch("danger_search.navigation_tasks.astar_plan", return_value=PlanResult(status=BUDGET_EXHAUSTED)):
+            status = task.tick(manager, (0.2, -1.1, 2.3))
+
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "GO_PASS_POINT")
+        self.assertEqual(len(recorded_paths), 1)
+        self.assertEqual(recorded_paths[0][0], (0.2, -1.1))
+        self.assertEqual(recorded_paths[0][-1], (0.0, 0.8))
+        self.assertEqual(cleared_doors, ["main_entrance"])
+
+    def test_pass_point_blocked_and_line_blocked_triggers_recover(self):
+        """GO_PASS_POINT 规划失败且直连也被阻塞时，应清理门区并触发恢复转向。"""
+        recovered = []
+        cleared_doors = []
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "GO_PASS_POINT"
+        task._wait_point = (0.0, -0.8)
+        task._pass_point = (0.0, 0.8)
+        task._commit_point = (0.0, 1.8)
+
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+        )
+        grid = mapper.floor(0)
+        grid.mark_occupied(*grid.world_to_grid(0.0, 0.0))
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(),
+            mapper=SimpleNamespace(floor=lambda floor_index: grid),
+            current_floor=0,
+            controller=SimpleNamespace(
+                goal_tolerance=0.35,
+                has_path=lambda: False,
+                set_path=lambda path: None,
+                clear_path=lambda: None,
+                tick=lambda pose: RUNNING,
+                recover=lambda: recovered.append(True),
+            ),
+            clear_opened_door_area=lambda door_id: cleared_doors.append(door_id),
+        )
+
+        with patch("danger_search.navigation_tasks.astar_plan", return_value=PlanResult(status=UNREACHABLE)):
+            status = task.tick(manager, (0.2, -1.1, 2.3))
+
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "GO_PASS_POINT")
+        self.assertEqual(recovered, [True])
         self.assertEqual(cleared_doors, ["main_entrance"])
 
 

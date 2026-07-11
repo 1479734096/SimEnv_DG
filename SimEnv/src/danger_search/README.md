@@ -47,12 +47,13 @@ roslaunch danger_search danger_search_smoke.launch
 - 楼层探索至少持续 `mission/min_floor_explore_time`，最大离家距离至少达到 `mission/min_floor_travel_distance`，已知面积至少达到 `mission/min_known_area`；`mission/no_reachable_frontier_confirmations` 控制无可达前沿需连续确认的次数，`mission/min_corridor_progress_distance` 可选限制走廊主方向已知范围。
 - 无前沿且无远处 FREE 目标时，会从机器人当前位置按 `mission/probe_distance` 做短距离探测前进，再重新建图；默认 `mission/probe_yaw=1.5708`，沿比赛入口到房间的全局 +Y 方向探测，避免起立后的机体 yaw 抖动把探测方向带反。探测段如果穿过已知障碍或黑名单栅格，会跳过该目标。
 - Frontier 选择带短期惯性：当前区域仍可达时，新目标分数需要高出 `frontier/switch_score_margin` 才会切换；日志会记录每次选择的分数、距离、门侧、fallback 和切换原因。
-- 过门后除了短时间抑制回头，还会在门后推进距离和门后侧已知面积达到 `mission/post_door_min_distance`、`mission/post_door_min_known_area` 前持续优先门后侧目标，减少刚进门又回头。
-- 路径跟踪默认允许有限转向和侧移：`controller/min_linear_fraction=0.35`、`controller/max_angular=1.2`、`controller/max_lateral=0.25`，目标偏角较大时会降低前进速度，避免目标在侧后方时仍满速直顶墙体；转角处使用 `controller/corner_tolerance=0.10` 限制提前切换到下一段，防止在 U 型/平行走廊中切角或跳到未来折返段。
-- 卡住恢复默认等待 `frontier/no_progress_timeout=8.0` 秒，避免 A1 刚起步就被频繁判定为卡住并后退。
+- 过门后除了短时间抑制回头，还会在门后推进距离和门后侧已知面积达到 `mission/post_door_min_distance`、`mission/post_door_min_known_area` 前持续优先门后侧目标，减少刚进门又回头；临时和永久禁区都只在门口有限半径内完全跳过，远处仅按距离衰减降分，避免用无限半平面把整片可达区域永久屏蔽。
+- 路径跟踪默认允许有限转向和侧移：`controller/min_linear_fraction=0.35`、`controller/max_angular=1.2`、`controller/max_lateral=0.25`，目标偏角较大时按余弦平方衰减前进速度，避免旋转中满速撞墙；转角处使用 `controller/corner_tolerance=0.10` 限制提前切换到下一段，防止在 U 型/平行走廊中切角或跳到未来折返段。
+- 卡住恢复默认等待 `frontier/no_progress_timeout=8.0` 秒后原地停止 `controller/recover_duration=0.5` 秒，不盲目后退，避免贴墙时推压导致倒地。
 - 默认使用 `/livox/Pointcloud2` 做 2.5D 栅格建图。
+- 诊断话题 `/danger_search/path_raw`、`/danger_search/path_followed` 和 `/danger_search/local_target` 分别发布原始 A* 路径、控制器实际跟踪路径和局部前视目标；`path_followed` 当前只做共线点压缩，不应误解为几何平滑器输出。
 - 点云命中障碍会按 `map/obstacle_inflation_radius` 做栅格膨胀，给 A1 留出安全余量。
-- 建图默认启用可视扇区自由空间清空：`map/free_clear_*` 会按角度桶聚合可见方向，只在该方向点数足够时把机器人到最近障碍前的连续区域标成 FREE；遇到已知 `OCC/BLACK` 会停止，避免把静态墙体后方擦成可通行。
+- 建图默认启用可视扇区自由空间清空：`map/free_clear_*` 会按角度桶聚合可见方向，只在该方向点数足够时把机器人到最近障碍前的连续区域标成 FREE；遇到已知 `OCC/BLACK` 会停止，避免把静态墙体后方擦成可通行；无障碍点的方向只清到 1.5m 保守距离，不按 `free_clear_max_range` 全距离清空，防止点云稀疏时穿墙。
 - 前沿目标默认先找更安全的内部 free cell，而不是直接贴着 frontier 边缘落点；`frontier/frontier_obstacle_clearance`、`frontier/frontier_unknown_standoff` 和 `frontier/frontier_min_information_gain` 分别控制离障碍余量、离 unknown 边缘退让和最小信息增益。
 - 默认使用 `/real_sense/rgb/image_raw` 和 `/real_sense/depth/image_raw` 做红球识别。
 - Mapper 只维护 free / occupied / unknown 占据栅格，不编码门、电梯或房间入口语义；普通点云射线不会擦除已知静态障碍。

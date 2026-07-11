@@ -1,0 +1,11 @@
+mission:
+  max_runtime: 80.0
+  floor_timeout: 30.0
+  min_floor_explore_time: 5.0
+  return_safety_buffer: 10.0
+  return_speed_estimate: 0.35
+  floor_change_time_estimate: 20.0
+  floor_finish_time_ratio: 0.65
+  exploration_progress_window: 8.0
+  min_exploration_progress_cells: 15
+  min_remaining_frontiers: 2

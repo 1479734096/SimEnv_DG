@@ -1,0 +1,6 @@
+docs/HANDOFF_20260711.md
+results/handoff_20260711/HANDOFF_20260711.md
+results/handoff_20260711/diff_stat.txt
+results/handoff_20260711/git_status.txt
+results/handoff_20260711/untracked_files.txt
+results/handoff_20260711/worktree.patch

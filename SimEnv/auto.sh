@@ -46,6 +46,51 @@ START_CONTROLLER="${START_CONTROLLER:-1}"
 START_VIRTUAL_JOY="${START_VIRTUAL_JOY:-0}"
 CONTROLLER_FOREGROUND="${CONTROLLER_FOREGROUND:-1}"
 START_BUILDING_CONTROL="${START_BUILDING_CONTROL:-1}"
+RUN_PID_DIR="${RUN_PID_DIR:-$WORKSPACE_DIR/logs/run_pids}"
+
+OWNED_PIDS=()
+
+record_owned_pid() {
+  local name="$1"
+  local pid="$2"
+  OWNED_PIDS+=("$pid")
+  mkdir -p "$RUN_PID_DIR"
+  printf '%s\n' "$pid" > "$RUN_PID_DIR/$name.pid"
+}
+
+cleanup_owned_processes() {
+  local pid
+  local _
+  local any_alive
+  trap - EXIT INT TERM
+  for pid in "${OWNED_PIDS[@]:-}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -INT "$pid" 2>/dev/null || true
+    fi
+  done
+  for _ in $(seq 1 50); do
+    any_alive=0
+    for pid in "${OWNED_PIDS[@]:-}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        any_alive=1
+      fi
+    done
+    if [ "$any_alive" = "0" ]; then
+      break
+    fi
+    sleep 0.2
+  done
+  for pid in "${OWNED_PIDS[@]:-}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "${OWNED_PIDS[@]:-}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+}
+
+trap cleanup_owned_processes EXIT INT TERM
 
 # Unitree 控制器周期，默认 0.004 秒，即 250 Hz。
 # 周期太小会更接近原始控制频率，但大场景下更容易出现控制循环超时。
@@ -85,16 +130,25 @@ if [ "$START_CONTROLLER" = "1" ]; then
 fi
 
 # ==============================
-# 清理旧进程
+# 启动冲突检查
 # ==============================
-# 一键启动前先终止上一次残留的 Gazebo、roslaunch、控制器和辅助服务。
-# 每条 pkill 后面的 “|| true” 是刻意保留的：找不到进程不算错误。
-echo "Terminating previous Gazebo, launch, controller, and optional joystick processes..."
-pkill -f "roslaunch unitree_guide multi_floor_gazeboSim.launch" 2>/dev/null || true
-pkill -f "building_generator_classic_control" 2>/dev/null || true
-pkill -f "gzserver|gzclient|gazebo" 2>/dev/null || true
-pkill -f "junior_ctrl" 2>/dev/null || true
-pkill -f "virtual_joy.py" 2>/dev/null || true
+# 不主动终止未知进程；已有仿真时直接拒绝启动，避免破坏其他用户的任务。
+CONFLICTS="$(
+  {
+    pgrep -a -x rosmaster 2>/dev/null || true
+    pgrep -a -x rosout 2>/dev/null || true
+    pgrep -a -x gzserver 2>/dev/null || true
+    pgrep -a -x gzclient 2>/dev/null || true
+    pgrep -a -x junior_ctrl 2>/dev/null || true
+    pgrep -af '[r]oslaunch unitree_guide multi_floor_gazeboSim.launch' 2>/dev/null || true
+    pgrep -af '[b]uilding_generator_classic_control' 2>/dev/null || true
+  } | sort -u
+)"
+if [ -n "$CONFLICTS" ]; then
+  echo "检测到已有 ROS/Gazebo 仿真进程，拒绝启动以避免实例冲突：" >&2
+  printf '%s\n' "$CONFLICTS" >&2
+  exit 2
+fi
 
 # ==============================
 # 加载 ROS 和工作区环境
@@ -190,7 +244,7 @@ echo "=========================================="
 if [ "$START_VIRTUAL_JOY" = "1" ]; then
   echo "Starting virtual joystick. This may require uinput permissions."
   rosrun unitree_guide virtual_joy.py > "$WORKSPACE_DIR/logs/virtual_joy.log" 2>&1 &
-  echo $! > "$WORKSPACE_DIR/logs/virtual_joy.pid"
+  record_owned_pid "virtual_joy" "$!"
 fi
 
 # ==============================
@@ -220,6 +274,7 @@ roslaunch unitree_guide multi_floor_gazeboSim.launch \
 # 记录 roslaunch 进程号，便于后续人工排查或停止。
 LAUNCH_PID=$!
 echo "$LAUNCH_PID" > "$WORKSPACE_DIR/logs/competition_gazebo.pid"
+record_owned_pid "competition_gazebo" "$LAUNCH_PID"
 
 # 给 Gazebo、模型和 ROS 服务一点初始化时间。
 # 后面的门/电梯控制服务依赖 Gazebo 服务已经起来。
@@ -236,7 +291,9 @@ if [ "$START_BUILDING_CONTROL" = "1" ]; then
     --door-config "$SCENE_OUTPUT_DIR/door_config.yaml" \
     --elevator-config "$SCENE_OUTPUT_DIR/elevator_config.yaml" \
     > "$WORKSPACE_DIR/logs/building_control.log" 2>&1 &
-  echo $! > "$WORKSPACE_DIR/logs/building_control.pid"
+  BUILDING_CONTROL_PID=$!
+  echo "$BUILDING_CONTROL_PID" > "$WORKSPACE_DIR/logs/building_control.pid"
+  record_owned_pid "building_control" "$BUILDING_CONTROL_PID"
 fi
 
 # ==============================
@@ -264,7 +321,7 @@ if [ "$START_CONTROLLER" = "1" ]; then
     echo "UNITREE_CTRL_DT=$UNITREE_CTRL_DT seconds."
     "$WORKSPACE_DIR/devel/lib/unitree_guide/junior_ctrl" \
       > "$WORKSPACE_DIR/logs/junior_ctrl.log" 2>&1 &
-    echo $! > "$WORKSPACE_DIR/logs/junior_ctrl.pid"
+    record_owned_pid "junior_ctrl" "$!"
   fi
 fi
 

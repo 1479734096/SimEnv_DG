@@ -1,5 +1,8 @@
+import json
 import math
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from danger_search.navigator import PathFollower, compute_tracking_command, RUNNING, STUCK
 
@@ -32,15 +35,16 @@ class LocalControllerTest(unittest.TestCase):
         self.assertAlmostEqual(angular, 0.0)
 
     def test_min_linear_fraction_is_clamped(self):
+        # min_linear_fraction 被 clamp 到 1.0 时，小角度偏角应满速前进。
         linear_x, _, _ = compute_tracking_command(
-            3.14,
+            0.1,
             max_linear=0.4,
             max_lateral=0.3,
             max_angular=1.0,
             min_linear_fraction=2.0,
         )
 
-        self.assertAlmostEqual(linear_x, 0.4)
+        self.assertAlmostEqual(linear_x, 0.4, places=2)
 
     def test_large_yaw_error_does_not_drive_full_speed_straight(self):
         linear_x, linear_y, angular = compute_tracking_command(
@@ -94,6 +98,159 @@ class LocalControllerTest(unittest.TestCase):
 
         status = follower.tick((0.0, 0.0, 0.0))
         self.assertEqual(status, STUCK)
+        snapshot = follower.tracking_debug_snapshot()
+        self.assertEqual(snapshot["stuck_count"], 1)
+        self.assertEqual(snapshot["replan_reason"], "no_progress_timeout")
+        self.assertEqual(snapshot["zero_command_reason"], "no_progress_timeout")
+
+        follower.recover(reason="frontier_stuck")
+        snapshot = follower.tracking_debug_snapshot()
+        self.assertEqual(snapshot["recover_count"], 1)
+        self.assertEqual(snapshot["recover_state"], "settle")
+        self.assertEqual(snapshot["recover_reason"], "frontier_stuck")
+        self.assertEqual(snapshot["zero_command_reason"], "frontier_stuck")
+
+    def test_angular_saturation_band_strongly_limits_forward_speed(self):
+        """下游角速度接近饱和的偏角下，不能继续以约 0.5m/s 前冲。"""
+        linear_x, _, angular = compute_tracking_command(
+            0.59,
+            max_linear=0.60,
+            max_lateral=0.25,
+            max_angular=1.2,
+            min_linear_fraction=0.35,
+        )
+
+        self.assertGreater(abs(angular), 0.99)
+        self.assertLessEqual(linear_x, 0.24)
+
+    def test_curvature_and_forward_obstacle_jointly_limit_speed(self):
+        straight, _, _ = compute_tracking_command(
+            0.0,
+            max_linear=0.60,
+            max_angular=1.2,
+        )
+        corner, _, _ = compute_tracking_command(
+            0.0,
+            max_linear=0.60,
+            max_angular=1.2,
+            path_curvature=math.pi / 2.0,
+        )
+        obstacle, _, _ = compute_tracking_command(
+            0.0,
+            max_linear=0.60,
+            max_angular=1.2,
+            nearest_obstacle_distance=0.5,
+        )
+
+        self.assertLess(corner, straight)
+        self.assertLess(obstacle, corner)
+
+    def test_close_forward_obstacle_stops_translation_but_keeps_turning(self):
+        linear_x, linear_y, angular = compute_tracking_command(
+            0.4,
+            max_linear=0.60,
+            max_lateral=0.25,
+            max_angular=1.2,
+            nearest_obstacle_distance=0.49,
+            obstacle_stop_distance=0.50,
+            obstacle_slow_distance=1.00,
+        )
+
+        self.assertEqual(linear_x, 0.0)
+        self.assertEqual(linear_y, 0.0)
+        self.assertGreater(angular, 0.0)
+
+    def test_recover_has_turn_and_replan_exit(self):
+        follower = PathFollower(
+            cmd_vel_topic="/cmd_vel",
+            recover_duration=0.5,
+            recover_turn_duration=1.0,
+        )
+        follower._debug_heading_error = -0.4
+
+        with patch("danger_search.navigator.get_time", return_value=10.0):
+            follower.recover(reason="frontier_stuck")
+        with patch("danger_search.navigator.get_time", return_value=10.6):
+            self.assertEqual(follower.tick((0.0, 0.0, 0.0)), RUNNING)
+            turn_snapshot = follower.tracking_debug_snapshot()
+            self.assertEqual(turn_snapshot["recover_state"], "turn")
+            self.assertLess(turn_snapshot["angular_command"], 0.0)
+        with patch("danger_search.navigator.get_time", return_value=11.7):
+            self.assertEqual(follower.tick((0.0, 0.0, 0.0)), "idle")
+
+        snapshot = follower.tracking_debug_snapshot()
+        self.assertEqual(snapshot["recover_state"], "idle")
+        self.assertEqual(snapshot["replan_reason"], "recover_turn_completed")
+
+    def test_tracking_debug_snapshot_records_tracking_context(self):
+        follower = PathFollower(cmd_vel_topic="/cmd_vel", pure_pursuit_lookahead=0.45)
+        follower.set_path([(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)])
+
+        status = follower.tick((0.0, 0.0, 0.0))
+        snapshot = follower.tracking_debug_snapshot()
+
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(snapshot["pose"], [0.0, 0.0, 0.0])
+        self.assertEqual(snapshot["raw_path_size"], 3)
+        self.assertEqual(snapshot["path_size"], 3)
+        self.assertEqual(snapshot["current_waypoint"], [0.0, 1.0])
+        self.assertEqual(snapshot["local_target"], [0.0, 0.45])
+        self.assertAlmostEqual(snapshot["distance_to_target"], 0.45)
+        self.assertAlmostEqual(snapshot["heading_error"], math.pi / 2.0)
+        self.assertAlmostEqual(snapshot["path_turn_angle"], -math.pi / 2.0)
+        self.assertAlmostEqual(snapshot["path_curvature"], -math.pi / 2.0)
+        self.assertGreater(snapshot["linear_command"], 0.0)
+        self.assertGreater(snapshot["lateral_command"], 0.0)
+        self.assertEqual(snapshot["angular_command"], follower.max_angular)
+        self.assertIsNone(snapshot["zero_command_reason"])
+        self.assertIsNone(snapshot["last_command_wall_time"])
+        json.dumps(snapshot, allow_nan=False)
+
+    def test_path_snapshots_preserve_raw_and_followed_paths(self):
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path([(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 1.0)])
+
+        self.assertEqual(
+            follower.raw_path_snapshot(),
+            [(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.0, 1.0)],
+        )
+        self.assertEqual(
+            follower.followed_path_snapshot(),
+            [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+        )
+
+        follower.clear_path(reason="test_complete")
+        self.assertEqual(follower.raw_path_snapshot(), [])
+        self.assertEqual(follower.followed_path_snapshot(), [])
+
+    def test_tracking_debug_records_wall_command_time_and_zero_reason(self):
+        class FakeTwist:
+            def __init__(self):
+                self.linear = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+                self.angular = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+        class FakePublisher:
+            def __init__(self):
+                self.messages = []
+
+            def publish(self, msg):
+                self.messages.append(msg)
+
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        publisher = FakePublisher()
+        follower._publisher = publisher
+
+        with patch("danger_search.navigator.Twist", FakeTwist):
+            follower.stop(reason="diagnostic_stop")
+
+        snapshot = follower.tracking_debug_snapshot()
+        self.assertEqual(len(publisher.messages), 1)
+        self.assertEqual(snapshot["command_count"], 1)
+        self.assertEqual(snapshot["zero_command_reason"], "diagnostic_stop")
+        self.assertIsNotNone(snapshot["last_command_wall_time"])
+        self.assertIsNotNone(snapshot["wall_command_age"])
+        self.assertGreaterEqual(snapshot["wall_command_age"], 0.0)
+        json.dumps(follower.command_debug_summary(), allow_nan=False)
 
     def test_lookahead_uses_path_distance_not_euclidean(self):
         """直角路径上，lookahead 应落在第一段路径上，而不是直接看穿墙角。"""
@@ -144,6 +301,18 @@ class LocalControllerTest(unittest.TestCase):
 
         # 距离转角 0.05m，小于等于 corner_tolerance，允许推进。
         target = follower._lookahead_target(0.0, 1.95)
+        self.assertEqual(follower._waypoint_index, 1)
+
+    def test_passed_corner_advances_despite_small_lateral_offset(self):
+        follower = PathFollower(
+            cmd_vel_topic="/cmd_vel",
+            waypoint_tolerance=0.25,
+            corner_tolerance=0.10,
+        )
+        follower.set_path([(0.0, 0.0), (0.0, 2.0), (1.0, 2.0)])
+
+        follower._lookahead_target(0.28, 2.05)
+
         self.assertEqual(follower._waypoint_index, 1)
 
     def test_is_turn_vertex_detects_right_angle(self):

@@ -78,6 +78,70 @@ class MultiFloorMapperTest(unittest.TestCase):
         self.assertAlmostEqual(grid.known_area(), 0.75)
         self.assertAlmostEqual(grid.visited_area(), 0.25)
         self.assertEqual(grid.known_bbox_extent(), (2.0, 1.5))
+        self.assertAlmostEqual(grid.known_bbox_fill_ratio(), 3.0 / 12.0)
+        self.assertAlmostEqual(grid.traversable_known_ratio(), 2.0 / 3.0)
+        self.assertAlmostEqual(grid.coverage_ratio(), 3.0 / 12.0)
+        self.assertAlmostEqual(grid.visited_traversable_ratio(), 1.0 / 2.0)
+
+    def test_debug_snapshot_records_ray_stop_and_nearest_obstacle(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+            obstacle_inflation_radius=0.0,
+            free_clear_enabled=False,
+        )
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[
+                (0.5, 0.0, 0.6),
+                (1.0, 0.0, 0.0),
+            ],
+        )
+
+        snapshot = mapper.latest_debug_snapshot()
+        assert snapshot is not None
+        self.assertEqual(snapshot.point_ray_count, 2)
+        self.assertEqual(snapshot.sector_ray_count, 0)
+        self.assertEqual(snapshot.blocked_stop_count, 1)
+        self.assertGreater(snapshot.suspicious_clearing_prevented_count, 0)
+        self.assertAlmostEqual(snapshot.nearest_obstacle_distance, 0.5)
+        self.assertGreater(snapshot.max_clearing_length, 0.0)
+        self.assertEqual(snapshot.occupied_to_free_count, 0)
+
+    def test_debug_snapshot_counts_capped_no_obstacle_sector(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=10.0,
+            length=10.0,
+            origin_x=-5.0,
+            origin_y=-5.0,
+            obstacle_inflation_radius=0.0,
+            free_clear_enabled=True,
+            free_clear_max_range=8.0,
+            free_clear_angle_step=0.3,
+            free_clear_min_points_per_bin=2,
+        )
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[
+                self._point_from_polar(2.0, -0.1, z=0.0),
+                self._point_from_polar(2.0, 0.1, z=0.0),
+            ],
+        )
+
+        snapshot = mapper.latest_debug_snapshot()
+        assert snapshot is not None
+        self.assertEqual(snapshot.point_ray_count, 2)
+        self.assertEqual(snapshot.sector_ray_count, 1)
+        self.assertIsNone(snapshot.nearest_obstacle_distance)
+        self.assertGreaterEqual(snapshot.suspicious_clearing_prevented_count, 1)
 
     def test_free_clear_marks_visible_sector_as_free(self):
         mapper = MultiFloorGridMap(
@@ -206,6 +270,59 @@ class MultiFloorMapperTest(unittest.TestCase):
         self.assertEqual(grid.data[wall_cell[1], wall_cell[0]], OCC)
         self.assertEqual(grid.data[after_wall[1], after_wall[0]], UNKNOWN)
 
+    def test_same_frame_obstacle_blocks_earlier_miss_ray(self):
+        """同帧 miss 即使排在墙命中前，也不能先把墙后清成 free。"""
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+            obstacle_inflation_radius=0.0,
+            free_clear_enabled=False,
+            point_free_clear_max_range=1.5,
+        )
+        grid = mapper.floor(0)
+        wall_cell = grid.world_to_grid(0.8, 0.0)
+        behind_wall = grid.world_to_grid(1.2, 0.0)
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[
+                (1.4, 0.0, 0.0),
+                (0.8, 0.0, 0.6),
+            ],
+        )
+
+        self.assertEqual(grid.data[wall_cell[1], wall_cell[0]], OCC)
+        self.assertEqual(grid.data[behind_wall[1], behind_wall[0]], UNKNOWN)
+
+    def test_non_obstacle_point_ray_is_capped_to_near_field(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=8.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+            obstacle_inflation_radius=0.0,
+            free_clear_enabled=False,
+            point_free_clear_max_range=1.5,
+        )
+        grid = mapper.floor(0)
+        far_cell = grid.world_to_grid(2.0, 0.0)
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[(3.0, 0.0, 0.0)],
+        )
+
+        self.assertEqual(grid.data[far_cell[1], far_cell[0]], UNKNOWN)
+        snapshot = mapper.latest_debug_snapshot()
+        assert snapshot is not None
+        self.assertGreater(snapshot.suspicious_clearing_prevented_count, 0)
+
     def test_dynamic_door_strip_clears_only_door_area_obstacles(self):
         mapper = MultiFloorGridMap(
             resolution=0.1,
@@ -231,6 +348,16 @@ class MultiFloorMapperTest(unittest.TestCase):
         self.assertEqual(grid.data[inside_cell[1], inside_cell[0]], FREE)
         self.assertEqual(grid.data[outside_cell[1], outside_cell[0]], OCC)
         self.assertEqual(grid.data[black_cell[1], black_cell[0]], BLACK)
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+        )
+        snapshot = mapper.latest_debug_snapshot()
+        assert snapshot is not None
+        self.assertEqual(snapshot.dynamic_door_cleared_count, 1)
+        self.assertEqual(snapshot.occupied_to_free_count, 1)
 
     def test_free_clear_skips_sector_when_points_are_insufficient(self):
         mapper = MultiFloorGridMap(

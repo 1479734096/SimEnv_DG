@@ -1,0 +1,4 @@
+results/golden_candidate_20260711_132738/HEAD.txt
+results/golden_candidate_20260711_132738/git_status.txt
+results/golden_candidate_20260711_132738/tracked_diff.patch
+results/golden_candidate_20260711_132738/untracked_files.txt

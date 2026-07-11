@@ -1,0 +1,17 @@
+# 中等时长时间预算测试配置：用于验证去除隐藏余量后的探索深度。
+# 在默认参数基础上仅调整总时长和楼层时限，保留默认返航缓冲与速度估计。
+mission:
+  max_runtime: 300.0
+  floor_timeout: 300.0
+  min_floor_explore_time: 20.0
+  return_safety_buffer: 30.0
+  return_speed_estimate: 0.35
+  floor_finish_time_ratio: 0.75
+  exploration_progress_window: 15.0
+  min_exploration_progress_cells: 30
+  min_remaining_frontiers: 2
+  # 任务层最小进度监督器（第一版）
+  progress_monitor_window: 5.0
+  progress_monitor_repeat: 3
+  progress_monitor_min_displacement: 0.20
+  progress_monitor_cooldown: 10.0
