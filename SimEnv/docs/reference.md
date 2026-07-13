@@ -230,7 +230,7 @@ rosrun building_generator_classic building_generator_classic_control \
 | 服务 | 类型 | 说明 |
 |------|------|------|
 | `/set_door_state` | `building_generator_interfaces/SetDoorState` | 打开或关闭指定动态门 |
-| `/call_elevator` | `building_generator_interfaces/CallElevator` | 将电梯轿厢移动到目标楼层 |
+| `/call_elevator` | `building_generator_interfaces/CallElevator` | 将电梯轿厢及轿厢内的 A1 移动到目标楼层 |
 
 楼层索引从 `0` 开始：
 
@@ -282,7 +282,7 @@ rosservice call /call_elevator "{elevator_id: 'elevator_main', target_floor: 0, 
 - `elevator_floor_0`、`elevator_floor_1` 等为各楼层电梯厅门。
 - `elevator_main` 为当前楼栋默认电梯 ID。
 - 电梯厅门默认采用 60 s 缓慢开门或关门过程，控制服务会持续插值更新左右门板位置，`rosservice call /set_door_state` 通常在动作完成后返回。
-- 当前电梯为简化仿真模型，`/call_elevator` 负责移动轿厢到目标楼层；机器人进出轿厢仍由参赛算法通过 `/cmd_vel` 控制。
+- 当前电梯为简化仿真模型，`/call_elevator` 负责移动轿厢到目标楼层；若 A1 位于轿厢范围内，控制服务会同步施加相同的竖直位移。机器人进入和离开轿厢的水平运动仍由参赛算法通过 `/cmd_vel` 控制。
 - `open_doors` 字段记录电梯状态，但楼层电梯厅门建议仍通过 `/set_door_state` 明确开关，便于比赛流程可复现。
 
 ## 结果文件格式

@@ -23,7 +23,18 @@ class BuildingControlRuntimeTest(unittest.TestCase):
                     },
                 }
             ],
-            elevator_specs=[{"id": "elevator_main", "current_floor": 0, "served_floors": [0, 1, 2]}],
+            elevator_specs=[
+                {
+                    "id": "elevator_main",
+                    "current_floor": 0,
+                    "served_floors": [0, 1, 2],
+                    "car_size": [1.9, 2.1, 2.3],
+                    "floor_poses": {
+                        "0": [2.76, 2.6, 1.03, 0.0, 0.0, -1.5708],
+                        "2": [2.76, 2.6, 6.23, 0.0, 0.0, -1.5708],
+                    },
+                }
+            ],
         )
 
         door_result = runtime.set_door_state("elevator_floor_0", False)
@@ -35,6 +46,9 @@ class BuildingControlRuntimeTest(unittest.TestCase):
         self.assertEqual(door_result["panel_poses"]["left_panel"], [0.0, -0.35, 0.0, 0.0, 0.0, 0.0])
         self.assertEqual(elevator_result["current_floor"], 2)
         self.assertEqual(elevator_result["state"], "door_open")
+        self.assertEqual(elevator_result["source_pose"][2], 1.03)
+        self.assertEqual(elevator_result["target_pose"][2], 6.23)
+        self.assertEqual(elevator_result["car_size"], [1.9, 2.1, 2.3])
 
     def test_compose_world_pose_rotates_local_offsets(self) -> None:
         pose = _compose_world_pose(

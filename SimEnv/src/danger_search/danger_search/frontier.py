@@ -63,6 +63,7 @@ class FrontierSelectionDebug:
     final_score: float
     path_length: float
     budget_exhausted_count: int = 0
+    inside_tolerance_count: int = 0
     retained_by_inertia: bool = False
     inertia_reason: str = ""
     previous_target: tuple[float, float] | None = None
@@ -121,6 +122,7 @@ class FrontierExplorer:
         max_planning_candidates: int = 8,
         max_goal_candidates_per_frontier: int = 2,
         max_fallback_planning_candidates: int = 8,
+        goal_tolerance: float = 0.35,
     ):
         self.min_cluster_size = int(min_cluster_size)
         self.blacklist_ttl = float(blacklist_ttl)
@@ -139,6 +141,7 @@ class FrontierExplorer:
         self.max_planning_candidates = max(1, int(max_planning_candidates))
         self.max_goal_candidates_per_frontier = max(1, int(max_goal_candidates_per_frontier))
         self.max_fallback_planning_candidates = max(1, int(max_fallback_planning_candidates))
+        self.goal_tolerance = float(goal_tolerance)
         self._blacklist: dict[tuple[int, int], float] = {}
         self._fail_counts: dict[tuple[int, int], int] = {}
         self.last_selection_debug: FrontierSelectionDebug | None = None
@@ -183,6 +186,7 @@ class FrontierExplorer:
         reachable_count = 0
         context_filtered_count = 0
         budget_exhausted_count = 0
+        inside_tolerance_count = 0
         ranked_frontiers = sorted(
             frontiers,
             key=lambda frontier: self._optimistic_score(frontier, robot_pose),
@@ -216,6 +220,7 @@ class FrontierExplorer:
                 context_adjustment,
                 context_filtered_only,
                 budget_exhausted,
+                inside_tolerance_only,
                 candidate_debug,
             ) = self._resolve_frontier_target(
                 grid,
@@ -232,6 +237,10 @@ class FrontierExplorer:
                 elif budget_exhausted:
                     # 预算耗尽：可能可达，不累计失败，留待下轮地图更新后重试。
                     budget_exhausted_count += 1
+                elif inside_tolerance_only:
+                    # 落点在 controller goal_tolerance 内：不算失败、不拉黑、不屏蔽 cluster。
+                    # 跳过此 frontier，继续尝试其他 frontier。
+                    inside_tolerance_count += 1
                 else:
                     unreachable_count += 1
                     self.record_failure(grid, frontier.centroid)
@@ -287,8 +296,9 @@ class FrontierExplorer:
                 blacklisted_count=blacklisted_count,
                 unreachable_count=unreachable_count,
                 context_filtered_count=context_filtered_count,
-                budget_exhausted_count=budget_exhausted_count,
-                used_fallback=True,
+                    budget_exhausted_count=budget_exhausted_count,
+                    inside_tolerance_count=inside_tolerance_count,
+                    used_fallback=True,
                 frontier=fallback_frontier,
                 path=fallback_path,
                 selection_context=selection_context,
@@ -298,9 +308,10 @@ class FrontierExplorer:
                     blacklisted_count=blacklisted_count,
                     unreachable_count=unreachable_count,
                     context_filtered_count=context_filtered_count,
-                    budget_exhausted_count=budget_exhausted_count,
-                    used_fallback=True,
-                    final_target=final_target,
+                budget_exhausted_count=budget_exhausted_count,
+                inside_tolerance_count=inside_tolerance_count,
+                used_fallback=True,
+                final_target=final_target,
                     final_score=fallback_frontier.score if fallback_frontier is not None else 0.0,
                     path_length=path_length(fallback_path) if fallback_path else 0.0,
                     previous_target=selection_context.current_target if selection_context is not None else None,
@@ -336,6 +347,7 @@ class FrontierExplorer:
             unreachable_count=unreachable_count,
             context_filtered_count=context_filtered_count,
             budget_exhausted_count=budget_exhausted_count,
+            inside_tolerance_count=inside_tolerance_count,
             used_fallback=False,
             frontier=best_frontier,
             path=best_path,
@@ -347,6 +359,7 @@ class FrontierExplorer:
                 unreachable_count=unreachable_count,
                 context_filtered_count=context_filtered_count,
                 budget_exhausted_count=budget_exhausted_count,
+                inside_tolerance_count=inside_tolerance_count,
                 used_fallback=False,
                 final_target=best_frontier.centroid,
                 final_score=best_frontier.score,
@@ -526,7 +539,13 @@ class FrontierExplorer:
                     continue
                 wx, wy = grid.grid_to_world(gx, gy)
                 distance = math.hypot(wx - robot_xy[0], wy - robot_xy[1])
-                if distance < 1.0 or self._is_blacklisted(grid, (wx, wy)):
+                if distance <= self.goal_tolerance:
+                    # 与 controller 完成半径保持一致：过近 fallback 不是规划失败。
+                    continue
+                if distance < 1.0:
+                    # 保留既有 fallback 近距离预筛选，避免重新开放 0.35~1.0m 候选。
+                    continue
+                if self._is_blacklisted(grid, (wx, wy)):
                     continue
                 unknown_neighbors = self._count_neighbor_cells(grid, gx, gy, UNKNOWN)
                 visited_neighbors = self._count_neighbor_cells(grid, gx, gy, VISITED)
@@ -771,6 +790,7 @@ class FrontierExplorer:
         float,
         bool,
         bool,
+        bool,
         FrontierCandidateDebug,
     ]:
         robot_xy = (robot_pose[0], robot_pose[1])
@@ -789,6 +809,7 @@ class FrontierExplorer:
                 [],
                 False,
                 0.0,
+                False,
                 False,
                 False,
                 FrontierCandidateDebug(
@@ -811,6 +832,7 @@ class FrontierExplorer:
         saw_path_attempt = False
         saw_budget_exhausted = False
         saw_unreachable = False
+        saw_inside_tolerance = False
         path_attempt_count = 0
         blacklisted_target_count = 0
         debug_position = candidates[0]
@@ -836,6 +858,9 @@ class FrontierExplorer:
             if skip_target:
                 saw_context_skip = True
                 continue
+            if _world_distance(target_xy, robot_xy) <= self.goal_tolerance:
+                saw_inside_tolerance = True
+                continue
             if path_attempt_count >= self.max_goal_candidates_per_frontier:
                 # 仍可能存在可达落点，因此按预算耗尽处理，不能累计失败或拉黑。
                 saw_budget_exhausted = True
@@ -858,6 +883,7 @@ class FrontierExplorer:
                         result.path,
                         False,
                         0.0,
+                        False,
                         False,
                         False,
                         FrontierCandidateDebug(
@@ -896,6 +922,7 @@ class FrontierExplorer:
                 best_choice[2],
                 False,
                 False,
+                False,
                 FrontierCandidateDebug(
                     position=best_choice[0],
                     cluster_size=len(frontier.cells),
@@ -913,6 +940,13 @@ class FrontierExplorer:
         # 没有可达候选：若全是预算耗尽，则不视为不可达，避免误黑名单。
         blacklisted_only = not saw_non_blacklisted
         context_filtered_only = saw_context_skip and not saw_budget_exhausted and not saw_unreachable
+        inside_tolerance_only = (
+            saw_inside_tolerance
+            and not blacklisted_only
+            and not context_filtered_only
+            and not saw_budget_exhausted
+            and not saw_unreachable
+        )
         if last_path_position is not None:
             debug_position = last_path_position
             debug_context_adjustment = last_path_context_adjustment
@@ -931,6 +965,10 @@ class FrontierExplorer:
             rejection_reason = "planning_budget_exhausted"
             reachability_result = "budget_exhausted"
             blacklist_status = "partial" if blacklisted_target_count else "not_blacklisted"
+        elif inside_tolerance_only:
+            rejection_reason = "inside_goal_tolerance"
+            reachability_result = "inside_goal_tolerance"
+            blacklist_status = "partial" if blacklisted_target_count else "not_blacklisted"
         else:
             rejection_reason = "unreachable"
             reachability_result = UNREACHABLE
@@ -942,6 +980,7 @@ class FrontierExplorer:
             0.0,
             context_filtered_only,
             saw_budget_exhausted,
+            inside_tolerance_only,
             FrontierCandidateDebug(
                 position=debug_position,
                 cluster_size=len(frontier.cells),
@@ -1260,6 +1299,7 @@ class FrontierExplorer:
         unreachable_count: int,
         context_filtered_count: int,
         budget_exhausted_count: int,
+        inside_tolerance_count: int,
         used_fallback: bool,
         frontier: Frontier | None,
         path: list[tuple[float, float]],

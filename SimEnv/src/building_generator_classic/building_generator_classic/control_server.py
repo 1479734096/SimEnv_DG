@@ -13,6 +13,7 @@ door_config.yaml 和 elevator_config.yaml。
 from __future__ import annotations
 
 import argparse
+import json
 import math
 from pathlib import Path
 import time
@@ -21,11 +22,12 @@ from building_generator_classic.control_runtime import BuildingControlRuntime
 import yaml
 
 DEFAULT_DOOR_ANIMATION_RATE_HZ = 10.0
+DEFAULT_ELEVATOR_PASSENGER_MODEL = "a1_gazebo"
 
 
 def main(argv: list[str] | None = None) -> int:
     import rospy
-    from gazebo_msgs.srv import SetLinkState, SetModelState
+    from gazebo_msgs.srv import GetModelState, SetLinkState, SetModelState
     from building_generator_interfaces.srv import (
         CallElevator,
         CallElevatorResponse,
@@ -41,12 +43,20 @@ def main(argv: list[str] | None = None) -> int:
     # 等 Gazebo 服务可用后再注册本节点服务；否则第一次请求可能无法应用到模型。
     rospy.wait_for_service("/gazebo/set_model_state")
     rospy.wait_for_service("/gazebo/set_link_state")
+    rospy.wait_for_service("/gazebo/get_model_state")
     set_model_state = rospy.ServiceProxy("/gazebo/set_model_state", SetModelState)
     set_link_state = rospy.ServiceProxy("/gazebo/set_link_state", SetLinkState)
+    get_model_state = rospy.ServiceProxy("/gazebo/get_model_state", GetModelState)
     rospy.Service(
         "call_elevator",
         CallElevator,
-        lambda request: _handle_call_elevator(runtime, request, CallElevatorResponse, set_model_state),
+        lambda request: _handle_call_elevator(
+            runtime,
+            request,
+            CallElevatorResponse,
+            set_model_state,
+            get_model_state,
+        ),
     )
     rospy.Service(
         "set_door_state",
@@ -75,22 +85,149 @@ def _load_runtime(door_config_path: str, elevator_config_path: str) -> BuildingC
     )
 
 
-def _handle_call_elevator(runtime: BuildingControlRuntime, request, response_type, set_model_state):
+def _handle_call_elevator(
+    runtime: BuildingControlRuntime,
+    request,
+    response_type,
+    set_model_state,
+    get_model_state=None,
+):
     """ROS /call_elevator 服务处理函数。"""
     result = runtime.call_elevator(
         request.elevator_id,
         request.target_floor,
         request.open_doors,
     )
+    passenger_state = None
+    passenger_lookup_success = False
+    passenger_inside_elevator = False
+    passenger_before_xyz = None
+    if (
+        result.get("accepted")
+        and result.get("source_pose")
+        and result.get("target_pose")
+        and result.get("car_size")
+        and get_model_state is not None
+    ):
+        try:
+            candidate = get_model_state(DEFAULT_ELEVATOR_PASSENGER_MODEL, "world")
+            passenger_lookup_success = bool(getattr(candidate, "success", True))
+            if passenger_lookup_success:
+                passenger_before_xyz = [
+                    float(candidate.pose.position.x),
+                    float(candidate.pose.position.y),
+                    float(candidate.pose.position.z),
+                ]
+                passenger_inside_elevator = _passenger_is_inside_elevator(
+                    candidate.pose,
+                    result["source_pose"],
+                    result["car_size"],
+                )
+                if passenger_inside_elevator:
+                    passenger_state = candidate
+        except Exception as exc:
+            import rospy
+
+            rospy.logwarn("读取电梯乘客状态失败，轿厢仍按原逻辑移动: %s", exc)
+
     # 逻辑请求通过后，把电梯轿厢模型移动到目标楼层。
+    transport_applied = False
+    passenger_requested_after_z = None
     if result.get("accepted") and result.get("target_pose"):
         _apply_model_pose(set_model_state, result["model_name"], result["target_pose"])
+        if passenger_state is not None:
+            z_offset = float(result["target_pose"][2]) - float(result["source_pose"][2])
+            passenger_requested_after_z = float(passenger_state.pose.position.z) + z_offset
+            _apply_model_z_offset(
+                set_model_state,
+                DEFAULT_ELEVATOR_PASSENGER_MODEL,
+                passenger_state,
+                z_offset,
+            )
+            transport_applied = True
+            import rospy
+
+            rospy.loginfo(
+                "电梯已同步运输乘客模型: model=%s z_offset=%.3f",
+                DEFAULT_ELEVATOR_PASSENGER_MODEL,
+                z_offset,
+            )
+    if result.get("accepted"):
+        import rospy
+
+        rospy.loginfo(
+            "%s",
+            json.dumps(
+                {
+                    "event": "elevator_transport",
+                    "elevator_id": request.elevator_id,
+                    "target_floor": int(request.target_floor),
+                    "source_z": (
+                        float(result["source_pose"][2])
+                        if result.get("source_pose")
+                        else None
+                    ),
+                    "target_z": (
+                        float(result["target_pose"][2])
+                        if result.get("target_pose")
+                        else None
+                    ),
+                    "passenger_model": DEFAULT_ELEVATOR_PASSENGER_MODEL,
+                    "passenger_lookup_success": passenger_lookup_success,
+                    "passenger_inside_elevator": passenger_inside_elevator,
+                    "passenger_before_xyz": passenger_before_xyz,
+                    "passenger_requested_after_z": passenger_requested_after_z,
+                    "transport_applied": transport_applied,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
     return response_type(
         accepted=bool(result["accepted"]),
         current_floor=int(result["current_floor"]),
         state=str(result["state"]),
         message=str(result["message"]),
     )
+
+
+def _passenger_is_inside_elevator(
+    passenger_pose,
+    elevator_pose: list[float],
+    car_size: list[float],
+    margin: float = 0.12,
+) -> bool:
+    """按轿厢局部坐标判断机器人是否位于轿厢内部。"""
+    if len(elevator_pose) < 6 or len(car_size) < 3:
+        return False
+    yaw = float(elevator_pose[5])
+    dx = float(passenger_pose.position.x) - float(elevator_pose[0])
+    dy = float(passenger_pose.position.y) - float(elevator_pose[1])
+    dz = float(passenger_pose.position.z) - float(elevator_pose[2])
+    local_x = math.cos(yaw) * dx + math.sin(yaw) * dy
+    local_y = -math.sin(yaw) * dx + math.cos(yaw) * dy
+    horizontal_margin = max(0.0, float(margin))
+    vertical_margin = 0.25
+    return bool(
+        abs(local_x) <= float(car_size[0]) / 2.0 + horizontal_margin
+        and abs(local_y) <= float(car_size[1]) / 2.0 + horizontal_margin
+        and -float(car_size[2]) / 2.0 - vertical_margin
+        <= dz
+        <= float(car_size[2]) / 2.0 + vertical_margin
+    )
+
+
+def _apply_model_z_offset(set_model_state, model_name: str, source_state, z_offset: float) -> None:
+    """保留乘客姿态与速度，只施加与轿厢一致的竖直位移。"""
+    from gazebo_msgs.msg import ModelState
+
+    model_state = ModelState()
+    model_state.model_name = model_name
+    model_state.reference_frame = "world"
+    model_state.pose = source_state.pose
+    model_state.pose.position.z += float(z_offset)
+    model_state.twist = source_state.twist
+    set_model_state(model_state)
 
 
 def _handle_set_door_state(runtime: BuildingControlRuntime, request, response_type, set_model_state, set_link_state):

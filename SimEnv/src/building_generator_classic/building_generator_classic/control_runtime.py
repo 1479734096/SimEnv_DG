@@ -31,6 +31,7 @@ class ElevatorState:
     model_name: str
     current_floor: int
     served_floors: list[int]
+    car_size: list[float]
     floor_poses: dict[int, list[float]]
     state: str = "idle"
     doors_open: bool = False
@@ -66,6 +67,7 @@ class BuildingControlRuntime:
                 model_name=str(spec.get("model_name", f"dynamic_{spec['id']}")),
                 current_floor=int(spec.get("current_floor", 0)),
                 served_floors=[int(value) for value in spec.get("served_floors", [])],
+                car_size=[float(value) for value in spec.get("car_size", [0.0, 0.0, 0.0])],
                 floor_poses={
                     int(key): [float(value) for value in pose]
                     for key, pose in (spec.get("floor_poses", {}) or {}).items()
@@ -125,6 +127,7 @@ class BuildingControlRuntime:
                 "message": f"floor {target_floor} is not served by '{elevator_id}'",
             }
 
+        source_pose = state.floor_poses.get(state.current_floor)
         state.state = "moving" if target_floor != state.current_floor else "idle"
         state.current_floor = target_floor
         state.doors_open = bool(open_doors)
@@ -135,5 +138,7 @@ class BuildingControlRuntime:
             "state": state.state,
             "message": f"elevator '{elevator_id}' moved to floor {target_floor}",
             "model_name": state.model_name,
+            "source_pose": source_pose,
             "target_pose": state.floor_poses.get(state.current_floor),
+            "car_size": list(state.car_size),
         }

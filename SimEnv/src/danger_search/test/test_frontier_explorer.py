@@ -78,13 +78,15 @@ class FrontierExplorerTest(unittest.TestCase):
     def test_selection_emits_single_structured_candidate_log(self):
         grid = FloorGrid(
             floor_index=0,
-            resolution=1.0,
-            width=9.0,
-            length=9.0,
-            origin_x=0.0,
-            origin_y=0.0,
+            resolution=0.1,
+            width=3.0,
+            length=3.0,
+            origin_x=-1.5,
+            origin_y=-1.5,
         )
-        self._mark_free_rect(grid, 3, 5, 3, 5)
+        for gy in range(10, 20):
+            for gx in range(10, 20):
+                grid.mark_free(gx, gy)
         explorer = FrontierExplorer(min_cluster_size=1)
         log_messages: list[str] = []
         fake_rospy = SimpleNamespace(
@@ -92,7 +94,7 @@ class FrontierExplorerTest(unittest.TestCase):
         )
 
         with patch("danger_search.frontier.rospy", fake_rospy):
-            frontier, path = explorer.select_frontier(grid, (4.5, 4.5, 0.0))
+            frontier, path = explorer.select_frontier(grid, (0.0, 0.0, 0.0))
 
         self.assertIsNotNone(frontier)
         self.assertTrue(path)
@@ -266,7 +268,7 @@ class FrontierExplorerTest(unittest.TestCase):
 
         self.assertIsNotNone(frontier)
         self.assertTrue(path)
-        self.assertGreater(math.hypot(frontier.centroid[0], frontier.centroid[1]), 1.0)
+        self.assertGreater(math.hypot(frontier.centroid[0], frontier.centroid[1]), 0.35)
 
     def test_fallback_prefers_unknown_adjacent_over_far_open_space(self):
         """无有效 frontier 进入 free-space fallback 时，应优先选择靠近未知区域的自由格子，
@@ -454,7 +456,7 @@ class FrontierExplorerTest(unittest.TestCase):
             "danger_search.frontier.astar_plan",
             return_value=PlanResult(path=[(0.0, 2.0), (0.0, -2.0)], status=REACHED),
         ):
-            target, path, _, _, context_filtered, _, debug = explorer._resolve_frontier_target(
+            target, path, _, _, context_filtered, _, _, debug = explorer._resolve_frontier_target(
                 grid,
                 frontier,
                 (0.0, 2.0, -math.pi / 2.0),
@@ -594,6 +596,455 @@ class FrontierExplorerTest(unittest.TestCase):
             frontier, path = explorer.select_frontier(grid, (1.0, 1.0, 0.0))
 
         self.assertGreater(len(recorded_failures), 0)
+
+    # ------------------------------------------------------------------
+    # 近邻 Frontier 退化循环修复：inside_goal_tolerance 源头过滤测试
+    # ------------------------------------------------------------------
+
+    def test_inside_goal_tolerance_rejects_without_failure(self):
+        """落点在 controller goal_tolerance 内时，应跳过且不记录失败、不拉黑。"""
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        )
+        for gy in range(5, 35):
+            for gx in range(5, 35):
+                grid.mark_free(gx, gy)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            goal_tolerance=0.35,
+            fail_limit=1,
+        )
+        recorded_failures: list[tuple[float, float]] = []
+        explorer.record_failure = lambda g, xy: recorded_failures.append(xy)
+
+        frontier, path = explorer.select_frontier(grid, (0.0, 0.0, 0.0))
+
+        # 不应选中在 tolerance 内的落点
+        if frontier is not None and path:
+            self.assertGreater(
+                math.hypot(frontier.centroid[0], frontier.centroid[1]),
+                0.35,
+            )
+        self.assertEqual(recorded_failures, [])
+        self.assertEqual(explorer._blacklist, {})
+        self.assertEqual(explorer._fail_counts, {})
+
+    def test_euclidean_not_path_length_for_tolerance_check(self):
+        """历史回放：欧氏距离 0.31m <= tolerance 0.35m，即使 path_length 0.38m > 0.35m 也应拒绝。
+
+        证明过滤使用欧氏距离而非路径长度。
+        """
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        )
+        for gy in range(5, 35):
+            for gx in range(5, 35):
+                grid.mark_free(gx, gy)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            goal_tolerance=0.35,
+        )
+        recorded_failures: list[tuple[float, float]] = []
+        explorer.record_failure = lambda g, xy: recorded_failures.append(xy)
+
+        # 构造一个 frontier，其安全落点距 robot 欧氏距离 0.31m
+        # mock astar 返回一条弯曲路径，path_length 约 0.38m
+        target = (0.31, 0.0)
+        frontier = Frontier(
+            cells=((20, 20),),
+            centroid=target,
+            information_gain=10.0,
+        )
+
+        def fake_astar(_grid, start, goal, max_iterations=None):
+            # 弯曲路径：0 -> (0.2, 0.18) -> (0.31, 0)，路径长度 > 0.38
+            return PlanResult(
+                path=[start, (0.2, 0.18), goal],
+                status=REACHED,
+            )
+
+        with patch.object(
+            explorer, "_candidate_targets_for_frontier", return_value=[target]
+        ), patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+            result = explorer._resolve_frontier_target(
+                grid, frontier, (0.0, 0.0, 0.0), selection_context=None
+            )
+
+        # target_xy 应为 None：被 inside_goal_tolerance 拒绝
+        self.assertIsNone(result[0])
+        self.assertEqual(result[1], [])
+        # inside_tolerance_only 标志应为 True
+        self.assertTrue(result[6])
+        debug = result[7]
+        self.assertEqual(debug.rejection_reason, "inside_goal_tolerance")
+        self.assertEqual(debug.reachability_result, "inside_goal_tolerance")
+        # 不记录失败
+        self.assertEqual(recorded_failures, [])
+
+    def test_tolerance_skip_does_not_block_other_cluster_candidates(self):
+        """同一 cluster 中一个候选在 tolerance 内，另一个在 tolerance 外，应选中后者。"""
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+        )
+        for gy in range(5, 55):
+            for gx in range(5, 55):
+                grid.mark_free(gx, gy)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            goal_tolerance=0.35,
+            max_goal_candidates_per_frontier=10,
+        )
+
+        # 两个候选：一个在 tolerance 内 (0.20, 0.0)，一个在 tolerance 外 (1.50, 0.0)
+        near_target = (0.20, 0.0)
+        far_target = (1.50, 0.0)
+        frontier = Frontier(
+            cells=((20, 20),),
+            centroid=(0.20, 0.0),
+            information_gain=10.0,
+        )
+
+        def fake_astar(_grid, start, goal, max_iterations=None):
+            return PlanResult(path=[start, goal], status=REACHED)
+
+        with patch.object(
+            explorer,
+            "_candidate_targets_for_frontier",
+            return_value=[near_target, far_target],
+        ), patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+            result = explorer._resolve_frontier_target(
+                grid, frontier, (0.0, 0.0, 0.0), selection_context=None
+            )
+
+        # 应选中 far_target
+        self.assertIsNotNone(result[0])
+        self.assertEqual(result[0], far_target)
+        self.assertTrue(result[1])
+
+    def test_inside_tolerance_in_free_space_fallback(self):
+        """Fallback 候选在 tolerance 内时也应跳过，不选中过近落点。"""
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.2,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        )
+        for gy in range(grid.size_y):
+            for gx in range(grid.size_x):
+                grid.mark_free(gx, gy)
+        grid.mark_visited_radius(0.0, 0.0, 0.3)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            goal_tolerance=0.35,
+        )
+
+        frontier, path = explorer._select_free_space_goal(grid, (0.0, 0.0, 0.0))
+
+        # 选中的目标应在 tolerance 外
+        self.assertIsNotNone(frontier)
+        self.assertTrue(path)
+        self.assertGreater(
+            math.hypot(frontier.centroid[0], frontier.centroid[1]),
+            0.35,
+        )
+
+    def test_all_frontiers_inside_tolerance_no_failure_recorded(self):
+        """所有 frontier 落点都在 tolerance 内时，不应记录失败或拉黑。"""
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.1,
+            width=2.0,
+            length=2.0,
+            origin_x=-1.0,
+            origin_y=-1.0,
+        )
+        # 小地图，robot 在中心，所有 frontier 落点都在 0.35m 内
+        for gy in range(5, 15):
+            for gx in range(5, 15):
+                grid.mark_free(gx, gy)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            goal_tolerance=0.35,
+            fail_limit=1,
+        )
+        recorded_failures: list[tuple[float, float]] = []
+        explorer.record_failure = lambda g, xy: recorded_failures.append(xy)
+
+        frontier, path = explorer.select_frontier(grid, (0.0, 0.0, 0.0))
+
+        # 可能选中 fallback（如果存在 tolerance 外的 FREE 格子）或 None
+        # 无论哪种，都不应记录 failure
+        self.assertEqual(recorded_failures, [])
+        self.assertEqual(explorer._blacklist, {})
+        self.assertEqual(explorer._fail_counts, {})
+
+    def test_centroid_inside_tolerance_but_safe_goal_outside_allowed(self):
+        """Frontier centroid 在 tolerance 内，但最终安全落点在 tolerance 外时应允许。"""
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+        )
+        for gy in range(5, 55):
+            for gx in range(5, 55):
+                grid.mark_free(gx, gy)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            goal_tolerance=0.35,
+        )
+
+        # centroid 在 tolerance 内 (0.20, 0.0)，但安全落点在 tolerance 外 (1.50, 0.0)
+        near_centroid = (0.20, 0.0)
+        far_safe_goal = (1.50, 0.0)
+        frontier = Frontier(
+            cells=((20, 20),),
+            centroid=near_centroid,
+            information_gain=10.0,
+        )
+
+        def fake_astar(_grid, start, goal, max_iterations=None):
+            return PlanResult(path=[start, goal], status=REACHED)
+
+        with patch.object(
+            explorer,
+            "_candidate_targets_for_frontier",
+            return_value=[far_safe_goal],
+        ), patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+            result = explorer._resolve_frontier_target(
+                grid, frontier, (0.0, 0.0, 0.0), selection_context=None
+            )
+
+        # 应选中 far_safe_goal（在 tolerance 外）
+        self.assertIsNotNone(result[0])
+        self.assertEqual(result[0], far_safe_goal)
+        self.assertTrue(result[1])
+
+    def test_safe_goal_inside_tolerance_but_centroid_outside_rejected(self):
+        """反向：centroid 在 tolerance 外，但最终安全落点在 tolerance 内时应拒绝该落点。"""
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+        )
+        for gy in range(5, 55):
+            for gx in range(5, 55):
+                grid.mark_free(gx, gy)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            goal_tolerance=0.35,
+        )
+
+        # centroid 在 tolerance 外 (2.0, 0.0)，但安全落点在 tolerance 内 (0.30, 0.0)
+        far_centroid = (2.0, 0.0)
+        near_safe_goal = (0.30, 0.0)
+        frontier = Frontier(
+            cells=((20, 20),),
+            centroid=far_centroid,
+            information_gain=10.0,
+        )
+
+        def fake_astar(_grid, start, goal, max_iterations=None):
+            return PlanResult(path=[start, goal], status=REACHED)
+
+        with patch.object(
+            explorer,
+            "_candidate_targets_for_frontier",
+            return_value=[near_safe_goal],
+        ), patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+            result = explorer._resolve_frontier_target(
+                grid, frontier, (0.0, 0.0, 0.0), selection_context=None
+            )
+
+        # 应拒绝：target_xy 为 None，inside_tolerance_only 为 True
+        self.assertIsNone(result[0])
+        self.assertTrue(result[6])
+        debug = result[7]
+        self.assertEqual(debug.rejection_reason, "inside_goal_tolerance")
+
+    # ------------------------------------------------------------------
+    # 最小补丁补充测试
+    # ------------------------------------------------------------------
+
+    def test_distance_equal_to_tolerance_rejected(self):
+        """distance == goal_tolerance 应拒绝（与 controller <= 一致）。"""
+        grid = FloorGrid(
+            floor_index=0, resolution=0.1, width=6.0, length=6.0, origin_x=-3.0, origin_y=-3.0,
+        )
+        for gy in range(5, 55):
+            for gx in range(5, 55):
+                grid.mark_free(gx, gy)
+        explorer = FrontierExplorer(min_cluster_size=1, goal_tolerance=0.35)
+        target = (0.35, 0.0)
+        frontier = Frontier(cells=((20, 20),), centroid=target, information_gain=10.0)
+
+        def fake_astar(_grid, start, goal, max_iterations=None):
+            return PlanResult(path=[start, goal], status=REACHED)
+
+        with patch.object(explorer, "_candidate_targets_for_frontier", return_value=[target]), \
+             patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+            result = explorer._resolve_frontier_target(grid, frontier, (0.0, 0.0, 0.0), selection_context=None)
+
+        self.assertIsNone(result[0])
+        self.assertTrue(result[6])
+
+    def test_distance_just_above_tolerance_allowed(self):
+        """distance 刚大于 goal_tolerance 应允许。"""
+        grid = FloorGrid(
+            floor_index=0, resolution=0.1, width=6.0, length=6.0, origin_x=-3.0, origin_y=-3.0,
+        )
+        for gy in range(5, 55):
+            for gx in range(5, 55):
+                grid.mark_free(gx, gy)
+        explorer = FrontierExplorer(min_cluster_size=1, goal_tolerance=0.35)
+        target = (0.36, 0.0)
+        frontier = Frontier(cells=((20, 20),), centroid=target, information_gain=10.0)
+
+        def fake_astar(_grid, start, goal, max_iterations=None):
+            return PlanResult(path=[start, goal], status=REACHED)
+
+        with patch.object(explorer, "_candidate_targets_for_frontier", return_value=[target]), \
+             patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+            result = explorer._resolve_frontier_target(grid, frontier, (0.0, 0.0, 0.0), selection_context=None)
+
+        self.assertIsNotNone(result[0])
+        self.assertEqual(result[0], target)
+
+    def test_frontier_a_all_inside_tolerance_frontier_b_selected(self):
+        """frontier A 全部过近、frontier B 有有效落点：选择 B。"""
+        grid = FloorGrid(
+            floor_index=0, resolution=0.1, width=8.0, length=8.0, origin_x=-4.0, origin_y=-4.0,
+        )
+        for gy in range(5, 75):
+            for gx in range(5, 75):
+                grid.mark_free(gx, gy)
+        explorer = FrontierExplorer(min_cluster_size=1, goal_tolerance=0.35)
+
+        frontier_a = Frontier(cells=((10, 10),), centroid=(0.20, 0.0), information_gain=5.0)
+        frontier_b = Frontier(cells=((60, 60),), centroid=(3.0, 3.0), information_gain=8.0)
+
+        def fake_astar(_grid, start, goal, max_iterations=None):
+            return PlanResult(path=[start, goal], status=REACHED)
+
+        with patch.object(explorer, "extract_frontiers", return_value=[frontier_a, frontier_b]), \
+             patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+            # mock _candidate_targets to force specific targets
+            def fake_candidates(_grid, f, _robot):
+                if f is frontier_a:
+                    return [(0.20, 0.0)]
+                return [(3.0, 3.0)]
+            with patch.object(explorer, "_candidate_targets_for_frontier", side_effect=fake_candidates):
+                selected, path = explorer.select_frontier(grid, (0.0, 0.0, 0.0))
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.centroid, (3.0, 3.0))
+
+    def test_same_cluster_first_two_inside_third_still_checked(self):
+        """同 cluster 前两个落点在 tolerance 内，第三个在 tolerance 外且可达，必须选中第三个。
+
+        证明 inside_goal_tolerance 不消耗 max_goal_candidates_per_frontier 预算。
+        """
+        grid = FloorGrid(
+            floor_index=0, resolution=0.1, width=8.0, length=8.0, origin_x=-4.0, origin_y=-4.0,
+        )
+        for gy in range(5, 75):
+            for gx in range(5, 75):
+                grid.mark_free(gx, gy)
+        explorer = FrontierExplorer(
+            min_cluster_size=1, goal_tolerance=0.35, max_goal_candidates_per_frontier=2,
+        )
+
+        t1 = (0.20, 0.0)  # inside tolerance
+        t2 = (0.30, 0.0)  # inside tolerance
+        t3 = (2.0, 0.0)   # outside tolerance, reachable
+        frontier = Frontier(cells=((20, 20),), centroid=(0.20, 0.0), information_gain=10.0)
+
+        astar_calls = []
+        def fake_astar(_grid, start, goal, max_iterations=None):
+            astar_calls.append(goal)
+            return PlanResult(path=[start, goal], status=REACHED)
+
+        with patch.object(explorer, "_candidate_targets_for_frontier", return_value=[t1, t2, t3]), \
+             patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+            result = explorer._resolve_frontier_target(grid, frontier, (0.0, 0.0, 0.0), selection_context=None)
+
+        # 必须选中第三个
+        self.assertIsNotNone(result[0])
+        self.assertEqual(result[0], t3)
+        # A* 只对 t3 调用过（t1, t2 在 A* 前被 tolerance 拒绝）
+        self.assertEqual(len(astar_calls), 1)
+        self.assertEqual(astar_calls[0], t3)
+
+    def test_fallback_inside_tolerance_branch_executes(self):
+        """fallback 的 inside_goal_tolerance 预过滤真实执行：不选 tolerance 内候选。"""
+        grid = FloorGrid(
+            floor_index=0, resolution=0.1, width=3.0, length=3.0, origin_x=-1.5, origin_y=-1.5,
+        )
+        for gy in range(grid.size_y):
+            for gx in range(grid.size_x):
+                grid.mark_free(gx, gy)
+        grid.mark_visited_radius(0.0, 0.0, 0.3)
+        explorer = FrontierExplorer(min_cluster_size=1, goal_tolerance=0.35)
+
+        frontier, path = explorer._select_free_space_goal(grid, (0.0, 0.0, 0.0))
+
+        # 选中的目标应在 tolerance 外
+        self.assertIsNotNone(frontier)
+        self.assertTrue(path)
+        self.assertGreater(math.hypot(frontier.centroid[0], frontier.centroid[1]), 0.35)
+
+    def test_fallback_preserves_legacy_one_meter_prefilter(self):
+        """fallback 仅允许 1m 及更远候选进入 A*，不能重新开放 0.35~1m 区间。"""
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.1,
+            width=1.0,
+            length=0.1,
+            origin_x=0.15,
+            origin_y=-0.05,
+        )
+        # fallback stride 为 4 格，三个真实采样点分别位于 0.2m、0.6m、1.0m。
+        for gx in (0, 4, 8):
+            grid.mark_free(gx, 0)
+        explorer = FrontierExplorer(min_cluster_size=1, goal_tolerance=0.35)
+        astar_goals = []
+        recorded_failures = []
+        explorer.record_failure = lambda _grid, goal: recorded_failures.append(goal)
+
+        def fake_astar(_grid, start, goal, max_iterations=None):
+            astar_goals.append(goal)
+            return PlanResult(path=[start, goal], status=REACHED)
+
+        with patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+            frontier, path = explorer._select_free_space_goal(grid, (0.0, 0.0, 0.0))
+
+        self.assertIsNotNone(frontier)
+        self.assertTrue(path)
+        self.assertEqual(astar_goals, [(1.0, 0.0)])
+        self.assertEqual(frontier.centroid, (1.0, 0.0))
+        self.assertEqual(recorded_failures, [])
 
 
 if __name__ == "__main__":

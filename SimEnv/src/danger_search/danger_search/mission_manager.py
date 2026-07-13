@@ -5,7 +5,7 @@ import json
 import math
 import os
 from collections import deque
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 import time
 
@@ -45,6 +45,31 @@ WRITE_RESULT = "WRITE_RESULT"
 FINISH = "FINISH"
 MISSION_FAILED = "FAILED"
 PROBE_LATERAL_OFFSETS = (0.0, -1.0, 1.0, -2.0, 2.0)
+FLOOR_ALIGNMENT_REQUIRED_ODOM_SAMPLES = 2
+
+
+@dataclass
+class _FloorTransitionGuard:
+    """电梯换层期间 floor-scoped 点云处理的锁存诊断状态。"""
+
+    entered_at: float
+    enter_odom_stamp: float | None
+    source_floor: int
+    enter_estimated_floor: int
+    target_floor: int | None
+    enter_phase: str | None
+    last_mismatch_odom_stamp: float | None
+    alignment_floor: int | None = None
+    alignment_sample_count: int = 0
+    last_alignment_odom_stamp: float | None = None
+    task_exit_at: float | None = None
+    timeout_reported: bool = False
+    skipped_cloud_count: int = 0
+    first_skipped_at: float | None = None
+    last_skipped_at: float | None = None
+    first_skipped_cloud_stamp: float | None = None
+    last_skipped_cloud_stamp: float | None = None
+    last_skip_log_key: tuple[int, int, str | None] | None = None
 
 
 class _ProgressMonitor:
@@ -191,6 +216,7 @@ class MissionManager:
         self._change_phase: str | None = None
         self._no_frontier_scan_until = 0.0
         self._no_reachable_frontier_confirmations = 0
+        self._last_no_frontier_signature = None
         self._floor_timeout_logged = False
         self._last_status_publish = 0.0
         self._probe_attempt = 0
@@ -215,6 +241,9 @@ class MissionManager:
         self._timeout_triggered = False
         self._failure_reasons: list[str] = []
         self._last_pose: tuple[float, float, float] | None = None
+        self._last_xyz: tuple[float, float, float] | None = None
+        self._last_floor_alignment_mismatch_key = None
+        self._floor_transition_guard: _FloorTransitionGuard | None = None
         self._max_home_distance = 0.0
         self.manual_goal: tuple[float, float] | None = None
         self.manual_mode = False
@@ -441,6 +470,7 @@ class MissionManager:
             "max_fallback_planning_candidates": int(
                 _param("frontier/max_fallback_planning_candidates", 8)
             ),
+            "goal_tolerance": float(_param("controller/goal_tolerance", 0.35)),
         }
         self.frontier_switch_score_margin = float(_param("frontier/switch_score_margin", 2.0))
         self.frontier_current_region_radius = float(_param("frontier/current_region_radius", 1.2))
@@ -566,6 +596,7 @@ class MissionManager:
             self.controller.stop()
             return
 
+        self._last_xyz = xyz
         self._update_pose_progress(pose)
         self._update_mapping_and_detection(snapshot, pose, xyz)
 
@@ -647,32 +678,272 @@ class MissionManager:
         elif self.state == RETURN_HOME:
             self._tick_return_home(pose)
 
+    def _floor_scoped_updates_are_blocked(self, snapshot, estimated_floor: int) -> bool:
+        """更新换层锁存，并返回当前 tick 是否应暂停楼层相关点云处理。"""
+        current_floor = int(self.current_floor)
+        current_task = getattr(self, "current_task", None)
+        guard = getattr(self, "_floor_transition_guard", None)
+        if guard is None and not (
+            isinstance(current_task, TakeElevator)
+            and int(estimated_floor) != current_floor
+        ):
+            return False
+
+        odom_stamp = _message_stamp_seconds(getattr(snapshot, "odom_msg", None))
+        if odom_stamp is not None and not math.isfinite(odom_stamp):
+            odom_stamp = None
+        now = float(self._elapsed())
+
+        if guard is None:
+            target_floor = getattr(current_task, "target_floor", getattr(self, "target_floor", None))
+            guard = _FloorTransitionGuard(
+                entered_at=now,
+                enter_odom_stamp=odom_stamp,
+                source_floor=current_floor,
+                enter_estimated_floor=int(estimated_floor),
+                target_floor=int(target_floor) if target_floor is not None else None,
+                enter_phase=getattr(current_task, "phase", None),
+                last_mismatch_odom_stamp=odom_stamp,
+            )
+            self._floor_transition_guard = guard
+            self._log_structured(
+                {
+                    "event": "floor_transition_ambiguous_enter",
+                    "enter_time": round(now, 3),
+                    "enter_reason": "take_elevator_floor_mismatch",
+                    "source_floor": guard.source_floor,
+                    "current_floor": current_floor,
+                    "mapper_estimated_floor": int(estimated_floor),
+                    "target_floor": guard.target_floor,
+                    "current_task": current_task.name,
+                    "current_task_phase": guard.enter_phase,
+                    "odom_stamp": odom_stamp,
+                    "floor_transition_ambiguous": True,
+                }
+            )
+
+        if not isinstance(current_task, TakeElevator) and guard.task_exit_at is None:
+            guard.task_exit_at = now
+
+        if int(estimated_floor) != current_floor:
+            guard.alignment_floor = None
+            guard.alignment_sample_count = 0
+            guard.last_alignment_odom_stamp = None
+            if odom_stamp is not None and (
+                guard.last_mismatch_odom_stamp is None
+                or odom_stamp > guard.last_mismatch_odom_stamp
+            ):
+                guard.last_mismatch_odom_stamp = odom_stamp
+            return True
+
+        freshness_floor = guard.last_mismatch_odom_stamp
+        if freshness_floor is None:
+            freshness_floor = guard.enter_odom_stamp
+        odom_is_fresh = (
+            odom_stamp is not None
+            and (freshness_floor is None or odom_stamp > freshness_floor)
+        )
+        if guard.alignment_floor != current_floor:
+            guard.alignment_floor = current_floor
+            guard.alignment_sample_count = 0
+            guard.last_alignment_odom_stamp = None
+        if odom_is_fresh and (
+            guard.last_alignment_odom_stamp is None
+            or odom_stamp > guard.last_alignment_odom_stamp
+        ):
+            guard.alignment_sample_count += 1
+            guard.last_alignment_odom_stamp = odom_stamp
+
+        if guard.alignment_sample_count < FLOOR_ALIGNMENT_REQUIRED_ODOM_SAMPLES:
+            return True
+
+        self._log_structured(
+            {
+                "event": "floor_transition_ambiguous_exit",
+                "enter_time": round(guard.entered_at, 3),
+                "exit_time": round(now, 3),
+                "exit_reason": "fresh_odom_floor_alignment_confirmed",
+                "duration": round(max(0.0, now - guard.entered_at), 3),
+                "source_floor": guard.source_floor,
+                "current_floor": current_floor,
+                "mapper_estimated_floor": int(estimated_floor),
+                "target_floor": guard.target_floor,
+                "enter_phase": guard.enter_phase,
+                "current_task_phase": getattr(current_task, "phase", None),
+                "alignment_odom_samples": guard.alignment_sample_count,
+                "last_alignment_odom_stamp": guard.last_alignment_odom_stamp,
+                "skipped_cloud_count": guard.skipped_cloud_count,
+                "first_skipped_at": guard.first_skipped_at,
+                "last_skipped_at": guard.last_skipped_at,
+                "first_skipped_cloud_stamp": guard.first_skipped_cloud_stamp,
+                "last_skipped_cloud_stamp": guard.last_skipped_cloud_stamp,
+                "floor_transition_ambiguous": False,
+            }
+        )
+        self._floor_transition_guard = None
+        return False
+
+    def _record_skipped_floor_scoped_update(
+        self,
+        *,
+        cloud_stamp: float | None,
+        estimated_floor: int,
+    ) -> None:
+        guard = getattr(self, "_floor_transition_guard", None)
+        if guard is None:
+            return
+        now = float(self._elapsed())
+        guard.skipped_cloud_count += 1
+        if guard.first_skipped_at is None:
+            guard.first_skipped_at = now
+            guard.first_skipped_cloud_stamp = cloud_stamp
+        guard.last_skipped_at = now
+        guard.last_skipped_cloud_stamp = cloud_stamp
+
+        current_task = getattr(self, "current_task", None)
+        phase = getattr(current_task, "phase", None)
+        log_key = (int(self.current_floor), int(estimated_floor), phase)
+        if log_key == guard.last_skip_log_key:
+            return
+        guard.last_skip_log_key = log_key
+        self._log_structured(
+            {
+                "event": "skipped_floor_scoped_update",
+                "elapsed": round(now, 3),
+                "source_floor": guard.source_floor,
+                "current_floor": int(self.current_floor),
+                "mapper_estimated_floor": int(estimated_floor),
+                "target_floor": guard.target_floor,
+                "current_task": (
+                    getattr(current_task, "name", type(current_task).__name__)
+                    if current_task is not None
+                    else None
+                ),
+                "current_task_phase": phase,
+                "cloud_stamp": cloud_stamp,
+                "skipped_cloud_count": guard.skipped_cloud_count,
+                "mapper_update_applied": False,
+                "obstacle_query_applied": False,
+                "floor_transition_ambiguous": True,
+            }
+        )
+
+    def _report_floor_transition_alignment_timeout(self, estimated_floor: int) -> None:
+        guard = getattr(self, "_floor_transition_guard", None)
+        if guard is None or guard.task_exit_at is None or guard.timeout_reported:
+            return
+        now = float(self._elapsed())
+        service_timeout = float(getattr(self, "floor_params", {}).get("service_timeout", 5.0))
+        if now - guard.task_exit_at < max(0.0, service_timeout):
+            return
+        guard.timeout_reported = True
+        self._record_failure("楼层过渡对齐超时")
+        current_task = getattr(self, "current_task", None)
+        self._log_structured(
+            {
+                "event": "floor_transition_alignment_timeout",
+                "enter_time": round(guard.entered_at, 3),
+                "task_exit_time": round(guard.task_exit_at, 3),
+                "timeout_time": round(now, 3),
+                "timeout_reason": "task_exited_before_floor_alignment",
+                "duration": round(max(0.0, now - guard.entered_at), 3),
+                "source_floor": guard.source_floor,
+                "current_floor": int(self.current_floor),
+                "mapper_estimated_floor": int(estimated_floor),
+                "target_floor": guard.target_floor,
+                "enter_phase": guard.enter_phase,
+                "current_task": (
+                    getattr(current_task, "name", type(current_task).__name__)
+                    if current_task is not None
+                    else None
+                ),
+                "current_task_phase": getattr(current_task, "phase", None),
+                "alignment_odom_samples": guard.alignment_sample_count,
+                "skipped_cloud_count": guard.skipped_cloud_count,
+                "first_skipped_at": guard.first_skipped_at,
+                "last_skipped_at": guard.last_skipped_at,
+                "first_skipped_cloud_stamp": guard.first_skipped_cloud_stamp,
+                "last_skipped_cloud_stamp": guard.last_skipped_cloud_stamp,
+                "floor_transition_ambiguous": True,
+                "automatic_recovery_applied": False,
+            }
+        )
+
     def _update_mapping_and_detection(self, snapshot, pose, xyz) -> None:
         cloud_stamp = _message_stamp_seconds(snapshot.cloud_msg)
         cloud_is_new = cloud_stamp is None or cloud_stamp != getattr(self, "_last_cloud_stamp", None)
+        estimated_floor = self.mapper.estimate_floor_from_z(xyz[2])
+        floor_scoped_updates_blocked = self._floor_scoped_updates_are_blocked(
+            snapshot,
+            estimated_floor,
+        )
+        if estimated_floor == self.current_floor:
+            self._last_floor_alignment_mismatch_key = None
         if cloud_is_new:
-            points = self.sensor_buffer.read_cloud_xyz(
-                snapshot.cloud_msg,
-                max_points=self.cloud_max_points,
-                stride=self.cloud_stride,
-            )
-            self._latest_cloud_points = points
-            self._last_cloud_stamp = cloud_stamp
-            self.mapper.update_from_cloud(
-                floor_index=self.current_floor,
-                robot_xyz=xyz,
-                points=points,
-            )
-            set_obstacle_distance = getattr(self.controller, "set_nearest_obstacle_distance", None)
-            if callable(set_obstacle_distance):
-                set_obstacle_distance(
-                    nearest_forward_obstacle_distance(
-                        points,
-                        pose,
-                        floor_index=self.current_floor,
-                        mapper=self.mapper,
-                    )
+            if floor_scoped_updates_blocked:
+                # 被门控的 cloud 必须标记为已消费，避免对齐后重放旧帧。
+                self._last_cloud_stamp = cloud_stamp
+                self._record_skipped_floor_scoped_update(
+                    cloud_stamp=cloud_stamp,
+                    estimated_floor=estimated_floor,
                 )
+            else:
+                points = self.sensor_buffer.read_cloud_xyz(
+                    snapshot.cloud_msg,
+                    max_points=self.cloud_max_points,
+                    stride=self.cloud_stride,
+                )
+                self._latest_cloud_points = points
+                self._last_cloud_stamp = cloud_stamp
+                self.mapper.update_from_cloud(
+                    floor_index=self.current_floor,
+                    robot_xyz=xyz,
+                    points=points,
+                )
+                if estimated_floor != self.current_floor:
+                    current_task = getattr(self, "current_task", None)
+                    mismatch_key = (
+                        int(self.current_floor),
+                        int(estimated_floor),
+                        getattr(current_task, "phase", None),
+                    )
+                    if mismatch_key != getattr(self, "_last_floor_alignment_mismatch_key", None):
+                        self._last_floor_alignment_mismatch_key = mismatch_key
+                        self._log_structured(
+                            {
+                                "event": "floor_alignment_mismatch",
+                                "elapsed": round(float(self._elapsed()), 3),
+                                "odom_xyz": [round(float(value), 3) for value in xyz],
+                                "mapper_estimated_floor": int(estimated_floor),
+                                "current_floor": int(self.current_floor),
+                                "target_floor": getattr(self, "target_floor", None),
+                                "current_task": (
+                                    getattr(current_task, "name", type(current_task).__name__)
+                                    if current_task is not None
+                                    else None
+                                ),
+                                "current_task_phase": (
+                                    getattr(current_task, "phase", None)
+                                    if current_task is not None
+                                    else None
+                                ),
+                                "cloud_stamp": cloud_stamp,
+                                "map_update_floor": int(self.current_floor),
+                                "mapper_update_applied": True,
+                            }
+                        )
+                set_obstacle_distance = getattr(self.controller, "set_nearest_obstacle_distance", None)
+                if callable(set_obstacle_distance):
+                    set_obstacle_distance(
+                        nearest_forward_obstacle_distance(
+                            points,
+                            pose,
+                            floor_index=self.current_floor,
+                            mapper=self.mapper,
+                        )
+                    )
+
+        self._report_floor_transition_alignment_timeout(estimated_floor)
 
         bundle = snapshot.image_bundle
         if bundle is None:
@@ -859,6 +1130,19 @@ class MissionManager:
         # 4. 继续当前层探索
         return "CONTINUE", "budget_allows_continue"
 
+    @staticmethod
+    def _frontier_scan_signature(
+        grid,
+        pose: tuple[float, float, float],
+        frontiers: list[Frontier],
+    ) -> tuple[object, ...]:
+        """生成扫描期可重复签名，忽略原地旋转造成的 yaw 变化。"""
+        robot_cell = grid.world_to_grid(pose[0], pose[1])
+        frontier_cells = tuple(
+            sorted(tuple(sorted(frontier.cells)) for frontier in frontiers)
+        )
+        return (grid.floor_index, robot_cell, frontier_cells)
+
     def _tick_explore(self, pose: tuple[float, float, float]) -> None:
         grid = self.mapper.floor(self.current_floor)
         now = get_time()
@@ -952,79 +1236,59 @@ class MissionManager:
             return
 
         if not self.controller.has_path():
+            scan_signature = self._frontier_scan_signature(grid, pose, frontiers)
+            # 扫描门控：pose 栅格和 frontier 内容均未变时，避免逐 tick A* 空转。
+            if self._no_frontier_scan_until > 0:
+                now_gate = get_time()
+                if now_gate < self._no_frontier_scan_until:
+                    if scan_signature == self._last_no_frontier_signature:
+                        self.controller.rotate_in_place(0.45)
+                        return
+                    # pose 或 frontier 内容变化，清除扫描状态并立即重试选择。
+                    self._no_frontier_scan_until = 0.0
+            self._last_no_frontier_signature = scan_signature
+
             self.controller.stop(reason="frontier_planning")
             selection_context = self._frontier_selection_context(pose)
 
             frontier, path = None, []
-            if progress_monitor is not None:
-                # 任务层最小进度监督：排除已冷却的退化区域
-                available_frontiers = progress_monitor.filter_frontiers(now, frontiers)
-                if available_frontiers:
-                    frontier, path = self.explorer.select_frontier(
-                        grid,
-                        pose,
-                        selection_context=selection_context,
-                        frontiers=available_frontiers,
-                    )
+            if frontiers:
+                frontier, path = self.explorer.select_frontier(
+                    grid,
+                    pose,
+                    selection_context=selection_context,
+                    frontiers=frontiers,
+                )
 
-                # 退化循环检测：反复选中同一近邻目标且实际位移极小
-                if frontier is not None and path:
-                    progress_monitor.record_selection(now, frontier.centroid)
-                    is_degenerate, repeat_count, displacement, reason_code = (
-                        progress_monitor.check_degenerate(now, frontier.centroid)
+            # ProgressMonitor 仅作诊断：记录选择历史并检测退化循环，
+            # 但不执行 filter_frontiers、start_cooldown、clear_path 或主动重选。
+            # 过近落点已在 FrontierExplorer 源头通过 inside_goal_tolerance 过滤。
+            if frontier is not None and path and progress_monitor is not None:
+                progress_monitor.record_selection(now, frontier.centroid)
+                is_degenerate, repeat_count, displacement, reason_code = (
+                    progress_monitor.check_degenerate(now, frontier.centroid)
+                )
+                if is_degenerate and progress_monitor.should_log(now, interval=5.0):
+                    rospy.logwarn(
+                        "检测到退化 frontier 循环：target=(%.2f, %.2f) "
+                        "repeat=%d displacement=%.3f reason=%s",
+                        frontier.centroid[0],
+                        frontier.centroid[1],
+                        repeat_count,
+                        displacement,
+                        reason_code,
                     )
-                    if is_degenerate:
-                        if progress_monitor.should_log(now, interval=5.0):
-                            rospy.logwarn(
-                                "检测到退化 frontier 循环：target=(%.2f, %.2f) "
-                                "repeat=%d displacement=%.3f reason=%s",
-                                frontier.centroid[0],
-                                frontier.centroid[1],
-                                repeat_count,
-                                displacement,
-                                reason_code,
-                            )
-                            diagnostic = self._mission_diagnostic_snapshot()
-                            diagnostic.update({
-                                "event": "mission_progress_monitor",
-                                "action": "cooldown_and_reselect",
-                                "reason_code": reason_code,
-                                "target": list(frontier.centroid),
-                                "repeat_count": int(repeat_count),
-                                "displacement": round(displacement, 3),
-                                "region_radius": round(progress_monitor.region_radius, 3),
-                                "cooldown_duration": self.progress_monitor_cooldown,
-                            })
-                            self._log_structured(diagnostic)
-
-                        progress_monitor.start_cooldown(now, frontier.centroid, reason_code)
-                        self.controller.clear_path(reason="degenerate_target_cooldown")
-                        self.current_frontier = None
-                        self._last_frontier_target = None
-                        self._last_frontier_score = None
-                        self._last_frontier_used_fallback = False
-
-                        # 尝试选择空间上明显不同的 frontier
-                        available_frontiers = progress_monitor.filter_frontiers(now, frontiers)
-                        if available_frontiers:
-                            frontier, path = self.explorer.select_frontier(
-                                grid,
-                                pose,
-                                selection_context=selection_context,
-                                frontiers=available_frontiers,
-                            )
-                            if frontier is not None and path:
-                                progress_monitor.record_selection(now, frontier.centroid)
-                        else:
-                            frontier, path = None, []
-            else:
-                if frontiers:
-                    frontier, path = self.explorer.select_frontier(
-                        grid,
-                        pose,
-                        selection_context=selection_context,
-                        frontiers=frontiers,
-                    )
+                    diagnostic = self._mission_diagnostic_snapshot()
+                    diagnostic.update({
+                        "event": "mission_progress_monitor",
+                        "action": "diagnostic_only",
+                        "reason_code": reason_code,
+                        "target": list(frontier.centroid),
+                        "repeat_count": int(repeat_count),
+                        "displacement": round(displacement, 3),
+                        "region_radius": round(progress_monitor.region_radius, 3),
+                    })
+                    self._log_structured(diagnostic)
 
             self._log_post_door_frontier_debug(frontier, path, pose)
 
@@ -1040,10 +1304,22 @@ class MissionManager:
                     return
 
             if frontier is None or not path:
+                # 检查本轮无目标是否仅因 inside_goal_tolerance 拒绝
+                debug = self.explorer.last_selection_debug
+                all_inside_tolerance = (
+                    debug is not None
+                    and debug.candidate_count > 0
+                    and debug.inside_tolerance_count >= debug.candidate_count - debug.blacklisted_count
+                    and debug.unreachable_count == 0
+                    and debug.reachable_count == 0
+                )
                 if not frontiers and self._try_probe_unknown_space(pose):
                     self._no_reachable_frontier_confirmations = 0
                     return
-                if self._tick_no_frontier_scan(frontiers):
+                if self._tick_no_frontier_scan(
+                    frontiers,
+                    record_failure=not all_inside_tolerance,
+                ):
                     self._no_reachable_frontier_confirmations += 1
                     if self._floor_completion_ready(grid, floor_elapsed):
                         self._finish_current_floor(
@@ -1468,7 +1744,12 @@ class MissionManager:
             return True
         return False
 
-    def _tick_no_frontier_scan(self, frontiers: list[Frontier]) -> bool:
+    def _tick_no_frontier_scan(
+        self,
+        frontiers: list[Frontier],
+        *,
+        record_failure: bool = True,
+    ) -> bool:
         now = get_time()
         if self._no_frontier_scan_until <= 0.0:
             self._no_frontier_scan_until = now + self.no_frontier_scan_duration
@@ -1482,7 +1763,8 @@ class MissionManager:
         self.controller.stop()
         self._no_frontier_scan_until = 0.0
         if frontiers:
-            self._record_failure("无可达前沿")
+            if record_failure:
+                self._record_failure("无可达前沿")
             rospy.logwarn("扫描后仍无可达前沿，结束当前楼层")
         return True
 
@@ -1581,6 +1863,7 @@ class MissionManager:
         self.controller.clear_path()
         self._no_frontier_scan_until = 0.0
         self._no_reachable_frontier_confirmations = 0
+        self._last_no_frontier_signature = None
 
         can_change_floor = (
             self.current_floor + 1 < self.max_floor
@@ -1837,6 +2120,17 @@ class MissionManager:
             if self._last_pose is not None
             else None
         )
+        last_xyz = getattr(self, "_last_xyz", None)
+        diagnostic["odom_xyz"] = (
+            [round(float(value), 3) for value in last_xyz]
+            if last_xyz is not None
+            else None
+        )
+        diagnostic["mapper_estimated_floor"] = (
+            int(self.mapper.estimate_floor_from_z(last_xyz[2]))
+            if last_xyz is not None
+            else None
+        )
 
         controller_snapshot = getattr(self.controller, "tracking_debug_snapshot", None)
         diagnostic["controller"] = controller_snapshot() if callable(controller_snapshot) else None
@@ -1918,6 +2212,7 @@ class MissionManager:
                 elapsed = round(float(self._elapsed()), 3)
             except (TypeError, ValueError):
                 elapsed = None
+        floor_transition_guard = getattr(self, "_floor_transition_guard", None)
         return {
             "state": getattr(self, "state", None),
             "elapsed": elapsed,
@@ -1931,6 +2226,13 @@ class MissionManager:
                 getattr(self, "_no_reachable_frontier_confirmations", 0)
             ),
             "current_floor": floor,
+            "target_floor": getattr(self, "target_floor", None),
+            "floor_transition_ambiguous": floor_transition_guard is not None,
+            "floor_transition_skipped_cloud_count": (
+                floor_transition_guard.skipped_cloud_count
+                if floor_transition_guard is not None
+                else 0
+            ),
             "return_home_started": bool(getattr(self, "_return_home_started", False)),
             "return_home_completed": bool(
                 getattr(self, "_return_home_completed", False)

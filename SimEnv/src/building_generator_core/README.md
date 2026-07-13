@@ -173,7 +173,7 @@ manifest_path = export_classic_bundle(layout, "/tmp/building_python_case")
 - 一栋楼默认只有一个楼梯核心和一个电梯核心
 - 普通房门保持静态开口
 - 动态门覆盖主入口门和电梯门
-- 电梯采用简单召唤模型，不做群控和乘客逻辑
+- 电梯采用简单召唤模型，不做群控；Classic 控制服务会同步运输轿厢内的 A1，进出轿厢仍由参赛算法控制
 
 ## Gazebo Classic 接入
 

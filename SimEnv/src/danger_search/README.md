@@ -32,6 +32,16 @@ roslaunch danger_search danger_search.launch
 roslaunch danger_search danger_search.launch max_floor:=3
 ```
 
+上述命令沿用默认单层时限。三层完整闭环回归应通过 `run_seed.py` 合并专用时间预算覆盖：
+
+```bash
+python3 src/danger_search/tools/run_seed.py --seed 42 \
+  --params config/three_floor_time_budget_test.yaml \
+  --gui --timeout 6000 --max-floor 3
+```
+
+该配置只调整总任务时间、单层时限和最小探索时间，已用于验证 0/1/2 层探索、换层、返回 0 层和最终返航。它是工程回归配置，不代表危险源识别率等官方比赛就绪标准。
+
 短超时自检可使用：
 
 ```bash
@@ -69,20 +79,25 @@ roslaunch danger_search danger_search_smoke.launch
 单个 seed 运行并归档：
 
 ```bash
-python3 src/danger_search/tools/run_seed.py --seed 42 --timeout 10000 --max-floor 3
+python3 src/danger_search/tools/run_seed.py --seed 42 \
+  --params config/three_floor_time_budget_test.yaml \
+  --timeout 6000 --max-floor 3
 ```
 
 `run_seed.py` 默认使用 GUI auto 模式：检测到 `DISPLAY` 时启动 Gazebo GUI，否则自动使用 headless。也可以显式指定：
 
 ```bash
-python3 src/danger_search/tools/run_seed.py --seed 42 --headless --timeout 10000 --max-floor 3
-python3 src/danger_search/tools/run_seed.py --seed 42 --gui --timeout 10000 --max-floor 3
+python3 src/danger_search/tools/run_seed.py --seed 42 --headless --timeout 6000 --max-floor 3 \
+  --params config/three_floor_time_budget_test.yaml
+python3 src/danger_search/tools/run_seed.py --seed 42 --gui --timeout 6000 --max-floor 3 \
+  --params config/three_floor_time_budget_test.yaml
 ```
 
 无 `DISPLAY` 时不能使用 `--gui`，请改用 `--headless`，或通过虚拟显示运行：
 
 ```bash
-xvfb-run -a python3 src/danger_search/tools/run_seed.py --seed 42 --gui --timeout 10000 --max-floor 3
+xvfb-run -a python3 src/danger_search/tools/run_seed.py --seed 42 --gui --timeout 6000 --max-floor 3 \
+  --params config/three_floor_time_budget_test.yaml
 ```
 
 批量 seed 评测：
