@@ -26,6 +26,26 @@ from danger_search.planner import PlanResult, BUDGET_EXHAUSTED
 
 
 class MissionManagerHelperTest(unittest.TestCase):
+    def test_optional_exit_cap_uses_zero_as_ros_safe_disabled_value(self):
+        self.assertIsNone(
+            mission_manager_module._optional_positive_float(
+                0.0,
+                "controller/exit_first_max_linear",
+            )
+        )
+        self.assertEqual(
+            mission_manager_module._optional_positive_float(
+                0.25,
+                "controller/exit_first_max_linear",
+            ),
+            0.25,
+        )
+        with self.assertRaises(ValueError):
+            mission_manager_module._optional_positive_float(
+                -0.1,
+                "controller/exit_first_max_linear",
+            )
+
     @staticmethod
     def _stamped_message(stamp: float):
         return SimpleNamespace(

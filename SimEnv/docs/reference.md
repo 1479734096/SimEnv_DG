@@ -1,6 +1,6 @@
 # 完整参考文档
 
-本文保留拆分前的完整说明，便于交叉核对历史内容。比赛选手建议优先阅读根目录 [README](../README.md) 和本目录下的专题文档。
+本文为比赛仿真环境的完整参考说明。比赛选手建议优先阅读根目录 [README](../README.md) 和本目录下的专题文档。
 
 ## 环境介绍
 
@@ -16,7 +16,9 @@
 - 源只允许生成在房间内部。
 - 源生成时避开墙体、家具、其他源以及房间门口保留区。
 - 源高度贴合对应楼层地面，不悬空，不嵌入地板。
-- 真值只写入 `results/danger_truth.json`，参赛算法应输出 `results/detected_danger.json`。
+- 公开场景信息写入 `generated_building/team_scene_info.json`。
+- 参赛算法应输出 `results/detected_danger.json`。
+- 真值文件仅供裁判评估和本地自检使用，不作为参赛算法输入。
 
 ## 运行要求
 
@@ -26,16 +28,14 @@
 - CUDA >= 11.7
 - Python >= 3.8
 - `python3-yaml`
-- `scipy` 和 `numpy`，用于评估脚本
+- `numpy`，用于评估脚本
 - libtorch C++ 版本，用于 Unitree A1 控制器
-- cuDNN 开发头文件和库，用于匹配 GPU 版 libtorch
 
-libtorch、CUDA 和 cuDNN 路径在 `src/unitree_guide/unitree_guide/unitree_guide/CMakeLists.txt` 中配置。工程会优先使用 `-DLIBTORCH_ROOT` 或环境变量 `LIBTORCH_ROOT`，未设置时依次尝试 `/home/xbh/third_party/libtorch` 和 `/home/ros/Guoyulun/Download/libtorch`。如 cuDNN 不在系统默认路径，可设置 `CUDNN_ROOT`、`CUDNN_INCLUDE_DIR` 或 `CUDNN_LIBRARY`。
+libtorch 和 CUDA 路径在 `src/unitree_guide/unitree_guide/unitree_guide/CMakeLists.txt` 中配置。如部署路径不同，需要按实际机器调整。
 
 ## 编译
 
 ```bash
-cd /home/ros/Guoyulun/Competition/SimEnv
 source /opt/ros/noetic/setup.bash
 catkin_make -j
 source ./devel/setup.bash
@@ -44,7 +44,6 @@ source ./devel/setup.bash
 ## 一键启动
 
 ```bash
-cd /home/ros/Guoyulun/Competition/SimEnv
 ./auto.sh
 ```
 
@@ -60,19 +59,21 @@ cd /home/ros/Guoyulun/Competition/SimEnv
 
 启动后关键文件如下：
 
-| 文件 | 说明 |
-|------|------|
-| `generated_building/competition_scene.world` | Gazebo 使用的完整比赛世界，已包含楼栋和全部源模型 |
-| `generated_building/layout_metadata.json` | 楼栋布局、房间、门、电梯、目标点等元数据 |
-| `generated_building/door_config.yaml` | 动态门控制配置，由 `building_generator_classic` 读取 |
-| `generated_building/elevator_config.yaml` | 简化电梯控制配置，由 `building_generator_classic` 读取 |
-| `generated_building/scene_manifest.json` | 本次场景 manifest，记录 seed、文件路径、源数量、机器人出生点 |
-| `generated_building/building_config.json` | 兼容脚本使用的建筑配置 |
-| `results/danger_truth.json` | 裁判真值文件，包含危险源和干扰源列表 |
-| `results/detected_danger.json` | 参赛算法应输出的检测结果文件 |
-| `logs/competition_gazebo.log` | Gazebo/launch 日志 |
-| `logs/building_control.log` | 楼栋门/电梯控制服务日志 |
-| `logs/junior_ctrl.log` | 控制器日志 |
+| 文件 | 说明 | 是否可作为算法输入 |
+|------|------|--------------------|
+| `generated_building/team_scene_info.json` | 机器人起点、公开门/电梯 ID、允许接口和结果文件路径 | 是 |
+| `results/detected_danger.json` | 参赛算法应输出的检测结果文件 | 输出文件 |
+| `generated_building/competition_scene.world` | Gazebo 使用的完整比赛世界，已包含楼栋和全部源模型 | 否 |
+| `generated_building/layout_metadata.json` | 楼栋布局、房间、门、电梯、目标点等元数据 | 否 |
+| `generated_building/door_config.yaml` | 动态门控制配置，由 `building_generator_classic` 读取 | 否 |
+| `generated_building/elevator_config.yaml` | 简化电梯控制配置，由 `building_generator_classic` 读取 | 否 |
+| `generated_building/scene_manifest.json` | 本次场景 manifest，记录 seed、文件路径、源数量、机器人出生点 | 否 |
+| `generated_building/building_config.json` | 环境内部使用的建筑配置 | 否 |
+| `generated_building/danger_truth.json` | 裁判真值副本，本地调试时可能存在 | 否 |
+| `results/danger_truth.json` | 裁判真值文件，包含危险源和干扰源列表 | 否 |
+| `logs/competition_gazebo.log` | Gazebo/launch 日志 | 否 |
+| `logs/building_control.log` | 楼栋门/电梯控制服务日志 | 否 |
+| `logs/junior_ctrl.log` | 控制器日志 | 否 |
 
 ## 启动参数
 
@@ -94,14 +95,28 @@ SEED=77 FLOOR_COUNT=3 ROOMS_PER_FLOOR=4 ./auto.sh
 | `DANGER_COUNT` | `3:6` | 危险源数量，支持 `min:max` |
 | `DISTRACTOR_COUNT` | `4:8` | 干扰源数量，支持 `min:max` |
 | `GUI` | `true` | 是否启动 Gazebo GUI |
-| `PAUSED` | `true` | Gazebo 启动后是否暂停 |
+| `PAUSED` | `false` | Gazebo 启动后是否暂停 |
 | `START_CONTROLLER` | `1` | 是否启动 `junior_ctrl` |
-| `CONTROLLER_FOREGROUND` | `1` | 是否在前台运行控制器。前台运行时可以在当前终端输入 `2`、`6` 切换状态 |
+| `CONTROLLER_FOREGROUND` | `1` | 是否在前台运行控制器。前台运行时可以在当前终端输入 `1`、`2`、`4`、`6`、`8` 切换状态 |
 | `START_BUILDING_CONTROL` | `1` | 是否启动楼栋门/电梯控制服务 |
-| `UNITREE_CTRL_DT` | `0.004` | `junior_ctrl` 控制周期，单位 s。默认 250 Hz，降低 Gazebo 大场景下控制循环超时 warning |
+| `ROBOT_SPAWN_TIMEOUT` | `120` | 等待 Gazebo 完成机器人模型生成的最长时间，单位 s |
+| `CONTROLLER_SPAWNER_TIMEOUT` | `120` | 等待 Gazebo 暴露 controller_manager 接口的最长时间，单位 s |
+| `UNITREE_CTRL_DT` | `0.004` | `junior_ctrl` 控制周期，单位 s。默认 250 Hz |
+| `UNITREE_LOG_WAIT_WARNINGS` | `0` | 是否输出 `absoluteWait is not enough` 控制周期超时提示 |
+| `ENABLE_SENSOR_DATA` | `1` | 比赛传感器数据默认总开关；具体传感器可用下列变量覆盖 |
+| `ENABLE_LIVOX` | 跟随 `ENABLE_SENSOR_DATA` | 是否发布 Livox 雷达 `/scan` |
+| `ENABLE_LIVOX_IMU` | 跟随 `ENABLE_LIVOX` | 是否发布 `/livox/imu` |
+| `ENABLE_REALSENSE` | 跟随 `ENABLE_SENSOR_DATA` | 是否发布 RealSense RGB、深度图和深度点云 |
+| `ENABLE_DEPTH_CAMERA` | 空 | `ENABLE_REALSENSE` 的别名，便于只控制深度相机 |
+| `ENABLE_FRONT_CAMERA` | `0` | 是否启用可选前视 RGB 相机 |
+| `ENABLE_POINTCLOUD_CONVERTER` | 跟随 `ENABLE_LIVOX` | 是否将 `/scan` 转换为 `/livox/Pointcloud2` 和 `/livox/lidar2` |
+| `ENABLE_GROUND_TRUTH` | `1` | 是否发布 Gazebo 真值调试话题 |
+| `ENABLE_REFEREE_ODOM` | `1` | 是否发布 `/Odometry_gazebo` 和 `odom -> base` TF |
+| `ENABLE_FOOT_CONTACT_SENSOR` | `0` | 是否启用四个足端 ContactSensor 及接触力话题 |
+| `UNITREE_STAND_DURATION` | `3.0` | 按 `2` 后从当前姿态平滑站立的时长，单位 s |
 | `START_VIRTUAL_JOY` | `0` | 是否启动虚拟手柄。该功能通常需要 `uinput` 权限 |
 | `ROBOT_X` | `0.0` | 机器人出生点 x |
-| `ROBOT_Y` | `-2.2` | 机器人出生点 y |
+| `ROBOT_Y` | `-3.2` | 机器人出生点 y |
 | `ROBOT_Z` | `0.6` | 机器人出生点 z |
 | `ROBOT_YAW` | `1.5708` | 机器人出生点 yaw |
 
@@ -109,6 +124,18 @@ SEED=77 FLOOR_COUNT=3 ROOMS_PER_FLOOR=4 ./auto.sh
 
 ```bash
 SEED=20260507 FLOOR_COUNT=4 ROOMS_PER_FLOOR=5 DANGER_COUNT=5 DISTRACTOR_COUNT=8 GUI=false ./auto.sh
+```
+
+只开启 RealSense 深度相机：
+
+```bash
+ENABLE_SENSOR_DATA=0 ENABLE_REALSENSE=1 ./auto.sh
+```
+
+只开启 Livox 雷达：
+
+```bash
+ENABLE_SENSOR_DATA=0 ENABLE_LIVOX=1 ./auto.sh
 ```
 
 ## 单独生成场景
@@ -128,14 +155,6 @@ rosrun building_obstacles generate_competition_scene.py \
   --output-dir ./generated_building \
   --results-dir ./results
 ```
-
-兼容旧命令：
-
-```bash
-rosrun building_obstacles generate_multi_floor_building.py ./generated_building 3 4
-```
-
-该旧入口现在会转调新的比赛场景生成器。
 
 默认楼栋尺寸按 Unitree A1 室内探索做了收敛：走廊约 2.2 m，单层默认 4 个房间，建筑占地约 20 m x 36 m。该尺寸保留进门、转向和传感器观测余量，同时避免场景过大导致探索时间主要消耗在长距离行走上。若需要提高比赛难度，可通过 `BUILDING_WIDTH`、`BUILDING_LENGTH` 和 `ROOMS_PER_FLOOR` 逐步增大场景。
 
@@ -161,29 +180,30 @@ rosrun building_obstacles generate_multi_floor_building.py ./generated_building 
 
 ## 控制器与算法接入
 
-`auto.sh` 默认以前台方式启动 `junior_ctrl`。该控制器仍遵循 Unitree 原有交互流程，进入 RL 模式后接收 `/cmd_vel`：
+`auto.sh` 默认以前台方式启动 `junior_ctrl`。该控制器仍遵循 Unitree 原有交互流程：
 
 - 键盘输入 `2`：站立。
-- 键盘输入 `6`：切换到 RL 模式。
-- RL 模式下订阅 `/cmd_vel`，消息类型为 `geometry_msgs/Twist`。
+- 键盘输入 `4`：切换到 RL 键盘行走模式，使用 `W/S`、`A/D`、`J/L` 控制速度。
+- 键盘输入 `6`：切换到 RL `/cmd_vel` 模式。
+- RL `/cmd_vel` 模式下订阅 `/cmd_vel`，消息类型为 `geometry_msgs/Twist`。
 
-`junior_ctrl` 原始控制周期为 `0.002 s`，即 500 Hz。在 Gazebo GUI、随机楼栋、传感器和 RL 推理同时运行时，部分机器会出现：
+`junior_ctrl` 当前默认控制周期为 `0.004 s`，即 250 Hz。在 Gazebo GUI、随机楼栋、传感器和 RL 推理同时运行时，部分机器仍可能出现：
 
 ```text
-[WARNING] The waitTime=2000 of function absoluteWait is not enough!
-The program has already cost 2435us.
+[WARNING] The waitTime=4000 of function absoluteWait is not enough!
+The program has already cost 5110us.
 ```
 
-该提示表示单次控制循环耗时超过了 2 ms 目标周期，不代表场景生成失败。当前 `auto.sh` 默认设置 `UNITREE_CTRL_DT=0.004`，即 250 Hz，通常能减少该 warning，并保持仿真控制稳定。如机器性能充足或需要沿用 500 Hz，可显式启动：
+该提示表示单次控制循环耗时超过了 4 ms 目标周期，不代表场景生成失败。当前 `auto.sh` 默认设置 `UNITREE_LOG_WAIT_WARNINGS=0`，不会打印该刷屏日志；需要排查控制周期时可显式开启。
 
 ```bash
-UNITREE_CTRL_DT=0.002 ./auto.sh
+UNITREE_LOG_WAIT_WARNINGS=1 ./auto.sh
 ```
 
-如仍持续刷屏，建议同时降低运行负载：
+如 GUI 下仍明显慢动作，建议无 GUI 启动：
 
 ```bash
-GUI=false UNITREE_CTRL_DT=0.006 ./auto.sh
+GUI=false ./auto.sh
 ```
 
 算法接入建议：
@@ -191,14 +211,24 @@ GUI=false UNITREE_CTRL_DT=0.006 ./auto.sh
 | 接口 | 类型 | 说明 |
 |------|------|------|
 | `/cmd_vel` | `geometry_msgs/Twist` | 机器人速度指令输入 |
-| `/Odometry_gazebo` | `nav_msgs/Odometry` | 仿真里程计输出 |
 | `/scan` | `sensor_msgs/PointCloud2` | Livox Mid-360 点云数据 |
+| `/livox/Pointcloud2` | `sensor_msgs/PointCloud2` | 点云转换节点输出，开启时可用 |
+| `/livox/lidar2` | `unitree_guide/CustomMsg` | Livox 风格点云消息，开启时可用 |
 | `/livox/imu` | `sensor_msgs/Imu` | Livox 内置 IMU |
 | `/trunk_imu` | `sensor_msgs/Imu` | 机体 IMU |
-| `/camera/image_raw` | `sensor_msgs/Image` | 前视 RGB 图像 |
+| `/real_sense/rgb/image_raw` | `sensor_msgs/Image` | RealSense RGB 图像 |
+| `/real_sense/rgb/camera_info` | `sensor_msgs/CameraInfo` | RealSense RGB 相机标定 |
+| `/real_sense/depth/image_raw` | `sensor_msgs/Image` | RealSense 深度图像 |
+| `/real_sense/depth/camera_info` | `sensor_msgs/CameraInfo` | RealSense 深度相机标定 |
 | `/real_sense/depth/points` | `sensor_msgs/PointCloud2` | 深度相机点云 |
+| `/set_door_state` | `building_generator_interfaces/SetDoorState` | 设置动态门开关状态 |
+| `/call_elevator` | `building_generator_interfaces/CallElevator` | 呼叫电梯到目标楼层 |
 
-参赛算法不应读取 `results/danger_truth.json`。该文件用于裁判评估和环境自检。
+参赛算法可以读取 `generated_building/team_scene_info.json`。该文件只包含机器人起点、公开门/电梯 ID、允许话题、允许服务和结果文件路径。
+
+参赛算法不应读取 `results/danger_truth.json`、`generated_building/danger_truth.json`、`generated_building/layout_metadata.json`、`generated_building/building_config.json` 或 `generated_building/scene_manifest.json`。这些文件用于裁判评估、环境启动或本地自检。
+
+`/Odometry_gazebo`、`/ground_truth/base_w`、`/ground_truth/base_trunk` 和 `/ground_truth/*_foot` 是 Gazebo 真值通道，不作为正式比赛算法输入。即使本地调试时能够看到这些话题，参赛算法也不得订阅或读取。
 
 ## 门与电梯控制
 
@@ -216,7 +246,6 @@ START_BUILDING_CONTROL=1 ./auto.sh
 如需手动启动或重启门/电梯控制服务，可在 Gazebo 场景启动后运行：
 
 ```bash
-cd /home/ros/Guoyulun/Competition/SimEnv
 source ./devel/setup.bash
 rosrun building_generator_classic building_generator_classic_control \
   --door-config ./generated_building/door_config.yaml \
@@ -230,7 +259,7 @@ rosrun building_generator_classic building_generator_classic_control \
 | 服务 | 类型 | 说明 |
 |------|------|------|
 | `/set_door_state` | `building_generator_interfaces/SetDoorState` | 打开或关闭指定动态门 |
-| `/call_elevator` | `building_generator_interfaces/CallElevator` | 将电梯轿厢及轿厢内的 A1 移动到目标楼层 |
+| `/call_elevator` | `building_generator_interfaces/CallElevator` | 将电梯轿厢移动到目标楼层 |
 
 楼层索引从 `0` 开始：
 
@@ -281,8 +310,8 @@ rosservice call /call_elevator "{elevator_id: 'elevator_main', target_floor: 0, 
 - `main_entrance` 为首层主入口门。
 - `elevator_floor_0`、`elevator_floor_1` 等为各楼层电梯厅门。
 - `elevator_main` 为当前楼栋默认电梯 ID。
-- 电梯厅门默认采用 60 s 缓慢开门或关门过程，控制服务会持续插值更新左右门板位置，`rosservice call /set_door_state` 通常在动作完成后返回。
-- 当前电梯为简化仿真模型，`/call_elevator` 负责移动轿厢到目标楼层；若 A1 位于轿厢范围内，控制服务会同步施加相同的竖直位移。机器人进入和离开轿厢的水平运动仍由参赛算法通过 `/cmd_vel` 控制。
+- 电梯厅门默认采用约 25 s 开门或关门过程，控制服务会持续插值更新左右门板位置，`rosservice call /set_door_state` 通常在动作完成后返回。
+- 当前电梯为简化仿真模型，`/call_elevator` 负责移动轿厢到目标楼层；机器人进出轿厢仍由参赛算法通过 `/cmd_vel` 控制。
 - `open_doors` 字段记录电梯状态，但楼层电梯厅门建议仍通过 `/set_door_state` 明确开关，便于比赛流程可复现。
 
 ## 结果文件格式
@@ -416,7 +445,9 @@ python3 ./src/building_obstacles/scripts/evaulate_danger.py
 
 | 话题名称 | 消息类型 | 发布频率 | 说明 |
 |---------|---------|---------|------|
-| `/scan` | `sensor_msgs/PointCloud2` | 10 Hz | Livox Mid-360点云数据 |
+| `/scan` | `sensor_msgs/PointCloud` | 10 Hz | Livox Mid-360 原始点云数据 |
+| `/livox/Pointcloud2` | `sensor_msgs/PointCloud2` | 约 10 Hz | 点云转换节点输出，开启时可用 |
+| `/livox/lidar2` | `unitree_guide/CustomMsg` | 约 10 Hz | Livox 风格自定义点云消息，开启时可用 |
 | `/livox/imu` | `sensor_msgs/Imu` | 1000 Hz | 雷达内置IMU（同状态估计） |
 
 **雷达参数**：
@@ -491,3 +522,4 @@ rosrun rviz rviz
 
 # 查看深度图像
 rosrun image_view image_view image:=/real_sense/depth/image_raw
+```

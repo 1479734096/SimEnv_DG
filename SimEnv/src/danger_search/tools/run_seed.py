@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import datetime
 from dataclasses import dataclass
+import math
 import os
 import shutil
 import shlex
@@ -44,6 +45,14 @@ OWNED_ENVIRONMENT_NAMES = {
 
 
 DEFAULT_HEALTH_CHECK_TIMEOUT = 120
+
+# 启动姿态门禁阈值：只读采样 /Odometry_gazebo，超限即判定 startup_posture_failure。
+# 正常起立 run 实测 max_abs_roll≈0.066、max_abs_pitch≈0.041、z∈[0.18,0.34]，
+# 翻倒 run 实测 max_abs_roll≈3.14、z<0.1，阈值在两者间留充足余量。
+POSTURE_MAX_ABS_ROLL = 0.5
+POSTURE_MAX_ABS_PITCH = 0.5
+POSTURE_MIN_Z = 0.10
+POSTURE_SAMPLE_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -298,6 +307,85 @@ def wait_for_ros_topic(
         raise RuntimeError(f"等待 {topic} 数据超时") from exc
 
 
+def _quaternion_to_rpy(x: float, y: float, z: float, w: float) -> tuple[float, float]:
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+    sinp = max(-1.0, min(1.0, 2.0 * (w * y - z * x)))
+    pitch = math.asin(sinp)
+    return roll, pitch
+
+
+def _probe_robot_posture(sample_seconds: float) -> dict:
+    """只读采样 /Odometry_gazebo 姿态统计；绝不发布任何命令、不调用 set_model_state。
+
+    使用墙钟窗口采样（use_sim_time 下 rospy.sleep 会受 RTF 拖慢），disable_signals
+    避免干扰父进程已有的信号处理；采样后立即注销订阅并关闭临时节点。
+    """
+    import rospy
+    from nav_msgs.msg import Odometry
+
+    stats = {
+        "max_abs_roll": 0.0,
+        "max_abs_pitch": 0.0,
+        "min_z": None,
+        "samples": 0,
+        "sample_seconds": float(sample_seconds),
+    }
+    finished = {"done": False}
+
+    def _on_odom(msg) -> None:
+        if finished["done"]:
+            return
+        pose = msg.pose.pose
+        roll, pitch = _quaternion_to_rpy(
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        )
+        stats["max_abs_roll"] = max(stats["max_abs_roll"], abs(roll))
+        stats["max_abs_pitch"] = max(stats["max_abs_pitch"], abs(pitch))
+        z = float(pose.position.z)
+        if stats["min_z"] is None or z < stats["min_z"]:
+            stats["min_z"] = z
+        stats["samples"] += 1
+
+    rospy.init_node("startup_posture_probe", anonymous=True, disable_signals=True)
+    subscriber = rospy.Subscriber("/Odometry_gazebo", Odometry, _on_odom, queue_size=200)
+    try:
+        deadline = time.monotonic() + float(sample_seconds)
+        while time.monotonic() < deadline and not rospy.is_shutdown():
+            time.sleep(0.05)
+    finally:
+        finished["done"] = True
+        subscriber.unregister()
+        rospy.signal_shutdown("posture_probe_done")
+    return stats
+
+
+def _posture_breach_detail(stats: dict) -> str | None:
+    """姿态统计超阈值时返回 startup_posture_failure 详情字符串，否则返回 None。"""
+    samples = int(stats.get("samples", 0))
+    roll = float(stats.get("max_abs_roll", 0.0))
+    pitch = float(stats.get("max_abs_pitch", 0.0))
+    min_z_raw = stats.get("min_z")
+    min_z = float(min_z_raw) if min_z_raw is not None else None
+    breached = (
+        samples == 0
+        or roll > POSTURE_MAX_ABS_ROLL
+        or pitch > POSTURE_MAX_ABS_PITCH
+        or (min_z is not None and min_z < POSTURE_MIN_Z)
+    )
+    if not breached:
+        return None
+    min_z_text = "" if min_z is None else f" min_z={min_z:.4f}"
+    return (
+        f"startup_posture_failure: samples={samples}"
+        f" max_abs_roll={roll:.4f} max_abs_pitch={pitch:.4f}{min_z_text}"
+    )
+
+
 def check_startup_health(workspace_dir: Path, health_log_path: Path) -> None:
     required_topics = (
         ("/Odometry_gazebo", "里程计"),
@@ -330,6 +418,29 @@ def check_startup_health(workspace_dir: Path, health_log_path: Path) -> None:
                 raise RuntimeError(
                     f"启动健康检查失败：未收到 {topic} 数据，详见 logs/health_check.log"
                 ) from exc
+        health_log.write("\n检查机器人姿态（只读采样 /Odometry_gazebo）\n")
+        health_log.flush()
+        posture: dict | None = None
+        try:
+            posture = _probe_robot_posture(POSTURE_SAMPLE_SECONDS)
+        except Exception as exc:
+            health_log.write(f"姿态采样异常（跳过姿态门禁）: {exc}\n")
+            health_log.flush()
+        if posture is not None:
+            health_log.write(
+                f"姿态采样: samples={posture['samples']} "
+                f"max_abs_roll={posture['max_abs_roll']:.4f} "
+                f"max_abs_pitch={posture['max_abs_pitch']:.4f} "
+                f"min_z={posture['min_z']:.4f}\n"
+            )
+            health_log.flush()
+            detail = _posture_breach_detail(posture)
+            if detail is not None:
+                health_log.write(f"姿态门禁失败：{detail}\n")
+                health_log.flush()
+                raise RuntimeError(detail)
+            health_log.write("姿态门禁通过\n")
+            health_log.flush()
         health_log.write(f"\n启动健康检查通过: {datetime.datetime.now().isoformat()}\n")
 
 

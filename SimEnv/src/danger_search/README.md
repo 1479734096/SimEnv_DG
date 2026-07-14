@@ -59,7 +59,7 @@ roslaunch danger_search danger_search_smoke.launch
 - Frontier 选择带短期惯性：当前区域仍可达时，新目标分数需要高出 `frontier/switch_score_margin` 才会切换；日志会记录每次选择的分数、距离、门侧、fallback 和切换原因。
 - 过门后除了短时间抑制回头，还会在门后推进距离和门后侧已知面积达到 `mission/post_door_min_distance`、`mission/post_door_min_known_area` 前持续优先门后侧目标，减少刚进门又回头；临时和永久禁区都只在门口有限半径内完全跳过，远处仅按距离衰减降分，避免用无限半平面把整片可达区域永久屏蔽。
 - 路径跟踪默认允许有限转向和侧移：`controller/min_linear_fraction=0.35`、`controller/max_angular=1.2`、`controller/max_lateral=0.25`，目标偏角较大时按余弦平方衰减前进速度，避免旋转中满速撞墙；转角处使用 `controller/corner_tolerance=0.10` 限制提前切换到下一段，防止在 U 型/平行走廊中切角或跳到未来折返段。
-- 卡住恢复默认等待 `frontier/no_progress_timeout=8.0` 秒后原地停止 `controller/recover_duration=0.5` 秒，不盲目后退，避免贴墙时推压导致倒地。
+- ENTER/EXIT 不再直接复用普通导航的完成半径和栅格折线路径：机器人先在厅外等待点或轿厢中心精确就位，再原地对准最终目标，随后只跟踪一条两点直线，直到机身到达具有后足净空余量的最终端点才完成。Gazebo 已证伪跨骑卡死后的倒车恢复，因此 `mission/exit_cabin_backoff_enabled` 默认关闭；旧 backoff 代码仅保留为显式诊断能力。
 - 默认使用 `/livox/Pointcloud2` 做 2.5D 栅格建图。
 - 诊断话题 `/danger_search/path_raw`、`/danger_search/path_followed` 和 `/danger_search/local_target` 分别发布原始 A* 路径、控制器实际跟踪路径和局部前视目标；`path_followed` 当前只做共线点压缩，不应误解为几何平滑器输出。
 - 点云命中障碍会按 `map/obstacle_inflation_radius` 做栅格膨胀，给 A1 留出安全余量。
@@ -177,3 +177,26 @@ frontier/current_region_radius: 1.2
 - `frontier/door_front_half_plane_penalty`
 
 注意：`danger_search_node` 运行期间不会读取 `danger_truth.json`。`run_seed.py` 只在算法退出后调用 `evaluate_danger.py` 做离线评测，此阶段才读取真值并写入 `evaluation.json`。
+
+## EXIT_CABIN 外部诊断
+
+需要复现电梯出厢卡住时，可在 GUI 环境运行低频外部观察：
+
+```bash
+src/danger_search/tools/run_observation.sh \
+  --seed 42 \
+  --max-floor 2 \
+  --params results/runs/<既有运行目录>/params.yaml \
+  --timeout 900 \
+  --diagnostic-rate 10 \
+  --stop-after-exit
+```
+
+观察器不修改导航、控制或电梯状态。它仅在 `TakeElevator` 活跃后低频汇总机器人真实高度、轿厢/门板姿态、A1 trunk/足端/腿部 link 世界状态、跟踪目标、门区点云和深度 ROI；同名 Gazebo link 会保留为带序号的独立样本，足端 link 明显偏离官方 URDF 的小腿固定关节时，离线分析会标记并采用运动学推导值。观察到 `EXIT_CABIN` 成功或失败后，`--stop-after-exit` 会终止本次工程诊断。足端力话题只作为辅助记录，零值不能作为接触证据。输出位于运行目录的 `observation/`，可用以下命令生成对时时间线：
+
+```bash
+python3 src/danger_search/tools/analyze_observation.py \
+  results/runs/<运行目录>/observation/telemetry.bag
+```
+
+`observation/offline_scene/` 中的 layout、manifest、门和电梯配置只用于离线复现及覆盖分析，不得接入生产算法决策。Gazebo model/link state、足端接触等裁判侧信息同样只属于外部诊断证据。

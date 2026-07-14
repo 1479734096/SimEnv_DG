@@ -1,10 +1,3 @@
-"""门/电梯控制的纯运行时状态机。
-
-本文件不依赖 rospy，也不直接调用 Gazebo。它只读取 exporter.py 生成的
-door_config.yaml / elevator_config.yaml，并根据服务请求计算“是否接受请求、
-目标状态是什么、模型或门板应该移动到哪里”。
-control_server.py 负责把这些结果应用到 Gazebo。
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -13,7 +6,6 @@ from typing import Any
 
 @dataclass
 class DoorState:
-    """单扇动态门的运行时状态。"""
     door_id: str
     kind: str
     model_name: str
@@ -26,23 +18,20 @@ class DoorState:
 
 @dataclass
 class ElevatorState:
-    """单台电梯的运行时状态。"""
     elevator_id: str
     model_name: str
     current_floor: int
     served_floors: list[int]
-    car_size: list[float]
     floor_poses: dict[int, list[float]]
+    car_size: list[float]
     state: str = "idle"
     doors_open: bool = False
 
 
 class BuildingControlRuntime:
-    """门/电梯服务的内存状态机。"""
+    """In-memory state machine used by the Gazebo Classic control adapter."""
 
     def __init__(self, *, door_specs: list[dict[str, Any]], elevator_specs: list[dict[str, Any]]):
-        # 配置来自 generated_building/door_config.yaml。
-        # panel_poses 是门板相对门模型的局部位姿，稍后由 control_server.py 转成 world 位姿。
         self._doors = {
             spec["id"]: DoorState(
                 door_id=spec["id"],
@@ -59,25 +48,22 @@ class BuildingControlRuntime:
             )
             for spec in door_specs
         }
-        # 配置来自 generated_building/elevator_config.yaml。
-        # floor_poses 保存电梯轿厢在每个服务楼层的 world 位姿。
         self._elevators = {
             spec["id"]: ElevatorState(
                 elevator_id=spec["id"],
                 model_name=str(spec.get("model_name", f"dynamic_{spec['id']}")),
                 current_floor=int(spec.get("current_floor", 0)),
                 served_floors=[int(value) for value in spec.get("served_floors", [])],
-                car_size=[float(value) for value in spec.get("car_size", [0.0, 0.0, 0.0])],
                 floor_poses={
                     int(key): [float(value) for value in pose]
                     for key, pose in (spec.get("floor_poses", {}) or {}).items()
                 },
+                car_size=[float(value) for value in spec.get("car_size", [0.0, 0.0, 0.0])],
             )
             for spec in elevator_specs
         }
 
     def set_door_state(self, door_id: str, open_state: bool) -> dict[str, Any]:
-        """处理开关门请求，返回 Gazebo 需要应用的模型/门板目标位姿。"""
         if door_id not in self._doors:
             return {
                 "accepted": False,
@@ -89,6 +75,7 @@ class BuildingControlRuntime:
         state.is_open = bool(open_state)
         start_suffix = "open" if previous_is_open else "closed"
         target_suffix = "open" if state.is_open else "closed"
+        motion_duration = 0.0 if previous_is_open == state.is_open else state.motion_duration
         return {
             "accepted": True,
             "state": "open" if state.is_open else "closed",
@@ -98,7 +85,7 @@ class BuildingControlRuntime:
             "model_name": state.model_name,
             "target_pose": state.closed_pose,
             "model_pose": state.closed_pose,
-            "motion_duration": state.motion_duration,
+            "motion_duration": motion_duration,
             "start_panel_poses": {
                 "left_panel": state.panel_poses.get(f"left_{start_suffix}"),
                 "right_panel": state.panel_poses.get(f"right_{start_suffix}"),
@@ -110,7 +97,6 @@ class BuildingControlRuntime:
         }
 
     def call_elevator(self, elevator_id: str, target_floor: int, open_doors: bool) -> dict[str, Any]:
-        """处理呼叫电梯请求，返回电梯轿厢应移动到的楼层位姿。"""
         if elevator_id not in self._elevators:
             return {
                 "accepted": False,
@@ -127,7 +113,8 @@ class BuildingControlRuntime:
                 "message": f"floor {target_floor} is not served by '{elevator_id}'",
             }
 
-        source_pose = state.floor_poses.get(state.current_floor)
+        previous_floor = state.current_floor
+        previous_pose = state.floor_poses.get(previous_floor)
         state.state = "moving" if target_floor != state.current_floor else "idle"
         state.current_floor = target_floor
         state.doors_open = bool(open_doors)
@@ -135,10 +122,12 @@ class BuildingControlRuntime:
         return {
             "accepted": True,
             "current_floor": state.current_floor,
+            "previous_floor": previous_floor,
             "state": state.state,
             "message": f"elevator '{elevator_id}' moved to floor {target_floor}",
             "model_name": state.model_name,
-            "source_pose": source_pose,
+            "previous_pose": previous_pose,
             "target_pose": state.floor_poses.get(state.current_floor),
-            "car_size": list(state.car_size),
+            "car_size": state.car_size,
+            "target_door_id": f"elevator_floor_{state.current_floor}",
         }

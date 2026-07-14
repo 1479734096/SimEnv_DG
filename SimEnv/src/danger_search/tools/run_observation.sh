@@ -8,6 +8,9 @@ SIM_DIR="$(cd "$PACKAGE_DIR/../.." && pwd)"
 SEED=42
 TIMEOUT=10000
 MAX_FLOOR=1
+PARAMS=""
+STOP_AFTER_EXIT=0
+DIAGNOSTIC_RATE=2.0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --seed)
@@ -22,12 +25,32 @@ while [ "$#" -gt 0 ]; do
       MAX_FLOOR="$2"
       shift 2
       ;;
+    --params)
+      PARAMS="$2"
+      shift 2
+      ;;
+    --stop-after-exit)
+      STOP_AFTER_EXIT=1
+      shift
+      ;;
+    --diagnostic-rate)
+      DIAGNOSTIC_RATE="$2"
+      shift 2
+      ;;
     *)
       echo "未知参数: $1" >&2
       exit 2
       ;;
   esac
 done
+
+if [ -n "$PARAMS" ]; then
+  if [ ! -f "$PARAMS" ]; then
+    echo "参数覆盖文件不存在: $PARAMS" >&2
+    exit 2
+  fi
+  PARAMS="$(realpath "$PARAMS")"
+fi
 
 if [ -z "${DISPLAY:-}" ]; then
   echo "缺少 DISPLAY，不能执行 GUI 观察测试" >&2
@@ -44,8 +67,10 @@ BOOTSTRAP_LOG="$SIM_DIR/logs/observation_${STAMP}_seed_${SEED}.log"
 RUN_PID=""
 BAG_PID=""
 RECORD_PID=""
+DIAGNOSTIC_PID=""
 RUN_DIR=""
 OBS_DIR=""
+EXIT_MARKER=""
 ROS_RUN_ID=""
 WINDOW_ID=""
 MODEL_NAME=""
@@ -89,6 +114,15 @@ stop_process() {
   local signal_name="$2"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     kill "-$signal_name" "$pid" 2>/dev/null || true
+    for _ in $(seq 1 100); do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+    fi
     wait "$pid" 2>/dev/null || true
   fi
 }
@@ -122,20 +156,83 @@ stop_owned_algorithm() {
   done < <(ps -eo pid=,pgid=,args=)
 }
 
+archive_scene_evidence() {
+  local archive_dir="$OBS_DIR/offline_scene"
+  local source
+  mkdir -p "$archive_dir"
+  for source in \
+    scene_manifest.json \
+    scene_manifest.stdout.json \
+    generation_checks.json \
+    building_config.json \
+    layout_metadata.json \
+    door_config.yaml \
+    elevator_config.yaml \
+    team_scene_info.json; do
+    if [ -f "$SIM_DIR/generated_building/$source" ]; then
+      cp "$SIM_DIR/generated_building/$source" "$archive_dir/$source"
+    fi
+  done
+  (
+    cd "$archive_dir"
+    sha256sum ./* > sha256sums.txt 2>/dev/null || true
+  )
+  git -C "$SIM_DIR" rev-parse HEAD > "$OBS_DIR/source_head.txt"
+  git -C "$SIM_DIR" status --short > "$OBS_DIR/source_status.txt"
+  if [ -f "$SIM_DIR/../SimEnv初始.zip" ]; then
+    sha256sum "$SIM_DIR/../SimEnv初始.zip" > "$OBS_DIR/initial_archive_sha256.txt"
+  fi
+  cat > "$archive_dir/USAGE_BOUNDARY.txt" <<'EOF'
+本目录仅用于离线复现、场景覆盖分析和诊断归档。
+layout_metadata、scene_manifest、building_config、door/elevator 配置不得由生产算法读取或影响决策。
+若存在 team_scene_info.json，是否可作运行时输入必须以赛方正式接口文档为准。
+危险源真值不由本观察脚本归档；run_seed 只会在算法退出后的离线评估阶段读取真值。
+EOF
+}
+
+wait_for_current_scene() {
+  local manifest="$SIM_DIR/generated_building/scene_manifest.json"
+  for _ in $(seq 1 240); do
+    if [ -f "$manifest" ] \
+      && [ "$manifest" -nt "$BOOTSTRAP_LOG" ] \
+      && python3 -c \
+        'import json,sys; raise SystemExit(0 if int(json.load(open(sys.argv[1], encoding="utf-8")).get("seed", -1)) == int(sys.argv[2]) else 1)' \
+        "$manifest" "$SEED" 2>/dev/null; then
+      return 0
+    fi
+    if ! kill -0 "$RUN_PID" 2>/dev/null; then
+      echo "run_seed 在生成当前场景前退出" >&2
+      return 1
+    fi
+    sleep 1
+  done
+  echo "等待当前 seed 的 scene manifest 超时" >&2
+  return 1
+}
+
 write_manifest() {
   if [ -z "$OBS_DIR" ]; then
     return
   fi
   END_WALL="$(date --iso-8601=ns)"
   local abort_reason=""
+  local abort_reason_json='""'
+  local params_json="null"
+  if [ -n "$PARAMS" ]; then
+    params_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$PARAMS")"
+  fi
   if [ -f "$OBS_DIR/abort_reason.txt" ]; then
     abort_reason="$(tr '\n' ' ' < "$OBS_DIR/abort_reason.txt")"
+    abort_reason_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$abort_reason")"
   fi
   printf '%s\n' \
     '{' \
     "  \"seed\": $SEED," \
     "  \"max_floor\": $MAX_FLOOR," \
     "  \"wall_timeout\": $TIMEOUT," \
+    "  \"params\": $params_json," \
+    "  \"stop_after_exit\": $STOP_AFTER_EXIT," \
+    "  \"diagnostic_rate_hz\": $DIAGNOSTIC_RATE," \
     "  \"start_wall\": \"$START_WALL\"," \
     "  \"end_wall\": \"$END_WALL\"," \
     "  \"run_dir\": \"$RUN_DIR\"," \
@@ -144,7 +241,7 @@ write_manifest() {
     "  \"model_name\": \"$MODEL_NAME\"," \
     "  \"camera_name\": \"$CAMERA_NAME\"," \
     "  \"stop_reason\": \"$STOP_REASON\"," \
-    "  \"abort_reason\": \"$abort_reason\"," \
+    "  \"abort_reason\": $abort_reason_json," \
     "  \"run_status\": $RUN_STATUS," \
     '  "path_followed_semantics": "collinear_compression_only"' \
     '}' > "$OBS_DIR/manifest.json"
@@ -152,17 +249,32 @@ write_manifest() {
 
 cleanup() {
   trap - EXIT INT TERM
+  set +e
+  if [ -n "$OBS_DIR" ]; then
+    printf '%s cleanup_start run_pid=%s diagnostic_pid=%s bag_pid=%s record_pid=%s\n' \
+      "$(date --iso-8601=ns)" "$RUN_PID" "$DIAGNOSTIC_PID" "$BAG_PID" "$RECORD_PID" \
+      >> "$OBS_DIR/cleanup.log"
+    # 先落盘运行终止语义；即使后续某个外部进程拒绝退出，归档也不会完全丢失。
+    write_manifest
+  fi
+  stop_process "$DIAGNOSTIC_PID" INT
+  DIAGNOSTIC_PID=""
+  stop_process "$BAG_PID" INT
+  BAG_PID=""
+  stop_process "$RECORD_PID" INT
+  RECORD_PID=""
   if [ -n "$RUN_PID" ] && kill -0 "$RUN_PID" 2>/dev/null; then
     kill -INT "$RUN_PID" 2>/dev/null || true
     wait "$RUN_PID" 2>/dev/null || true
   fi
   stop_owned_algorithm
-  stop_process "$BAG_PID" INT
-  stop_process "$RECORD_PID" INT
   if [ -n "$OBS_DIR" ] && [ -f "$BOOTSTRAP_LOG" ]; then
     cp "$BOOTSTRAP_LOG" "$OBS_DIR/run_seed.log"
   fi
   write_manifest
+  if [ -n "$OBS_DIR" ]; then
+    printf '%s cleanup_end\n' "$(date --iso-8601=ns)" >> "$OBS_DIR/cleanup.log"
+  fi
 }
 
 handle_signal() {
@@ -176,13 +288,18 @@ trap 'handle_signal INT' INT
 trap 'handle_signal TERM' TERM
 
 cd "$SIM_DIR"
+PARAM_ARGS=()
+if [ -n "$PARAMS" ]; then
+  PARAM_ARGS=(--params "$PARAMS")
+fi
 (
   trap - INT TERM
   exec env PYTHONUNBUFFERED=1 python3 src/danger_search/tools/run_seed.py \
     --seed "$SEED" \
     --gui \
     --timeout "$TIMEOUT" \
-    --max-floor "$MAX_FLOOR"
+    --max-floor "$MAX_FLOOR" \
+    "${PARAM_ARGS[@]}"
 ) > "$BOOTSTRAP_LOG" 2>&1 &
 RUN_PID=$!
 
@@ -221,6 +338,23 @@ if ! rosparam list >/dev/null 2>&1; then
   exit 1
 fi
 ROS_RUN_ID="$(rosparam get /run_id 2>/dev/null || true)"
+wait_for_current_scene
+archive_scene_evidence
+EXIT_MARKER="$OBS_DIR/exit_cabin_outcome.json"
+(
+  trap - INT TERM
+  exec python3 "$SCRIPT_DIR/capture_exit_cabin_diagnostics.py" \
+    --output "$OBS_DIR/exit_cabin_diagnostics.jsonl" \
+    --summary "$OBS_DIR/exit_cabin_diagnostics_summary.json" \
+    --stop-marker "$EXIT_MARKER" \
+    --rate "$DIAGNOSTIC_RATE"
+) > "$OBS_DIR/exit_cabin_recorder.log" 2>&1 &
+DIAGNOSTIC_PID=$!
+sleep 2
+if ! kill -0 "$DIAGNOSTIC_PID" 2>/dev/null; then
+  echo "EXIT_CABIN 诊断采集器启动失败" >&2
+  exit 1
+fi
 
 for _ in $(seq 1 60); do
   WINDOW_ID="$(find_gazebo_window || true)"
@@ -326,6 +460,17 @@ echo "observation_dir=$OBS_DIR"
 echo "model=$MODEL_NAME camera=$CAMERA_NAME window=$WINDOW_ID"
 
 set +e
+while kill -0 "$RUN_PID" 2>/dev/null; do
+  if [ "$STOP_AFTER_EXIT" = "1" ] && [ -s "$EXIT_MARKER" ]; then
+    STOP_REASON="exit_cabin_outcome"
+    cp "$EXIT_MARKER" "$OBS_DIR/abort_reason.txt"
+    stop_process "$DIAGNOSTIC_PID" INT
+    DIAGNOSTIC_PID=""
+    kill -INT "$RUN_PID" 2>/dev/null || true
+    break
+  fi
+  sleep 1
+done
 wait "$RUN_PID"
 RUN_STATUS=$?
 set -e

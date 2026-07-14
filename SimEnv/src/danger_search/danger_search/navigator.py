@@ -150,7 +150,13 @@ class PathFollower:
         self._publish_path_diagnostics()
         self.stop(reason=reason)
 
-    def tick(self, pose_xy_yaw: tuple[float, float, float]) -> str:
+    def tick(
+        self,
+        pose_xy_yaw: tuple[float, float, float],
+        *,
+        max_linear: float | None = None,
+        goal_tolerance: float | None = None,
+    ) -> str:
         now = get_time()
         self._debug_pose = tuple(float(value) for value in pose_xy_yaw)
         self._debug_stuck_elapsed = max(0.0, now - self._last_progress_time)
@@ -179,7 +185,13 @@ class PathFollower:
         x, y, yaw = pose_xy_yaw
         goal = self._path[-1]
         goal_distance = math.hypot(goal[0] - x, goal[1] - y)
-        if goal_distance <= self.goal_tolerance:
+        effective_goal_tolerance = self.goal_tolerance
+        if goal_tolerance is not None:
+            effective_goal_tolerance = min(
+                effective_goal_tolerance,
+                max(0.0, float(goal_tolerance)),
+            )
+        if goal_distance <= effective_goal_tolerance:
             self._debug_current_waypoint = goal
             self._record_target_debug(pose_xy_yaw, goal)
             self.clear_path(reason="goal_reached")
@@ -208,9 +220,12 @@ class PathFollower:
         self._debug_path_turn_angle, self._debug_path_curvature = self._local_path_geometry()
         yaw_error = self._record_target_debug(pose_xy_yaw, target)
         self._publish_local_target(target)
+        linear_limit = self.max_linear
+        if max_linear is not None:
+            linear_limit = min(linear_limit, max(0.0, float(max_linear)))
         linear_x, linear_y, angular = compute_tracking_command(
             yaw_error,
-            max_linear=self.max_linear,
+            max_linear=linear_limit,
             max_lateral=self.max_lateral,
             max_angular=self.max_angular,
             min_linear_fraction=self.min_linear_fraction,
@@ -241,6 +256,16 @@ class PathFollower:
             _clamp(float(angular_z), -self.max_angular, self.max_angular),
             zero_reason="rotate_in_place_zero",
         )
+
+    def reverse_straight(self, *, reason: str = "reverse_straight") -> bool:
+        """按既有倒车配置发布直线速度；由上层负责空间与距离约束。"""
+        self._debug_recover_reason = str(reason)
+        speed = _clamp(float(self.reverse_speed), -abs(self.max_linear), 0.0)
+        if speed >= -1e-4:
+            self.stop(reason=f"{reason}_invalid_speed")
+            return False
+        self._publish(speed, 0.0)
+        return True
 
     def stop(self, repeat: int = 1, interval: float = 0.02, *, reason: str = "stop") -> None:
         count = max(1, int(repeat))

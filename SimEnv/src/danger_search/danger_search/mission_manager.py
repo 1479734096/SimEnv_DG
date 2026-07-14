@@ -422,6 +422,9 @@ class MissionManager:
             _param("mission/permanent_forbidden_decay_scale", 3.0)
         )
         self.status_publish_period = float(_param("mission/status_publish_period", 1.0))
+        self.exit_cabin_backoff_enabled = bool(
+            _param("mission/exit_cabin_backoff_enabled", False)
+        )
         self.result_file = str(_param("result_file", os.path.join(os.getcwd(), "results", "detected_danger.json")))
         self.mission_summary_file = str(_param("mission_summary_file", ""))
 
@@ -474,6 +477,10 @@ class MissionManager:
         }
         self.frontier_switch_score_margin = float(_param("frontier/switch_score_margin", 2.0))
         self.frontier_current_region_radius = float(_param("frontier/current_region_radius", 1.2))
+        self.exit_first_max_linear = _optional_positive_float(
+            _param("controller/exit_first_max_linear", None),
+            "controller/exit_first_max_linear",
+        )
         self.controller_params = {
             "max_linear": float(_param("controller/max_linear", 0.60)),
             "max_lateral": float(_param("controller/max_lateral", 0.25)),
@@ -2357,6 +2364,17 @@ def _message_stamp_seconds(message) -> float | None:
         return None
     to_sec = getattr(stamp, "to_sec", None)
     return float(to_sec()) if callable(to_sec) else None
+
+
+def _optional_positive_float(value, name: str) -> float | None:
+    if value is None or value == "":
+        return None
+    parsed = float(value)
+    if parsed == 0.0:
+        return None
+    if not math.isfinite(parsed) or parsed < 0.0:
+        raise ValueError(f"{name} 必须为非负有限数")
+    return parsed
 
 
 def _param(path: str, default):

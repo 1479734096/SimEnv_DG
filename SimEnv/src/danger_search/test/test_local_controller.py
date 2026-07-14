@@ -66,6 +66,47 @@ class LocalControllerTest(unittest.TestCase):
         self.assertGreater(follower.max_lateral, 0.0)
         self.assertLess(follower.min_linear_fraction, 1.0)
 
+    def test_per_tick_linear_cap_does_not_modify_following_ticks(self):
+        follower = PathFollower(cmd_vel_topic="/cmd_vel", max_linear=0.60)
+        follower.set_path([(0.0, 0.0), (2.0, 0.0)])
+
+        self.assertEqual(follower.tick((0.0, 0.0, 0.0), max_linear=0.25), RUNNING)
+        self.assertAlmostEqual(follower.tracking_debug_snapshot()["linear_command"], 0.25)
+        self.assertAlmostEqual(follower.max_linear, 0.60)
+
+        self.assertEqual(follower.tick((0.01, 0.0, 0.0)), RUNNING)
+        self.assertGreater(follower.tracking_debug_snapshot()["linear_command"], 0.25)
+        self.assertAlmostEqual(follower.max_linear, 0.60)
+
+    def test_per_tick_goal_tolerance_only_tightens_current_call(self):
+        follower = PathFollower(
+            cmd_vel_topic="/cmd_vel",
+            goal_tolerance=0.35,
+        )
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+
+        self.assertEqual(
+            follower.tick((0.75, 0.0, 0.0), goal_tolerance=0.15),
+            RUNNING,
+        )
+        self.assertAlmostEqual(follower.goal_tolerance, 0.35)
+
+        self.assertEqual(
+            follower.tick((0.86, 0.0, 0.0), goal_tolerance=0.15),
+            "done",
+        )
+        self.assertAlmostEqual(follower.goal_tolerance, 0.35)
+
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+        self.assertEqual(follower.tick((0.75, 0.0, 0.0)), "done")
+
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+        self.assertEqual(
+            follower.tick((0.60, 0.0, 0.0), goal_tolerance=0.50),
+            RUNNING,
+        )
+        self.assertAlmostEqual(follower.goal_tolerance, 0.35)
+
     def test_progress_resets_on_robot_displacement(self):
         """即使到终点欧氏距离没变，只要机器人自身移动了就不应误判 STUCK。"""
         follower = PathFollower(
@@ -181,6 +222,39 @@ class LocalControllerTest(unittest.TestCase):
         snapshot = follower.tracking_debug_snapshot()
         self.assertEqual(snapshot["recover_state"], "idle")
         self.assertEqual(snapshot["replan_reason"], "recover_turn_completed")
+
+    def test_reverse_straight_publishes_configured_negative_speed(self):
+        class FakeTwist:
+            def __init__(self):
+                self.linear = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+                self.angular = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+        class FakePublisher:
+            def __init__(self):
+                self.messages = []
+
+            def publish(self, message):
+                self.messages.append(message)
+
+        follower = PathFollower(
+            cmd_vel_topic="/cmd_vel",
+            max_linear=0.60,
+            reverse_speed=-0.15,
+        )
+        publisher = FakePublisher()
+        follower._publisher = publisher
+
+        with patch("danger_search.navigator.Twist", FakeTwist):
+            commanded = follower.reverse_straight(reason="exit_cabin_backoff")
+
+        self.assertTrue(commanded)
+        self.assertEqual(len(publisher.messages), 1)
+        self.assertAlmostEqual(publisher.messages[0].linear.x, -0.15)
+        self.assertAlmostEqual(publisher.messages[0].angular.z, 0.0)
+        self.assertEqual(
+            follower.tracking_debug_snapshot()["recover_reason"],
+            "exit_cabin_backoff",
+        )
 
     def test_tracking_debug_snapshot_records_tracking_context(self):
         follower = PathFollower(cmd_vel_topic="/cmd_vel", pure_pursuit_lookahead=0.45)

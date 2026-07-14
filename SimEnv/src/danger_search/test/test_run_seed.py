@@ -85,5 +85,70 @@ class RunSeedCompletionTest(unittest.TestCase):
         self.assertTrue(run_seed.runtime_completed_successfully(summary))
 
 
+class StartupPostureGateTest(unittest.TestCase):
+    def test_identity_quaternion_is_zero_rpy(self):
+        roll, pitch = run_seed._quaternion_to_rpy(0.0, 0.0, 0.0, 1.0)
+        self.assertAlmostEqual(roll, 0.0, places=6)
+        self.assertAlmostEqual(pitch, 0.0, places=6)
+
+    def test_quaternion_half_pi_roll(self):
+        import math
+        # 绕 x 轴旋转 +90°
+        roll, pitch = run_seed._quaternion_to_rpy(
+            math.sin(math.pi / 4), 0.0, 0.0, math.cos(math.pi / 4)
+        )
+        self.assertAlmostEqual(roll, math.pi / 2, places=5)
+        self.assertAlmostEqual(pitch, 0.0, places=5)
+
+    def test_normal_standup_passes_gate(self):
+        stats = {
+            "samples": 500,
+            "max_abs_roll": 0.066,
+            "max_abs_pitch": 0.041,
+            "min_z": 0.18,
+        }
+        self.assertIsNone(run_seed._posture_breach_detail(stats))
+
+    def test_flipped_robot_fails_gate(self):
+        stats = {
+            "samples": 100,
+            "max_abs_roll": 3.14,
+            "max_abs_pitch": 0.32,
+            "min_z": 0.15,
+        }
+        detail = run_seed._posture_breach_detail(stats)
+        self.assertIsNotNone(detail)
+        self.assertIn("startup_posture_failure", detail)
+        self.assertIn("max_abs_roll=3.1400", detail)
+
+    def test_low_z_fails_gate(self):
+        stats = {
+            "samples": 100,
+            "max_abs_roll": 0.05,
+            "max_abs_pitch": 0.04,
+            "min_z": 0.08,
+        }
+        detail = run_seed._posture_breach_detail(stats)
+        self.assertIsNotNone(detail)
+        self.assertIn("min_z=0.0800", detail)
+
+    def test_no_samples_fails_gate(self):
+        detail = run_seed._posture_breach_detail(
+            {"samples": 0, "max_abs_roll": 0.0, "max_abs_pitch": 0.0, "min_z": None}
+        )
+        self.assertIsNotNone(detail)
+        self.assertIn("samples=0", detail)
+
+    def test_boundary_roll_not_breached(self):
+        # 阈值使用严格大于，恰好 0.5 不触发
+        stats = {
+            "samples": 10,
+            "max_abs_roll": run_seed.POSTURE_MAX_ABS_ROLL,
+            "max_abs_pitch": 0.0,
+            "min_z": 0.20,
+        }
+        self.assertIsNone(run_seed._posture_breach_detail(stats))
+
+
 if __name__ == "__main__":
     unittest.main()

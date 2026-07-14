@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from danger_search.navigation_tasks import DONE, FAILED, OpenDoorAndPass, RUNNING, TakeElevator
 from danger_search.mapper import MultiFloorGridMap
+from danger_search.navigator import STUCK
 from danger_search.planner import BUDGET_EXHAUSTED, PlanResult, UNREACHABLE
 
 
@@ -208,6 +209,433 @@ class OpenDoorAndPassTest(unittest.TestCase):
 
 
 class TakeElevatorTest(unittest.TestCase):
+    @staticmethod
+    def _exit_manager(grid):
+        class Controller:
+            goal_tolerance = 0.35
+            corner_tolerance = 0.15
+            recover_duration = 0.5
+            recover_angular_speed = 0.55
+            reverse_speed = -0.15
+            max_angular = 1.2
+
+            def __init__(self):
+                self.stop_reasons = []
+                self.clear_reasons = []
+                self.turn_commands = []
+                self.reverse_reasons = []
+                self.recover_reasons = []
+                self.paths = []
+                self.path_active = False
+                self.tick_calls = []
+                self.next_tick_status = RUNNING
+
+            def stop(self, *, reason="stop"):
+                self.stop_reasons.append(reason)
+
+            def clear_path(self, *, reason="path_cleared"):
+                self.clear_reasons.append(reason)
+                self.path_active = False
+
+            def has_path(self):
+                return self.path_active
+
+            def set_path(self, path):
+                self.paths.append(list(path))
+                self.path_active = True
+
+            def tick(self, pose, **kwargs):
+                self.tick_calls.append((pose, kwargs))
+                return self.next_tick_status
+
+            def rotate_in_place(self, angular_z):
+                self.turn_commands.append(angular_z)
+
+            def reverse_straight(self, *, reason):
+                self.reverse_reasons.append(reason)
+                return True
+
+            def recover(self, *, reason="stuck"):
+                self.recover_reasons.append(reason)
+
+        controller = Controller()
+        client = SimpleNamespace(
+            get_elevator_points=lambda elevator_id, floor: (
+                (0.85, 2.60),
+                (2.60, 2.60),
+            )
+        )
+        return SimpleNamespace(
+            building_client=client,
+            mapper=SimpleNamespace(floor=lambda floor_index: grid),
+            current_floor=1,
+            controller=controller,
+        )
+
+    def test_exit_stuck_backs_into_cabin_then_realigns_before_retry(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        manager.exit_cabin_backoff_enabled = True
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+        task.cabin_transit_stage = "CROSS"
+
+        with patch.object(task, "_tick_cabin_transit", return_value=STUCK), patch(
+            "danger_search.navigation_tasks.get_time", return_value=10.0
+        ):
+            self.assertEqual(task.tick(manager, (1.37, 2.60, math.pi)), RUNNING)
+
+        self.assertEqual(task.phase, "EXIT_BACKOFF_SETTLE")
+        self.assertEqual(task._retry_count, 1)
+        self.assertGreater(task._exit_backoff_target_xy[0], 1.37)
+
+        with patch("danger_search.navigation_tasks.get_time", return_value=10.6):
+            task.tick(manager, (1.37, 2.60, math.pi))
+        self.assertEqual(task.phase, "EXIT_BACKOFF_ALIGN")
+
+        # 朝向与出口相反时只能原地对准，不能开始倒车。
+        with patch("danger_search.navigation_tasks.get_time", return_value=10.7):
+            task.tick(manager, (1.37, 2.60, 0.0))
+        self.assertEqual(task.phase, "EXIT_BACKOFF_ALIGN")
+        self.assertTrue(manager.controller.turn_commands)
+        self.assertEqual(manager.controller.reverse_reasons, [])
+
+        with patch("danger_search.navigation_tasks.get_time", return_value=10.8):
+            task.tick(manager, (1.37, 2.60, math.pi))
+        self.assertEqual(task.phase, "EXIT_BACKOFF_REVERSE")
+
+        with patch("danger_search.navigation_tasks.get_time", return_value=10.9):
+            task.tick(manager, (1.37, 2.60, math.pi))
+        self.assertEqual(manager.controller.reverse_reasons, ["exit_cabin_backoff"])
+
+        with patch("danger_search.navigation_tasks.get_time", return_value=12.0):
+            task.tick(manager, (1.72, 2.60, math.pi))
+        self.assertEqual(task.phase, "EXIT_BACKOFF_REALIGN")
+
+        with patch("danger_search.navigation_tasks.get_time", return_value=12.1):
+            task.tick(manager, (1.72, 2.60, math.pi))
+        self.assertEqual(task.phase, "EXIT_CABIN")
+        self.assertIn("exit_backoff_complete", manager.controller.clear_reasons)
+
+    def test_first_exit_attempt_passes_local_linear_cap_without_shared_override(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        manager.exit_first_max_linear = 0.25
+        manager.exit_cabin_backoff_enabled = False
+        observed_caps = []
+
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+        task._cabin_transit_mode = "exit"
+        task.cabin_transit_stage = "CROSS"
+        task._cabin_transit_start_xy = (2.0, 2.60)
+        task._cabin_transit_target_xy = (0.85, 2.60)
+        manager.controller.path_active = True
+
+        def tick_controller(pose, **kwargs):
+            observed_caps.append(kwargs.get("max_linear"))
+            return RUNNING
+
+        manager.controller.tick = tick_controller
+
+        self.assertEqual(task.tick(manager, (2.0, 2.60, math.pi)), RUNNING)
+        task._retry_count = 1
+        self.assertEqual(task.tick(manager, (2.0, 2.60, math.pi)), RUNNING)
+
+        self.assertEqual(observed_caps, [0.25, None])
+        self.assertFalse(hasattr(manager.controller, "max_linear"))
+
+    def test_unconfigured_exit_cap_keeps_legacy_controller_call(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        observed_poses = []
+        manager.controller.tick = lambda pose, **kwargs: observed_poses.append((pose, kwargs)) or RUNNING
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+        task._cabin_transit_mode = "exit"
+        task.cabin_transit_stage = "CROSS"
+        task._cabin_transit_start_xy = (2.0, 2.60)
+        task._cabin_transit_target_xy = (0.85, 2.60)
+        manager.controller.path_active = True
+
+        self.assertEqual(task.tick(manager, (2.0, 2.60, math.pi)), RUNNING)
+
+        self.assertEqual(observed_poses, [((2.0, 2.60, math.pi), {"goal_tolerance": 0.15})])
+
+    def test_disabled_exit_backoff_fails_on_first_stuck_without_recovery(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        manager.exit_cabin_backoff_enabled = False
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+
+        with patch.object(task, "_tick_cabin_transit", return_value=STUCK):
+            status = task.tick(manager, (1.37, 2.60, math.pi))
+
+        self.assertEqual(status, FAILED)
+        self.assertEqual(task.phase, "EXIT_CABIN")
+        self.assertEqual(task._retry_count, 0)
+        self.assertEqual(manager.controller.reverse_reasons, [])
+
+    def test_exit_backoff_rejects_blocked_segment(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        grid.mark_occupied(*grid.world_to_grid(1.55, 2.60))
+        manager = self._exit_manager(grid)
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+
+        manager.exit_cabin_backoff_enabled = True
+        task.cabin_transit_stage = "CROSS"
+        with patch.object(task, "_tick_cabin_transit", return_value=STUCK), patch(
+            "danger_search.navigation_tasks.get_time", return_value=10.0
+        ):
+            status = task.tick(manager, (1.37, 2.60, math.pi))
+
+        self.assertEqual(status, FAILED)
+        self.assertEqual(task.phase, "EXIT_CABIN")
+        self.assertEqual(manager.controller.reverse_reasons, [])
+
+    def test_exit_backoff_no_motion_times_out_without_second_recovery(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_BACKOFF_REVERSE"
+        task._retry_count = 1
+        task._exit_backoff_start_xy = (1.37, 2.60)
+        task._exit_backoff_target_xy = (1.72, 2.60)
+        task._exit_backoff_direction = (1.0, 0.0)
+        task._exit_backoff_exit_yaw = math.pi
+        task._exit_backoff_deadline = 13.0
+
+        with patch("danger_search.navigation_tasks.get_time", return_value=13.1):
+            status = task.tick(manager, (1.37, 2.60, math.pi))
+
+        self.assertEqual(status, FAILED)
+        self.assertEqual(manager.controller.reverse_reasons, [])
+        self.assertIn("exit_backoff_failed", manager.controller.stop_reasons)
+
+    def test_exit_positions_at_cabin_center_with_tight_tolerance_before_alignment(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+        calls = []
+
+        def navigate(manager_arg, pose, target_xy, **kwargs):
+            calls.append((target_xy, kwargs))
+            return DONE
+
+        with patch.object(task, "_navigate_to_with_status", side_effect=navigate):
+            status = task.tick(manager, (2.32, 2.53, 0.0))
+
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.cabin_transit_stage, "ALIGN")
+        self.assertEqual(calls, [((2.60, 2.60), {"goal_tolerance": 0.15})])
+
+    def test_exit_aligns_in_place_twice_then_commits_single_straight_path(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+        task._cabin_transit_mode = "exit"
+        task.cabin_transit_stage = "ALIGN"
+
+        self.assertEqual(task.tick(manager, (2.60, 2.60, 0.0)), RUNNING)
+        self.assertTrue(manager.controller.turn_commands)
+        self.assertEqual(manager.controller.paths, [])
+
+        self.assertEqual(task.tick(manager, (2.60, 2.60, math.pi)), RUNNING)
+        self.assertEqual(manager.controller.paths, [])
+
+        self.assertEqual(task.tick(manager, (2.60, 2.60, math.pi)), RUNNING)
+        self.assertEqual(task.cabin_transit_stage, "CROSS")
+        self.assertEqual(
+            manager.controller.paths,
+            [[(2.60, 2.60), (0.85, 2.60)]],
+        )
+
+    def test_alignment_reuses_recover_angular_speed_above_rl_dead_zone(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        task = TakeElevator(0, 1)
+        task.phase = "ENTER_CABIN"
+        task._cabin_transit_mode = "enter"
+        task.cabin_transit_stage = "ALIGN"
+
+        self.assertEqual(task.tick(manager, (0.85, 2.60, -0.14)), RUNNING)
+
+        self.assertGreaterEqual(
+            abs(manager.controller.turn_commands[-1]),
+            manager.controller.recover_angular_speed,
+        )
+
+    def test_exit_does_not_finish_at_general_goal_tolerance_or_replan_mid_crossing(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+        task._cabin_transit_mode = "exit"
+        task.cabin_transit_stage = "CROSS"
+        task._cabin_transit_start_xy = (2.60, 2.60)
+        task._cabin_transit_target_xy = (0.85, 2.60)
+        manager.controller.path_active = True
+
+        with patch("danger_search.navigation_tasks.astar_plan") as planner:
+            status = task.tick(manager, (1.12, 2.60, math.pi))
+
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "EXIT_CABIN")
+        self.assertEqual(task.cabin_transit_stage, "CROSS")
+        self.assertEqual(manager.controller.paths, [])
+        self.assertEqual(
+            manager.controller.tick_calls,
+            [((1.12, 2.60, math.pi), {"goal_tolerance": 0.15})],
+        )
+        planner.assert_not_called()
+
+        status = task.tick(manager, (0.98, 2.60, math.pi))
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "CLOSE_TARGET_FLOOR_DOOR")
+
+    def test_enter_uses_same_position_align_and_cross_sequence(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        task = TakeElevator(0, 1)
+        task.phase = "ENTER_CABIN"
+        task._cabin_transit_mode = "enter"
+        task.cabin_transit_stage = "ALIGN"
+
+        self.assertEqual(task.tick(manager, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.tick(manager, (0.85, 2.60, 0.0)), RUNNING)
+
+        self.assertEqual(task.cabin_transit_stage, "CROSS")
+        self.assertEqual(
+            manager.controller.paths,
+            [[(0.85, 2.60), (2.60, 2.60)]],
+        )
+
+    def test_enter_only_keeps_existing_recovery_before_crossing(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        task = TakeElevator(0, 1)
+        task.phase = "ENTER_CABIN"
+        task.cabin_transit_stage = "POSITION"
+
+        with patch.object(task, "_tick_cabin_transit", return_value=STUCK):
+            self.assertEqual(task.tick(manager, (0.70, 2.60, 0.0)), RUNNING)
+
+        self.assertEqual(
+            manager.controller.recover_reasons,
+            ["elevator_enter_position_stuck"],
+        )
+
+        task.cabin_transit_stage = "CROSS"
+        with patch.object(task, "_tick_cabin_transit", return_value=STUCK):
+            self.assertEqual(task.tick(manager, (1.50, 2.60, 0.0)), FAILED)
+
+        self.assertEqual(
+            manager.controller.recover_reasons,
+            ["elevator_enter_position_stuck"],
+        )
+
+    def test_wait_target_door_requires_unblocked_straight_cabin_segment(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        grid.mark_occupied(*grid.world_to_grid(1.55, 2.60))
+        manager = self._exit_manager(grid)
+        manager.target_floor = 1
+        task = TakeElevator(0, 1)
+        task.phase = "WAIT_TARGET_DOOR_OPEN"
+
+        with patch(
+            "danger_search.navigation_tasks.astar_plan",
+            return_value=PlanResult(path=[(2.60, 2.60), (0.85, 2.60)], status="reached"),
+        ):
+            status = task.tick(manager, (2.60, 2.60, math.pi))
+
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "WAIT_TARGET_DOOR_OPEN")
+
     def test_elevator_service_failure_returns_failed(self):
         failures = []
         task = TakeElevator(0, 1)
