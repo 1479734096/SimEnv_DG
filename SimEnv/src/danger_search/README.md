@@ -200,3 +200,62 @@ python3 src/danger_search/tools/analyze_observation.py \
 ```
 
 `observation/offline_scene/` 中的 layout、manifest、门和电梯配置只用于离线复现及覆盖分析，不得接入生产算法决策。Gazebo model/link state、足端接触等裁判侧信息同样只属于外部诊断证据。
+
+## 负障碍外部诊断
+
+负障碍诊断必须先做短平地采集，确认原始点云、Livox、深度、TF 和地图录制没有明显降低控制频率或 RTF：
+
+```bash
+src/danger_search/tools/run_observation.sh \
+  --seed 42 \
+  --max-floor 2 \
+  --params results/runs/<既有运行目录>/params.yaml \
+  --timeout 240 \
+  --ground-support-capture \
+  --ground-support-shadow \
+  --kill-only-sim-time 15
+```
+
+`--ground-support-shadow` 默认关闭，且必须与原始证据采集同时启用。它启动独立只订阅进程，按参赛配置的点云抽样方式维护稀疏支撑置信网格，并写出：
+
+- `observation/ground_support_shadow.jsonl`：低频状态变化、当前路径足迹扫掠、候选反事实告警和相邻阈值结果；
+- `observation/ground_support_shadow_summary.json`：负载、消息计数、方案 G 跳帧及各楼层状态汇总；
+- 退出前的 `ground_support_shadow_final_grid_v1`：完整稀疏网格，避免最后一个输出周期内的证据丢失。
+
+该进程没有 ROS publisher，`hypothetical_alert` 不会进入 Mapper、Planner 或控制器。方案 G 歧义期间收到的 cloud stamp 会被消费但不更新支撑层，对齐后只处理新 cloud。
+
+安全静止扫描需要让假想扫掠区覆盖待观测区域时，可单独运行 shadow 进程并传入
+`--minimum-lookahead`、`--maximum-lookahead`。这两个参数只改变诊断输出中的假想
+扫掠长度，默认仍为 0.5～0.8 m，不得作为生产控制或固定场景坐标输入。
+
+通过负载检查后，才允许在已知安全边界前采集。空间边界只属于本次外部诊断，不能写入参赛算法：
+
+```bash
+src/danger_search/tools/run_observation.sh \
+  --seed <seed> \
+  --max-floor <楼层数> \
+  --params <参数文件> \
+  --timeout <wall秒数> \
+  --ground-support-capture \
+  --kill-only-floor <楼层> \
+  --kill-only-min-x <边界> \
+  --kill-only-min-y <边界>
+```
+
+kill-only 工具只订阅状态和 odom，命中边界后向 runner 发送 `SIGINT`；它不发布速度、不修改路径，也不扶正机器人。若历史危险区域无法在安全距离前终止，应停止采集，不得再次实际坠落。
+
+平地制动包络可额外使用 `--kill-only-min-speed` 约束触发速度。独立楼梯诊断可配置 `--kill-only-minimum-z`、`--kill-only-maximum-abs-roll`、`--kill-only-maximum-abs-pitch` 和 `--kill-only-posture-active-after-sim`；任一姿态危险条件成立即只终止 runner。手动 `/nav/goal` 只能作为明确归档的非生产测试输入，不能写入比赛策略或由真值在正式运行时触发。
+
+离线分析命令如下：
+
+```bash
+python3 src/danger_search/tools/analyze_ground_support.py \
+  results/runs/<安全采集目录> \
+  --reference-run results/runs/<无原始采集参考目录> \
+  --evaluation-path-run results/runs/<历史坠落目录> \
+  --independent-normal-run results/runs/<独立正常采集目录>
+```
+
+分析器区分 `SUPPORTED`、`UNKNOWN_SUPPORT` 和 `NO_SUPPORT_EVIDENCE`。视场外、遮挡、点数不足、从未观测以及单纯“没有点”均保持 `UNKNOWN_SUPPORT`；只有明确穿过当前楼面并命中更低表面的回波才作为缺失支撑正证据。历史路径和 `offline_scene/` 几何只用于离线真值对照，不得成为运行时输入。
+
+Mapper 回放按 10 Hz 推断 tick、最新 cloud/odom 快照、cloud stamp 消费、点云抽样、当前楼层和楼层歧义跳帧近似生产语义。只要回放与实时 `map_debug` 不完全一致，就必须标记为近似回放，并禁止归因某个栅格的具体写入来源。

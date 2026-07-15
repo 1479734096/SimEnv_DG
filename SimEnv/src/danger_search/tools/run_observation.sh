@@ -11,6 +11,22 @@ MAX_FLOOR=1
 PARAMS=""
 STOP_AFTER_EXIT=0
 DIAGNOSTIC_RATE=2.0
+GROUND_SUPPORT_CAPTURE=0
+GROUND_SUPPORT_SHADOW=0
+DIAGNOSTIC_STOP_LATCH=0
+SHADOW_SWEEP_HALF_WIDTH=""
+SHADOW_THRESHOLD_WIDTHS=""
+KILL_ONLY_SIM_TIME=""
+KILL_ONLY_FLOOR=""
+KILL_ONLY_MIN_X=""
+KILL_ONLY_MAX_X=""
+KILL_ONLY_MIN_Y=""
+KILL_ONLY_MAX_Y=""
+KILL_ONLY_MIN_SPEED=""
+KILL_ONLY_MINIMUM_Z=""
+KILL_ONLY_MAXIMUM_ABS_ROLL=""
+KILL_ONLY_MAXIMUM_ABS_PITCH=""
+KILL_ONLY_POSTURE_ACTIVE_AFTER_SIM=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --seed)
@@ -37,12 +53,96 @@ while [ "$#" -gt 0 ]; do
       DIAGNOSTIC_RATE="$2"
       shift 2
       ;;
+    --ground-support-capture)
+      GROUND_SUPPORT_CAPTURE=1
+      shift
+      ;;
+    --ground-support-shadow)
+      GROUND_SUPPORT_SHADOW=1
+      shift
+      ;;
+    --diagnostic-stop-latch)
+      DIAGNOSTIC_STOP_LATCH=1
+      shift
+      ;;
+    --shadow-sweep-half-width)
+      SHADOW_SWEEP_HALF_WIDTH="$2"
+      shift 2
+      ;;
+    --shadow-threshold-widths)
+      SHADOW_THRESHOLD_WIDTHS="$2"
+      shift 2
+      ;;
+    --kill-only-sim-time)
+      KILL_ONLY_SIM_TIME="$2"
+      shift 2
+      ;;
+    --kill-only-floor)
+      KILL_ONLY_FLOOR="$2"
+      shift 2
+      ;;
+    --kill-only-min-x)
+      KILL_ONLY_MIN_X="$2"
+      shift 2
+      ;;
+    --kill-only-max-x)
+      KILL_ONLY_MAX_X="$2"
+      shift 2
+      ;;
+    --kill-only-min-y)
+      KILL_ONLY_MIN_Y="$2"
+      shift 2
+      ;;
+    --kill-only-max-y)
+      KILL_ONLY_MAX_Y="$2"
+      shift 2
+      ;;
+    --kill-only-min-speed)
+      KILL_ONLY_MIN_SPEED="$2"
+      shift 2
+      ;;
+    --kill-only-minimum-z)
+      KILL_ONLY_MINIMUM_Z="$2"
+      shift 2
+      ;;
+    --kill-only-maximum-abs-roll)
+      KILL_ONLY_MAXIMUM_ABS_ROLL="$2"
+      shift 2
+      ;;
+    --kill-only-maximum-abs-pitch)
+      KILL_ONLY_MAXIMUM_ABS_PITCH="$2"
+      shift 2
+      ;;
+    --kill-only-posture-active-after-sim)
+      KILL_ONLY_POSTURE_ACTIVE_AFTER_SIM="$2"
+      shift 2
+      ;;
     *)
       echo "未知参数: $1" >&2
       exit 2
       ;;
   esac
 done
+
+if [ "$GROUND_SUPPORT_CAPTURE" != "1" ] \
+  && [ -n "$KILL_ONLY_SIM_TIME$KILL_ONLY_FLOOR$KILL_ONLY_MIN_X$KILL_ONLY_MAX_X$KILL_ONLY_MIN_Y$KILL_ONLY_MAX_Y$KILL_ONLY_MIN_SPEED$KILL_ONLY_MINIMUM_Z$KILL_ONLY_MAXIMUM_ABS_ROLL$KILL_ONLY_MAXIMUM_ABS_PITCH" ]; then
+  echo "kill-only 边界仅供 --ground-support-capture 诊断使用" >&2
+  exit 2
+fi
+if [ "$GROUND_SUPPORT_SHADOW" = "1" ] && [ "$GROUND_SUPPORT_CAPTURE" != "1" ]; then
+  echo "--ground-support-shadow 必须与 --ground-support-capture 同时使用" >&2
+  exit 2
+fi
+if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ] \
+  && { [ "$GROUND_SUPPORT_CAPTURE" != "1" ] || [ "$GROUND_SUPPORT_SHADOW" != "1" ]; }; then
+  echo "--diagnostic-stop-latch 必须与原始采集及 shadow 同时使用" >&2
+  exit 2
+fi
+if [ -n "$SHADOW_SWEEP_HALF_WIDTH$SHADOW_THRESHOLD_WIDTHS" ] \
+  && [ "$GROUND_SUPPORT_SHADOW" != "1" ]; then
+  echo "shadow 扫掠参数只能与 --ground-support-shadow 同时使用" >&2
+  exit 2
+fi
 
 if [ -n "$PARAMS" ]; then
   if [ ! -f "$PARAMS" ]; then
@@ -64,13 +164,48 @@ source "$SIM_DIR/devel/setup.bash"
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
 BOOTSTRAP_LOG="$SIM_DIR/logs/observation_${STAMP}_seed_${SEED}.log"
+SCENE_REQUEST_MARKER="$SIM_DIR/logs/observation_${STAMP}_seed_${SEED}.scene_request"
+: > "$SCENE_REQUEST_MARKER"
+SOURCE_PARAMS="$PARAMS"
+DIAGNOSTIC_PARAMS=""
+RAW_COMMAND_TOPIC="/danger_search/diagnostic_cmd_vel_raw"
+if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ]; then
+  DIAGNOSTIC_PARAMS="$SIM_DIR/logs/ground_support_stop_params_${STAMP}.yaml"
+  python3 - "$SOURCE_PARAMS" "$DIAGNOSTIC_PARAMS" "$RAW_COMMAND_TOPIC" <<'PY'
+import sys
+from pathlib import Path
+import yaml
+
+source, output, raw_topic = sys.argv[1:]
+payload = {}
+if source:
+    loaded = yaml.safe_load(Path(source).read_text(encoding="utf-8"))
+    if isinstance(loaded, dict):
+        payload = loaded
+topics = payload.setdefault("topics", {})
+if not isinstance(topics, dict):
+    raise SystemExit("参数文件中的 topics 必须是映射")
+topics["cmd_vel"] = raw_topic
+Path(output).write_text(
+    yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+    encoding="utf-8",
+)
+PY
+  PARAMS="$DIAGNOSTIC_PARAMS"
+fi
 RUN_PID=""
 BAG_PID=""
 RECORD_PID=""
 DIAGNOSTIC_PID=""
+GUARD_PID=""
+SHADOW_PID=""
+STOP_LATCH_PID=""
 RUN_DIR=""
 OBS_DIR=""
 EXIT_MARKER=""
+GUARD_MARKER=""
+SHADOW_ALERT_STATE=""
+STOP_LATCH_MARKER=""
 ROS_RUN_ID=""
 WINDOW_ID=""
 MODEL_NAME=""
@@ -79,6 +214,33 @@ START_WALL=""
 END_WALL=""
 RUN_STATUS=1
 STOP_REASON="run_seed_exit"
+
+guard_has_fired() {
+  [ -n "$GUARD_MARKER" ] && [ -s "$GUARD_MARKER" ]
+}
+
+stop_latch_completed() {
+  [ "$DIAGNOSTIC_STOP_LATCH" = "1" ] \
+    && [ -n "$STOP_LATCH_MARKER" ] \
+    && [ -s "$STOP_LATCH_MARKER" ]
+}
+
+finish_guarded_capture() {
+  STOP_REASON="ground_support_kill_only_guard"
+  RUN_STATUS=0
+  cp "$GUARD_MARKER" "$OBS_DIR/abort_reason.txt"
+  exit 0
+}
+
+check_runner_during_setup() {
+  if kill -0 "$RUN_PID" 2>/dev/null; then
+    return 0
+  fi
+  if guard_has_fired; then
+    finish_guarded_capture
+  fi
+  return 1
+}
 
 find_gazebo_window() {
   local client_id
@@ -168,6 +330,7 @@ archive_scene_evidence() {
     layout_metadata.json \
     door_config.yaml \
     elevator_config.yaml \
+    competition_scene.world \
     team_scene_info.json; do
     if [ -f "$SIM_DIR/generated_building/$source" ]; then
       cp "$SIM_DIR/generated_building/$source" "$archive_dir/$source"
@@ -194,13 +357,13 @@ wait_for_current_scene() {
   local manifest="$SIM_DIR/generated_building/scene_manifest.json"
   for _ in $(seq 1 240); do
     if [ -f "$manifest" ] \
-      && [ "$manifest" -nt "$BOOTSTRAP_LOG" ] \
+      && [ "$manifest" -nt "$SCENE_REQUEST_MARKER" ] \
       && python3 -c \
         'import json,sys; raise SystemExit(0 if int(json.load(open(sys.argv[1], encoding="utf-8")).get("seed", -1)) == int(sys.argv[2]) else 1)' \
         "$manifest" "$SEED" 2>/dev/null; then
       return 0
     fi
-    if ! kill -0 "$RUN_PID" 2>/dev/null; then
+    if ! check_runner_during_setup; then
       echo "run_seed 在生成当前场景前退出" >&2
       return 1
     fi
@@ -218,8 +381,12 @@ write_manifest() {
   local abort_reason=""
   local abort_reason_json='""'
   local params_json="null"
+  local source_params_json="null"
   if [ -n "$PARAMS" ]; then
     params_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$PARAMS")"
+  fi
+  if [ -n "$SOURCE_PARAMS" ]; then
+    source_params_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$SOURCE_PARAMS")"
   fi
   if [ -f "$OBS_DIR/abort_reason.txt" ]; then
     abort_reason="$(tr '\n' ' ' < "$OBS_DIR/abort_reason.txt")"
@@ -231,7 +398,24 @@ write_manifest() {
     "  \"max_floor\": $MAX_FLOOR," \
     "  \"wall_timeout\": $TIMEOUT," \
     "  \"params\": $params_json," \
+    "  \"source_params\": $source_params_json," \
     "  \"stop_after_exit\": $STOP_AFTER_EXIT," \
+    "  \"ground_support_capture\": $GROUND_SUPPORT_CAPTURE," \
+    "  \"ground_support_shadow\": $GROUND_SUPPORT_SHADOW," \
+    "  \"diagnostic_stop_latch\": $DIAGNOSTIC_STOP_LATCH," \
+    "  \"shadow_sweep_half_width\": ${SHADOW_SWEEP_HALF_WIDTH:-null}," \
+    "  \"shadow_threshold_widths\": \"$SHADOW_THRESHOLD_WIDTHS\"," \
+    "  \"kill_only_sim_time\": ${KILL_ONLY_SIM_TIME:-null}," \
+    "  \"kill_only_floor\": ${KILL_ONLY_FLOOR:-null}," \
+    "  \"kill_only_min_x\": ${KILL_ONLY_MIN_X:-null}," \
+    "  \"kill_only_max_x\": ${KILL_ONLY_MAX_X:-null}," \
+    "  \"kill_only_min_y\": ${KILL_ONLY_MIN_Y:-null}," \
+    "  \"kill_only_max_y\": ${KILL_ONLY_MAX_Y:-null}," \
+    "  \"kill_only_min_speed\": ${KILL_ONLY_MIN_SPEED:-null}," \
+    "  \"kill_only_minimum_z\": ${KILL_ONLY_MINIMUM_Z:-null}," \
+    "  \"kill_only_maximum_abs_roll\": ${KILL_ONLY_MAXIMUM_ABS_ROLL:-null}," \
+    "  \"kill_only_maximum_abs_pitch\": ${KILL_ONLY_MAXIMUM_ABS_PITCH:-null}," \
+    "  \"kill_only_posture_active_after_sim\": ${KILL_ONLY_POSTURE_ACTIVE_AFTER_SIM:-null}," \
     "  \"diagnostic_rate_hz\": $DIAGNOSTIC_RATE," \
     "  \"start_wall\": \"$START_WALL\"," \
     "  \"end_wall\": \"$END_WALL\"," \
@@ -250,13 +434,22 @@ write_manifest() {
 cleanup() {
   trap - EXIT INT TERM
   set +e
+  if guard_has_fired; then
+    STOP_REASON="ground_support_kill_only_guard"
+    RUN_STATUS=0
+    cp "$GUARD_MARKER" "$OBS_DIR/abort_reason.txt"
+  fi
   if [ -n "$OBS_DIR" ]; then
-    printf '%s cleanup_start run_pid=%s diagnostic_pid=%s bag_pid=%s record_pid=%s\n' \
-      "$(date --iso-8601=ns)" "$RUN_PID" "$DIAGNOSTIC_PID" "$BAG_PID" "$RECORD_PID" \
+    printf '%s cleanup_start run_pid=%s diagnostic_pid=%s shadow_pid=%s stop_latch_pid=%s guard_pid=%s bag_pid=%s record_pid=%s\n' \
+      "$(date --iso-8601=ns)" "$RUN_PID" "$DIAGNOSTIC_PID" "$SHADOW_PID" "$STOP_LATCH_PID" "$GUARD_PID" "$BAG_PID" "$RECORD_PID" \
       >> "$OBS_DIR/cleanup.log"
     # 先落盘运行终止语义；即使后续某个外部进程拒绝退出，归档也不会完全丢失。
     write_manifest
   fi
+  stop_process "$GUARD_PID" INT
+  GUARD_PID=""
+  stop_process "$SHADOW_PID" INT
+  SHADOW_PID=""
   stop_process "$DIAGNOSTIC_PID" INT
   DIAGNOSTIC_PID=""
   stop_process "$BAG_PID" INT
@@ -268,6 +461,9 @@ cleanup() {
     wait "$RUN_PID" 2>/dev/null || true
   fi
   stop_owned_algorithm
+  # 实际控制输出门控最后退出，确保 runner/算法停止过程中仍保持零命令。
+  stop_process "$STOP_LATCH_PID" INT
+  STOP_LATCH_PID=""
   if [ -n "$OBS_DIR" ] && [ -f "$BOOTSTRAP_LOG" ]; then
     cp "$BOOTSTRAP_LOG" "$OBS_DIR/run_seed.log"
   fi
@@ -322,6 +518,7 @@ fi
 OBS_DIR="$RUN_DIR/observation"
 mkdir -p "$OBS_DIR"
 cp "$BOOTSTRAP_LOG" "$OBS_DIR/run_seed.log"
+START_WALL="$(date --iso-8601=ns)"
 
 for _ in $(seq 1 240); do
   if rosparam list >/dev/null 2>&1; then
@@ -338,6 +535,131 @@ if ! rosparam list >/dev/null 2>&1; then
   exit 1
 fi
 ROS_RUN_ID="$(rosparam get /run_id 2>/dev/null || true)"
+
+SHADOW_ALERT_STATE="$OBS_DIR/ground_support_shadow_alert_state.json"
+STOP_LATCH_MARKER="$OBS_DIR/ground_support_diagnostic_stop_complete.json"
+if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ]; then
+  (
+    trap - INT TERM
+    exec python3 "$SCRIPT_DIR/ground_support_stop_latch.py" \
+      --alert-state "$SHADOW_ALERT_STATE" \
+      --event-log "$OBS_DIR/ground_support_diagnostic_stop.jsonl" \
+      --stop-marker "$STOP_LATCH_MARKER" \
+      --raw-command-topic "$RAW_COMMAND_TOPIC" \
+      --output-command-topic /cmd_vel
+  ) > "$OBS_DIR/ground_support_diagnostic_stop.log" 2>&1 &
+  STOP_LATCH_PID=$!
+  sleep 1
+  if ! kill -0 "$STOP_LATCH_PID" 2>/dev/null; then
+    echo "负障碍诊断停车锁存器启动失败" >&2
+    exit 1
+  fi
+fi
+
+if [ "$GROUND_SUPPORT_CAPTURE" = "1" ]; then
+  (
+    trap - INT TERM
+    exec rosbag record --lz4 --buffsize=4096 -O "$OBS_DIR/ground_support_telemetry.bag" \
+      /clock \
+      /cmd_vel \
+      /danger_search/diagnostic_cmd_vel_raw \
+      /Odometry_gazebo \
+      /scan \
+      /livox/Pointcloud2 \
+      /real_sense/depth/image_raw \
+      /real_sense/depth/camera_info \
+      /real_sense/rgb/camera_info \
+      /tf \
+      /tf_static \
+      /danger_search/status \
+      /nav/map_debug \
+      /danger_search/path_raw \
+      /danger_search/path_followed \
+      /danger_search/local_target \
+      /junior_ctrl/rl_status \
+      /ground_truth/base_w \
+      /ground_truth/FR_foot \
+      /ground_truth/FL_foot \
+      /ground_truth/RR_foot \
+      /ground_truth/RL_foot \
+      /gazebo/performance_metrics \
+      /rosout_agg
+  ) > "$OBS_DIR/ground_support_rosbag.log" 2>&1 &
+  BAG_PID=$!
+  for _ in $(seq 1 60); do
+    if [ -f "$OBS_DIR/ground_support_telemetry.bag.active" ]; then
+      break
+    fi
+    if ! kill -0 "$BAG_PID" 2>/dev/null || ! kill -0 "$RUN_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 0.5
+  done
+  if ! kill -0 "$BAG_PID" 2>/dev/null \
+    || [ ! -f "$OBS_DIR/ground_support_telemetry.bag.active" ]; then
+    echo "负障碍原始证据 rosbag 未正常启动" >&2
+    exit 1
+  fi
+  printf '%s\n' "ready" > "$OBS_DIR/ground_support_capture_ready"
+
+  if [ "$GROUND_SUPPORT_SHADOW" = "1" ]; then
+    SHADOW_ARGS=()
+    [ -z "$SHADOW_SWEEP_HALF_WIDTH" ] || SHADOW_ARGS+=(--sweep-half-width "$SHADOW_SWEEP_HALF_WIDTH")
+    if [ -n "$SHADOW_THRESHOLD_WIDTHS" ]; then
+      IFS=',' read -r -a threshold_width_values <<< "$SHADOW_THRESHOLD_WIDTHS"
+      for threshold_width in "${threshold_width_values[@]}"; do
+        SHADOW_ARGS+=(--threshold-width "$threshold_width")
+      done
+    fi
+    if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ]; then
+      SHADOW_ARGS+=(--alert-state "$SHADOW_ALERT_STATE")
+    fi
+    (
+      trap - INT TERM
+      exec python3 "$SCRIPT_DIR/ground_support_shadow.py" \
+        --output "$OBS_DIR/ground_support_shadow.jsonl" \
+        --summary "$OBS_DIR/ground_support_shadow_summary.json" \
+        --snapshot-rate "$DIAGNOSTIC_RATE" \
+        "${SHADOW_ARGS[@]}"
+    ) > "$OBS_DIR/ground_support_shadow.log" 2>&1 &
+    SHADOW_PID=$!
+    sleep 1
+    if ! kill -0 "$SHADOW_PID" 2>/dev/null; then
+      echo "负障碍 shadow 诊断启动失败" >&2
+      exit 1
+    fi
+  fi
+
+  GUARD_MARKER="$OBS_DIR/ground_support_kill_only_guard.json"
+  GUARD_ARGS=()
+  [ -z "$KILL_ONLY_SIM_TIME" ] || GUARD_ARGS+=(--kill-sim-time "$KILL_ONLY_SIM_TIME")
+  [ -z "$KILL_ONLY_FLOOR" ] || GUARD_ARGS+=(--floor "$KILL_ONLY_FLOOR")
+  [ -z "$KILL_ONLY_MIN_X" ] || GUARD_ARGS+=(--min-x "$KILL_ONLY_MIN_X")
+  [ -z "$KILL_ONLY_MAX_X" ] || GUARD_ARGS+=(--max-x "$KILL_ONLY_MAX_X")
+  [ -z "$KILL_ONLY_MIN_Y" ] || GUARD_ARGS+=(--min-y "$KILL_ONLY_MIN_Y")
+  [ -z "$KILL_ONLY_MAX_Y" ] || GUARD_ARGS+=(--max-y "$KILL_ONLY_MAX_Y")
+  [ -z "$KILL_ONLY_MIN_SPEED" ] || GUARD_ARGS+=(--min-speed "$KILL_ONLY_MIN_SPEED")
+  [ -z "$KILL_ONLY_MINIMUM_Z" ] || GUARD_ARGS+=(--minimum-z "$KILL_ONLY_MINIMUM_Z")
+  [ -z "$KILL_ONLY_MAXIMUM_ABS_ROLL" ] || GUARD_ARGS+=(--maximum-abs-roll "$KILL_ONLY_MAXIMUM_ABS_ROLL")
+  [ -z "$KILL_ONLY_MAXIMUM_ABS_PITCH" ] || GUARD_ARGS+=(--maximum-abs-pitch "$KILL_ONLY_MAXIMUM_ABS_PITCH")
+  [ -z "$KILL_ONLY_POSTURE_ACTIVE_AFTER_SIM" ] || GUARD_ARGS+=(--posture-active-after-sim "$KILL_ONLY_POSTURE_ACTIVE_AFTER_SIM")
+  if [ "${#GUARD_ARGS[@]}" -gt 0 ]; then
+    (
+      trap - INT TERM
+      exec python3 "$SCRIPT_DIR/ground_support_kill_guard.py" \
+        --runner-pid "$RUN_PID" \
+        --marker "$GUARD_MARKER" \
+        "${GUARD_ARGS[@]}"
+    ) > "$OBS_DIR/ground_support_kill_guard.log" 2>&1 &
+    GUARD_PID=$!
+    sleep 1
+    if ! kill -0 "$GUARD_PID" 2>/dev/null; then
+      echo "kill-only 安全边界启动失败" >&2
+      exit 1
+    fi
+  fi
+fi
+
 wait_for_current_scene
 archive_scene_evidence
 EXIT_MARKER="$OBS_DIR/exit_cabin_outcome.json"
@@ -361,7 +683,7 @@ for _ in $(seq 1 60); do
   if [ -n "$WINDOW_ID" ]; then
     break
   fi
-  if ! kill -0 "$RUN_PID" 2>/dev/null; then
+  if ! check_runner_during_setup; then
     echo "run_seed 在 Gazebo 窗口出现前退出" >&2
     exit 1
   fi
@@ -376,12 +698,12 @@ xprop -id "$WINDOW_ID" WM_CLASS _NET_WM_NAME WM_NAME > "$OBS_DIR/gazebo_window_p
 
 MODEL_NAME="${GAZEBO_TRACK_MODEL:-a1_gazebo}"
 for _ in $(seq 1 60); do
-  if gz model -m "$MODEL_NAME" -p > "$OBS_DIR/gazebo_model_check.txt" 2>&1; then
+  if timeout 5 gz model -m "$MODEL_NAME" -p > "$OBS_DIR/gazebo_model_check.txt" 2>&1; then
     model_ready=1
   else
     model_ready=0
   fi
-  gz camera -l > "$OBS_DIR/gazebo_cameras.txt" 2>&1 || true
+  timeout 5 gz camera -l > "$OBS_DIR/gazebo_cameras.txt" 2>&1 || true
   CAMERA_NAME="$(grep -m1 '^gzclient_camera$' "$OBS_DIR/gazebo_cameras.txt" || true)"
   if [ -z "$CAMERA_NAME" ]; then
     CAMERA_NAME="$(grep -m1 '^user_camera$' "$OBS_DIR/gazebo_cameras.txt" || true)"
@@ -389,17 +711,25 @@ for _ in $(seq 1 60); do
   if [ "$model_ready" = "1" ] && [ -n "$CAMERA_NAME" ]; then
     break
   fi
+  if ! check_runner_during_setup; then
+    echo "run_seed 在 Gazebo 模型/相机就绪前退出" >&2
+    exit 1
+  fi
   sleep 1
 done
 if [ "${model_ready:-0}" != "1" ] || [ -z "$CAMERA_NAME" ]; then
   echo "无法确认 Gazebo 模型或 user camera，拒绝开始无跟踪录屏" >&2
   exit 1
 fi
-if ! gz camera -c "$CAMERA_NAME" -f "$MODEL_NAME" > "$OBS_DIR/gazebo_follow.log" 2>&1; then
+if ! timeout 5 gz camera -c "$CAMERA_NAME" -f "$MODEL_NAME" > "$OBS_DIR/gazebo_follow.log" 2>&1; then
   echo "Gazebo 相机跟踪命令失败" >&2
   exit 1
 fi
 
+if ! check_runner_during_setup; then
+  echo "run_seed 在窗口快照前退出" >&2
+  exit 1
+fi
 if ! gst-launch-1.0 -q \
   ximagesrc display-name="$DISPLAY" xid="$WINDOW_ID" remote=true use-damage=false show-pointer=false num-buffers=1 \
   ! videoconvert \
@@ -410,7 +740,6 @@ if ! gst-launch-1.0 -q \
   exit 1
 fi
 
-START_WALL="$(date --iso-8601=ns)"
 (
   trap - INT TERM
   exec gst-launch-1.0 -e \
@@ -425,31 +754,68 @@ START_WALL="$(date --iso-8601=ns)"
 ) > "$OBS_DIR/recording.log" 2>&1 &
 RECORD_PID=$!
 
-(
-  trap - INT TERM
-  exec rosbag record --buffsize=1024 -O "$OBS_DIR/telemetry.bag" \
-    /clock \
-    /cmd_vel \
-    /Odometry_gazebo \
-    /danger_search/status \
-    /nav/map_debug \
-    /danger_search/path_raw \
-    /danger_search/path_followed \
-    /danger_search/local_target \
-    /junior_ctrl/rl_status \
-    /gazebo/performance_metrics \
-    /rosout_agg
-) > "$OBS_DIR/rosbag.log" 2>&1 &
-BAG_PID=$!
+if [ "$GROUND_SUPPORT_CAPTURE" != "1" ]; then
+  (
+    trap - INT TERM
+    exec rosbag record --buffsize=1024 -O "$OBS_DIR/telemetry.bag" \
+      /clock \
+      /cmd_vel \
+      /Odometry_gazebo \
+      /danger_search/status \
+      /nav/map_debug \
+      /danger_search/path_raw \
+      /danger_search/path_followed \
+      /danger_search/local_target \
+      /junior_ctrl/rl_status \
+        /gazebo/performance_metrics \
+        /rosout_agg
+  ) > "$OBS_DIR/rosbag.log" 2>&1 &
+  BAG_PID=$!
+fi
 
 sleep 2
 if ! kill -0 "$RECORD_PID" 2>/dev/null || ! kill -0 "$BAG_PID" 2>/dev/null; then
   echo "录屏或 rosbag 进程未保持运行，拒绝继续测试" >&2
   exit 1
 fi
-if [ ! -s "$OBS_DIR/gazebo.mkv" ] || [ ! -f "$OBS_DIR/telemetry.bag.active" ]; then
+ACTIVE_BAG="$OBS_DIR/telemetry.bag.active"
+if [ "$GROUND_SUPPORT_CAPTURE" = "1" ]; then
+  ACTIVE_BAG="$OBS_DIR/ground_support_telemetry.bag.active"
+fi
+if [ ! -s "$OBS_DIR/gazebo.mkv" ] || [ ! -f "$ACTIVE_BAG" ]; then
   echo "录屏或 rosbag 文件没有正常产生，拒绝继续测试" >&2
   exit 1
+fi
+if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ]; then
+  for _ in $(seq 1 60); do
+    if rostopic info "$RAW_COMMAND_TOPIC" 2>/dev/null \
+      | grep -A 5 '^Publishers:' \
+      | grep -q '^ \* /danger_search '; then
+      break
+    fi
+    if ! kill -0 "$RUN_PID" 2>/dev/null || ! kill -0 "$STOP_LATCH_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 0.5
+  done
+  rostopic info /cmd_vel > "$OBS_DIR/diagnostic_cmd_vel_output_info.txt" 2>&1 || true
+  rostopic info "$RAW_COMMAND_TOPIC" > "$OBS_DIR/diagnostic_cmd_vel_raw_info.txt" 2>&1 || true
+  if ! grep -A 5 '^Publishers:' "$OBS_DIR/diagnostic_cmd_vel_raw_info.txt" \
+      | grep -q '^ \* /danger_search '; then
+    echo "生产控制器没有发布到诊断 raw 命令话题" >&2
+    exit 1
+  fi
+  output_publisher_count="$(
+    grep -A 10 '^Publishers:' "$OBS_DIR/diagnostic_cmd_vel_output_info.txt" \
+      | sed -n '/^Subscribers:/q; /^ \* /p' \
+      | wc -l
+  )"
+  if [ "$output_publisher_count" -ne 1 ] \
+    || ! grep -q '^ \* /ground_support_diagnostic_stop_latch_' \
+      "$OBS_DIR/diagnostic_cmd_vel_output_info.txt"; then
+    echo "实际 /cmd_vel 不是诊断停车门控的唯一发布源" >&2
+    exit 1
+  fi
 fi
 
 printf '%s\n' "$START_WALL" > "$OBS_DIR/start_wall.txt"
@@ -461,6 +827,26 @@ echo "model=$MODEL_NAME camera=$CAMERA_NAME window=$WINDOW_ID"
 
 set +e
 while kill -0 "$RUN_PID" 2>/dev/null; do
+  if guard_has_fired; then
+    STOP_REASON="ground_support_kill_only_guard"
+    cp "$GUARD_MARKER" "$OBS_DIR/abort_reason.txt"
+    break
+  fi
+  if stop_latch_completed; then
+    STOP_REASON="ground_support_diagnostic_stop_complete"
+    cp "$STOP_LATCH_MARKER" "$OBS_DIR/abort_reason.txt"
+    kill -INT "$RUN_PID" 2>/dev/null || true
+    break
+  fi
+  if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ] \
+    && [ -n "$STOP_LATCH_PID" ] \
+    && ! kill -0 "$STOP_LATCH_PID" 2>/dev/null; then
+    STOP_REASON="ground_support_diagnostic_stop_failed"
+    RUN_STATUS=1
+    printf '%s\n' "诊断停车锁存器在完全停车前退出" > "$OBS_DIR/abort_reason.txt"
+    kill -INT "$RUN_PID" 2>/dev/null || true
+    break
+  fi
   if [ "$STOP_AFTER_EXIT" = "1" ] && [ -s "$EXIT_MARKER" ]; then
     STOP_REASON="exit_cabin_outcome"
     cp "$EXIT_MARKER" "$OBS_DIR/abort_reason.txt"
@@ -473,6 +859,13 @@ while kill -0 "$RUN_PID" 2>/dev/null; do
 done
 wait "$RUN_PID"
 RUN_STATUS=$?
+if guard_has_fired; then
+  STOP_REASON="ground_support_kill_only_guard"
+  RUN_STATUS=0
+elif stop_latch_completed; then
+  STOP_REASON="ground_support_diagnostic_stop_complete"
+  RUN_STATUS=0
+fi
 set -e
 RUN_PID=""
 exit "$RUN_STATUS"
