@@ -34,11 +34,20 @@ class KillOnlyBoundary:
     min_y: float | None = None
     max_y: float | None = None
     min_speed: float | None = None
+    min_world_x_velocity: float | None = None
 
     def configured(self) -> bool:
         return any(value is not None for value in asdict(self).values())
 
-    def matches(self, *, floor: int | None, x: float, y: float, speed: float = 0.0) -> bool:
+    def matches(
+        self,
+        *,
+        floor: int | None,
+        x: float,
+        y: float,
+        speed: float = 0.0,
+        world_x_velocity: float = 0.0,
+    ) -> bool:
         if self.floor is not None and floor != self.floor:
             return False
         if self.min_x is not None and x < self.min_x:
@@ -50,6 +59,11 @@ class KillOnlyBoundary:
         if self.max_y is not None and y > self.max_y:
             return False
         if self.min_speed is not None and speed < self.min_speed:
+            return False
+        if (
+            self.min_world_x_velocity is not None
+            and world_x_velocity < self.min_world_x_velocity
+        ):
             return False
         return self.configured()
 
@@ -100,6 +114,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-y", type=float)
     parser.add_argument("--max-y", type=float)
     parser.add_argument("--min-speed", type=float)
+    parser.add_argument("--min-world-x-velocity", type=float)
     parser.add_argument("--minimum-z", type=float)
     parser.add_argument("--maximum-abs-roll", type=float)
     parser.add_argument("--maximum-abs-pitch", type=float)
@@ -125,7 +140,7 @@ class KillOnlyGuard:
         self._lock = Lock()
         self._floor: int | None = None
         self._floor_observed_at: float | None = None
-        self._odom: tuple[float, float, float, float, float, float, float] | None = None
+        self._odom: tuple[float, float, float, float, float, float, float, float, float] | None = None
         self._triggered = False
 
     def on_status(self, message) -> None:
@@ -152,6 +167,8 @@ class KillOnlyGuard:
                     float(message.twist.twist.linear.x),
                     float(message.twist.twist.linear.y),
                 ),
+                float(message.twist.twist.linear.x),
+                float(message.twist.twist.linear.y),
                 roll,
                 pitch,
             )
@@ -171,7 +188,7 @@ class KillOnlyGuard:
             reason = "kill_only_sim_time"
             details["configured_sim_time"] = self.kill_sim_time
         elif odom is not None:
-            x, y, z, odom_stamp, speed, roll, pitch = odom
+            x, y, z, odom_stamp, speed, world_vx, world_vy, roll, pitch = odom
             floor_is_fresh = (
                 floor_observed_at is not None and now - floor_observed_at <= 2.0
             )
@@ -193,6 +210,7 @@ class KillOnlyGuard:
                         "odom_rpy": [roll, pitch, None],
                         "odom_stamp": odom_stamp,
                         "odom_linear_speed": speed,
+                        "odom_world_velocity_xy": [world_vx, world_vy],
                     }
                 )
             elif floor_is_fresh and odom_is_fresh and self.boundary.matches(
@@ -200,6 +218,7 @@ class KillOnlyGuard:
                 x=x,
                 y=y,
                 speed=speed,
+                world_x_velocity=world_vx,
             ):
                 reason = "kill_only_spatial_boundary"
                 details.update(
@@ -209,6 +228,7 @@ class KillOnlyGuard:
                         "odom_xyz": [x, y, z],
                         "odom_stamp": odom_stamp,
                         "odom_linear_speed": speed,
+                        "odom_world_velocity_xy": [world_vx, world_vy],
                         "odom_rpy": [roll, pitch, None],
                     }
                 )
@@ -273,6 +293,7 @@ def main() -> int:
         min_y=args.min_y,
         max_y=args.max_y,
         min_speed=args.min_speed,
+        min_world_x_velocity=args.min_world_x_velocity,
     )
     posture_limits = PostureLimits(
         minimum_z=args.minimum_z,

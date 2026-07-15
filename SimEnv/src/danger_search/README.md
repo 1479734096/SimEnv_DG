@@ -239,10 +239,11 @@ src/danger_search/tools/run_observation.sh \
   --ground-support-capture \
   --kill-only-floor <楼层> \
   --kill-only-min-x <边界> \
-  --kill-only-min-y <边界>
+  --kill-only-min-y <边界> \
+  --kill-only-min-world-x-velocity <朝空带方向的最小世界速度>
 ```
 
-kill-only 工具只订阅状态和 odom，命中边界后向 runner 发送 `SIGINT`；它不发布速度、不修改路径，也不扶正机器人。若历史危险区域无法在安全距离前终止，应停止采集，不得再次实际坠落。
+kill-only 工具只订阅状态和 odom，命中边界后向 runner 发送 `SIGINT`；它不发布速度、不修改路径，也不扶正机器人。自然闭环中应同时约束朝危险区域的世界速度，避免机器人沿安全边界平行行驶时被误杀。若历史危险区域无法在安全距离前终止，应停止采集，不得再次实际坠落。
 
 平地制动包络可额外使用 `--kill-only-min-speed` 约束触发速度。独立楼梯诊断可配置 `--kill-only-minimum-z`、`--kill-only-maximum-abs-roll`、`--kill-only-maximum-abs-pitch` 和 `--kill-only-posture-active-after-sim`；任一姿态危险条件成立即只终止 runner。手动 `/nav/goal` 只能作为明确归档的非生产测试输入，不能写入比赛策略或由真值在正式运行时触发。
 

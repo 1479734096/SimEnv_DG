@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from collections import Counter
+from threading import Lock
 from types import SimpleNamespace
 import unittest
 
@@ -27,6 +29,7 @@ def _load_tool(name: str):
 
 guard = _load_tool("ground_support_kill_guard")
 analyzer = _load_tool("analyze_ground_support")
+shadow_recorder = _load_tool("ground_support_shadow")
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 if str(PACKAGE_DIR) not in sys.path:
@@ -61,6 +64,33 @@ class GroundSupportKillGuardTest(unittest.TestCase):
         self.assertFalse(boundary.matches(floor=0, x=5.0, y=5.0, speed=0.44))
         self.assertTrue(boundary.matches(floor=0, x=5.0, y=5.0, speed=0.45))
 
+    def test_boundary_can_require_motion_toward_positive_world_x(self):
+        boundary = guard.KillOnlyBoundary(
+            floor=1,
+            min_x=0.90,
+            min_y=5.50,
+            min_world_x_velocity=0.05,
+        )
+
+        self.assertFalse(
+            boundary.matches(
+                floor=1,
+                x=0.95,
+                y=5.60,
+                speed=0.50,
+                world_x_velocity=-0.01,
+            )
+        )
+        self.assertTrue(
+            boundary.matches(
+                floor=1,
+                x=0.95,
+                y=5.60,
+                speed=0.50,
+                world_x_velocity=0.20,
+            )
+        )
+
     def test_posture_limits_trigger_on_any_configured_hazard(self):
         limits = guard.PostureLimits(
             minimum_z=0.20,
@@ -89,6 +119,7 @@ class GroundSupportKillGuardTest(unittest.TestCase):
         self.assertIn("--ground-support-capture", source)
         self.assertIn("ground_support_kill_guard.py", source)
         self.assertIn("ground_support_telemetry.bag", source)
+        self.assertIn("--min-world-x-velocity", source)
 
     def test_scene_manifest_wait_uses_static_request_marker(self):
         source = (TOOLS_DIR / "run_observation.sh").read_text(encoding="utf-8")
@@ -156,6 +187,61 @@ class GroundSupportKillGuardTest(unittest.TestCase):
         self.assertNotIn("layout_metadata", source)
         self.assertNotIn("scene_manifest", source)
         self.assertNotIn("danger_truth", source)
+
+
+class GroundSupportShadowGuardTest(unittest.TestCase):
+    def _recorder(self):
+        recorder = shadow_recorder.GroundSupportShadowRecorder.__new__(
+            shadow_recorder.GroundSupportShadowRecorder
+        )
+        recorder._lock = Lock()
+        recorder._floor = 0
+        recorder._ambiguous = True
+        recorder._topic_counts = Counter()
+        recorder._event_counts = Counter()
+        recorder.written = []
+        recorder._write = recorder.written.append
+        return recorder
+
+    def test_alignment_exit_updates_floor_before_releasing_latch(self):
+        recorder = self._recorder()
+        original_rospy = shadow_recorder.rospy
+        shadow_recorder.rospy = SimpleNamespace(get_time=lambda: 12.3)
+        try:
+            recorder._on_rosout(
+                SimpleNamespace(
+                    msg=json.dumps(
+                        {
+                            "event": "floor_transition_ambiguous_exit",
+                            "current_floor": 1,
+                        }
+                    )
+                )
+            )
+        finally:
+            shadow_recorder.rospy = original_rospy
+
+        self.assertEqual(recorder._floor, 1)
+        self.assertFalse(recorder._ambiguous)
+        self.assertEqual(recorder.written[-1]["shadow_action"], "resume_on_next_fresh_cloud")
+
+    def test_alignment_exit_without_confirmed_floor_remains_fail_closed(self):
+        recorder = self._recorder()
+        original_rospy = shadow_recorder.rospy
+        shadow_recorder.rospy = SimpleNamespace(get_time=lambda: 12.3)
+        try:
+            recorder._on_rosout(
+                SimpleNamespace(msg=json.dumps({"event": "floor_transition_ambiguous_exit"}))
+            )
+        finally:
+            shadow_recorder.rospy = original_rospy
+
+        self.assertEqual(recorder._floor, 0)
+        self.assertTrue(recorder._ambiguous)
+        self.assertEqual(
+            recorder.written[-1]["shadow_action"],
+            "keep_latch_missing_confirmed_floor",
+        )
 
 
 class DiagnosticStopLatchTest(unittest.TestCase):

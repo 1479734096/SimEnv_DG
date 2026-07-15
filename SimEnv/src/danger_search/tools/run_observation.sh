@@ -23,6 +23,7 @@ KILL_ONLY_MAX_X=""
 KILL_ONLY_MIN_Y=""
 KILL_ONLY_MAX_Y=""
 KILL_ONLY_MIN_SPEED=""
+KILL_ONLY_MIN_WORLD_X_VELOCITY=""
 KILL_ONLY_MINIMUM_Z=""
 KILL_ONLY_MAXIMUM_ABS_ROLL=""
 KILL_ONLY_MAXIMUM_ABS_PITCH=""
@@ -101,6 +102,10 @@ while [ "$#" -gt 0 ]; do
       KILL_ONLY_MIN_SPEED="$2"
       shift 2
       ;;
+    --kill-only-min-world-x-velocity)
+      KILL_ONLY_MIN_WORLD_X_VELOCITY="$2"
+      shift 2
+      ;;
     --kill-only-minimum-z)
       KILL_ONLY_MINIMUM_Z="$2"
       shift 2
@@ -125,7 +130,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$GROUND_SUPPORT_CAPTURE" != "1" ] \
-  && [ -n "$KILL_ONLY_SIM_TIME$KILL_ONLY_FLOOR$KILL_ONLY_MIN_X$KILL_ONLY_MAX_X$KILL_ONLY_MIN_Y$KILL_ONLY_MAX_Y$KILL_ONLY_MIN_SPEED$KILL_ONLY_MINIMUM_Z$KILL_ONLY_MAXIMUM_ABS_ROLL$KILL_ONLY_MAXIMUM_ABS_PITCH" ]; then
+  && [ -n "$KILL_ONLY_SIM_TIME$KILL_ONLY_FLOOR$KILL_ONLY_MIN_X$KILL_ONLY_MAX_X$KILL_ONLY_MIN_Y$KILL_ONLY_MAX_Y$KILL_ONLY_MIN_SPEED$KILL_ONLY_MIN_WORLD_X_VELOCITY$KILL_ONLY_MINIMUM_Z$KILL_ONLY_MAXIMUM_ABS_ROLL$KILL_ONLY_MAXIMUM_ABS_PITCH" ]; then
   echo "kill-only 边界仅供 --ground-support-capture 诊断使用" >&2
   exit 2
 fi
@@ -412,6 +417,7 @@ write_manifest() {
     "  \"kill_only_min_y\": ${KILL_ONLY_MIN_Y:-null}," \
     "  \"kill_only_max_y\": ${KILL_ONLY_MAX_Y:-null}," \
     "  \"kill_only_min_speed\": ${KILL_ONLY_MIN_SPEED:-null}," \
+    "  \"kill_only_min_world_x_velocity\": ${KILL_ONLY_MIN_WORLD_X_VELOCITY:-null}," \
     "  \"kill_only_minimum_z\": ${KILL_ONLY_MINIMUM_Z:-null}," \
     "  \"kill_only_maximum_abs_roll\": ${KILL_ONLY_MAXIMUM_ABS_ROLL:-null}," \
     "  \"kill_only_maximum_abs_pitch\": ${KILL_ONLY_MAXIMUM_ABS_PITCH:-null}," \
@@ -639,6 +645,7 @@ if [ "$GROUND_SUPPORT_CAPTURE" = "1" ]; then
   [ -z "$KILL_ONLY_MIN_Y" ] || GUARD_ARGS+=(--min-y "$KILL_ONLY_MIN_Y")
   [ -z "$KILL_ONLY_MAX_Y" ] || GUARD_ARGS+=(--max-y "$KILL_ONLY_MAX_Y")
   [ -z "$KILL_ONLY_MIN_SPEED" ] || GUARD_ARGS+=(--min-speed "$KILL_ONLY_MIN_SPEED")
+  [ -z "$KILL_ONLY_MIN_WORLD_X_VELOCITY" ] || GUARD_ARGS+=(--min-world-x-velocity "$KILL_ONLY_MIN_WORLD_X_VELOCITY")
   [ -z "$KILL_ONLY_MINIMUM_Z" ] || GUARD_ARGS+=(--minimum-z "$KILL_ONLY_MINIMUM_Z")
   [ -z "$KILL_ONLY_MAXIMUM_ABS_ROLL" ] || GUARD_ARGS+=(--maximum-abs-roll "$KILL_ONLY_MAXIMUM_ABS_ROLL")
   [ -z "$KILL_ONLY_MAXIMUM_ABS_PITCH" ] || GUARD_ARGS+=(--maximum-abs-pitch "$KILL_ONLY_MAXIMUM_ABS_PITCH")

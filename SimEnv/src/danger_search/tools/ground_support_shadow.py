@@ -358,7 +358,24 @@ class GroundSupportShadowRecorder:
                 }
             )
         elif event == "floor_transition_ambiguous_exit":
+            try:
+                confirmed_floor = int(payload["current_floor"])
+            except (KeyError, TypeError, ValueError):
+                self._event_counts["floor_transition_ambiguous_exit_missing_floor"] += 1
+                self._write(
+                    {
+                        "schema": "ground_support_shadow_guard_event_v1",
+                        "sim_time": float(rospy.get_time()),
+                        "event": event,
+                        "shadow_action": "keep_latch_missing_confirmed_floor",
+                        "production_event": payload,
+                    }
+                )
+                return
             with self._lock:
+                # 生产状态已用新 odom 确认楼层；同步更新诊断快照，避免低频
+                # /danger_search/status 的旧楼层把解锁后的首帧写入源楼层。
+                self._floor = confirmed_floor
                 self._ambiguous = False
             self._event_counts[event] += 1
             self._write(
