@@ -1,11 +1,11 @@
 """门/电梯客户端控制封装。"""
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass
-from pathlib import Path
 from threading import Lock, Thread
+
+from danger_search.interface_policy import require_allowed_service
 
 try:
     import rospy
@@ -79,60 +79,49 @@ class ElevatorInfo:
 
 
 class BuildingControlClient:
-    def __init__(self, metadata_path: str = "generated_building/layout_metadata.json", service_timeout: float = 5.0):
-        self.metadata_path = metadata_path
+    """只封装初始文档允许的门/电梯服务。
+
+    公开 scene info 不提供空间坐标，因此本类不读取布局元数据，也不会自行
+    创建可导航的门或电梯目标。后续只有传感器发现并提供空间几何时才可接入。
+    """
+
+    def __init__(self, service_timeout: float = 5.0):
         self.service_timeout = float(service_timeout)
         self.doors: dict[str, DoorInfo] = {}
         self.elevators: dict[str, ElevatorInfo] = {}
+        self.public_door_ids: set[str] = set()
+        self.public_elevators: dict[str, set[int]] = {}
 
         self._set_door = None
         self._call_elevator = None
-        self._load_metadata()
 
-    def _load_metadata(self) -> None:
-        path = Path(self.metadata_path)
-        if not path.is_file():
-            if rospy:
-                rospy.logwarn("找不到场景元数据文件: %s", self.metadata_path)
-            return
-
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        for door_spec in data.get("door_specs", []):
-            if not door_spec.get("dynamic", False):
-                continue
-            door_id = door_spec["id"]
-            pose = door_spec.get("pose", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            self.doors[door_id] = DoorInfo(
-                door_id=door_id,
-                kind=door_spec.get("kind", ""),
-                floor_index=int(door_spec.get("floor_index", 0)),
-                x=float(pose[0]),
-                y=float(pose[1]),
-                yaw=float(pose[5]),
-                width=float(door_spec.get("width", 1.0)),
-            )
-
-        for el_spec in data.get("elevator_specs", []):
-            el_id = el_spec["id"]
-            lobby_poses = {}
-            for floor_str, pose in el_spec.get("lobby_positions", {}).items():
-                lobby_poses[int(floor_str)] = (float(pose[0]), float(pose[1]), float(pose[5]))
-            self.elevators[el_id] = ElevatorInfo(elevator_id=el_id, lobby_poses=lobby_poses)
+    def set_public_features(
+        self,
+        *,
+        door_ids: set[str] | frozenset[str],
+        elevators: dict[str, set[int] | frozenset[int]],
+    ) -> None:
+        """登记公开 ID，不把公开信息错误扩展为坐标真值。"""
+        self.public_door_ids = {str(door_id) for door_id in door_ids}
+        self.public_elevators = {
+            str(elevator_id): {int(floor) for floor in floors}
+            for elevator_id, floors in elevators.items()
+        }
 
     def start(self, *, connect_elevator: bool = True) -> None:
         if rospy is None:
             raise RuntimeError("没有 rospy 环境")
         try:
-            rospy.wait_for_service("/set_door_state", timeout=self.service_timeout)
-            self._set_door = rospy.ServiceProxy("/set_door_state", SetDoorState)
+            service = require_allowed_service("/set_door_state", purpose="门服务客户端")
+            rospy.wait_for_service(service, timeout=self.service_timeout)
+            self._set_door = rospy.ServiceProxy(service, SetDoorState)
         except Exception as exc:
             rospy.logwarn("开关门服务初始化失败/超时：%s", exc)
         if connect_elevator:
             try:
-                rospy.wait_for_service("/call_elevator", timeout=self.service_timeout)
-                self._call_elevator = rospy.ServiceProxy("/call_elevator", CallElevator)
+                service = require_allowed_service("/call_elevator", purpose="电梯服务客户端")
+                rospy.wait_for_service(service, timeout=self.service_timeout)
+                self._call_elevator = rospy.ServiceProxy(service, CallElevator)
             except Exception as exc:
                 rospy.logwarn("电梯服务初始化失败/超时：%s", exc)
 
@@ -163,6 +152,8 @@ class BuildingControlClient:
         return door is not None and door.kind == "elevator"
 
     def open_door(self, door_id: str) -> AsyncServiceCall:
+        if self.public_door_ids and door_id not in self.public_door_ids:
+            raise ValueError(f"门 ID 未在公开场景信息中声明: {door_id}")
         def call():
             if self._set_door is None:
                 raise RuntimeError("/set_door_state 尚未连接")
@@ -172,6 +163,8 @@ class BuildingControlClient:
         return task
 
     def close_door(self, door_id: str) -> AsyncServiceCall:
+        if self.public_door_ids and door_id not in self.public_door_ids:
+            raise ValueError(f"门 ID 未在公开场景信息中声明: {door_id}")
         def call():
             if self._set_door is None:
                 raise RuntimeError("/set_door_state 尚未连接")
@@ -181,6 +174,9 @@ class BuildingControlClient:
         return task
 
     def call_elevator(self, elevator_id: str, floor: int, open_doors: bool = False) -> AsyncServiceCall:
+        floors = self.public_elevators.get(elevator_id)
+        if floors is not None and int(floor) not in floors:
+            raise ValueError(f"电梯 {elevator_id} 不服务公开楼层 {floor}")
         def call():
             if self._call_elevator is None:
                 raise RuntimeError("/call_elevator 尚未连接")

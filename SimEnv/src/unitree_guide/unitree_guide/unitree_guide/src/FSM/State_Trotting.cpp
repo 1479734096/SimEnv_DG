@@ -42,6 +42,14 @@ State_Trotting::State_Trotting(CtrlComponents *ctrlComp)
 }
 
 State_Trotting::~State_Trotting(){
+    ampthreadRunning = State_Trotting::STOP;
+    if(amp_obs_thread != nullptr){
+        if(amp_obs_thread->joinable()){
+            amp_obs_thread->join();
+        }
+        delete amp_obs_thread;
+        amp_obs_thread = nullptr;
+    }
     delete _gait;
 }
 
@@ -56,16 +64,29 @@ void State_Trotting::enter(){
     _ctrlComp->ioInter->zeroCmdPanel();
     _gait->restart();
 
-    amp_obs_thread = new std::thread(&State_Trotting::save_amp_obs_thread,this);
+    if(amp_obs_thread != nullptr){
+        if(amp_obs_thread->joinable()){
+            amp_obs_thread->join();
+        }
+        delete amp_obs_thread;
+        amp_obs_thread = nullptr;
+    }
     ampthreadRunning = State_Trotting::RUNNING;
+    amp_obs_thread = new std::thread(&State_Trotting::save_amp_obs_thread,this);
 }
 
 void State_Trotting::exit(){
     _ctrlComp->ioInter->zeroCmdPanel();
     _ctrlComp->setAllSwing();
     ampthreadRunning = State_Trotting::STOP;
-    amp_obs_thread->join();
-    std::cout << "amp_obs_thread退出!" << std::endl;
+    if(amp_obs_thread != nullptr){
+        if(amp_obs_thread->joinable()){
+            amp_obs_thread->join();
+        }
+        delete amp_obs_thread;
+        amp_obs_thread = nullptr;
+        std::cout << "amp_obs_thread退出!" << std::endl;
+    }
     if (outfile.is_open()) {
         outfile.close();
         std::cout << "文件关闭成功!" << std::endl;
@@ -404,7 +425,7 @@ void State_Trotting::close_amp_save_file()
 
         if (current_pos > 0) {
             // 退回一个字符
-            outfile.seekp(current_pos - 1);
+            outfile.seekp(current_pos - std::streamoff(1));
         }
 
         // 写入结尾内容

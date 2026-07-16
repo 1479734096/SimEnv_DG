@@ -11,13 +11,22 @@
   <param name="/use_sim_time" value="false"/>
   <rosparam command="load" file="$(arg config)"/>
 
+  <!-- 仅诊断：缺少公开场景文件时使用相对原点，不能作为正式评分运行。 -->
+  <include file="$(find danger_search_localization)/launch/scan_localization.launch">
+    <arg name="require_team_scene_info" value="false"/>
+    <arg name="allow_relative_origin" value="true"/>
+  </include>
+
   <node pkg="danger_search"
         type="danger_search_node"
         name="danger_search_smoke"
         output="screen">
     <param name="mission/max_runtime" value="$(arg max_runtime)"/>
+    <param name="runtime/profile" value="diagnostic"/>
     <param name="mission/max_floor" value="1"/>
     <param name="result_file" value="$(arg result_file)"/>
     <param name="mission_summary_file" value="$(arg mission_summary_file)"/>
+    <param name="localization/require_team_scene_info" value="false"/>
+    <param name="localization/allow_relative_origin" value="true"/>
   </node>
 </launch>

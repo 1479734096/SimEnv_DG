@@ -17,22 +17,28 @@
 #include "nav_msgs/Odometry.h"
 #include "rosgraph_msgs/Clock.h"
 #include <sensor_msgs/Joy.h>
+#include <array>
+#include <atomic>
 
 class IOROS : public IOInterface{
 public:
 IOROS();
 ~IOROS();
 void sendRecv(const LowlevelCmd *cmd, LowlevelState *state);
+bool hasFullStateFeedback() const override;
 
 private:
 void sendCmd(const LowlevelCmd *cmd);
 void recvState(LowlevelState *state);
+void updateMotorState(int index, const unitree_legged_msgs::MotorState& msg);
 ros::NodeHandle _nm;
 ros::Subscriber _servo_sub[12], _imu_sub, _foot_states_sub[4], _base_w_sub,_base_t_sub, _time_sub,joy_sub;;
 ros::Publisher _servo_pub[12];
 unitree_legged_msgs::LowCmd _lowCmd;
 unitree_legged_msgs::LowState _lowState;
 std::string _robot_name;
+std::array<std::atomic_bool, 12> _joint_state_received;
+std::atomic_bool _imu_received;
 
 //repeated functions for multi-thread
 void initRecv();

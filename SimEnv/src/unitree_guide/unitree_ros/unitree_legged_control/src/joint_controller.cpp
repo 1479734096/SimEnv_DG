@@ -116,13 +116,14 @@ namespace unitree_legged_control
     // Controller startup in realtime
     void UnitreeJointController::starting(const ros::Time& time)
     {
-        // lastCmd.Kp = 0;
-        // lastCmd.Kd = 0;
         double init_pos = joint.getPosition();
+        lastCmd.mode = PMSM;
         lastCmd.q = init_pos;
         lastState.q = init_pos;
         lastCmd.dq = 0;
         lastState.dq = 0;
+        lastCmd.Kp = isHip ? 25.0 : 45.0;
+        lastCmd.Kd = isHip ? 1.5 : 2.0;
         lastCmd.tau = 0;
         lastState.tauEst = 0;
         command.initRT(lastCmd);

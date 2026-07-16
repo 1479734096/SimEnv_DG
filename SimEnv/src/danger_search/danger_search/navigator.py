@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Iterator
 
 from .time_utils import get_time
+from .interface_policy import require_allowed_topic
 
 from dataclasses import dataclass, field
 import math
@@ -92,6 +93,7 @@ class PathFollower:
     def start(self) -> None:
         if rospy is None:
             raise RuntimeError("当前环境没有 rospy，无法发布 /cmd_vel")
+        require_allowed_topic(self.cmd_vel_topic, purpose="PathFollower 控制输出")
         self._publisher = rospy.Publisher(self.cmd_vel_topic, Twist, queue_size=1)
         if PathMessage is not None:
             self._raw_path_publisher = rospy.Publisher(

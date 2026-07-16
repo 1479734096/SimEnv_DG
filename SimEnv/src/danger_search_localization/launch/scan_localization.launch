@@ -1,0 +1,22 @@
+<launch>
+  <arg name="raw_cloud_topic" default="/scan"/>
+  <arg name="team_scene_info_path" default="$(find danger_search)/../../generated_building/team_scene_info.json"/>
+  <arg name="require_team_scene_info" default="true"/>
+  <arg name="allow_relative_origin" default="false"/>
+
+  <node pkg="danger_search_localization"
+        type="scan_localization_node"
+        name="scan_localization"
+        required="true"
+        output="screen">
+    <param name="raw_cloud_topic" value="$(arg raw_cloud_topic)"/>
+    <param name="team_scene_info_path" value="$(arg team_scene_info_path)"/>
+    <param name="require_team_scene_info" value="$(arg require_team_scene_info)"/>
+    <param name="allow_relative_origin" value="$(arg allow_relative_origin)"/>
+    <param name="min_range" value="0.5"/>
+    <param name="max_range" value="15.0"/>
+    <param name="voxel_size" value="0.15"/>
+    <param name="base_to_livox_xyz" value="[0.2, 0.0, 0.08]"/>
+    <param name="base_to_livox_rpy" value="[0.0, 0.785, 0.0]"/>
+  </node>
+</launch>

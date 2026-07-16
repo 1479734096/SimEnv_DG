@@ -3,15 +3,15 @@
 危险源检测与探索时间评估脚本
 根据比赛规则计算识别概率、虚警率、探索时间得分，并输出技术实现得分（客观部分）。
 需与主观评分结合得到最终总分。
-
-本脚本不使用命令行参数，所有配置在代码开头定义。
 """
 
-import json
-import numpy as np
-import sys
 import argparse
+import json
+import math
 from pathlib import Path
+import sys
+
+import numpy as np
 
 # ==================== 配置区 ====================
 # 请根据实际情况修改以下配置
@@ -20,8 +20,6 @@ from pathlib import Path
 truth_file = "./results/danger_truth.json"          # 真值文件路径
 detected_file = "./results/detected_danger.json"    # 选手检测文件路径
 
-# 阈值设置
-use_fixed_threshold = True
 fixed_threshold = 1.0        # 固定阈值，单位：米
 
 # 是否打印详细匹配信息
@@ -29,10 +27,14 @@ verbose = False
 
 # ================================================
 
-def load_positions_from_json(file_path, key, subkey=None):
-    """从JSON文件中提取位置列表，返回Nx3的numpy数组"""
+
+def load_json(file_path):
     with open(file_path, 'r') as f:
-        data = json.load(f)
+        return json.load(f)
+
+
+def load_positions_from_data(data, key, subkey=None):
+    """从已读取的JSON对象中提取位置列表，返回Nx3的numpy数组"""
     positions = []
     if subkey:
         for item in data[key]:
@@ -48,16 +50,27 @@ def load_positions_from_json(file_path, key, subkey=None):
             positions.append(pos)
     return np.array(positions, dtype=float)
 
-def compute_scene_diagonal(truth_positions):
-    """根据真值危险源位置估算场景对角线（最远两点距离）"""
-    if len(truth_positions) < 2:
-        # 如果只有一个点，假设场景尺寸为10米（默认）
-        return 10.0
-    # 真值点数量很小，直接用 NumPy 计算两两欧氏距离，避免依赖与系统
-    # NumPy 版本不兼容的旧版 SciPy。
-    offsets = truth_positions[:, np.newaxis, :] - truth_positions[np.newaxis, :, :]
-    distances = np.linalg.norm(offsets, axis=-1)
-    return float(np.max(distances))
+
+def compute_scene_size_from_truth(truth_data, mode="max-dimension"):
+    """根据真值文件中的楼栋尺度计算场景尺度，避免用危险源分布反推。"""
+    building = truth_data.get("building", {})
+    footprint = building.get("footprint", {})
+    width = float(footprint.get("width", 0.0) or 0.0)
+    length = float(footprint.get("length", 0.0) or 0.0)
+    floor_heights = [float(value) for value in building.get("floor_heights", [])]
+    height = max(floor_heights) - min(floor_heights) if len(floor_heights) >= 2 else 0.0
+
+    if width <= 0.0 or length <= 0.0:
+        raise ValueError("真值文件缺少有效的 building.footprint.width/length，无法自动计算场景尺度")
+
+    if mode == "max-dimension":
+        return max(width, length)
+    if mode == "footprint-diagonal":
+        return math.hypot(width, length)
+    if mode == "three-dimensional-diagonal":
+        return math.sqrt(width * width + length * length + height * height)
+    raise ValueError(f"不支持的 scene size mode: {mode}")
+
 
 def evaluate_detection(truth_positions, detected_positions, threshold, verbose=False):
     """评估检测结果，返回正确数、漏报数、虚警数"""
@@ -97,6 +110,7 @@ def evaluate_detection(truth_positions, detected_positions, threshold, verbose=F
     false_alarms = m_detected - len(matched_detected)
     return correct, missed, false_alarms
 
+
 def compute_scores(exploration_time, correct, truth_count, false_alarms, detected_count):
     """计算各项得分"""
     # 探索时间得分
@@ -132,6 +146,7 @@ def compute_scores(exploration_time, correct, truth_count, false_alarms, detecte
 
     return time_score, prob_score, far_score
 
+
 def _build_parser():
     parser = argparse.ArgumentParser(description="Evaluate competition danger-source detection results.")
     parser.add_argument("--truth-file", default=truth_file)
@@ -139,31 +154,30 @@ def _build_parser():
     parser.add_argument("--output-file", default="./results/evaluation_result.json")
     parser.add_argument("--threshold", type=float, default=fixed_threshold)
     parser.add_argument("--scene-size", type=float)
-    parser.add_argument("--use-scene-ratio", action="store_true", help="Use five percent of scene size instead of fixed threshold.")
+    parser.add_argument(
+        "--scene-size-mode",
+        choices=["max-dimension", "footprint-diagonal", "three-dimensional-diagonal"],
+        default="max-dimension",
+    )
+    parser.add_argument("--use-scene-ratio", action="store_true", help="Use 5% of scene size instead of fixed threshold.")
     parser.add_argument("--verbose", action="store_true")
     return parser
 
 
 def main(argv=None):
     args = _build_parser().parse_args(argv)
+    truth_data = load_json(args.truth_file)
     # 读取真值危险源位置
-    truth_positions = load_positions_from_json(args.truth_file, 'danger_sources', 'position')
+    truth_positions = load_positions_from_data(truth_data, 'danger_sources', 'position')
     # 读取选手检测结果
-    with open(args.detected_file, 'r') as f:
-        detected_data = json.load(f)
+    detected_data = load_json(args.detected_file)
     # 提取探索时间
     if 'exploration_time' not in detected_data:
         print("错误：选手文件中缺少 exploration_time 字段")
         sys.exit(1)
     exploration_time = detected_data['exploration_time']
     # 提取检测位置
-    detected_positions = []
-    for item in detected_data['detected_danger_sources']:
-        pos = item['position']
-        if len(pos) != 3:
-            raise ValueError(f"位置必须为三维坐标: {pos}")
-        detected_positions.append(pos)
-    detected_positions = np.array(detected_positions, dtype=float)
+    detected_positions = load_positions_from_data(detected_data, 'detected_danger_sources')
 
     # 确定阈值
     if not args.use_scene_ratio:
@@ -172,9 +186,8 @@ def main(argv=None):
     else:
         # 使用场景尺寸的5%
         if args.scene_size is None:
-            # 如果未定义 scene_size，则根据真值估算
-            scene_size = compute_scene_diagonal(truth_positions)
-            print(f"未指定 scene_size，根据真值计算场景对角线 = {scene_size:.2f} 米")
+            scene_size = compute_scene_size_from_truth(truth_data, args.scene_size_mode)
+            print(f"未指定 scene_size，根据楼栋尺度({args.scene_size_mode})计算场景尺寸 = {scene_size:.2f} 米")
         else:
             scene_size = args.scene_size
         threshold = scene_size * 0.05
@@ -226,6 +239,7 @@ def main(argv=None):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(f"评估结果已保存至: {output_path}")
+
 
 if __name__ == '__main__':
     main()

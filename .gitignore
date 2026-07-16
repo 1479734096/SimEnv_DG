@@ -59,6 +59,6 @@ SimEnv/generated_building/
 *.zip
 temp.md
 fix.md
-chat.md
 opencode.json
+config.toml
 SimEnv初始

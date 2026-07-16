@@ -1,10 +1,3 @@
-"""楼栋生成器的数据模型。
-
-本文件只定义“楼栋是什么”，不负责随机生成，也不负责导出 SDF。
-generator.py 负责填充这些 dataclass，exporter.py 负责把它们翻译成 Gazebo 文件。
-这些结构最终会同时出现在 layout_metadata.json、door_config.yaml、
-elevator_config.yaml 和比赛真值文件中。
-"""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -13,7 +6,6 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Rect2D:
-    """二维轴对齐矩形，用于描述房间、走廊、楼梯间、电梯井等平面范围。"""
     x_min: float
     x_max: float
     y_min: float
@@ -42,7 +34,6 @@ class Rect2D:
 
 @dataclass(frozen=True)
 class FurnitureSpec:
-    """房间内家具的抽象描述，导出时会转成 Gazebo 中的静态 box。"""
     id: str
     kind: str
     pose: tuple[float, float, float, float, float, float]
@@ -59,11 +50,6 @@ class FurnitureSpec:
 
 @dataclass(frozen=True)
 class RoomSpec:
-    """单个房间的布局信息。
-
-    door_pose 用于生成房门和危险源避让区域，goal_pose 用于给导航/评估提供
-    房间内部的代表性目标点。
-    """
     id: str
     floor_index: int
     room_type: str
@@ -88,11 +74,6 @@ class RoomSpec:
 
 @dataclass(frozen=True)
 class DoorSpec:
-    """动态门的抽象状态。
-
-    exporter.py 会根据这里的 pose/width/height 生成 Gazebo 门模型和
-    door_config.yaml；control_server.py 再读取配置来开关门。
-    """
     id: str
     floor_index: int
     kind: str
@@ -117,11 +98,6 @@ class DoorSpec:
 
 @dataclass(frozen=True)
 class ElevatorSpec:
-    """电梯抽象状态。
-
-    served_floors 和 lobby_positions 用于生成每层电梯门、电梯轿厢目标位置，
-    后续 /call_elevator 服务会根据这些位置移动轿厢模型。
-    """
     id: str
     shaft_bounds: Rect2D
     served_floors: list[int]
@@ -144,7 +120,6 @@ class ElevatorSpec:
 
 @dataclass(frozen=True)
 class FloorLayout:
-    """单层楼的完整布局。"""
     floor_index: int
     elevation: float
     lobby_bounds: Rect2D
@@ -169,7 +144,6 @@ class FloorLayout:
 
 @dataclass(frozen=True)
 class BuildingLayout:
-    """整栋楼的完整抽象布局，是 generator.py 的核心输出。"""
     model_name: str
     footprint: dict[str, float]
     floor_height: float
@@ -200,7 +174,6 @@ class BuildingLayout:
 
 @dataclass(frozen=True)
 class ArtifactPaths:
-    """export_sdf 写出的关键产物路径，供上层脚本继续组装比赛场景。"""
     world_sdf: str
     model_sdf: str
     layout_metadata: str

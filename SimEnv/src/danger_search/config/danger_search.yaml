@@ -1,10 +1,13 @@
 # danger_search 默认参数。
-# 坐标输出遵循 docs/evaluation.md：使用 Gazebo world/odom 数值坐标。
+# 坐标由参赛方 /scan 定位节点锚定；正式模式只读取公开 team_scene_info.json。
+
+runtime:
+  profile: formal
 
 topics:
   cmd_vel: /cmd_vel
-  odom: /Odometry_gazebo
-  cloud: /livox/Pointcloud2
+  localization_odom: /danger_search/localization/odom
+  cloud: /danger_search/localization/cloud_registered
   rgb: /real_sense/rgb/image_raw
   depth: /real_sense/depth/image_raw
   camera_info: /real_sense/rgb/camera_info
@@ -14,8 +17,17 @@ topics:
   path_followed: /danger_search/path_followed
   local_target: /danger_search/local_target
 
+localization:
+  team_scene_info_path: generated_building/team_scene_info.json
+  require_team_scene_info: true
+  allow_relative_origin: false
+  base_to_camera_xyz: [0.28, 0.0, 0.043]
+  base_to_camera_rpy: [0.0, 0.0, 0.0]
+
 mission:
   startup_delay: 2.0
+  # /nav/goal 不属于比赛公开接口，仅诊断工具可显式开启。
+  manual_goal_enabled: false
   max_runtime: 590.0
   max_floor: 1
   floor_timeout: 180.0
@@ -39,7 +51,7 @@ mission:
   # 过门后先深入到门后，避免刚过门就把 frontier 选择权交回门口。
   door_pass_offset: 0.8
   door_commit_distance: 1.8
-  # 开门后沿门洞 yaw 清理动态障碍的条带深度，宽度来自 layout_metadata.json 的门 width。
+  # 传感器发现门后才启用过门条带；单层合规基线不从布局文件读取门宽。
   door_clear_radius: 0.9
   # 仅在过门后的短时间、且机器人仍在门口附近时抑制回头目标。
   door_transition_duration: 3.0

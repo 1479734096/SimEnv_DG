@@ -1,49 +1,50 @@
 /**********************************************************************
  Copyright (c) 2020-2023, Unitree Robotics.Co.Ltd. All rights reserved.
 ***********************************************************************/
-/*
- * RL 控制状态。
- *
- * 这个状态是比赛算法控制机器狗的关键入口：
- * - 构造函数订阅 /cmd_vel。
- * - refresh_rl_obs() 把里程计/IMU/关节状态和 /cmd_vel 拼成策略网络观测。
- * - infer_thread_callback() 调用 TorchScript 策略网络，只计算 12 个目标关节角。
- * - run() 统一把目标关节角写入 _lowCmd，最终由 IOROS/ros_control 发送到 Gazebo 关节控制器。
- */
 #include <iostream>
-#include <sstream>
-#include <std_msgs/String.h>
+#include <cmath>
 #include "FSM/State_RL_test.h"
+
+namespace {
+float finiteAxis(float value)
+{
+    if(!std::isfinite(value)){
+        return 0.0f;
+    }
+    if(value > 1.0f){
+        return 1.0f;
+    }
+    if(value < -1.0f){
+        return -1.0f;
+    }
+    return value;
+}
+}
 
 State_RL::State_RL(CtrlComponents *ctrlComp)
                 :FSMState(ctrlComp, FSMStateName::RL, "RL")
 {
+    load_policy();
     gravity(0,0) = 0.0;
     gravity(1,0) = 0.0;
     gravity(2,0) = -0.98;
-    nh.param("rl_cmd_vel/max_linear_x", cmd_vel_max_linear_x, cmd_vel_max_linear_x);
-    nh.param("rl_cmd_vel/max_linear_y", cmd_vel_max_linear_y, cmd_vel_max_linear_y);
-    nh.param("rl_cmd_vel/max_angular_z", cmd_vel_max_angular_z, cmd_vel_max_angular_z);
-    nh.param("rl_cmd_vel/timeout", cmd_vel_timeout, cmd_vel_timeout);
-    nh.param("rl_status/log_period", status_log_period, status_log_period);
-    configureVelocityCommandLimits(cmd_vel_max_linear_x,
-                                   cmd_vel_max_linear_y,
-                                   cmd_vel_max_angular_z,
-                                   cmd_vel_timeout);
-    load_policy();
-    // 在构造函数中订阅 /cmd_vel；auto.sh 提示“进入 RL 模式后发布 /cmd_vel”就是走这里。
+    //在构造函数中初始化，订阅
     this->Sub_=nh.subscribe<geometry_msgs::Twist>("/cmd_vel",1000,boost::bind(&FSMState::cmdVelCallback,this,_1));
-    this->Pub_ = nh.advertise<std_msgs::String>("/junior_ctrl/rl_status", 1);
 
-}
-
-State_RL::~State_RL(){
-    stopWorkerThreads();
 }
 
 
 void State_RL::enter(){
-     // 进入 RL 状态时，先把当前关节位置作为起点，并设置站立控制增益。
+    const bool keyboardMode = (_lowState->userCmd == UserCommand::RL_KEYBOARD);
+    _keyboardMode.store(keyboardMode);
+    if(keyboardMode){
+        _ctrlComp->ioInter->zeroCmdPanel();
+        _lowState->userValue.setZero();
+        std::cout << "[INFO] Entered RL keyboard mode. Use W/S, A/D, J/L, Space." << std::endl;
+    }else{
+        std::cout << "[INFO] Entered RL /cmd_vel mode." << std::endl;
+    }
+
      // if (real == false){
         for(int i=0; i<12; i++){
             _lowCmd->motorCmd[i].q = _lowState->motorState[i].q;
@@ -73,62 +74,44 @@ void State_RL::enter(){
             _ctrlComp->ioInterFreeDog->setCmd(i,joint);
         }
     // }
-    // 策略网络使用历史观测，刚进入状态时先用当前状态填满历史窗口。
     for (int i = 0; i < HISTORY_LEN; i++)
     {
         refresh_rl_obs();
     }
-    {
-        std::lock_guard<std::mutex> lock(desired_q_mutex_);
-        for(int i=0; i<12; ++i){
-            desired_q[i] = _startPos[i];
-            amp_desired_q[i] = _startPos[i];
-        }
-        desired_q_valid = true;
-        amp_desired_q_valid = false;
-    }
-    // 推理线程独立运行，避免策略网络推理阻塞 FSM 主循环。
     infer_thread_runnning = State_RL::RUNNING;
-    if(policy_loaded){
-        infer_thread = std::thread(&State_RL::infer_thread_callback,this);
-    }else{
-        infer_thread_runnning = State_RL::STOP;
-        ROS_ERROR("[junior_ctrl][rl] 策略未加载，RL 状态不会启动推理线程。");
-    }
+    infer_thread = new std::thread(&State_RL::infer_thread_callback,this);
     if (debug == true){
         ampthreadRunning = State_RL::RUNNING;
-        amp_obs_thread = std::thread(&State_RL::save_amp_obs_thread,this);
-    }else{
-        ampthreadRunning = State_RL::STOP;
+        amp_obs_thread = new std::thread(&State_RL::save_amp_obs_thread,this);
     }
 }
 
 void State_RL::run(){
-    writeDesiredJointCommand();
-    const CmdVel command = getVelocityCommand();
-    std::ostringstream status_stream;
-    status_stream << "in_rl=1"
-                  << " policy_loaded=" << policy_loaded
-                  << " infer_thread=" << static_cast<int>(infer_thread_runnning.load())
-                  << " cmd_source=" << command.source
-                  << " cmd_valid=" << command.valid
-                  << " cmd_timed_out=" << command.timed_out
-                  << " cmd_clamped=" << command.clamped
-                  << " last_cmd_age=" << (command.valid && !command.stamp.isZero() ? (ros::Time::now() - command.stamp).toSec() : -1.0)
-                  << " cmd=(" << command.linear_x << "," << command.linear_y << "," << command.angular_z << ")";
-    std_msgs::String status_msg;
-    status_msg.data = status_stream.str();
-    Pub_.publish(status_msg);
-    ROS_INFO_STREAM_THROTTLE(status_log_period,
-                             "[junior_ctrl][rl_status] " << status_msg.data);
 }
 
 void State_RL::exit(){
-    // 离开 RL 状态时停止后台线程，避免继续写关节命令。
     _percent = 0;
-    stopWorkerThreads();
+    ampthreadRunning = State_RL::STOP;
+    infer_thread_runnning = State_RL::STOP;
+    if(amp_obs_thread != nullptr){
+        if(amp_obs_thread->joinable()){
+            amp_obs_thread->join();
+        }
+        delete amp_obs_thread;
+        amp_obs_thread = nullptr;
+        std::cout << "amp_obs_thread退出!" << std::endl;
+    }
+    if(infer_thread != nullptr){
+        if(infer_thread->joinable()){
+            infer_thread->join();
+        }
+        delete infer_thread;
+        infer_thread = nullptr;
+        std::cout << "infer_thread退出!" << std::endl;
+    }
     if (outfile.is_open()) {
         outfile.close();
+        std::cout << "文件关闭成功!" << std::endl;
     }
 }
 
@@ -139,12 +122,30 @@ FSMStateName State_RL::checkChange(){
     else if(_lowState->userCmd == UserCommand::L2_A){
         return FSMStateName::FIXEDSTAND;
     }
+    else if(_lowState->userCmd == UserCommand::RL_KEYBOARD){
+        if(!_keyboardMode.exchange(true)){
+            _ctrlComp->ioInter->zeroCmdPanel();
+            _lowState->userValue.setZero();
+            std::cout << "[INFO] Switched RL command source to keyboard axes." << std::endl;
+        }
+        _last_cmd = static_cast<int>(_lowState->userCmd);
+        return FSMStateName::RL;
+    }
+    else if(_lowState->userCmd == UserCommand::RL){
+        if(_keyboardMode.exchange(false)){
+            std::cout << "[INFO] Switched RL command source to /cmd_vel." << std::endl;
+        }
+        _last_cmd = static_cast<int>(_lowState->userCmd);
+        return FSMStateName::RL;
+    }
     else if(_lowState->userCmd == UserCommand::L1_X){
-        if (_last_cmd==static_cast<int>(UserCommand::RL))
+        if (_last_cmd==static_cast<int>(UserCommand::RL) ||
+            _last_cmd==static_cast<int>(UserCommand::RL_KEYBOARD))
         {
             _cnt = (_cnt+1)%(sizeof(_targetPos_map) / sizeof(_targetPos_map[0]));
             if (real == false){
                 for(int i=0; i<12; i++){
+                    _lowCmd->motorCmd[i].q = _lowState->motorState[i].q;
                     _startPos[i] = _lowState->motorState[i].q;
                 }
             }
@@ -169,13 +170,11 @@ FSMStateName State_RL::checkChange(){
 
 void State_RL::infer_thread_callback()
 {
-    // 策略推理主循环：刷新观测 -> TorchScript 推理 -> 写入目标关节角缓存。
     while(infer_thread_runnning == State_RL::RUNNING)
     {
         long long _start_time = getTime();
         // std::cout << "_start_time" << _start_time << std::endl;
         refresh_rl_obs();
-        // 策略输入是 HISTORY_LEN 帧观测拼平后的张量。
         torch::Tensor flattened_obs = obs_history_tensor.view({1, HISTORY_LEN * 45});
         if (debug == true)
         {
@@ -187,7 +186,6 @@ void State_RL::infer_thread_callback()
         std::vector<torch::jit::IValue> inputs;
         inputs.push_back(flattened_obs);
         // std::cout << "flattened_obs: " << flattened_obs << std::endl;
-        // TorchScript 模型的 act_inference 输出 12 维动作，对应 12 个关节的偏移量。
         actions_tensor = model.get_method("act_inference")(inputs).toTensor().to(torch::kCPU).squeeze();
         if (debug==true){
             torch::Tensor input_tensor = torch::arange(1, 226).view({1, 225}).to(torch::kFloat32).to(device); // 注意范围是 [start, end)
@@ -196,19 +194,28 @@ void State_RL::infer_thread_callback()
             torch::Tensor output = model.get_method("act_inference")(test).toTensor().to(torch::kCPU).squeeze();
             // printTensorHorizontal(output, "same_net_work_test");
         }
-        // 策略动作是相对默认站姿的偏移，缩放后再加 default_dof_pos 得到关节目标角。
         actions_tensor_scaled = actions_tensor.clone() * 0.25;
         std::vector<float> actions(actions_tensor_scaled.data_ptr<float>(),
                            actions_tensor_scaled.data_ptr<float>() + actions_tensor_scaled.numel());
-        std::array<float, 12> desired_q_local{};
+        if (debug == true) std::cout << "actions[reindex[j]]  + default_dof_pos" << std::endl;
         for(int i=0; i<12; i++){
-            desired_q_local[i] = actions[reindex[i]] + default_dof_pos_tensor[reindex[i]].item<float>();
+            if (real == false)
+            {
+                _lowCmd->motorCmd[i].q = actions[reindex[i]]  + default_dof_pos_tensor[reindex[i]].item<float>();
+                _lowCmd->motorCmd[i].Kp = 80;
+                _lowCmd->motorCmd[i].Kd = 1;
+            }
+            else if (real == true)
+            {
+                // float t_joint = actions[reindex[i]]  + default_dof_pos_tensor[reindex[i]].item<float>();
+                // std::vector<double> joint{t_joint, 0, 0, 80, 1};
+                // _ctrlComp->ioInterFreeDog->setCmd(i,joint);
+            }
+            if (debug == true) std::cout << actions[reindex[i]]  + default_dof_pos_tensor[reindex[i]].item<float>() << " ";
         }
-        {
-            std::lock_guard<std::mutex> lock(desired_q_mutex_);
-            desired_q = desired_q_local;
-            desired_q_valid = true;
-        }
+        if (debug == true)
+            std::cout << std::endl;
+        // std::cout << "actions_tensor: " << actions_tensor << std::endl;
         wait(_start_time, (long long)(infer_duration * 1000000));
     }
     infer_thread_runnning = State_RL::OVER;
@@ -222,34 +229,56 @@ void State_RL::save_amp_obs_thread()
         if ((getTime() - dofPosSwitBeginTime)<_duration) {
             _percent = (float)(getTime() - dofPosSwitBeginTime)/_duration;
             _percent = _percent > 1 ? 1 : _percent;
-            std::array<float, 12> amp_desired_q_local{};
-            for(int j=0; j<12; j++){
-                    amp_desired_q_local[j] = (1 - _percent)*_startPos[j] + _percent*_targetPos_map[_cnt][reindex[j]];
+            std::cout << "_percent" << _percent << std::endl;
+            // if (real == false){
+                std::cout << "_lowCmd->motorCmd ";
+                for(int j=0; j<12; j++){
+                    std::cout << _targetPos_map[_cnt][reindex[j]] << " ";
+                    _lowCmd->motorCmd[j].q = (1 - _percent)*_startPos[j] + _percent*_targetPos_map[_cnt][reindex[j]];
                 }
-            {
-                std::lock_guard<std::mutex> lock(desired_q_mutex_);
-                amp_desired_q = amp_desired_q_local;
-                amp_desired_q_valid = true;
-            }
+                std::cout << _lowCmd->motorCmd << std::endl;
+                std::cout << std::endl;
+            // }
+            // else if (real == true){
+                std::cout << "target_joint";
+                for(int j=0; j<12; j++){
+                    std::cout << _targetPos_map[_cnt][j] << " ";
+                    float t_joint = (1 - _percent)*_startPos[j] + _percent*_targetPos_map[_cnt][reindex[j]];
+                    std::vector<double> joint{t_joint, 0, 0, 80, 1};
+                    _ctrlComp->ioInterFreeDog->setCmd(j,joint);
+                }
+                std::cout << std::endl;
+            // }
             if ((float)(getTime() - dofPosSwitBeginTime)>(float)_duration*0.95)
                 close_amp_save_file();
-        }else{
-            std::lock_guard<std::mutex> lock(desired_q_mutex_);
-            amp_desired_q_valid = false;
         }
         if (outfile.is_open())
         {
+            std::cout << "save data" << std::endl;
             refresh_amp_obs();
         }
-        wait(_start_time, (long long)(amp_duration * 1000000));
+        wait(_start_time, (long long)(infer_duration * 1000000));
     }
     ampthreadRunning = State_RL::OVER;
+}
+
+void State_RL::updateCommandTensor(){
+    if(_keyboardMode.load()){
+        _userValue = _lowState->userValue;
+        commands_tensor[0] = finiteAxis(_userValue.ly) * _keyboardVxScale;
+        commands_tensor[1] = -finiteAxis(_userValue.lx) * _keyboardVyScale;
+        commands_tensor[2] = -finiteAxis(_userValue.rx) * _keyboardWzScale;
+        return;
+    }
+
+    commands_tensor[0] = this->current_cmd_vel_.linear_x;
+    commands_tensor[1] = this->current_cmd_vel_.linear_y;
+    commands_tensor[2] = this->current_cmd_vel_.angular_z;
 }
 
 
 
 void State_RL::refresh_rl_obs(){
-    // 构造策略网络观测。仿真模式下，状态来自 Gazebo/ROS，速度指令来自 /cmd_vel。
     auto opts = torch::TensorOptions().dtype(torch::kFloat32);
     //gazebo simulation mode
     if (real == false)
@@ -265,16 +294,10 @@ void State_RL::refresh_rl_obs(){
         base_ang_vel_tensor = quat_rotate_inverse(orientation_tensor, w_angular_vel_tensor).squeeze().clone();
         projected_gravity_tensor = quat_rotate_inverse(orientation_tensor, gravity_tensor.unsqueeze(0)).squeeze().clone();
         
-        // /cmd_vel 已在构造函数订阅，这里只读取回调缓存的最新速度指令。
+        //订阅cmd_vel
         // this->Sub_=nh.subscribe<geometry_msgs::Twist>("/cmd_vel",1000,boost::bind(&FSMState::cmdVelCallback,this,_1));
 
-        // commands_tensor[0] = _ctrlComp->ioInter->axes[1];
-        // commands_tensor[1] = _ctrlComp->ioInter->axes[0];
-        // commands_tensor[2] = _ctrlComp->ioInter->axes[3]*3.14;
-        const CmdVel command = getVelocityCommand();
-        commands_tensor[0] = command.linear_x;
-        commands_tensor[1] = command.linear_y;
-        commands_tensor[2] = command.angular_z;
+        updateCommandTensor();
 
 
         // std::cout << _ctrlComp->ioInter->axes << std::endl;
@@ -288,8 +311,6 @@ void State_RL::refresh_rl_obs(){
             joint_vel[i] = _lowState->motorState[reindex[i]].dq;
         }
         dof_vel_tensor = torch::from_blob(joint_vel.data(), {int64_t(joint_vel.size())}, opts).clone();
-        // 单帧观测共 45 维：
-        // 角速度、重力方向、速度指令、关节位置误差、关节速度、上一帧动作。
         obs_tensor = torch::cat({
             base_ang_vel_tensor * obs_scales_ang_vel,
             projected_gravity_tensor,
@@ -298,7 +319,6 @@ void State_RL::refresh_rl_obs(){
             dof_vel_tensor * obs_scales_dof_vel,
             actions_tensor
         }, -1).to(device);
-        // 维护滑动历史窗口：丢掉最早一帧，把当前 obs 追加到最后。
         obs_history_tensor = torch::cat({
             obs_history_tensor.slice(0, 1, HISTORY_LEN).to(device),  // 删除最早的一步
             obs_tensor.unsqueeze(0)  // 将当前 obs_tensor 插入到历史中
@@ -313,10 +333,9 @@ void State_RL::refresh_rl_obs(){
          for (int i=0; i<3; i++) {
             base_ang_vel_tensor[i] = _ctrlComp->ioInterFreeDog->low_state.imu_gyroscope[i];
         }
-        const CmdVel command = getVelocityCommand();
-        commands_tensor[0] = command.linear_x;
-        commands_tensor[1] = command.linear_y;
-        commands_tensor[2] = command.angular_z;
+        commands_tensor[0] = _ctrlComp->ioInter->axes[1];
+        commands_tensor[1] = _ctrlComp->ioInter->axes[0];
+        commands_tensor[2] = _ctrlComp->ioInter->axes[3]*3.14;
         for(int i=0; i<12; i++){
             joint_pos[i] = _ctrlComp->ioInterFreeDog->low_state.motorState_free_dog[reindex[i]].q;
         }
@@ -464,55 +483,6 @@ void State_RL::close_amp_save_file()
     }
 }
 
-void State_RL::writeDesiredJointCommand()
-{
-    std::array<float, 12> desired_joint_q = {};
-    bool has_desired_joint_q = false;
-    {
-        std::lock_guard<std::mutex> lock(desired_q_mutex_);
-        if(amp_desired_q_valid){
-            desired_joint_q = amp_desired_q;
-            has_desired_joint_q = true;
-        }else if(desired_q_valid){
-            desired_joint_q = desired_q;
-            has_desired_joint_q = true;
-        }
-    }
-
-    if(!has_desired_joint_q){
-        for(int i=0; i<12; ++i){
-            desired_joint_q[i] = _startPos[i];
-        }
-    }
-
-    for(int i=0; i<12; ++i){
-        _lowCmd->motorCmd[i].mode = 10;
-        _lowCmd->motorCmd[i].q = desired_joint_q[i];
-        _lowCmd->motorCmd[i].dq = 0;
-        _lowCmd->motorCmd[i].Kp = 80;
-        _lowCmd->motorCmd[i].Kd = 1;
-        _lowCmd->motorCmd[i].tau = 0;
-        if(real == true){
-            std::vector<double> joint{desired_joint_q[i], 0, 0, 80, 1};
-            _ctrlComp->ioInterFreeDog->setCmd(i, joint);
-        }
-    }
-}
-
-void State_RL::stopWorkerThreads()
-{
-    ampthreadRunning = State_RL::STOP;
-    infer_thread_runnning = State_RL::STOP;
-    if(amp_obs_thread.joinable()){
-        amp_obs_thread.join();
-    }
-    if(infer_thread.joinable()){
-        infer_thread.join();
-    }
-    std::lock_guard<std::mutex> lock(desired_q_mutex_);
-    amp_desired_q_valid = false;
-}
-
 torch::Tensor State_RL::quat_rotate_inverse(const torch::Tensor& q, const torch::Tensor& v) {
     // Ensure q and v are of the correct shape: (batch_size, 4) for quaternions and (batch_size, 3) for vectors
     auto shape = q.sizes();
@@ -543,25 +513,17 @@ void State_RL::load_policy()
 {
     model_path = "src/unitree_guide/logs/policy_act_inference_stair.pt";
     std::cout << model_path << std::endl;
-    try{
-        std::cout << "cuda::is_available():" << torch::cuda::is_available() << std::endl;
-        device= torch::kCPU;
-        if (torch::cuda::is_available()){
-            device = torch::kCUDA;
-        }
-        model = torch::jit::load(model_path);
-        std::cout << "load model is successed!" << std::endl;
-        model.to(device);
-        std::cout << "load model to device!" << std::endl;
-        model.eval();
-        policy_loaded = true;
-    }catch(const c10::Error &e){
-        policy_loaded = false;
-        ROS_ERROR_STREAM("[junior_ctrl][rl] 策略加载失败: " << e.what());
-    }catch(const std::exception &e){
-        policy_loaded = false;
-        ROS_ERROR_STREAM("[junior_ctrl][rl] 策略加载失败: " << e.what());
+    // load model from check point
+    std::cout << "cuda::is_available():" << torch::cuda::is_available() << std::endl;
+    device= torch::kCPU;
+    if (torch::cuda::is_available()){
+        device = torch::kCUDA;
     }
+    model = torch::jit::load(model_path);
+    std::cout << "load model is successed!" << std::endl;
+    model.to(device);
+    std::cout << "load model to device!" << std::endl;
+    model.eval();
 }
 
 void State_RL::printSegments(const torch::Tensor& tensor, int segment_size, const std::vector<int>& sub_sizes) {

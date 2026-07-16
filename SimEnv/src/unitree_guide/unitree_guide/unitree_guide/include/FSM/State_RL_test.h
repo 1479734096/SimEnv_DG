@@ -6,7 +6,6 @@
 
 #include "FSM/FSMState.h"
 #include <atomic>
-#include <mutex>
 #include <fstream>  // 包含文件流的头文件
 #include <thread>
 #include <string>
@@ -17,7 +16,7 @@ class State_RL : public FSMState{
 
 public:
     State_RL(CtrlComponents *ctrlComp);
-    ~State_RL();
+    ~State_RL(){}
     void enter();
     void run();
     void exit();
@@ -30,13 +29,13 @@ public:
     void open_amp_save_file();
     void close_amp_save_file();
     void load_policy();
-    void writeDesiredJointCommand();
-    void stopWorkerThreads();
     void printSegments(const torch::Tensor& tensor, int segment_size, const std::vector<int>& sub_sizes);
     void printTensorHorizontal(const torch::Tensor& tensor, const std::string& name);
     torch::Tensor quat_rotate_inverse(const torch::Tensor& q, const torch::Tensor& v);
     std::ofstream outfile;
 private:
+    void updateCommandTensor();
+
     int debug = false;
     at::string model_path;
     torch::DeviceType device;
@@ -94,21 +93,14 @@ private:
     torch::Tensor obs_history_tensor = torch::zeros({HISTORY_LEN, 45});
     long long dofPosSwitBeginTime = 0.0;//关节位置切换开始时间
     float motion_time = 0.0;
-    std::thread infer_thread;
-    std::thread amp_obs_thread;
-    std::atomic<uint8_t> infer_thread_runnning{STOP};
-    std::atomic<uint8_t> ampthreadRunning{STOP};
-    std::mutex desired_q_mutex_;
-    std::array<float, 12> desired_q = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-    std::array<float, 12> amp_desired_q = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-    bool desired_q_valid = false;
-    bool amp_desired_q_valid = false;
-    bool policy_loaded = false;
-    double status_log_period = 1.0;
-    double cmd_vel_max_linear_x = 0.6;
-    double cmd_vel_max_linear_y = 0.4;
-    double cmd_vel_max_angular_z = 1.0;
-    double cmd_vel_timeout = 0.5;
+    std::thread* infer_thread = nullptr;
+    std::thread* amp_obs_thread = nullptr;
+    std::atomic_bool _keyboardMode{false};
+    float _keyboardVxScale = 0.6f;
+    float _keyboardVyScale = 0.35f;
+    float _keyboardWzScale = 0.9f;
+    uint8_t infer_thread_runnning = State_RL::STOP;
+    uint8_t ampthreadRunning = State_RL::STOP;
     float infer_duration = 0.02;
     float amp_duration = 0.005;
 };

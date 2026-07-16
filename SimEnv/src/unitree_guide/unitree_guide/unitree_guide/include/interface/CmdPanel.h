@@ -41,6 +41,8 @@ public:
     virtual ~CmdPanel(){}
     UserCommand getUserCmd(){return userCmd;}
     UserValue getUserValue(){return userValue;}
+    void setUserCmd(UserCommand cmd){userCmd = cmd;}
+    void setUserValue(const UserValue& value){userValue = value;}
     void setPassive(){userCmd = UserCommand::L2_B;}
     void setZero(){userValue.setZero();}
 #ifdef COMPILE_WITH_REAL_ROBOT

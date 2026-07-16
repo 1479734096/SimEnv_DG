@@ -1,10 +1,17 @@
 <launch>
   <arg name="config" default="$(find danger_search)/config/danger_search.yaml"/>
   <arg name="max_floor" default="1"/>
-  <arg name="result_file" default="$(find danger_search)/../../results/detected_danger.json"/>
+  <arg name="result_file" default=""/>
   <arg name="mission_summary_file" default=""/>
+  <arg name="team_scene_info_path" default="$(find danger_search)/../../generated_building/team_scene_info.json"/>
 
   <rosparam command="load" file="$(arg config)"/>
+
+  <include file="$(find danger_search_localization)/launch/scan_localization.launch">
+    <arg name="team_scene_info_path" value="$(arg team_scene_info_path)"/>
+    <arg name="require_team_scene_info" value="true"/>
+    <arg name="allow_relative_origin" value="false"/>
+  </include>
 
   <node pkg="danger_search"
         type="danger_search_node"
@@ -12,7 +19,9 @@
         required="true"
         output="screen">
     <param name="mission/max_floor" value="$(arg max_floor)"/>
+    <param name="runtime/profile" value="formal"/>
     <param name="result_file" value="$(arg result_file)"/>
-    <param name="mission_summary_file" value="$(arg mission_summary_file)"/>
+    <param name="mission_summary_file" value=""/>
+    <param name="localization/team_scene_info_path" value="$(arg team_scene_info_path)"/>
   </node>
 </launch>

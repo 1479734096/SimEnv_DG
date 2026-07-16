@@ -50,10 +50,6 @@ void WirelessHandle::receiveHandle(UNITREE_LEGGED_SDK::LowState *lowState){
             ((int)_keyData.btn.components.Y  == 1)){
         userCmd = UserCommand::L1_Y;
     }
-    else if((int)_keyData.btn.components.start == 1){
-        userCmd = UserCommand::START;
-    }
-
     userValue.L2 = killZeroOffset(_keyData.L2, 0.08);
     userValue.lx = killZeroOffset(_keyData.lx, 0.08);
     userValue.ly = killZeroOffset(_keyData.ly, 0.08);

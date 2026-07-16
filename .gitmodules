@@ -1,0 +1,3 @@
+[submodule "SimEnv/src/danger_search_localization/third_party/kiss_icp"]
+	path = SimEnv/src/danger_search_localization/third_party/kiss_icp
+	url = https://github.com/PRBonn/kiss-icp.git

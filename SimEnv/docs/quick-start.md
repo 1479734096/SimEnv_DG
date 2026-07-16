@@ -1,10 +1,6 @@
 # 快速启动
 
-本文面向第一次运行比赛仿真环境的选手。默认工作目录为：
-
-```bash
-cd /home/ros/Guoyulun/Competition/SimEnv
-```
+本文面向第一次运行比赛仿真环境的选手。除特别说明外，以下命令均在 SimEnv 仓库根目录执行。
 
 ## 运行要求
 
@@ -13,24 +9,17 @@ cd /home/ros/Guoyulun/Competition/SimEnv
 - Gazebo Classic
 - Python >= 3.8
 - `python3-yaml`
-- `numpy` 和 `scipy`，用于评估脚本
+- `numpy`，用于评估脚本
 - CUDA >= 11.7
 - libtorch C++ 版本，用于 Unitree A1 控制器
-- cuDNN 开发头文件和库，用于匹配 GPU 版 libtorch
 
-libtorch、CUDA 和 cuDNN 路径在 `src/unitree_guide/unitree_guide/unitree_guide/CMakeLists.txt` 中配置。工程会优先使用 `-DLIBTORCH_ROOT` 或环境变量 `LIBTORCH_ROOT`，未设置时依次尝试 `/home/xbh/third_party/libtorch` 和 `/home/ros/Guoyulun/Download/libtorch`。如 cuDNN 不在系统默认路径，可设置 `CUDNN_ROOT`、`CUDNN_INCLUDE_DIR` 或 `CUDNN_LIBRARY`。
-
-GPU 版 libtorch 可能把 CUDA 运行库打包成带哈希的文件名，例如 `libcudart-xxxx.so.11.0`，但 `junior_ctrl` 运行期会按标准 SONAME 查找 `libcudart.so.11.0`。编译和 `auto.sh` 启动前会自动运行 `scripts/prepare_libtorch_runtime.sh`，在 libtorch 的 `lib` 目录内补齐缺失的同目录软链接。把工程复制到其他电脑后，如果 libtorch 不在默认路径，请先设置：
-
-```bash
-export LIBTORCH_ROOT=/path/to/libtorch
-```
+libtorch 和 CUDA 路径在 `src/unitree_guide/unitree_guide/unitree_guide/CMakeLists.txt` 中配置。如部署路径不同，需要按实际机器调整。
 
 ## 编译
 
 ```bash
 source /opt/ros/noetic/setup.bash
-catkin_make -j4
+catkin_make -j
 source ./devel/setup.bash
 ```
 
@@ -48,6 +37,8 @@ source ./devel/setup.bash
 4. 启动 Gazebo、Unitree A1 模型、传感器、状态话题和控制器接口。
 5. 启动 `building_generator_classic` 门/电梯控制服务。
 6. 启动 `devel/lib/unitree_guide/junior_ctrl`。
+
+Livox 点云插件启动时会读取扫描模式 CSV 文件，启动后前十几秒可能出现 `rostopic hz /scan` 暂时显示 `no new messages`。请等待 `auto.sh` 完成并再等待数秒后检查传感器话题。
 
 ## 常用启动方式
 
@@ -75,6 +66,18 @@ SEED=20260507 FLOOR_COUNT=4 ROOMS_PER_FLOOR=5 DANGER_COUNT=5 DISTRACTOR_COUNT=8 
 START_CONTROLLER=0 ./auto.sh
 ```
 
+只开启 RealSense 深度相机数据，关闭 Livox 和其他比赛传感器数据：
+
+```bash
+ENABLE_SENSOR_DATA=0 ENABLE_REALSENSE=1 ./auto.sh
+```
+
+只开启 Livox 雷达数据：
+
+```bash
+ENABLE_SENSOR_DATA=0 ENABLE_LIVOX=1 ./auto.sh
+```
+
 ## 启动参数
 
 | 环境变量 | 默认值 | 说明 |
@@ -87,16 +90,41 @@ START_CONTROLLER=0 ./auto.sh
 | `DANGER_COUNT` | `3:6` | 危险源数量，支持 `min:max` |
 | `DISTRACTOR_COUNT` | `4:8` | 干扰源数量，支持 `min:max` |
 | `GUI` | `true` | 是否启动 Gazebo GUI |
-| `PAUSED` | `true` | Gazebo 启动后是否暂停 |
+| `PAUSED` | `false` | Gazebo 启动后是否暂停 |
 | `START_CONTROLLER` | `1` | 是否启动 `junior_ctrl` |
 | `CONTROLLER_FOREGROUND` | `1` | 是否在前台运行控制器 |
 | `START_BUILDING_CONTROL` | `1` | 是否启动楼栋门/电梯控制服务 |
-| `UNITREE_CTRL_DT` | `0.004` | `junior_ctrl` 控制周期，单位 s。默认 250 Hz |
+| `ROBOT_SPAWN_TIMEOUT` | `120` | 等待 Gazebo 完成机器人模型生成的最长时间，单位 s |
+| `CONTROLLER_SPAWNER_TIMEOUT` | `120` | 等待 Gazebo 暴露 controller_manager 接口的最长时间，单位 s |
+| `UNITREE_CTRL_DT` | `0.004` | `junior_ctrl` 控制周期，单位 s |
+| `UNITREE_LOG_WAIT_WARNINGS` | `0` | 是否输出 `absoluteWait is not enough` 控制周期超时提示 |
+| `ENABLE_SENSOR_DATA` | `1` | 比赛传感器数据默认总开关；具体传感器可用下列变量覆盖 |
+| `ENABLE_LIVOX` | 跟随 `ENABLE_SENSOR_DATA` | 是否发布 Livox 雷达 `/scan` |
+| `ENABLE_LIVOX_IMU` | 跟随 `ENABLE_LIVOX` | 是否发布 `/livox/imu` |
+| `ENABLE_REALSENSE` | 跟随 `ENABLE_SENSOR_DATA` | 是否发布 RealSense RGB、深度图和深度点云 |
+| `ENABLE_DEPTH_CAMERA` | 空 | `ENABLE_REALSENSE` 的别名，便于只控制深度相机 |
+| `ENABLE_FRONT_CAMERA` | `0` | 是否启用可选前视 RGB 相机 |
+| `ENABLE_POINTCLOUD_CONVERTER` | 跟随 `ENABLE_LIVOX` | 是否将 `/scan` 转换为 `/livox/Pointcloud2` 和 `/livox/lidar2` |
+| `ENABLE_GROUND_TRUTH` | `1` | 是否发布 Gazebo 真值调试话题 |
+| `ENABLE_REFEREE_ODOM` | `1` | 是否发布 `/Odometry_gazebo` 和 `odom -> base` TF |
+| `ENABLE_FOOT_CONTACT_SENSOR` | `0` | 是否启用四个足端 ContactSensor 及接触力话题 |
 | `START_VIRTUAL_JOY` | `0` | 是否启动虚拟手柄，通常需要 `uinput` 权限 |
 | `ROBOT_X` | `0.0` | 机器人出生点 x |
-| `ROBOT_Y` | `-2.2` | 机器人出生点 y |
+| `ROBOT_Y` | `-3.2` | 机器人出生点 y |
 | `ROBOT_Z` | `0.6` | 机器人出生点 z |
 | `ROBOT_YAW` | `1.5708` | 机器人出生点 yaw |
+
+性能较弱时建议优先使用：
+
+```bash
+GUI=false ./auto.sh
+```
+
+如只需要测试感知链路，可暂时不启动控制器：
+
+```bash
+START_CONTROLLER=0 ./auto.sh
+```
 
 ## 单独生成场景
 
@@ -115,14 +143,6 @@ rosrun building_obstacles generate_competition_scene.py \
   --output-dir ./generated_building \
   --results-dir ./results
 ```
-
-兼容旧命令：
-
-```bash
-rosrun building_obstacles generate_multi_floor_building.py ./generated_building 3 4
-```
-
-旧入口会转调新的比赛场景生成器。
 
 ## 默认场景规模
 

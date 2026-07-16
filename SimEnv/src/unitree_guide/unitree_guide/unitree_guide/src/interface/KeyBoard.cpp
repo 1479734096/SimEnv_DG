@@ -31,7 +31,7 @@ UserCommand KeyBoard::checkCmd(){
     case '3':
         return UserCommand::L2_X;
     case '4':
-        return UserCommand::START;
+        return UserCommand::RL_KEYBOARD;
 #ifdef COMPILE_WITH_MOVE_BASE
     case '5':
         return UserCommand::L2_Y;
@@ -43,7 +43,7 @@ UserCommand KeyBoard::checkCmd(){
     case '9':
         return UserCommand::L1_A;
     case '8':
-        return UserCommand::L1_Y;
+        return UserCommand::RESET;
     case ' ':
         userValue.setZero();
         return UserCommand::NONE;

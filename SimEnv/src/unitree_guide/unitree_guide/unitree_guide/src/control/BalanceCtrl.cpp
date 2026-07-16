@@ -4,6 +4,7 @@
 #include "control/BalanceCtrl.h"
 #include "common/mathTools.h"
 #include "common/timeMarker.h"
+#include <cmath>
 
 BalanceCtrl::BalanceCtrl(double mass, Mat3 Ib, Mat6 S, double alpha, double beta)
             : _mass(mass), _Ib(Ib), _S(S), _alpha(alpha), _beta(beta){
@@ -149,6 +150,11 @@ void BalanceCtrl::solveQP(){
     double value = solve_quadprog(G, g0, CE, ce0, CI, ci0, x);
 
     for (int i = 0; i < n; ++i) {
+        if(!std::isfinite(x[i])){
+            std::cout << "[WARNING] BalanceCtrl QP returned non-finite force, reusing previous force." << std::endl;
+            _F = _Fprev;
+            return;
+        }
         _F[i] = x[i];
     }
 }

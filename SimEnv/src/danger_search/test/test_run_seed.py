@@ -121,16 +121,14 @@ class StartupPostureGateTest(unittest.TestCase):
         self.assertIn("startup_posture_failure", detail)
         self.assertIn("max_abs_roll=3.1400", detail)
 
-    def test_low_z_fails_gate(self):
+    def test_height_truth_is_not_used_by_formal_posture_gate(self):
         stats = {
             "samples": 100,
             "max_abs_roll": 0.05,
             "max_abs_pitch": 0.04,
             "min_z": 0.08,
         }
-        detail = run_seed._posture_breach_detail(stats)
-        self.assertIsNotNone(detail)
-        self.assertIn("min_z=0.0800", detail)
+        self.assertIsNone(run_seed._posture_breach_detail(stats))
 
     def test_no_samples_fails_gate(self):
         detail = run_seed._posture_breach_detail(

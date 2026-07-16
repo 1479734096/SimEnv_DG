@@ -59,6 +59,10 @@ public:
 private:
     FSMState* getNextState(FSMStateName stateName);
     bool checkSafty();
+    bool handleResetCommand();
+    bool resetGazeboRobot();
+    void forcePassiveState();
+    void setResetDownCommand();
     CtrlComponents *_ctrlComp;
     FSMState *_currentState;
     FSMState *_nextState;
@@ -67,6 +71,9 @@ private:
     FSMMode _mode;
     long long _startTime;
     int count;
+    bool _waitingForStateFeedback = false;
+    bool _resetCommandLatched = false;
+    bool _fallSafetyLatched = false;
 };
 
 

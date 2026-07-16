@@ -5,12 +5,6 @@
 @brief: 将 /scan (sensor_msgs/PointCloud) 变换到 odom 坐标系后发布为 PointCloud2
 @Editor: CJH + 修改完善版
 @Date: 2025-10-22 → 2025-11-22
-
-整体链路：
-1. gazebo.xacro 中的 Livox 插件发布 /scan。
-2. multi_floor_gazeboSim.launch 启动本节点。
-3. 本节点同步读取 /Odometry_gazebo 和 TF，把雷达点变换到 odom。
-4. 发布 /livox/lidar2 兼容 Livox CustomMsg，同时发布 /livox/Pointcloud2 供通用算法使用。
 """
 
 import tf
@@ -25,15 +19,15 @@ import sensor_msgs.point_cloud2 as pc2
 from nav_msgs.msg import Odometry
 
 
-SENSOR_FRAME = "odom"    
-ODOM_TOPIC = "/Odometry_gazebo"           
+ODOM_FRAME = "odom"
+LOCAL_SENSOR_FRAME = "laser_livox"
+ODOM_TOPIC = "/Odometry_gazebo"
 m_buf = Lock()
 latest_odom = None
-latest_odom_time = None
+use_ground_truth_odom = True
 
 
 def _get_struct_fmt(pointcloud2):
-    """根据 PointCloud2 字段类型构造 struct 解包格式。"""
     fmt = ''
     for field in pointcloud2.fields:
         if field.datatype == PointField.FLOAT32:
@@ -56,10 +50,6 @@ def _get_struct_fmt(pointcloud2):
 
 
 def pointcloud2_to_custommsg(pointcloud2):
-    """把通用 PointCloud2 转成 Livox CustomMsg。
-
-    一些现成 Livox 算法依赖 CustomMsg，因此这里保留一份兼容输出。
-    """
     custom_msg = CustomMsg()
     custom_msg.header = pointcloud2.header
     custom_msg.timebase = rospy.Time.now().to_nsec()
@@ -86,8 +76,15 @@ def pointcloud2_to_custommsg(pointcloud2):
 
     return custom_msg
 
+
+def publish_custom_livox(stamp, points):
+    header = rospy.Header()
+    header.stamp = stamp
+    header.frame_id = LOCAL_SENSOR_FRAME
+    cloud_msg = pc2.create_cloud_xyz32(header, points)
+    pub_laser_livox.publish(pointcloud2_to_custommsg(cloud_msg))
+
 def rotate_pointcloud_y(points, theta):
-    """按 Y 轴旋转点云，用于补偿雷达安装角。当前 theta=0，相当于保留接口。"""
     # theta = np.deg2rad(theta_deg)
     cos_t, sin_t = np.cos(theta), np.sin(theta)
     R_y = np.array([
@@ -100,11 +97,9 @@ def rotate_pointcloud_y(points, theta):
     return rotated.tolist()
 
 def odom_callback(odom_msg):
-    """缓存最新 Gazebo 里程计，供点云回调用于坐标变换。"""
-    global latest_odom, latest_odom_time
+    global latest_odom
     with m_buf:
         latest_odom = odom_msg
-        latest_odom_time = odom_msg.header.stamp
 
 def quat_to_rot_matrix(q):
     """四元数 → 3x3 旋转矩阵 (numpy)"""
@@ -118,10 +113,7 @@ def quat_to_rot_matrix(q):
 def transform_points_to_odom(points_sensor, odom_msg):
     global tf_listener
     """
-    将雷达坐标系中的点云变换到 odom 坐标系。
-
-    优先使用 TF 获取 base -> laser_livox 的安装关系，再叠加
-    /Odometry_gazebo 给出的 odom -> base 位姿。
+    将 sensor_frame 中的点云变换到 odom 坐标系
     """
     if odom_msg is None:
         return points_sensor
@@ -170,6 +162,7 @@ def filter_points_by_angle(points, min_angle_deg, max_angle_deg):
     points_np = np.array(points, dtype=np.float32)
     if points_np.size == 0:
         return []
+    points_np = points_np.reshape((-1, 3))
     
     # 计算每个点的垂直角度
     distances = np.linalg.norm(points_np[:, :2], axis=1)  # xy平面距离
@@ -182,21 +175,13 @@ def filter_points_by_angle(points, min_angle_deg, max_angle_deg):
 
 
 def mmw_handler(mmw_cloud_msg):
-    """处理一帧原始 Livox 点云。
-
-    该回调是本节点主数据流：原始点 -> 角度过滤 -> 盲区过滤 ->
-    CustomMsg 发布 -> odom 坐标 PointCloud2 发布。
-    """
-    global latest_odom, pub_laser_cloud,pub_laser_livox, laser_blind,min_angle,max_angle
+    global latest_odom, pub_laser_cloud,pub_laser_livox, laser_blind,min_angle,max_angle,use_ground_truth_odom
 
     with m_buf:
         odom_now = latest_odom
         stamp = mmw_cloud_msg.header.stamp
 
     # Step 1: 提取原始点云 (更快的方式)
-    header = rospy.Header()
-    header.stamp = stamp
-    header.frame_id = SENSOR_FRAME
     x = np.fromiter((p.x for p in mmw_cloud_msg.points), dtype=np.float32)
     y = np.fromiter((p.y for p in mmw_cloud_msg.points), dtype=np.float32)
     z = np.fromiter((p.z for p in mmw_cloud_msg.points), dtype=np.float32)
@@ -213,20 +198,33 @@ def mmw_handler(mmw_cloud_msg):
 
     # Step 3: 盲区过滤
     points_np = np.array(angle_filtered_points, dtype=np.float32)
+    if points_np.size == 0:
+        publish_custom_livox(stamp, [])
+        header = rospy.Header()
+        header.stamp = stamp
+        header.frame_id = ODOM_FRAME if use_ground_truth_odom else LOCAL_SENSOR_FRAME
+        pub_laser_cloud.publish(pc2.create_cloud_xyz32(header, []))
+        return
+    points_np = points_np.reshape((-1, 3))
     distances = np.linalg.norm(points_np, axis=1)
     filtered_points = points_np[distances >= laser_blind].tolist()
 
     # Step 3.5 转为 CustomMsg 并发布
-    m_buf.acquire()
-    cloud_msg_ = pc2.create_cloud_xyz32(header, filtered_points)
-    custom_msg = pointcloud2_to_custommsg(cloud_msg_)
-    pub_laser_livox.publish(custom_msg)
-    m_buf.release()
+    with m_buf:
+        publish_custom_livox(stamp, filtered_points)
 
-    # Step 4: 变换到 odom 坐标系
-    transformed_points = transform_points_to_odom(filtered_points, odom_now)
+    # Step 4: 可选地使用 Gazebo 真值里程计变换到 odom。正式比赛应关闭该选项。
+    if use_ground_truth_odom:
+        transformed_points = transform_points_to_odom(filtered_points, odom_now)
+        pointcloud2_frame = ODOM_FRAME
+    else:
+        transformed_points = filtered_points
+        pointcloud2_frame = LOCAL_SENSOR_FRAME
 
-    # Step 5: 创建 PointCloud2，frame_id = "odom"
+    # Step 5: 创建 PointCloud2
+    header = rospy.Header()
+    header.stamp = stamp
+    header.frame_id = pointcloud2_frame
     cloud_msg = pc2.create_cloud_xyz32(header, transformed_points)
     # 发布pocintcloud2消息
     pub_laser_cloud.publish(cloud_msg)
@@ -236,11 +234,11 @@ def mmw_handler(mmw_cloud_msg):
 
 
 def main():
-    global pub_laser_cloud,pub_laser_livox,laser_blind,min_angle,max_angle,tf_listener
+    global pub_laser_cloud,pub_laser_livox,laser_blind,min_angle,max_angle,tf_listener,use_ground_truth_odom
 
 
     rospy.init_node('pre_mmw_to_odom', anonymous=True)
-    # 监听雷达与底盘的安装角度，便于矫正雷达位置。
+    #监听雷达与底盘的安装角度，便于矫正雷达位置
 
     tf_listener = tf.TransformListener()
 
@@ -252,17 +250,22 @@ def main():
     max_angle = rospy.get_param('~max_angle',60)   # 默认上限45度
     rospy.loginfo(f"Angle filter : {min_angle} ~ {max_angle} deg")
 
-    # 订阅原始点云和里程计
+    use_ground_truth_odom = rospy.get_param('~use_ground_truth_odom', True)
+    rospy.loginfo(f"Use ground-truth odom for /livox/Pointcloud2: {use_ground_truth_odom}")
+
+    # 订阅原始点云；真值里程计仅在显式开启时订阅。
     rospy.Subscriber('/scan', PointCloud, mmw_handler, queue_size=10)
-    rospy.Subscriber(ODOM_TOPIC, Odometry, odom_callback, queue_size=10)
+    if use_ground_truth_odom:
+        rospy.Subscriber(ODOM_TOPIC, Odometry, odom_callback, queue_size=10)
 
     pub_laser_livox = rospy.Publisher('/livox/lidar2', CustomMsg, queue_size=10)
 
     pub_laser_cloud = rospy.Publisher("/livox/Pointcloud2", PointCloud2, queue_size=10)
 
-    rospy.loginfo("=== Pointcloud2livox (published in odom) STARTED ===")
-    rospy.loginfo(f"Sensor frame: {SENSOR_FRAME}")
-    rospy.loginfo(f"Odom topic : {ODOM_TOPIC}")
+    rospy.loginfo("=== Pointcloud2livox STARTED ===")
+    rospy.loginfo(f"Local sensor frame: {LOCAL_SENSOR_FRAME}")
+    if use_ground_truth_odom:
+        rospy.loginfo(f"Odom topic : {ODOM_TOPIC}")
 
     rospy.spin()
 

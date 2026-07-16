@@ -10,7 +10,6 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   sensor_msgs
   std_msgs
-  tf
 )
 
 catkin_python_setup()
@@ -25,7 +24,6 @@ catkin_package(
   rospy
   sensor_msgs
   std_msgs
-  tf
 )
 
 catkin_install_python(PROGRAMS

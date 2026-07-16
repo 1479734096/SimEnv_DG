@@ -105,28 +105,22 @@ class MissionManagerHelperTest(unittest.TestCase):
             0.04,
         )
 
-    def test_ground_support_snapshot_uses_opt_in_nearest_odom_without_changing_latest(self):
-        buffer = SensorBuffer(
-            odom_topic="/odom",
-            cloud_topic="/cloud",
-            rgb_topic="/rgb",
-            depth_topic="/depth",
-            camera_info_topic="/camera_info",
-        )
-        buffer.enable_cloud_odom_matching(max_samples=8)
-        for stamp in (1.0, 1.02, 1.04):
-            buffer._on_odom(self._odom_message(stamp))
-        buffer._on_cloud(self._stamped_message(1.021))
+    def test_pose_provider_uses_nearest_internal_localization_sample(self):
+        from danger_search.pose_provider import PoseProvider
 
-        matched = buffer.ground_support_snapshot()
-        latest = buffer.snapshot()
+        provider = PoseProvider("/danger_search/localization/odom", max_samples=8)
+        for stamp in (1.0, 1.02, 1.04):
+            provider._on_odometry(self._odom_message(stamp))
+
+        matched = provider.at(1.021)
+        latest = provider.latest()
 
         self.assertAlmostEqual(
-            matched.odom_msg.header.stamp.to_sec(),
+            matched.stamp,
             1.02,
         )
         self.assertAlmostEqual(
-            latest.odom_msg.header.stamp.to_sec(),
+            latest.stamp,
             1.04,
         )
 
@@ -170,6 +164,13 @@ class MissionManagerHelperTest(unittest.TestCase):
             SimpleNamespace(odom_msg=None),
             (0.0, 0.0, 0.0),
             (0.0, 0.0, 0.0),
+            mission_manager_module.PoseSample(
+                stamp=1.0,
+                xyz=(0.0, 0.0, 0.0),
+                quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                linear_xyz=(0.0, 0.0, 0.0),
+                angular_xyz=(0.0, 0.0, 0.0),
+            ),
             [],
             1.0,
         )
@@ -194,8 +195,17 @@ class MissionManagerHelperTest(unittest.TestCase):
             snapshot=lambda: snapshot,
             read_cloud_xyz=lambda *args, **kwargs: reads.append(True) or [(0.0, 0.0, 0.0)],
         )
+        manager.pose_provider = SimpleNamespace(
+            at=lambda _stamp: mission_manager_module.PoseSample(
+                stamp=1.01,
+                xyz=(0.0, 0.0, 0.39),
+                quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                linear_xyz=(0.0, 0.0, 0.0),
+                angular_xyz=(0.0, 0.0, 0.0),
+            )
+        )
         manager._update_ground_support_assessment = (
-            lambda _snapshot, _pose, _xyz, _points, stamp: updates.append(stamp)
+            lambda _snapshot, _pose, _xyz, _sample, _points, stamp: updates.append(stamp)
         )
 
         manager._on_ground_support_timer(None)
@@ -1807,12 +1817,16 @@ class MissionManagerHelperTest(unittest.TestCase):
             ),
             read_cloud_xyz=lambda *a, **k: [],
         )
+        manager.pose_provider = SimpleNamespace(
+            latest=lambda: mission_manager_module.PoseSample(
+                stamp=10.0, xyz=(0.0, 0.0, 0.0), quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                linear_xyz=(0.0, 0.0, 0.0), angular_xyz=(0.0, 0.0, 0.0),
+            )
+        )
 
         with patch.object(mission_manager_module, "rospy", SimpleNamespace(
             loginfo=lambda *a, **k: None, logwarn=lambda *a, **k: None, logerr=lambda *a, **k: None,
-        )), patch.object(mission_manager_module, "get_time", return_value=10.0), \
-             patch.object(mission_manager_module, "odom_pose_xy_yaw", return_value=(0.0, 0.0, 0.0)), \
-             patch.object(mission_manager_module, "odom_xyz", return_value=(0.0, 0.0, 0.0)):
+        )), patch.object(mission_manager_module, "get_time", return_value=10.0):
             manager.tick()
 
         self.assertIsNone(manager.main_entrance_xy)
@@ -1869,12 +1883,16 @@ class MissionManagerHelperTest(unittest.TestCase):
             ),
             read_cloud_xyz=lambda *a, **k: [],
         )
+        manager.pose_provider = SimpleNamespace(
+            latest=lambda: mission_manager_module.PoseSample(
+                stamp=10.0, xyz=(0.0, 0.0, 0.0), quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                linear_xyz=(0.0, 0.0, 0.0), angular_xyz=(0.0, 0.0, 0.0),
+            )
+        )
 
         with patch.object(mission_manager_module, "rospy", SimpleNamespace(
             loginfo=lambda *a, **k: None, logwarn=lambda *a, **k: None, logerr=lambda *a, **k: None,
-        )), patch.object(mission_manager_module, "get_time", return_value=10.0), \
-             patch.object(mission_manager_module, "odom_pose_xy_yaw", return_value=(0.0, 0.0, 0.0)), \
-             patch.object(mission_manager_module, "odom_xyz", return_value=(0.0, 0.0, 0.0)):
+        )), patch.object(mission_manager_module, "get_time", return_value=10.0):
             manager.tick()
 
         self.assertEqual(manager.main_entrance_xy, (0.0, 0.0))

@@ -46,7 +46,7 @@ OWNED_ENVIRONMENT_NAMES = {
 
 DEFAULT_HEALTH_CHECK_TIMEOUT = 120
 
-# 启动姿态门禁阈值：只读采样 /Odometry_gazebo，超限即判定 startup_posture_failure。
+# 启动姿态门禁阈值：只读采样初始接口允许的 /trunk_imu，超限即判定 startup_posture_failure。
 # 正常起立 run 实测 max_abs_roll≈0.066、max_abs_pitch≈0.041、z∈[0.18,0.34]，
 # 翻倒 run 实测 max_abs_roll≈3.14、z<0.1，阈值在两者间留充足余量。
 POSTURE_MAX_ABS_ROLL = 0.5
@@ -317,42 +317,37 @@ def _quaternion_to_rpy(x: float, y: float, z: float, w: float) -> tuple[float, f
 
 
 def _probe_robot_posture(sample_seconds: float) -> dict:
-    """只读采样 /Odometry_gazebo 姿态统计；绝不发布任何命令、不调用 set_model_state。
+    """只读采样初始文档允许的 /trunk_imu 姿态统计。
 
     使用墙钟窗口采样（use_sim_time 下 rospy.sleep 会受 RTF 拖慢），disable_signals
     避免干扰父进程已有的信号处理；采样后立即注销订阅并关闭临时节点。
     """
     import rospy
-    from nav_msgs.msg import Odometry
+    from sensor_msgs.msg import Imu
 
     stats = {
         "max_abs_roll": 0.0,
         "max_abs_pitch": 0.0,
-        "min_z": None,
         "samples": 0,
         "sample_seconds": float(sample_seconds),
     }
     finished = {"done": False}
 
-    def _on_odom(msg) -> None:
+    def _on_imu(msg) -> None:
         if finished["done"]:
             return
-        pose = msg.pose.pose
         roll, pitch = _quaternion_to_rpy(
-            pose.orientation.x,
-            pose.orientation.y,
-            pose.orientation.z,
-            pose.orientation.w,
+            msg.orientation.x,
+            msg.orientation.y,
+            msg.orientation.z,
+            msg.orientation.w,
         )
         stats["max_abs_roll"] = max(stats["max_abs_roll"], abs(roll))
         stats["max_abs_pitch"] = max(stats["max_abs_pitch"], abs(pitch))
-        z = float(pose.position.z)
-        if stats["min_z"] is None or z < stats["min_z"]:
-            stats["min_z"] = z
         stats["samples"] += 1
 
     rospy.init_node("startup_posture_probe", anonymous=True, disable_signals=True)
-    subscriber = rospy.Subscriber("/Odometry_gazebo", Odometry, _on_odom, queue_size=200)
+    subscriber = rospy.Subscriber("/trunk_imu", Imu, _on_imu, queue_size=200)
     try:
         deadline = time.monotonic() + float(sample_seconds)
         while time.monotonic() < deadline and not rospy.is_shutdown():
@@ -369,28 +364,29 @@ def _posture_breach_detail(stats: dict) -> str | None:
     samples = int(stats.get("samples", 0))
     roll = float(stats.get("max_abs_roll", 0.0))
     pitch = float(stats.get("max_abs_pitch", 0.0))
-    min_z_raw = stats.get("min_z")
-    min_z = float(min_z_raw) if min_z_raw is not None else None
     breached = (
         samples == 0
         or roll > POSTURE_MAX_ABS_ROLL
         or pitch > POSTURE_MAX_ABS_PITCH
-        or (min_z is not None and min_z < POSTURE_MIN_Z)
     )
     if not breached:
         return None
-    min_z_text = "" if min_z is None else f" min_z={min_z:.4f}"
     return (
         f"startup_posture_failure: samples={samples}"
-        f" max_abs_roll={roll:.4f} max_abs_pitch={pitch:.4f}{min_z_text}"
+        f" max_abs_roll={roll:.4f} max_abs_pitch={pitch:.4f}"
     )
 
 
-def check_startup_health(workspace_dir: Path, health_log_path: Path) -> None:
-    required_topics = (
-        ("/Odometry_gazebo", "里程计"),
-        ("/livox/Pointcloud2", "点云"),
-    )
+def check_startup_health(
+    workspace_dir: Path,
+    health_log_path: Path,
+    *,
+    require_localization: bool = False,
+) -> None:
+    """分两阶段检查，避免在定位节点尚未启动时错误判定环境失败。"""
+    required_topics = [("/scan", "Livox 原始点云")]
+    if require_localization:
+        required_topics.append(("/danger_search/localization/odom", "参赛方定位"))
     health_log_path.parent.mkdir(parents=True, exist_ok=True)
     with health_log_path.open("w", encoding="utf-8") as health_log:
         health_log.write(f"启动健康检查开始: {datetime.datetime.now().isoformat()}\n")
@@ -410,15 +406,15 @@ def check_startup_health(workspace_dir: Path, health_log_path: Path) -> None:
             except RuntimeError as exc:
                 health_log.write(f"{topic} 检查失败: {exc}\n")
                 health_log.flush()
-                if topic == "/livox/Pointcloud2":
+                if topic == "/scan":
                     raise RuntimeError(
-                        "启动健康检查失败：未收到 /livox/Pointcloud2 点云；"
-                        "请检查 Gazebo/Livox 插件和 pointcloud2livox.py，详见 logs/health_check.log"
+                        "启动健康检查失败：未收到 /scan 原始点云；"
+                        "请检查 Gazebo/Livox 插件，详见 logs/health_check.log"
                     ) from exc
                 raise RuntimeError(
                     f"启动健康检查失败：未收到 {topic} 数据，详见 logs/health_check.log"
                 ) from exc
-        health_log.write("\n检查机器人姿态（只读采样 /Odometry_gazebo）\n")
+        health_log.write("\n检查机器人姿态（只读采样 /trunk_imu）\n")
         health_log.flush()
         posture: dict | None = None
         try:
@@ -431,7 +427,7 @@ def check_startup_health(workspace_dir: Path, health_log_path: Path) -> None:
                 f"姿态采样: samples={posture['samples']} "
                 f"max_abs_roll={posture['max_abs_roll']:.4f} "
                 f"max_abs_pitch={posture['max_abs_pitch']:.4f} "
-                f"min_z={posture['min_z']:.4f}\n"
+                "高度真值不参与正式健康检查\n"
             )
             health_log.flush()
             detail = _posture_breach_detail(posture)
@@ -447,8 +443,8 @@ def check_startup_health(workspace_dir: Path, health_log_path: Path) -> None:
 def run_danger_search(
     workspace_dir: Path,
     run_config_path: Path,
-    result_file: Path,
-    mission_summary_file: Path,
+    result_file: Path | None,
+    mission_summary_file: Path | None,
     max_floor: int,
     timeout: int,
     log_path: Path,
@@ -464,8 +460,6 @@ def run_danger_search(
             "roslaunch danger_search danger_search.launch",
             f"config:={shlex.quote(str(run_config_path))}",
             f"max_floor:={int(max_floor)}",
-            f"result_file:={shlex.quote(str(result_file))}",
-            f"mission_summary_file:={shlex.quote(str(mission_summary_file))}",
         ]
     )
     with log_path.open("w", encoding="utf-8") as log_file:
@@ -479,6 +473,11 @@ def run_danger_search(
         deadline = time.monotonic() + timeout
         termination: RunTermination | None = None
         try:
+            check_startup_health(
+                workspace_dir,
+                log_path.with_name("algorithm_health_check.log"),
+                require_localization=True,
+            )
             while termination is None:
                 drain_environment_output(environment_process)
                 return_code = process.poll()
@@ -557,6 +556,17 @@ def evaluate_run(workspace_dir: Path, run_dir: Path, result_file: Path) -> bool:
     return True
 
 
+def public_result_file(workspace_dir: Path) -> Path:
+    """读取唯一允许的公开 scene info，并返回裁判指定的结果路径。"""
+    from danger_search.building_feature_provider import BuildingFeatureProvider
+
+    provider = BuildingFeatureProvider.load(
+        workspace_dir / "generated_building" / "team_scene_info.json",
+        purpose="正式运行归档",
+    )
+    return provider.result_file
+
+
 def copy_runtime_logs(workspace_dir: Path, run_dir: Path) -> None:
     logs_dir = run_dir / "logs"
     logs_dir.mkdir(exist_ok=True)
@@ -587,6 +597,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-cleanup-after",
         action="store_true",
         help="调试时保留本轮启动的仿真进程",
+    )
+    parser.add_argument(
+        "--offline-evaluate",
+        action="store_true",
+        help="运行结束后显式读取裁判真值进行离线评估；不属于正式算法运行",
     )
     return parser
 
@@ -625,6 +640,7 @@ def main() -> int:
     failure_reason: list[str] = []
     termination: RunTermination | None = None
     evaluation_completed = False
+    production_result_file: Path | None = None
     started_at = datetime.datetime.now()
 
     try:
@@ -638,17 +654,21 @@ def main() -> int:
                 max_floor=args.max_floor,
                 run_pid_dir=logs_dir / "processes",
             )
+            production_result_file = public_result_file(workspace_dir)
             termination = run_danger_search(
                 workspace_dir=workspace_dir,
                 run_config_path=run_config_path,
-                result_file=result_file,
-                mission_summary_file=runtime_summary_file,
+                result_file=None,
+                mission_summary_file=None,
                 max_floor=args.max_floor,
                 timeout=args.timeout,
                 log_path=logs_dir / "danger_search.log",
                 environment_process=env_process,
                 gui_enabled=gui_enabled,
             )
+            # 结果由公开 scene info 指定；在停止环境前先归档，避免清理脚本影响证据。
+            if production_result_file.exists():
+                shutil.copy2(production_result_file, result_file)
     except Exception as exc:
         failure_reason.append(str(exc))
         print(f"运行失败: {exc}")
@@ -657,10 +677,14 @@ def main() -> int:
             stop_environment(env_process)
         copy_runtime_logs(workspace_dir, run_dir)
 
-    try:
-        evaluation_completed = evaluate_run(workspace_dir, run_dir, result_file)
-    except subprocess.CalledProcessError as exc:
-        failure_reason.append(f"评测脚本失败: {exc}")
+    if production_result_file is not None and production_result_file.exists():
+        shutil.copy2(production_result_file, result_file)
+
+    if args.offline_evaluate:
+        try:
+            evaluation_completed = evaluate_run(workspace_dir, run_dir, result_file)
+        except subprocess.CalledProcessError as exc:
+            failure_reason.append(f"评测脚本失败: {exc}")
 
     write_json(run_dir / "detection_debug.json", {"status": "not_collected", "source": "logs/danger_search.log"})
     write_json(run_dir / "planner_debug.json", {"status": "not_collected", "source": "logs/danger_search.log"})
@@ -684,7 +708,7 @@ def main() -> int:
         and termination is not None
         and termination.kind == "algorithm_exit"
         and termination.return_code == 0
-        and normal_runtime_completion
+        and (normal_runtime_completion or not runtime_summary)
     )
     if result_written and not normal_runtime_completion:
         failure_reason.append(

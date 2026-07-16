@@ -16,14 +16,17 @@ public:
     FSMStateName checkChange();
 
 private:
-    float _targetPos[12] = {0.0, 0.67, -1.3, 0.0, 0.67, -1.3, 
-                            0.0, 0.67, -1.3, 0.0, 0.67, -1.3};
+    float _targetPos[12] = {0.0, 0.9, -1.8, 0.0, 0.9, -1.8,
+                            0.0, 0.9, -1.8, 0.0, 0.9, -1.8};
     float _startPos[12];
     float _startPos_real[12];
     float real_stand_p[12] = {80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80, 80};
     float real_stand_d[12]= {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
-    float _duration = 1000;   //steps
-    float _percent = 0;       //%
+    float _duration = 3.0;   // seconds
+    float _settleDuration = 0.5;
+    float _elapsed = 0;
+    float _percent = 0;
+    void setRampSimStanceGain(float percent);
 };
 
 #endif  // FIXEDSTAND_H

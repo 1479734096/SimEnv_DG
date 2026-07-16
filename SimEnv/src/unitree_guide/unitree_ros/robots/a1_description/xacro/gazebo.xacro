@@ -1,12 +1,6 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-    <!--
-      A1 的 Gazebo 插件定义。
-      robot.xacro 定义 link/joint，本文件把 Gazebo 运行时能力挂到这些 link 上：
-      ros_control、IMU、真值位姿、脚底接触、Livox、RGB 相机、深度相机。
-    -->
-
-    <!-- ros_control 插件让 controller_manager 能控制 Gazebo 里的 12 个腿部关节。 -->
+    <!-- ros_control plugin -->
     <gazebo>
         <plugin name="gazebo_ros_control" filename="libgazebo_ros_control.so">
             <robotNamespace>/a1_gazebo</robotNamespace>
@@ -65,148 +59,100 @@
         </sensor>
     </gazebo>
 
-    <!-- 机身相对 trunk 坐标的真值位姿，供 Unitree 控制框架内部使用。 -->
-    <gazebo>
-        <plugin name="p3d_base_trunk_pos_vel" filename="libgazebo_ros_p3d.so">
-            <alwaysOn>true</alwaysOn>
-            <update_rate>100</update_rate>
-            <bodyName>base</bodyName>
-            <topicName>ground_truth/base_trunk</topicName>
-            <frameName>trunk</frameName>
-            <xyzOffsets>0 0 0</xyzOffsets>
-            <rpyOffsets>0 0 0</rpyOffsets>
-        </plugin>
-    </gazebo>
-
-    <!-- 机身在 world 坐标系下的真值位姿，是 state_from_gazebo 生成里程计的重要来源。 -->
-    <gazebo>
-        <plugin name="p3d_base_w_pos_vel" filename="libgazebo_ros_p3d.so">
-            <alwaysOn>true</alwaysOn>
-            <update_rate>100</update_rate>
-            <bodyName>base</bodyName>
-            <topicName>ground_truth/base_w</topicName>
-            <frameName>world</frameName>
-            <xyzOffsets>0 0 0</xyzOffsets>
-            <rpyOffsets>0 0 0</rpyOffsets>
-        </plugin>
-    </gazebo>
-
-    <!-- 四足端相对 base 的真值位姿/速度，供控制器状态估计和调试使用。 -->
-    <gazebo>
-        <plugin name="p3d_FL_foot_pos_vel" filename="libgazebo_ros_p3d.so">
-            <alwaysOn>true</alwaysOn>
-            <update_rate>100</update_rate>
-            <bodyName>FL_foot</bodyName>
-            <topicName>ground_truth/FL_foot</topicName>
-            <frameName>base</frameName>
-            <xyzOffsets>0 0 0</xyzOffsets>
-            <rpyOffsets>0 0 0</rpyOffsets>
-        </plugin>
-    </gazebo>
-
-    <gazebo>
-        <plugin name="p3d_FR_foot_pos_vel" filename="libgazebo_ros_p3d.so">
-            <alwaysOn>true</alwaysOn>
-            <update_rate>100</update_rate>
-            <bodyName>FR_foot</bodyName>
-            <topicName>ground_truth/FR_foot</topicName>
-            <frameName>base</frameName>
-            <xyzOffsets>0 0 0</xyzOffsets>
-            <rpyOffsets>0 0 0</rpyOffsets>
-        </plugin>
-    </gazebo>
-
-    <gazebo>
-        <plugin name="p3d_RL_foot_pos_vel" filename="libgazebo_ros_p3d.so">
-            <alwaysOn>true</alwaysOn>
-            <update_rate>100</update_rate>
-            <bodyName>RL_foot</bodyName>
-            <topicName>ground_truth/RL_foot</topicName>
-            <frameName>base</frameName>
-            <xyzOffsets>0 0 0</xyzOffsets>
-            <rpyOffsets>0 0 0</rpyOffsets>
-        </plugin>
-    </gazebo>
-
-    <gazebo>
-        <plugin name="p3d_RR_foot_pos_vel" filename="libgazebo_ros_p3d.so">
-            <alwaysOn>true</alwaysOn>
-            <update_rate>100</update_rate>
-            <bodyName>RR_foot</bodyName>
-            <topicName>ground_truth/RR_foot</topicName>
-            <frameName>base</frameName>
-            <xyzOffsets>0 0 0</xyzOffsets>
-            <rpyOffsets>0 0 0</rpyOffsets>
-        </plugin>
-    </gazebo>
-
-    <!-- 四个脚底接触传感器，控制器可用它判断落足状态。 -->
-    <gazebo reference="FR_calf">
-        <sensor name="FR_foot_contact" type="contact">
-        <update_rate>100</update_rate>
-        <plugin name="contactPlugin" filename="libunitreeFootContactPlugin.so"/>
-        <contact>
-            <collision>FR_calf_fixed_joint_lump__FR_foot_collision_1</collision>
-        </contact>
-        </sensor>
-    </gazebo>
-    <gazebo reference="FL_calf">
-        <sensor name="FL_foot_contact" type="contact">
-        <update_rate>100</update_rate>
-        <plugin name="contactPlugin" filename="libunitreeFootContactPlugin.so"/>
-        <contact>
-            <collision>FL_calf_fixed_joint_lump__FL_foot_collision_1</collision>
-        </contact>
-        </sensor>
-    </gazebo>
-    <gazebo reference="RR_calf">
-        <sensor name="RR_foot_contact" type="contact">
-        <update_rate>100</update_rate>
-        <plugin name="contactPlugin" filename="libunitreeFootContactPlugin.so"/>
-        <contact>
-            <collision>RR_calf_fixed_joint_lump__RR_foot_collision_1</collision>
-        </contact>
-        </sensor>
-    </gazebo>
-    <gazebo reference="RL_calf">
-        <sensor name="RL_foot_contact" type="contact">
-        <update_rate>100</update_rate>
-        <plugin name="contactPlugin" filename="libunitreeFootContactPlugin.so"/>
-        <contact>
-            <collision>RL_calf_fixed_joint_lump__RL_foot_collision_1</collision>
-        </contact>
-        </sensor>
-    </gazebo>
-
-    <!-- Visualization of Foot contacts. -->
-    <gazebo reference="FR_foot">
-        <visual>
-            <plugin name="drawForcePlugin" filename="libunitreeDrawForcePlugin.so">
-                <topicName>FR_foot_contact</topicName>
+    <xacro:macro name="p3d_truth_plugin" params="plugin_name body_name topic_name frame_name">
+        <gazebo>
+            <plugin name="${plugin_name}" filename="libgazebo_ros_p3d.so">
+                <alwaysOn>true</alwaysOn>
+                <update_rate>100</update_rate>
+                <bodyName>${body_name}</bodyName>
+                <topicName>${topic_name}</topicName>
+                <frameName>${frame_name}</frameName>
+                <xyzOffsets>0 0 0</xyzOffsets>
+                <rpyOffsets>0 0 0</rpyOffsets>
             </plugin>
-        </visual>
-    </gazebo>
-    <gazebo reference="FL_foot">
-        <visual>
-            <plugin name="drawForcePlugin" filename="libunitreeDrawForcePlugin.so">
-                <topicName>FL_foot_contact</topicName>
-            </plugin>
-        </visual>
-    </gazebo>
-    <gazebo reference="RR_foot">
-        <visual>
-            <plugin name="drawForcePlugin" filename="libunitreeDrawForcePlugin.so">
-                <topicName>RR_foot_contact</topicName>
-            </plugin>
-        </visual>
-    </gazebo>
-    <gazebo reference="RL_foot">
-        <visual>
-            <plugin name="drawForcePlugin" filename="libunitreeDrawForcePlugin.so">
-                <topicName>RL_foot_contact</topicName>
-            </plugin>
-        </visual>
-    </gazebo>
+        </gazebo>
+    </xacro:macro>
+
+    <xacro:if value="${'$(arg ENABLE_GROUND_TRUTH)' == 'true'}">
+        <xacro:p3d_truth_plugin plugin_name="p3d_base_trunk_pos_vel" body_name="base" topic_name="ground_truth/base_trunk" frame_name="trunk"/>
+        <xacro:p3d_truth_plugin plugin_name="p3d_base_w_pos_vel" body_name="base" topic_name="ground_truth/base_w" frame_name="world"/>
+        <xacro:p3d_truth_plugin plugin_name="p3d_FL_foot_pos_vel" body_name="FL_foot" topic_name="ground_truth/FL_foot" frame_name="base"/>
+        <xacro:p3d_truth_plugin plugin_name="p3d_FR_foot_pos_vel" body_name="FR_foot" topic_name="ground_truth/FR_foot" frame_name="base"/>
+        <xacro:p3d_truth_plugin plugin_name="p3d_RL_foot_pos_vel" body_name="RL_foot" topic_name="ground_truth/RL_foot" frame_name="base"/>
+        <xacro:p3d_truth_plugin plugin_name="p3d_RR_foot_pos_vel" body_name="RR_foot" topic_name="ground_truth/RR_foot" frame_name="base"/>
+    </xacro:if>
+
+    <xacro:if value="${'$(arg ENABLE_FOOT_CONTACT_SENSOR)' == 'true'}">
+        <!-- Optional foot contact force topics. Disabling them keeps foot collisions unchanged. -->
+        <gazebo reference="FR_calf">
+            <sensor name="FR_foot_contact" type="contact">
+                <update_rate>100</update_rate>
+                <plugin name="contactPlugin" filename="libunitreeFootContactPlugin.so"/>
+                <contact>
+                    <collision>FR_calf_fixed_joint_lump__FR_foot_collision_1</collision>
+                </contact>
+            </sensor>
+        </gazebo>
+        <gazebo reference="FL_calf">
+            <sensor name="FL_foot_contact" type="contact">
+                <update_rate>100</update_rate>
+                <plugin name="contactPlugin" filename="libunitreeFootContactPlugin.so"/>
+                <contact>
+                    <collision>FL_calf_fixed_joint_lump__FL_foot_collision_1</collision>
+                </contact>
+            </sensor>
+        </gazebo>
+        <gazebo reference="RR_calf">
+            <sensor name="RR_foot_contact" type="contact">
+                <update_rate>100</update_rate>
+                <plugin name="contactPlugin" filename="libunitreeFootContactPlugin.so"/>
+                <contact>
+                    <collision>RR_calf_fixed_joint_lump__RR_foot_collision_1</collision>
+                </contact>
+            </sensor>
+        </gazebo>
+        <gazebo reference="RL_calf">
+            <sensor name="RL_foot_contact" type="contact">
+                <update_rate>100</update_rate>
+                <plugin name="contactPlugin" filename="libunitreeFootContactPlugin.so"/>
+                <contact>
+                    <collision>RL_calf_fixed_joint_lump__RL_foot_collision_1</collision>
+                </contact>
+            </sensor>
+        </gazebo>
+    </xacro:if>
+
+    <xacro:if value="${'$(arg ENABLE_FOOT_CONTACT_SENSOR)' == 'true' and '$(arg ENABLE_FOOT_FORCE_VISUAL)' == 'true'}">
+        <!-- Visualization of foot contacts. Disabled by default for competition scenes. -->
+        <gazebo reference="FR_foot">
+            <visual>
+                <plugin name="drawForcePlugin" filename="libunitreeDrawForcePlugin.so">
+                    <topicName>FR_foot_contact</topicName>
+                </plugin>
+            </visual>
+        </gazebo>
+        <gazebo reference="FL_foot">
+            <visual>
+                <plugin name="drawForcePlugin" filename="libunitreeDrawForcePlugin.so">
+                    <topicName>FL_foot_contact</topicName>
+                </plugin>
+            </visual>
+        </gazebo>
+        <gazebo reference="RR_foot">
+            <visual>
+                <plugin name="drawForcePlugin" filename="libunitreeDrawForcePlugin.so">
+                    <topicName>RR_foot_contact</topicName>
+                </plugin>
+            </visual>
+        </gazebo>
+        <gazebo reference="RL_foot">
+            <visual>
+                <plugin name="drawForcePlugin" filename="libunitreeDrawForcePlugin.so">
+                    <topicName>RL_foot_contact</topicName>
+                </plugin>
+            </visual>
+        </gazebo>
+    </xacro:if>
 
     <gazebo reference="base">
         <material>Gazebo/Green</material>
@@ -344,128 +290,104 @@
         <kd  value="1.0"/>
     </gazebo>
 
-
-
-     <!--
-       Livox Mid-360 仿真插件。
-       这里的 samples/downsample/update_rate 直接影响点云密度和 Gazebo 性能。
-       插件发布 sensor_msgs/PointCloud 到 /scan，随后由 pointcloud2livox.py 转换。
-     -->
-    <xacro:property name="M_PI" value="3.14159"/> 
-    <gazebo reference="laser_livox">
-        <sensor type="ray" name="laser_livox">
-            <pose>0 0 0 0 0 0</pose>
-            <visualize>true</visualize>
-            <update_rate>10</update_rate>
-            <plugin name="gazebo_ros_laser_controller" filename="liblivox_laser_simulation.so">
-                            <ray>
-                            <scan>
-                                    <horizontal>
-                                    <samples>100</samples>
-                                    <resolution>1</resolution>
-                                    <min_angle>${0}</min_angle>
-                                    <max_angle>${2*M_PI}</max_angle>
-                                    </horizontal>
-                                    <vertical>
-                                    <samples>360</samples>
-                                    <resolution>1</resolution>
-                                    <min_angle>${-5.22/180*M_PI}</min_angle>
-                                    <max_angle>${57.22/180*M_PI}</max_angle>
-                                    </vertical>
-                            </scan>
-                            <range>
-                                    <min>0.1</min>
-                                    <max>40</max>
-                                    <resolution>0.01</resolution>
-                            </range>
-                            <noise>
-                                    <type>gaussian</type>
-                                    <mean>0.0</mean>
-                                    <stddev>0.005</stddev>
-                            </noise>
-                            </ray>
-            <visualize>true</visualize>
+    <!-- gazebo livox mid360 plugins -->
+    <xacro:property name="M_PI" value="3.14159"/>
+    <xacro:if value="${'$(arg ENABLE_LIVOX)' == 'true'}">
+        <gazebo reference="laser_livox">
+            <sensor type="ray" name="laser_livox">
+                <always_on>true</always_on>
+                <pose>0 0 0 0 0 0</pose>
+                <visualize>true</visualize>
+                <update_rate>10</update_rate>
+                <ray>
+                    <scan>
+                        <horizontal>
+                            <samples>100</samples>
+                            <resolution>1</resolution>
+                            <min_angle>${0}</min_angle>
+                            <max_angle>${2*M_PI}</max_angle>
+                        </horizontal>
+                        <vertical>
+                            <samples>360</samples>
+                            <resolution>1</resolution>
+                            <min_angle>${-5.22/180*M_PI}</min_angle>
+                            <max_angle>${57.22/180*M_PI}</max_angle>
+                        </vertical>
+                    </scan>
+                    <range>
+                        <min>0.1</min>
+                        <max>40</max>
+                        <resolution>0.01</resolution>
+                    </range>
+                    <noise>
+                        <type>gaussian</type>
+                        <mean>0.0</mean>
+                        <stddev>0.005</stddev>
+                    </noise>
+                </ray>
+                <plugin name="gazebo_ros_laser_controller" filename="liblivox_laser_simulation.so">
+                    <ray>
+                        <scan>
+                            <horizontal>
+                                <samples>100</samples>
+                                <resolution>1</resolution>
+                                <min_angle>${0}</min_angle>
+                                <max_angle>${2*M_PI}</max_angle>
+                            </horizontal>
+                            <vertical>
+                                <samples>360</samples>
+                                <resolution>1</resolution>
+                                <min_angle>${-5.22/180*M_PI}</min_angle>
+                                <max_angle>${57.22/180*M_PI}</max_angle>
+                            </vertical>
+                        </scan>
+                        <range>
+                            <min>0.1</min>
+                            <max>40</max>
+                            <resolution>0.01</resolution>
+                        </range>
+                        <noise>
+                            <type>gaussian</type>
+                            <mean>0.0</mean>
+                            <stddev>0.005</stddev>
+                        </noise>
+                    </ray>
+                    <visualize>true</visualize>
                     <samples>24000</samples>
                     <downsample>1</downsample>
                     <csv_file_name>package://a1_description/scan_mode/mid360.csv</csv_file_name>
                     <ros_topic>/scan</ros_topic>
                     <frameName>laser_livox</frameName>
-            </plugin>
-        </sensor>
-    </gazebo>
-
-
-    <!-- Livox 内置 IMU 插件，发布 /livox/imu。 -->
-    <gazebo reference="livox_imu_link">
-    <gravity>true</gravity>
-    <sensor name="imu_sensor" type="imu">
-        <always_on>true</always_on>
-        <update_rate>1000</update_rate>
-        <visualize>true</visualize>
-        <topic>__default_topic__</topic>
-        <plugin filename="libgazebo_ros_imu_sensor.so" name="imu_plugin">
-            <topicName>/livox/imu</topicName>
-            <bodyName>livox_imu_link</bodyName>
-            <updateRateHZ>1000.0</updateRateHZ>
-            <gaussianNoise>0.0</gaussianNoise>
-            <xyzOffset>0 0 0</xyzOffset>
-            <rpyOffset>0 0 0</rpyOffset>
-            <frameName>livox_imu_link</frameName>
-        </plugin>
-        <pose>0 0 0 0 0 0</pose>
-    </sensor>
-    </gazebo>
-
-    <!--
-      前视 RGB 相机插件。
-      话题命名会落在 /camera/image_raw 和 /camera/camera_info。
-      800x800、30 Hz 对 GUI/渲染有明显压力。
-    -->
-    <gazebo reference="front_camera">
-    <material>Gazebo/Grey</material>
-        <sensor type="camera" name="camera">
-        <update_rate>30.0</update_rate>
-        <camera name="head">
-            <horizontal_fov>1.3962634</horizontal_fov>
-            <image>
-            <width>800</width>
-            <height>800</height>
-            <format>R8G8B8</format>
-            </image>
-            <clip>
-            <near>0.02</near>
-            <far>300</far>
-            </clip>
-            <noise>
-            <type>gaussian</type>
-            <!-- Noise is sampled independently per pixel on each frame.
-                That pixel's noise value is added to each of its color
-                channels, which at that point lie in the range [0,1]. -->
-            <mean>0.0</mean>
-            <stddev>0.007</stddev>
-            </noise>
-        </camera>
-        <plugin name="camera_controller" filename="libgazebo_ros_camera.so">
-            <alwaysOn>true</alwaysOn>
-            <updateRate>0.0</updateRate>
-            <cameraName>camera</cameraName>
-            <imageTopicName>image_raw</imageTopicName>
-            <cameraInfoTopicName>camera_info</cameraInfoTopicName>
-            <frameName>front_camera</frameName>
-            <hackBaseline>0.07</hackBaseline>
-            <distortionK1>0.0</distortionK1>
-            <distortionK2>0.0</distortionK2>
-            <distortionK3>0.0</distortionK3>
-            <distortionT1>0.0</distortionT1>
-            <distortionT2>0.0</distortionT2>
-        </plugin>
-        </sensor>
+                </plugin>
+            </sensor>
         </gazebo>
+    </xacro:if>
 
-        <!--
-          RealSense 深度相机插件。
-          输出 RGB、深度图和深度点云；深度点云是性能开销较大的传感器之一。
-        -->
+    <!-- gazebo livox imu-link plugins -->
+    <xacro:if value="${'$(arg ENABLE_LIVOX_IMU)' == 'true'}">
+        <gazebo reference="livox_imu_link">
+            <gravity>true</gravity>
+            <sensor name="imu_sensor" type="imu">
+                <always_on>true</always_on>
+                <update_rate>1000</update_rate>
+                <visualize>true</visualize>
+                <topic>__default_topic__</topic>
+                <plugin filename="libgazebo_ros_imu_sensor.so" name="imu_plugin">
+                    <topicName>/livox/imu</topicName>
+                    <bodyName>livox_imu_link</bodyName>
+                    <updateRateHZ>1000.0</updateRateHZ>
+                    <gaussianNoise>0.0</gaussianNoise>
+                    <xyzOffset>0 0 0</xyzOffset>
+                    <rpyOffset>0 0 0</rpyOffset>
+                    <frameName>livox_imu_link</frameName>
+                </plugin>
+                <pose>0 0 0 0 0 0</pose>
+            </sensor>
+        </gazebo>
+    </xacro:if>
+
+    <!-- real_sense 深度相机(kinect)插件 -->
+    <xacro:if value="${'$(arg ENABLE_REALSENSE)' == 'true'}">
         <gazebo reference="real_sense">
             <sensor type="depth" name="real_sense">
                 <always_on>true</always_on>
@@ -491,7 +413,7 @@
                     <pointCloudTopicName>depth/points</pointCloudTopicName>
                     <cameraInfoTopicName>rgb/camera_info</cameraInfoTopicName>
                     <depthImageCameraInfoTopicName>depth/camera_info</depthImageCameraInfoTopicName>
-                    <frameName>real_sense</frameName>
+                    <frameName>real_sense_optical_frame</frameName>
                     <baseline>0.1</baseline>
                     <distortion_k1>0.0</distortion_k1>
                     <distortion_k2>0.0</distortion_k2>
@@ -502,5 +424,6 @@
                 </plugin>
             </sensor>
         </gazebo>
+    </xacro:if>
 
 </robot>

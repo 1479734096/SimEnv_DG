@@ -1,11 +1,3 @@
-"""Gazebo Classic 导出器。
-
-generator.py 只产生抽象布局，本文件负责把 BuildingLayout 翻译成：
-- world.sdf：Gazebo 可加载的完整世界骨架
-- model.sdf：裸楼栋模型
-- layout_metadata.json：布局元数据
-- door_config.yaml / elevator_config.yaml：运行时控制服务读取的动态对象配置
-"""
 from __future__ import annotations
 
 import json
@@ -30,6 +22,7 @@ DOOR_CLEARANCE = 0.02
 DOOR_PANEL_THICKNESS = 0.06
 ELEVATOR_CAR_FLOOR_THICKNESS = 0.12
 ELEVATOR_CAR_DOOR_GAP = 0.06
+ELEVATOR_DOOR_MOTION_DURATION = 25.0
 STAIR_STEP_HEIGHT = 0.13
 STAIR_STEP_DEPTH = 0.26
 STAIR_LANDING_THICKNESS = 0.18
@@ -45,7 +38,6 @@ VALIDATION_TOLERANCE = 1e-3
 
 
 def export_sdf(layout: BuildingLayout, target: str, output_dir: str | Path) -> ArtifactPaths:
-    """导出一次楼栋生成的所有 Gazebo/配置产物。"""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -56,8 +48,6 @@ def export_sdf(layout: BuildingLayout, target: str, output_dir: str | Path) -> A
     door_config_path = output_path / "door_config.yaml"
     validation_report_path = output_path / "generation_checks.json"
 
-    # world.sdf 包含 sun、ground_plane、静态楼栋、动态门和电梯；
-    # model.sdf 只包含裸楼栋，便于单独作为模型复用。
     world_sdf_path.write_text(_render_world_sdf(layout), encoding="utf-8")
     model_sdf_path.write_text(_render_model_sdf(layout), encoding="utf-8")
     metadata_path.write_text(
@@ -92,7 +82,6 @@ def export_sdf(layout: BuildingLayout, target: str, output_dir: str | Path) -> A
         ),
         encoding="utf-8",
     )
-    # 导出后立即做一致性检查，避免 auto.sh 后续加载到缺门/缺电梯的 world。
     validation_report = _validate_generated_artifacts(
         layout,
         world_sdf_path=world_sdf_path,
@@ -124,7 +113,6 @@ def export_sdf(layout: BuildingLayout, target: str, output_dir: str | Path) -> A
 
 
 def _render_world_sdf(layout: BuildingLayout) -> str:
-    """渲染 Gazebo world，包含环境和所有动态模型。"""
     sdf = ET.Element("sdf", {"version": SDF_VERSION})
     world = ET.SubElement(sdf, "world", {"name": "generated_world"})
     include_sun = ET.SubElement(world, "include")
@@ -140,18 +128,12 @@ def _render_world_sdf(layout: BuildingLayout) -> str:
 
 
 def _render_model_sdf(layout: BuildingLayout) -> str:
-    """渲染裸楼栋模型，不包含 sun/ground_plane/动态门电梯。"""
     sdf = ET.Element("sdf", {"version": SDF_VERSION})
     sdf.append(_build_static_shell_model(layout))
     return _to_pretty_xml(sdf)
 
 
 def _build_static_shell_model(layout: BuildingLayout) -> ET.Element:
-    """构建静态楼栋外壳。
-
-    静态模型包含地基、楼板、外墙、房间墙、楼梯、电梯井和家具。
-    动态门和电梯轿厢不放在这里，方便运行时通过 Gazebo 服务移动。
-    """
     model = ET.Element("model", {"name": layout.model_name})
     ET.SubElement(model, "static").text = "true"
     ET.SubElement(model, "pose").text = "0 0 0 0 0 0"
@@ -209,7 +191,6 @@ def _append_entrance_apron(model: ET.Element, layout: BuildingLayout) -> None:
 
 
 def _append_floor_plate(model: ET.Element, *, layout: BuildingLayout, floor: FloorLayout) -> None:
-    """按大厅/走廊/核心筒切片生成楼板，避开楼梯和电梯开口。"""
     z_floor = floor.elevation - SLAB_THICKNESS / 2.0
     half_width = layout.footprint["width"] / 2.0
     half_corridor = floor.corridor_bounds.width / 2.0
@@ -278,7 +259,6 @@ def _append_floor_plate(model: ET.Element, *, layout: BuildingLayout, floor: Flo
 
 
 def _append_exterior_shell(model: ET.Element, *, layout: BuildingLayout, floor: FloorLayout) -> None:
-    """生成每层外墙；一层南侧墙会为主入口留洞。"""
     z_center = floor.elevation + layout.wall_height / 2.0
     half_width = layout.footprint["width"] / 2.0
     total_length = layout.footprint["length"]
@@ -329,7 +309,6 @@ def _append_exterior_shell(model: ET.Element, *, layout: BuildingLayout, floor: 
 
 
 def _append_room_shell(model: ET.Element, *, floor: FloorLayout) -> None:
-    """生成走廊尽头墙和每个房间的墙体。"""
     north_end = floor.corridor_bounds.y_max
     wall_height = _floor_wall_height(floor)
     _append_wall(
@@ -343,7 +322,6 @@ def _append_room_shell(model: ET.Element, *, floor: FloorLayout) -> None:
 
 
 def _append_room_walls(model: ET.Element, *, room: RoomSpec, floor: FloorLayout) -> None:
-    """生成单个房间四周墙体，并在走廊侧留出门洞。"""
     wall_height = _floor_wall_height(floor)
     z_center = floor.elevation + wall_height / 2.0
     y_center = room.bounds.center[1]
@@ -407,7 +385,6 @@ def _append_room_walls(model: ET.Element, *, room: RoomSpec, floor: FloorLayout)
 
 
 def _append_core_shell(model: ET.Element, *, layout: BuildingLayout, floor: FloorLayout) -> None:
-    """生成楼梯间和电梯井的墙体。"""
     wall_height = _floor_wall_height(floor)
     z_center = floor.elevation + wall_height / 2.0
     elevator_door = _find_door(floor_index=floor.floor_index, kind="elevator", layout=layout)
@@ -530,7 +507,6 @@ def _append_core_box_with_door(
 
 
 def _append_stair_geometry(model: ET.Element, *, layout: BuildingLayout) -> None:
-    """生成贯通楼层的折返楼梯。"""
     if not layout.floors:
         return
 
@@ -695,11 +671,6 @@ def _append_elevator_shaft_details(model: ET.Element, *, floor: FloorLayout) -> 
 
 
 def _build_door_model(door: DoorSpec) -> ET.Element:
-    """生成可被 Gazebo 移动的动态门模型。
-
-    门模型本身放在 world 中，左右门板作为 link 存在；
-    control_server.py 后续通过 /gazebo/set_link_state 移动这些 link。
-    """
     model = ET.Element("model", {"name": f"dynamic_{door.id}"})
     ET.SubElement(model, "static").text = "false"
     ET.SubElement(model, "pose").text = _format_pose(door.pose)
@@ -712,7 +683,6 @@ def _build_door_model(door: DoorSpec) -> ET.Element:
 
 
 def _build_elevator_model(layout: BuildingLayout, elevator_id: str) -> ET.Element:
-    """生成可被 Gazebo 移动的电梯轿厢模型。"""
     elevator = next(item for item in layout.elevator_specs if item.id == elevator_id)
     current_floor = layout.floors[elevator.current_floor]
     model = ET.Element("model", {"name": f"dynamic_{elevator.id}"})
@@ -758,10 +728,6 @@ def _build_elevator_model(layout: BuildingLayout, elevator_id: str) -> ET.Elemen
 
 
 def _door_config_entry(door: DoorSpec) -> dict[str, object]:
-    """生成门控制服务读取的配置项。
-
-    panel_poses 使用门模型局部坐标；control_server.py 会把它们转换到 world 坐标。
-    """
     payload = door.as_dict()
     payload["model_name"] = f"dynamic_{door.id}"
     panel_offset = door.width / 4.0
@@ -770,7 +736,7 @@ def _door_config_entry(door: DoorSpec) -> dict[str, object]:
     if door.kind == "elevator":
         slide_offset = door.width / 2.0 + WALL_THICKNESS / 2.0 + DOOR_PANEL_THICKNESS
         recess_offset = -(WALL_THICKNESS / 2.0 + DOOR_PANEL_THICKNESS / 2.0)
-        payload["motion_duration"] = 60.0
+        payload["motion_duration"] = ELEVATOR_DOOR_MOTION_DURATION
     payload["panel_poses"] = {
         "left_closed": [0.0, -panel_offset, 0.0, 0.0, 0.0, 0.0],
         "right_closed": [0.0, panel_offset, 0.0, 0.0, 0.0, 0.0],
@@ -782,7 +748,6 @@ def _door_config_entry(door: DoorSpec) -> dict[str, object]:
 
 
 def _elevator_config_entry(layout: BuildingLayout, elevator_id: str) -> dict[str, object]:
-    """生成电梯控制服务读取的配置项。"""
     elevator = next(item for item in layout.elevator_specs if item.id == elevator_id)
     payload = elevator.as_dict()
     payload["model_name"] = f"dynamic_{elevator.id}"
@@ -797,7 +762,6 @@ def _elevator_car_pose(
     elevator,
     floor_elevation: float,
 ) -> tuple[float, float, float, float, float, float]:
-    """计算电梯轿厢在指定楼层的 world pose。"""
     return (
         elevator.shaft_bounds.x_min + elevator.car_size[1] / 2.0 + ELEVATOR_CAR_DOOR_GAP,
         elevator.shaft_bounds.center[1],
@@ -815,7 +779,6 @@ def _validate_generated_artifacts(
     elevator_config_path: Path,
     door_config_path: Path,
 ) -> dict[str, object]:
-    """对导出的 world 和配置做结构自检。"""
     world_root = ET.parse(world_sdf_path).getroot()
     elevator_config = yaml.safe_load(elevator_config_path.read_text()) or {}
     door_config = yaml.safe_load(door_config_path.read_text()) or {}

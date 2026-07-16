@@ -47,6 +47,14 @@ python3 ./src/building_obstacles/scripts/evaulate_danger.py
 
 默认匹配阈值为 `1.0 m`。评估脚本会对每个真实危险源和每个检测点计算三维欧氏距离。距离小于等于阈值的组合进入候选集。
 
+如需按场景尺度使用 5% 阈值，可加：
+
+```bash
+--use-scene-ratio
+```
+
+未显式传入 `--scene-size` 时，脚本会从真值文件中的 `building.footprint.width/length` 计算场景尺度，默认使用宽和长中的较大值。可通过 `--scene-size-mode footprint-diagonal` 或 `--scene-size-mode three-dimensional-diagonal` 改为平面对角线或三维对角线。
+
 候选集按距离从小到大排序，然后进行一对一贪心匹配：
 
 1. 从最近的一对开始处理。

@@ -13,6 +13,10 @@ public:
     void run();
     void exit();
     FSMStateName checkChange();
+
+private:
+    bool _simHoldEnabled = false;
+    void setSimDownCommand();
 };
 
 #endif  // PASSIVE_H

@@ -4,6 +4,7 @@
 #ifndef LOWLEVELCMD_H
 #define LOWLEVELCMD_H
 
+#include <cmath>
 #include "common/mathTypes.h"
 #include "common/mathTools.h"
 
@@ -50,8 +51,10 @@ struct LowlevelCmd{
     }
     void setTau(Vec12 tau, Vec2 torqueLimit = Vec2(-50, 50)){
         for(int i(0); i<12; ++i){
-            if(std::isnan(tau(i))){
-                printf("[ERROR] The setTau function meets Nan\n");
+            if(!std::isfinite(tau(i))){
+                printf("[WARNING] The setTau function received non-finite torque, using 0 instead.\n");
+                motorCmd[i].tau = 0;
+                continue;
             }
             motorCmd[i].tau = saturation(tau(i), torqueLimit);
         }

@@ -17,6 +17,13 @@ double x=0, y=0, z=0, roll=0, pitch=0, yaw=0;
 
 
 void callback_BASE(const gazebo_msgs::LinkStates::ConstPtr &msg) {
+    ros::Time stamp = ros::Time::now();
+    static ros::Time last_tf_stamp;
+    static bool has_last_tf_stamp = false;
+    if (has_last_tf_stamp && stamp <= last_tf_stamp) {
+        return;
+    }
+
     int index = 0;
     for (auto &linkName : msg->name) {
         if (linkName == robot_name+"_gazebo::base")
@@ -24,10 +31,11 @@ void callback_BASE(const gazebo_msgs::LinkStates::ConstPtr &msg) {
         ++index;
     }
     if (index >= static_cast<int>(msg->name.size())) {
-        ROS_WARN_THROTTLE(1.0, "未在 /gazebo/link_states 中找到 %s_gazebo::base，跳过本次里程计发布。", robot_name.c_str());
+        ROS_WARN_THROTTLE(5.0, "Could not find link '%s_gazebo::base' in /gazebo/link_states", robot_name.c_str());
         return;
     }
-    ros::Rate rate(500);//延迟至100hz发布，避免重复发布
+    last_tf_stamp = stamp;
+    has_last_tf_stamp = true;
 
     //map到odom的tf变换
     static tf::TransformBroadcaster bf1;
@@ -42,7 +50,7 @@ void callback_BASE(const gazebo_msgs::LinkStates::ConstPtr &msg) {
                                     y,
                                     z));
     // 发布odom到map的tf关系
-    bf1.sendTransform(tf::StampedTransform(transform_odom2map, ros::Time::now(), "map", "odom"));
+    bf1.sendTransform(tf::StampedTransform(transform_odom2map, stamp, "map", "odom"));
     
     //求变化矩阵的逆解，用于推算map到odom的关系，以便能得到base到map的关系，及
     tf::Transform transform_map2odom = transform_odom2map.inverse();
@@ -61,13 +69,13 @@ void callback_BASE(const gazebo_msgs::LinkStates::ConstPtr &msg) {
         msg->twist[index].linear.x,
         msg->twist[index].linear.y,
         msg->twist[index].linear.z);
-    tf::Vector3 transformed_linear_vel = transform_map2odom * linear_vel;
+    tf::Vector3 transformed_linear_vel = transform_map2odom.getBasis() * linear_vel;
 
     tf::Vector3 angular_vel(
         msg->twist[index].angular.x,
         msg->twist[index].angular.y,
         msg->twist[index].angular.z);
-    tf::Vector3 transformed_angular_vel = transform_map2odom * angular_vel;
+    tf::Vector3 transformed_angular_vel = transform_map2odom.getBasis() * angular_vel;
     
     //发布base到odom的tf变换
     static tf::TransformBroadcaster bf2;
@@ -75,9 +83,9 @@ void callback_BASE(const gazebo_msgs::LinkStates::ConstPtr &msg) {
     transform_odom2base.setRotation(q_odom);
     transform_odom2base.setOrigin(pt_odom);
 
-    bf2.sendTransform(tf::StampedTransform(transform_odom2base, ros::Time::now(), "odom", "base"));
+    bf2.sendTransform(tf::StampedTransform(transform_odom2base, stamp, "odom", "base"));
 
-    Odom.header.stamp = ros::Time::now();
+    Odom.header.stamp = stamp;
     Odom.header.frame_id = "odom";
     Odom.child_frame_id = "base";
 
@@ -93,9 +101,9 @@ void callback_BASE(const gazebo_msgs::LinkStates::ConstPtr &msg) {
 
 
     // set the velocity
-    Odom.twist.twist.linear.x= transformed_linear_vel.x();
-    Odom.twist.twist.linear.y= transformed_linear_vel.y();
-    Odom.twist.twist.linear.z= transformed_linear_vel.z();
+    Odom.twist.twist.linear.x = transformed_linear_vel.x();
+    Odom.twist.twist.linear.y = transformed_linear_vel.y();
+    Odom.twist.twist.linear.z = transformed_linear_vel.z();
 
 
     Odom.twist.twist.angular.x = transformed_angular_vel.x();
@@ -104,7 +112,6 @@ void callback_BASE(const gazebo_msgs::LinkStates::ConstPtr &msg) {
 
 
     robotVelocity_BASE_frame_pub.publish(Odom);
-    rate.sleep();
 }
 
 
@@ -126,9 +133,9 @@ int main(int argc, char **argv) {
     y = atof(argv[2]);
     z = atof(argv[3]);
 
-    double yaw   = atof(argv[4]);
-    double pitch = atof(argv[5]);
-    double roll  = atof(argv[6]);
+    yaw   = atof(argv[4]);
+    pitch = atof(argv[5]);
+    roll  = atof(argv[6]);
   
     nh.param<std::string>("robot_name", robot_name, string("a1"));
     tfState_BASE_sub = node.subscribe<gazebo_msgs::LinkStates>("/gazebo/link_states", 10, callback_BASE);
@@ -137,5 +144,3 @@ int main(int argc, char **argv) {
     ros::spin();
     return 0;
 }
-
-

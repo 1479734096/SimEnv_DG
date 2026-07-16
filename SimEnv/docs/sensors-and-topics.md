@@ -2,6 +2,33 @@
 
 本文列出 Unitree A1 在仿真中的传感器安装位姿、常用 ROS 话题和坐标系。坐标系遵循 ROS 常用约定：X 向前，Y 向左，Z 向上。
 
+## 传感器数据开关
+
+默认启动会发布 Livox、Livox IMU 和 RealSense 深度相机数据。传感器 link、joint 和可视模型始终保留；关闭下列开关只会停止对应 Gazebo sensor/plugin 的数据发布。
+
+| 环境变量 | 默认值 | 影响的话题 |
+|----------|--------|------------|
+| `ENABLE_SENSOR_DATA` | `1` | 比赛传感器数据默认总开关 |
+| `ENABLE_LIVOX` | 跟随 `ENABLE_SENSOR_DATA` | `/scan` |
+| `ENABLE_LIVOX_IMU` | 跟随 `ENABLE_LIVOX` | `/livox/imu` |
+| `ENABLE_REALSENSE` | 跟随 `ENABLE_SENSOR_DATA` | `/real_sense/rgb/*`、`/real_sense/depth/*` |
+| `ENABLE_DEPTH_CAMERA` | 空 | `ENABLE_REALSENSE` 的别名 |
+| `ENABLE_FRONT_CAMERA` | `0` | `/camera/image_raw`、`/camera/camera_info` |
+| `ENABLE_POINTCLOUD_CONVERTER` | 跟随 `ENABLE_LIVOX` | `/livox/Pointcloud2`、`/livox/lidar2` |
+
+常用示例：
+
+```bash
+# 关闭所有比赛传感器数据，但保留机器人和传感器模型显示
+ENABLE_SENSOR_DATA=0 ./auto.sh
+
+# 只开启 RealSense 深度相机/RGB/深度点云
+ENABLE_SENSOR_DATA=0 ENABLE_REALSENSE=1 ./auto.sh
+
+# 只开启 Livox 雷达和点云转换
+ENABLE_SENSOR_DATA=0 ENABLE_LIVOX=1 ./auto.sh
+```
+
 ## 传感器位姿
 
 ### 机载 IMU `imu_link`
@@ -41,6 +68,8 @@ Livox 内置 IMU `livox_imu_link`：
 
 ## 状态估计与真值
 
+`/ground_truth/*` 话题来自 Gazebo 真值插件，仅用于裁判和调试，不作为正式比赛算法输入。
+
 | 话题名称 | 消息类型 | 发布频率 | 说明 |
 |---------|---------|---------|------|
 | `/trunk_imu` | `sensor_msgs/Imu` | 1000 Hz | 躯干 IMU 数据 |
@@ -59,6 +88,14 @@ Livox 内置 IMU `livox_imu_link`：
 
 ## 足端接触力
 
+足端 ContactSensor 为可选传感器。官方环境可通过 `ENABLE_FOOT_CONTACT_SENSOR` 统一开启或关闭：
+
+```bash
+ENABLE_FOOT_CONTACT_SENSOR=1 ./auto.sh
+```
+
+默认关闭时，下表中的足端接触力话题不会发布；机器人足端碰撞体、惯性参数、关节参数以及脚与地面的物理接触仍保持不变。若正式比赛开启该开关，参赛算法可以订阅这些话题；若关闭，则算法不应依赖这些话题。
+
 | 话题名称 | 消息类型 | 发布频率 | 说明 |
 |---------|---------|---------|------|
 | `/FR_foot_contact` | `gazebo_msgs/ContactsState` | 100 Hz | 右前足接触力 |
@@ -70,7 +107,9 @@ Livox 内置 IMU `livox_imu_link`：
 
 | 话题名称 | 消息类型 | 发布频率 | 说明 |
 |---------|---------|---------|------|
-| `/scan` | `sensor_msgs/PointCloud2` | 10 Hz | Livox Mid-360 点云数据 |
+| `/scan` | `sensor_msgs/PointCloud` | 10 Hz | Livox Mid-360 原始点云，Gazebo 插件直接发布 |
+| `/livox/Pointcloud2` | `sensor_msgs/PointCloud2` | 约 10 Hz | 转换后的点云，便于 RViz 和常见点云算法使用 |
+| `/livox/lidar2` | `unitree_guide/CustomMsg` | 约 10 Hz | Livox 风格自定义点云消息 |
 | `/livox/imu` | `sensor_msgs/Imu` | 1000 Hz | 雷达内置 IMU |
 
 雷达参数：
@@ -80,6 +119,13 @@ Livox 内置 IMU `livox_imu_link`：
 - 测距范围：0.1 m 到 40 m
 - 分辨率：0.01 m
 - 噪声：高斯噪声，标准差 0.005
+
+说明：
+
+- `rostopic hz /scan` 统计的是整帧点云消息频率，不是每秒点数。
+- 当前配置每帧约 24000 个点，10 Hz 时点率约 24 万点/s，接近 Mid-360 量级。
+- 仿真刚启动时 Livox 插件需要读取扫描模式文件，前十几秒可能暂时没有点云消息。
+- 如果 Gazebo 实时因子低于 1.0，传感器话题也会表现为卡顿或低频，优先使用无 GUI 启动排查。
 
 ## 视觉传感器
 
@@ -140,9 +186,9 @@ RealSense D415 深度相机：
 # 查看 IMU 数据
 rostopic echo /trunk_imu
 
-# 可视化点云
+# 可视化 Livox 点云
 rosrun rviz rviz
-# 添加 PointCloud2 显示，订阅 /scan
+# 添加 PointCloud2 显示，订阅 /livox/Pointcloud2
 
 # 查看深度图像
 rosrun image_view image_view image:=/real_sense/depth/image_raw

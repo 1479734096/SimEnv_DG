@@ -99,8 +99,8 @@ private:
     std::vector<float> motion_data;
     uint32_t dofPosSwitBeginTime = 0.0;//关节位置切换开始时间
     float motion_time = 0.0;
-    std::thread* amp_obs_thread;
-    uint8_t ampthreadRunning=false;
+    std::thread* amp_obs_thread = nullptr;
+    uint8_t ampthreadRunning = State_Trotting::STOP;
     float amp_duration = 0.020;
 };
 

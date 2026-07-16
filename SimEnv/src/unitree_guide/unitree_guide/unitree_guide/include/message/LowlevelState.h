@@ -4,6 +4,7 @@
 #ifndef LOWLEVELSTATE_HPP
 #define LOWLEVELSTATE_HPP
 
+#include <cmath>
 #include <iostream>
 #include "common/mathTypes.h"
 #include "common/mathTools.h"
@@ -38,6 +39,7 @@ struct IMU
             gyroscope[i] = 0;
             accelerometer[i] = 0;
         }
+        quaternion[0] = 1;
         quaternion[3] = 0;
     }
 
@@ -125,6 +127,28 @@ struct LowlevelState
         for(int i(0); i<12; ++i){
             motorState[i].q = q(i);
         }
+    }
+
+    bool isFinite() const{
+        for(int i(0); i<4; ++i){
+            if(!std::isfinite(imu.quaternion[i])){
+                return false;
+            }
+        }
+        for(int i(0); i<3; ++i){
+            if(!std::isfinite(imu.gyroscope[i]) || !std::isfinite(imu.accelerometer[i])){
+                return false;
+            }
+        }
+        for(int i(0); i<12; ++i){
+            if(!std::isfinite(motorState[i].q) ||
+               !std::isfinite(motorState[i].dq) ||
+               !std::isfinite(motorState[i].ddq) ||
+               !std::isfinite(motorState[i].tauEst)){
+                return false;
+            }
+        }
+        return true;
     }
 };
 

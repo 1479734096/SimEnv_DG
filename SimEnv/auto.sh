@@ -1,28 +1,17 @@
 #!/usr/bin/env bash
-# 一键启动比赛仿真环境。
-# 这个脚本负责把“生成随机比赛场景、启动 Gazebo、启动门/电梯服务、
-# 启动 Unitree A1 控制器”串成一个固定流程。
-
-# set -e：任意命令失败时立即退出，避免带着错误状态继续启动。
-# set -u：使用未定义变量时报错，避免变量名写错后静默变成空值。
-# set -o pipefail：管道中任意一段失败都视为失败，便于发现隐藏错误。
 set -euo pipefail
 
-# 无论从哪个目录执行 ./auto.sh，都先切换到脚本所在的工作区根目录。
-# 这样后面的相对路径（devel、generated_building、results、logs）都稳定可用。
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$WORKSPACE_DIR"
 
-# ==============================
-# 启动参数
-# ==============================
-# 所有参数都支持通过环境变量覆盖，例如：
-#   SEED=77 GUI=false FLOOR_COUNT=1 ./auto.sh
-#
-# 场景生成参数：
-# - SEED 为空时使用随机种子；指定后可以复现实验。
-# - FLOOR_COUNT、ROOMS_PER_FLOOR 控制楼栋复杂度，也是影响 Gazebo 性能的关键参数。
-# - DANGER_COUNT、DISTRACTOR_COUNT 支持固定值或 min:max 范围。
+as_ros_bool() {
+  case "$1" in
+    1|true|TRUE|True|yes|YES|on|ON) printf "true" ;;
+    0|false|FALSE|False|no|NO|off|OFF) printf "false" ;;
+    *) printf "%s" "$1" ;;
+  esac
+}
+
 SEED="${SEED:-}"
 FLOOR_COUNT="${FLOOR_COUNT:-3}"
 ROOMS_PER_FLOOR="${ROOMS_PER_FLOOR:-4}"
@@ -30,157 +19,112 @@ BUILDING_WIDTH="${BUILDING_WIDTH:-20.0}"
 BUILDING_LENGTH="${BUILDING_LENGTH:-36.0}"
 DANGER_COUNT="${DANGER_COUNT:-3:6}"
 DISTRACTOR_COUNT="${DISTRACTOR_COUNT:-4:8}"
-
-# Gazebo 启动参数：
-# - GUI=false 可关闭 Gazebo 图形界面，通常能显著提升仿真速度。
-# - PAUSED=true 表示 Gazebo 启动后先暂停，便于检查场景和机器人状态。
 GUI="${GUI:-true}"
-PAUSED="${PAUSED:-true}"
-
-# 附加进程开关：
-# - START_CONTROLLER 控制是否启动 junior_ctrl。
-# - START_VIRTUAL_JOY 控制是否启动虚拟手柄，通常比赛算法不需要。
-# - CONTROLLER_FOREGROUND=1 时 junior_ctrl 在当前终端前台运行，便于键盘输入 2/6 切换状态。
-# - START_BUILDING_CONTROL 控制是否启动门/电梯服务。
+PAUSED="${PAUSED:-false}"
+AUTO_UNPAUSE="$(as_ros_bool "${AUTO_UNPAUSE:-1}")"
+AUTO_UNPAUSE_DELAY="${AUTO_UNPAUSE_DELAY:-6}"
 START_CONTROLLER="${START_CONTROLLER:-1}"
 START_VIRTUAL_JOY="${START_VIRTUAL_JOY:-0}"
 CONTROLLER_FOREGROUND="${CONTROLLER_FOREGROUND:-1}"
 START_BUILDING_CONTROL="${START_BUILDING_CONTROL:-1}"
-RUN_PID_DIR="${RUN_PID_DIR:-$WORKSPACE_DIR/logs/run_pids}"
-
-OWNED_PIDS=()
-
-record_owned_pid() {
-  local name="$1"
-  local pid="$2"
-  OWNED_PIDS+=("$pid")
-  mkdir -p "$RUN_PID_DIR"
-  printf '%s\n' "$pid" > "$RUN_PID_DIR/$name.pid"
-}
-
-cleanup_owned_processes() {
-  local pid
-  local _
-  local any_alive
-  trap - EXIT INT TERM
-  for pid in "${OWNED_PIDS[@]:-}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -INT "$pid" 2>/dev/null || true
-    fi
-  done
-  for _ in $(seq 1 50); do
-    any_alive=0
-    for pid in "${OWNED_PIDS[@]:-}"; do
-      if kill -0 "$pid" 2>/dev/null; then
-        any_alive=1
-      fi
-    done
-    if [ "$any_alive" = "0" ]; then
-      break
-    fi
-    sleep 0.2
-  done
-  for pid in "${OWNED_PIDS[@]:-}"; do
-    if kill -0 "$pid" 2>/dev/null; then
-      kill -TERM "$pid" 2>/dev/null || true
-    fi
-  done
-  for pid in "${OWNED_PIDS[@]:-}"; do
-    wait "$pid" 2>/dev/null || true
-  done
-}
-
-trap cleanup_owned_processes EXIT INT TERM
-
-# Unitree 控制器周期，默认 0.004 秒，即 250 Hz。
-# 周期太小会更接近原始控制频率，但大场景下更容易出现控制循环超时。
+ENABLE_SENSOR_DATA_DEFAULT="${ENABLE_SENSORS:-1}"
+ENABLE_SENSOR_DATA="$(as_ros_bool "${ENABLE_SENSOR_DATA:-$ENABLE_SENSOR_DATA_DEFAULT}")"
+ENABLE_LIVOX="$(as_ros_bool "${ENABLE_LIVOX:-$ENABLE_SENSOR_DATA}")"
+ENABLE_LIVOX_IMU="$(as_ros_bool "${ENABLE_LIVOX_IMU:-$ENABLE_LIVOX}")"
+ENABLE_REALSENSE_INPUT="${ENABLE_REALSENSE:-${ENABLE_DEPTH_CAMERA:-$ENABLE_SENSOR_DATA}}"
+ENABLE_REALSENSE="$(as_ros_bool "$ENABLE_REALSENSE_INPUT")"
+ENABLE_FRONT_CAMERA="$(as_ros_bool "${ENABLE_FRONT_CAMERA:-0}")"
+ENABLE_REFEREE_ODOM="$(as_ros_bool "${ENABLE_REFEREE_ODOM:-1}")"
+ENABLE_GROUND_TRUTH="$(as_ros_bool "${ENABLE_GROUND_TRUTH:-1}")"
+ENABLE_FOOT_CONTACT_SENSOR="$(as_ros_bool "${ENABLE_FOOT_CONTACT_SENSOR:-0}")"
+ENABLE_FOOT_FORCE_VISUAL="$(as_ros_bool "${ENABLE_FOOT_FORCE_VISUAL:-0}")"
+ENABLE_JOY_NODE="$(as_ros_bool "${ENABLE_JOY_NODE:-0}")"
+ENABLE_POINTCLOUD_CONVERTER="$(as_ros_bool "${ENABLE_POINTCLOUD_CONVERTER:-$ENABLE_LIVOX}")"
+POINTCLOUD_USE_GROUND_TRUTH_ODOM="$(as_ros_bool "${POINTCLOUD_USE_GROUND_TRUTH_ODOM:-1}")"
+WRITE_GENERATED_TRUTH_COPY="$(as_ros_bool "${WRITE_GENERATED_TRUTH_COPY:-1}")"
 UNITREE_CTRL_DT="${UNITREE_CTRL_DT:-0.004}"
-
-# 机器人初始位姿，会同时传给场景生成器和 Gazebo spawn_model。
+UNITREE_LOG_WAIT_WARNINGS="$(as_ros_bool "${UNITREE_LOG_WAIT_WARNINGS:-0}")"
+ROBOT_SPAWN_TIMEOUT="${ROBOT_SPAWN_TIMEOUT:-120}"
+CONTROLLER_SPAWNER_TIMEOUT="${CONTROLLER_SPAWNER_TIMEOUT:-120}"
+GAZEBO_PHYSICS_MAX_STEP_SIZE="${GAZEBO_PHYSICS_MAX_STEP_SIZE:-0.002}"
+GAZEBO_PHYSICS_REAL_TIME_UPDATE_RATE="${GAZEBO_PHYSICS_REAL_TIME_UPDATE_RATE:-500}"
+GAZEBO_PHYSICS_ODE_ITERS="${GAZEBO_PHYSICS_ODE_ITERS:-40}"
+GAZEBO_PHYSICS_CONTACT_MAX_CORRECTING_VEL="${GAZEBO_PHYSICS_CONTACT_MAX_CORRECTING_VEL:-5.0}"
 ROBOT_X="${ROBOT_X:-0.0}"
-ROBOT_Y="${ROBOT_Y:--2.2}"
+ROBOT_Y="${ROBOT_Y:--3.2}"
 ROBOT_Z="${ROBOT_Z:-0.6}"
 ROBOT_YAW="${ROBOT_YAW:-1.5708}"
 
-# ==============================
-# 检查 libtorch 运行库
-# ==============================
-# junior_ctrl 链接 GPU 版 libtorch。部分 libtorch 包内 CUDA 库文件名带哈希，
-# 但可执行文件运行期按标准 SONAME 查找，因此启动前先补齐安全的同目录软链接。
-if [ "$START_CONTROLLER" = "1" ]; then
-  LIBTORCH_RUNTIME_SCRIPT="$WORKSPACE_DIR/scripts/prepare_libtorch_runtime.sh"
-  JUNIOR_CTRL_BIN="$WORKSPACE_DIR/devel/lib/unitree_guide/junior_ctrl"
-  DETECTED_LIBTORCH_ROOT="${LIBTORCH_ROOT:-}"
-
-  if [ -z "$DETECTED_LIBTORCH_ROOT" ] && [ -f "$JUNIOR_CTRL_BIN" ] && command -v readelf >/dev/null 2>&1; then
-    DETECTED_LIBTORCH_ROOT="$(
-      readelf -d "$JUNIOR_CTRL_BIN" 2>/dev/null \
-        | sed -n 's/.*Library runpath: \[\(.*\)\].*/\1/p' \
-        | tr ':' '\n' \
-        | sed -n 's#^\(.*\)/libtorch/lib$#\1/libtorch#p' \
-        | head -n 1
-    )"
+schedule_unpause_physics() {
+  if [ "$AUTO_UNPAUSE" != "true" ]; then
+    return
   fi
 
-  if [ -n "$DETECTED_LIBTORCH_ROOT" ]; then
-    bash "$LIBTORCH_RUNTIME_SCRIPT" "$DETECTED_LIBTORCH_ROOT"
-  else
-    bash "$LIBTORCH_RUNTIME_SCRIPT"
-  fi
-fi
+  (
+    sleep "$AUTO_UNPAUSE_DELAY"
+    for _ in $(seq 1 40); do
+      if rosservice list 2>/dev/null | grep -q '^/gazebo/unpause_physics$'; then
+        rosservice call /gazebo/unpause_physics >/dev/null 2>&1 || true
+        exit 0
+      fi
+      sleep 0.25
+    done
+  ) &
+}
 
-# ==============================
-# 启动冲突检查
-# ==============================
-# 不主动终止未知进程；已有仿真时直接拒绝启动，避免破坏其他用户的任务。
-CONFLICTS="$(
-  {
-    pgrep -a -x rosmaster 2>/dev/null || true
-    pgrep -a -x rosout 2>/dev/null || true
-    pgrep -a -x gzserver 2>/dev/null || true
-    pgrep -a -x gzclient 2>/dev/null || true
-    pgrep -a -x junior_ctrl 2>/dev/null || true
-    pgrep -af '[r]oslaunch unitree_guide multi_floor_gazeboSim.launch' 2>/dev/null || true
-    pgrep -af '[b]uilding_generator_classic_control' 2>/dev/null || true
-  } | sort -u
-)"
-if [ -n "$CONFLICTS" ]; then
-  echo "检测到已有 ROS/Gazebo 仿真进程，拒绝启动以避免实例冲突：" >&2
-  printf '%s\n' "$CONFLICTS" >&2
-  exit 2
-fi
+wait_for_robot_spawn() {
+  local timeout="$ROBOT_SPAWN_TIMEOUT"
+  local deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if ! kill -0 "$LAUNCH_PID" 2>/dev/null; then
+      echo "roslaunch exited during startup. Last log lines:" >&2
+      tail -n 80 "$WORKSPACE_DIR/logs/competition_gazebo.log" >&2
+      exit 1
+    fi
+    if timeout 1s rosservice call /gazebo/get_model_state "{model_name: 'a1_gazebo', relative_entity_name: 'world'}" 2>/dev/null | grep -q "success: True"; then
+      return
+    fi
+    if grep -a -q "Successfully spawned entity" "$WORKSPACE_DIR/logs/competition_gazebo.log" 2>/dev/null; then
+      return
+    fi
+    if grep -a -E -q "Spawn service failed|Service call failed" "$WORKSPACE_DIR/logs/competition_gazebo.log" 2>/dev/null; then
+      echo "Robot spawn failed. Last log lines:" >&2
+      tail -n 80 "$WORKSPACE_DIR/logs/competition_gazebo.log" >&2
+      exit 1
+    fi
+    sleep 0.2
+  done
 
-# ==============================
-# 加载 ROS 和工作区环境
-# ==============================
-# /opt/ros/noetic/setup.bash 提供系统 ROS 包。
-# devel/setup.bash 提供当前工作区 catkin_make 后生成的包、节点和消息类型。
-# 如果 devel/setup.bash 不存在，说明还没有成功编译，需要先运行 catkin_make。
+  echo "Timed out waiting for robot spawn. Last log lines:" >&2
+  tail -n 80 "$WORKSPACE_DIR/logs/competition_gazebo.log" >&2
+  exit 1
+}
+
+echo "Terminating previous Gazebo, launch, controller, and optional joystick processes..."
+pkill -f "roslaunch unitree_guide multi_floor_gazeboSim.launch" 2>/dev/null || true
+pkill -f "building_generator_classic_control" 2>/dev/null || true
+pkill -f "gzserver|gzclient|gazebo" 2>/dev/null || true
+pkill -f "junior_ctrl" 2>/dev/null || true
+pkill -f "virtual_joy.py" 2>/dev/null || true
+
 echo "Sourcing ROS environment..."
 source /opt/ros/noetic/setup.bash
+if [ ! -f "$WORKSPACE_DIR/devel/setup.bash" ]; then
+  echo "Missing $WORKSPACE_DIR/devel/setup.bash. Run catkin_make in this workspace before starting the simulation." >&2
+  exit 1
+fi
 source "$WORKSPACE_DIR/devel/setup.bash"
+export ROS_PACKAGE_PATH="$WORKSPACE_DIR/src:${ROS_PACKAGE_PATH:-}"
+export CMAKE_PREFIX_PATH="$WORKSPACE_DIR/devel:${CMAKE_PREFIX_PATH:-}"
+export PYTHONPATH="$WORKSPACE_DIR/src/building_generator_classic:$WORKSPACE_DIR/src/building_generator_core:${PYTHONPATH:-}"
 
-# 通过 rospack 获取包路径，避免把 src 下的绝对路径写死。
-# building_obstacles 提供比赛场景生成脚本。
-# unitree_gazebo/models 提供 Gazebo 需要解析的 Unitree 模型资源。
-BUILDING_OBSTACLES_DIR="$(rospack find building_obstacles)"
-UNITREE_GAZEBO_MODELS="$(rospack find unitree_gazebo)/models"
-
-# 生成文件、结果文件和日志的固定输出目录。
+GENERATOR_SCRIPT="$WORKSPACE_DIR/src/building_obstacles/scripts/generate_competition_scene.py"
+BUILDING_CONTROL_SCRIPT="$WORKSPACE_DIR/src/building_generator_classic/scripts/building_generator_classic_control"
+UNITREE_GAZEBO_MODELS="$WORKSPACE_DIR/src/unitree_guide/unitree_ros/unitree_gazebo/models"
 SCENE_OUTPUT_DIR="$WORKSPACE_DIR/generated_building"
 RESULTS_DIR="$WORKSPACE_DIR/results"
 mkdir -p "$SCENE_OUTPUT_DIR" "$RESULTS_DIR" "$WORKSPACE_DIR/logs"
 
-# ==============================
-# 生成比赛场景
-# ==============================
-# generate_competition_scene.py 会生成：
-# - generated_building/competition_scene.world：Gazebo 加载的 world 文件
-# - generated_building/layout_metadata.json：楼栋、房间、门、电梯等元数据
-# - generated_building/door_config.yaml：门控制配置
-# - generated_building/elevator_config.yaml：电梯控制配置
-# - generated_building/scene_manifest.json：本次场景 manifest
-# - results/danger_truth.json：危险源真值，供裁判评估使用
 echo "Generating competition scene..."
 GENERATOR_ARGS=(
   --output-dir "$SCENE_OUTPUT_DIR"
@@ -196,69 +140,63 @@ GENERATOR_ARGS=(
   --robot-z "$ROBOT_Z"
   --robot-yaw "$ROBOT_YAW"
 )
-
-# 只有用户显式设置 SEED 时才传入 --seed。
-# 不传 seed 时，生成器内部会使用随机种子。
 if [ -n "$SEED" ]; then
   GENERATOR_ARGS+=(--seed "$SEED")
 fi
-
-# stdout 额外保存到 scene_manifest.stdout.json，便于排查生成器输出。
-# 真正被 Gazebo 使用的是下面导出的 competition_scene.world。
-python3 "$BUILDING_OBSTACLES_DIR/scripts/generate_competition_scene.py" "${GENERATOR_ARGS[@]}" \
+GENERATOR_ARGS+=(--physics-max-step-size "$GAZEBO_PHYSICS_MAX_STEP_SIZE")
+GENERATOR_ARGS+=(--physics-real-time-update-rate "$GAZEBO_PHYSICS_REAL_TIME_UPDATE_RATE")
+GENERATOR_ARGS+=(--physics-ode-iters "$GAZEBO_PHYSICS_ODE_ITERS")
+GENERATOR_ARGS+=(--physics-contact-max-correcting-vel "$GAZEBO_PHYSICS_CONTACT_MAX_CORRECTING_VEL")
+if [ "$WRITE_GENERATED_TRUTH_COPY" = "false" ]; then
+  GENERATOR_ARGS+=(--no-generated-truth-copy)
+fi
+python3 "$GENERATOR_SCRIPT" "${GENERATOR_ARGS[@]}" \
   > "$SCENE_OUTPUT_DIR/scene_manifest.stdout.json"
 
-# ==============================
-# 导出给 launch / 控制器使用的环境变量
-# ==============================
-# multi_floor_gazeboSim.launch 会读取 BUILDING_WORLD_FILE 加载刚生成的 world。
 export BUILDING_WORLD_FILE="$SCENE_OUTPUT_DIR/competition_scene.world"
-
-# 机器人出生点也通过环境变量传给 launch，保持场景生成和 Gazebo spawn 位置一致。
 export COMPETITION_ROBOT_X="$ROBOT_X"
 export COMPETITION_ROBOT_Y="$ROBOT_Y"
 export COMPETITION_ROBOT_Z="$ROBOT_Z"
 export COMPETITION_ROBOT_YAW="$ROBOT_YAW"
-
-# junior_ctrl 会读取该控制周期。
 export UNITREE_CTRL_DT
-
-# Gazebo 通过 GAZEBO_MODEL_PATH 查找模型资源。
-# 这里追加生成场景目录和 Unitree 模型目录，保留用户已有的 GAZEBO_MODEL_PATH。
+export UNITREE_LOG_WAIT_WARNINGS
+export CONTROLLER_SPAWNER_TIMEOUT
 export GAZEBO_MODEL_PATH="${GAZEBO_MODEL_PATH:-}:$SCENE_OUTPUT_DIR:$UNITREE_GAZEBO_MODELS"
+export GAZEBO_PLUGIN_PATH="$WORKSPACE_DIR/devel/lib:${GAZEBO_PLUGIN_PATH:-}"
 
-# 打印本次启动生成的关键文件，方便用户定位 world、真值和结果文件。
 echo "=========================================="
 echo "Competition scene is ready"
+echo "  Workspace: $WORKSPACE_DIR"
 echo "  World:   $BUILDING_WORLD_FILE"
 echo "  Truth:   $RESULTS_DIR/danger_truth.json"
 echo "  Manifest:$SCENE_OUTPUT_DIR/scene_manifest.json"
 echo "  Result:  $RESULTS_DIR/detected_danger.json"
+echo "  Robot pose: x=$ROBOT_X y=$ROBOT_Y z=$ROBOT_Z yaw=$ROBOT_YAW"
+echo "  Sensor data default: $ENABLE_SENSOR_DATA"
+echo "  Livox lidar: $ENABLE_LIVOX"
+echo "  Livox IMU: $ENABLE_LIVOX_IMU"
+echo "  RealSense depth camera: $ENABLE_REALSENSE"
+echo "  Front RGB camera: $ENABLE_FRONT_CAMERA"
+echo "  PointCloud2 converter: $ENABLE_POINTCLOUD_CONVERTER"
+echo "  Ground truth topics: $ENABLE_GROUND_TRUTH"
+echo "  Referee odom: $ENABLE_REFEREE_ODOM"
+echo "  Foot contact sensors: $ENABLE_FOOT_CONTACT_SENSOR"
+echo "  Foot force visual: $ENABLE_FOOT_FORCE_VISUAL"
+echo "  Gazebo starts paused: $PAUSED"
+echo "  Auto unpause: $AUTO_UNPAUSE after ${AUTO_UNPAUSE_DELAY}s"
+echo "  Unitree wait warnings: $UNITREE_LOG_WAIT_WARNINGS"
+echo "  Robot spawn timeout: ${ROBOT_SPAWN_TIMEOUT}s"
+echo "  Controller spawner timeout: ${CONTROLLER_SPAWNER_TIMEOUT}s"
+echo "  Gazebo physics: max_step=$GAZEBO_PHYSICS_MAX_STEP_SIZE update_rate=$GAZEBO_PHYSICS_REAL_TIME_UPDATE_RATE ode_iters=$GAZEBO_PHYSICS_ODE_ITERS"
+echo "  Gazebo plugin path: $GAZEBO_PLUGIN_PATH"
 echo "=========================================="
 
-# ==============================
-# 可选：启动虚拟手柄
-# ==============================
-# 默认不启动。比赛算法一般直接发布 /cmd_vel，不需要虚拟手柄。
-# 开启后日志写入 logs/virtual_joy.log。
 if [ "$START_VIRTUAL_JOY" = "1" ]; then
   echo "Starting virtual joystick. This may require uinput permissions."
   rosrun unitree_guide virtual_joy.py > "$WORKSPACE_DIR/logs/virtual_joy.log" 2>&1 &
-  record_owned_pid "virtual_joy" "$!"
+  echo $! > "$WORKSPACE_DIR/logs/virtual_joy.pid"
 fi
 
-# ==============================
-# 启动 Gazebo、A1 模型、传感器和 ROS 接口
-# ==============================
-# multi_floor_gazeboSim.launch 内部会做这些事：
-# - 使用 gazebo_ros/empty_world.launch 加载 BUILDING_WORLD_FILE
-# - 通过 xacro 生成 A1 的 robot_description
-# - spawn A1 到 Gazebo
-# - 启动 state_from_gazebo，发布 /Odometry_gazebo
-# - 启动 12 个腿部关节控制器
-# - 启动 robot_state_publisher
-# - 启动 joy_node
-# - 启动 pointcloud2livox.py，把 Livox 点云转换成算法使用的话题
 echo "Launching Gazebo, Unitree A1 model, sensors, and ROS interfaces..."
 roslaunch unitree_guide multi_floor_gazeboSim.launch \
   gui:="$GUI" \
@@ -269,63 +207,56 @@ roslaunch unitree_guide multi_floor_gazeboSim.launch \
   robot_y:="$ROBOT_Y" \
   robot_z:="$ROBOT_Z" \
   robot_yaw:="$ROBOT_YAW" \
+  controller_spawner_timeout:="$CONTROLLER_SPAWNER_TIMEOUT" \
+  enable_sensor_data:="$ENABLE_SENSOR_DATA" \
+  enable_livox:="$ENABLE_LIVOX" \
+  enable_livox_imu:="$ENABLE_LIVOX_IMU" \
+  enable_realsense:="$ENABLE_REALSENSE" \
+  enable_front_camera:="$ENABLE_FRONT_CAMERA" \
+  enable_referee_odom:="$ENABLE_REFEREE_ODOM" \
+  enable_ground_truth:="$ENABLE_GROUND_TRUTH" \
+  enable_foot_contact_sensor:="$ENABLE_FOOT_CONTACT_SENSOR" \
+  enable_foot_force_visual:="$ENABLE_FOOT_FORCE_VISUAL" \
+  enable_joy_node:="$ENABLE_JOY_NODE" \
+  enable_pointcloud_converter:="$ENABLE_POINTCLOUD_CONVERTER" \
+  pointcloud_use_ground_truth_odom:="$POINTCLOUD_USE_GROUND_TRUTH_ODOM" \
   > "$WORKSPACE_DIR/logs/competition_gazebo.log" 2>&1 &
-
-# 记录 roslaunch 进程号，便于后续人工排查或停止。
 LAUNCH_PID=$!
 echo "$LAUNCH_PID" > "$WORKSPACE_DIR/logs/competition_gazebo.pid"
-record_owned_pid "competition_gazebo" "$LAUNCH_PID"
+wait_for_robot_spawn
 
-# 给 Gazebo、模型和 ROS 服务一点初始化时间。
-# 后面的门/电梯控制服务依赖 Gazebo 服务已经起来。
-sleep 6
-
-# ==============================
-# 启动门 / 电梯控制服务
-# ==============================
-# building_generator_classic_control 会读取场景生成阶段写出的门和电梯配置，
-# 并通过 Gazebo 服务移动门模型、电梯轿厢等对象。
 if [ "$START_BUILDING_CONTROL" = "1" ]; then
   echo "Starting building door/elevator control service..."
-  rosrun building_generator_classic building_generator_classic_control \
+  python3 "$BUILDING_CONTROL_SCRIPT" \
     --door-config "$SCENE_OUTPUT_DIR/door_config.yaml" \
     --elevator-config "$SCENE_OUTPUT_DIR/elevator_config.yaml" \
     > "$WORKSPACE_DIR/logs/building_control.log" 2>&1 &
-  BUILDING_CONTROL_PID=$!
-  echo "$BUILDING_CONTROL_PID" > "$WORKSPACE_DIR/logs/building_control.pid"
-  record_owned_pid "building_control" "$BUILDING_CONTROL_PID"
+  echo $! > "$WORKSPACE_DIR/logs/building_control.pid"
 fi
-
-# ==============================
-# 启动 Unitree A1 控制器
-# ==============================
-# junior_ctrl 是机器狗运动控制核心。
-# 默认在前台运行，因为原始控制流程需要在终端输入：
-# - 2：进入站立状态
-# - 6：进入 RL 模式
-# 进入 RL 模式后，算法发布 geometry_msgs/Twist 到 /cmd_vel 才会生效。
-# 等待 ROS Master 和 Gazebo 核心完全启动，防止 junior_ctrl 报 Connection refused 和触发 SIGTRAP。
-echo "Waiting for ROS and Gazebo to initialize..."
-sleep 5
 
 if [ "$START_CONTROLLER" = "1" ]; then
   if [ "$CONTROLLER_FOREGROUND" = "1" ]; then
     echo "Starting junior_ctrl controller in the foreground."
     echo "UNITREE_CTRL_DT=$UNITREE_CTRL_DT seconds."
-    echo "Use keyboard input in this terminal: 2 = stand, 6 = RL mode."
-    "$WORKSPACE_DIR/devel/lib/unitree_guide/junior_ctrl"
+    echo "Use keyboard input in this terminal: 2 = stand, 4 = RL keyboard walk, 6 = RL /cmd_vel mode, 8 = reset."
+    echo "In RL keyboard walk mode: W/S = forward/back, A/D = left/right, J/L = turn, Space = stop."
+    schedule_unpause_physics
+    "$WORKSPACE_DIR/devel/lib/unitree_guide/junior_ctrl" || true
+    echo "junior_ctrl exited; keeping Gazebo running for inspection. Press Ctrl-C to stop this script."
+    wait "$LAUNCH_PID"
+    exit 0
   else
-    # 后台模式适合无人值守启动，但通常无法方便地通过当前终端输入 2/6。
-    # 如果要切换状态，建议保持默认前台模式。
     echo "Starting junior_ctrl controller in the background. Keyboard state switching may not be available."
     echo "UNITREE_CTRL_DT=$UNITREE_CTRL_DT seconds."
     "$WORKSPACE_DIR/devel/lib/unitree_guide/junior_ctrl" \
       > "$WORKSPACE_DIR/logs/junior_ctrl.log" 2>&1 &
-    record_owned_pid "junior_ctrl" "$!"
+    echo $! > "$WORKSPACE_DIR/logs/junior_ctrl.pid"
+    schedule_unpause_physics
   fi
+else
+  schedule_unpause_physics
 fi
 
-# 如果 START_CONTROLLER=1 且 CONTROLLER_FOREGROUND=1，脚本通常会停留在 junior_ctrl。
-# 只有控制器退出，才会执行到下面两行。
 echo "Simulation startup command completed."
-echo "Controller mode remains governed by unitree_guide keyboard/joy input; publish geometry_msgs/Twist to /cmd_vel after RL mode is enabled."
+echo "Controller mode remains governed by unitree_guide keyboard/joy input. Mode 4 uses RL with keyboard axes; mode 6 keeps the original RL /cmd_vel logic."
+wait "$LAUNCH_PID"

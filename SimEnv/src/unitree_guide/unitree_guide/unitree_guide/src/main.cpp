@@ -1,22 +1,17 @@
 /**********************************************************************
  Copyright (c) 2020-2023, Unitree Robotics.Co.Ltd. All rights reserved.
 ***********************************************************************/
-/*
- * junior_ctrl 控制器入口。
- *
- * auto.sh 最后启动本可执行文件。它负责初始化 Unitree 控制框架、选择仿真/真机 IO、
- * 设置控制周期 UNITREE_CTRL_DT，然后不断调用 ControlFrame::run()。
- *
- * 用户在前台终端输入 2/6 后，FSM 会切到站立/RL 状态；RL 状态中订阅 /cmd_vel，
- * 经过策略网络推理后写入 12 个关节命令，Gazebo 里的 ros_control 再执行这些命令。
- */
 #include <iostream>
 #include <unistd.h>
 #include <csignal>
 #include <sched.h>
 #include <cerrno>
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <string>
 
 #include "control/ControlFrame.h"
 #include "control/CtrlComponents.h"
@@ -35,7 +30,7 @@
 #include "interface/IOFREEDOGSDK.h"
 bool running = true;
 
-// 捕获 Ctrl+C，让主循环自然退出并释放控制组件。
+// over watch the ctrl+c command
 void ShutDown(int sig)
 {
     std::cout << "stop the controller" << std::endl;
@@ -44,20 +39,47 @@ void ShutDown(int sig)
 
 void setProcessScheduler()
 {
-    // 尝试使用实时调度，降低控制循环抖动；没有权限时只打印错误，不阻止仿真启动。
+    const char *envValue = std::getenv("UNITREE_ENABLE_REALTIME");
+    std::string realtimeMode = envValue == nullptr ? "auto" : envValue;
+    std::transform(
+        realtimeMode.begin(), realtimeMode.end(), realtimeMode.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+    bool enableRealtime = false;
+    if(realtimeMode == "auto" || realtimeMode.empty()){
+        enableRealtime = geteuid() == 0;
+    }else if(realtimeMode == "1" || realtimeMode == "true" || realtimeMode == "yes" || realtimeMode == "on"){
+        enableRealtime = true;
+    }else if(realtimeMode == "0" || realtimeMode == "false" || realtimeMode == "no" || realtimeMode == "off"){
+        enableRealtime = false;
+    }else{
+        std::cout << "[WARNING] Invalid UNITREE_ENABLE_REALTIME='" << envValue
+                  << "', using auto mode." << std::endl;
+        enableRealtime = geteuid() == 0;
+    }
+
+    if(!enableRealtime){
+        std::cout << "[INFO] Realtime scheduler disabled. Set UNITREE_ENABLE_REALTIME=1 to request SCHED_FIFO." << std::endl;
+        return;
+    }
+
     pid_t pid = getpid();
     sched_param param;
     param.sched_priority = sched_get_priority_max(SCHED_FIFO);
     if (sched_setscheduler(pid, SCHED_FIFO, &param) == -1)
     {
-        std::cout << "[ERROR] Function setProcessScheduler failed." << std::endl;
+        std::cout << "[WARNING] Could not enable SCHED_FIFO scheduler: "
+                  << std::strerror(errno)
+                  << ". Controller will continue with the normal scheduler." << std::endl;
+    }
+    else
+    {
+        std::cout << "[INFO] SCHED_FIFO realtime scheduler enabled." << std::endl;
     }
 }
 
 double readControllerDt()
 {
-    // auto.sh 默认导出 UNITREE_CTRL_DT=0.004，把控制频率从 500 Hz 降到 250 Hz，
-    // 目的是在大 Gazebo 场景中减少控制循环超时 warning。
     const double defaultDt = 0.002; // 500 Hz, Unitree upstream default.
     const char *envValue = std::getenv("UNITREE_CTRL_DT");
     if (envValue == nullptr || envValue[0] == '\0')
@@ -92,19 +114,16 @@ int main(int argc, char **argv)
     CtrlPlatform ctrlPlat;
 
 #ifdef COMPILE_WITH_SIMULATION
-    // 仿真模式：IOROS 从 Gazebo/ROS 读取低层状态，并向 ros_control 写关节命令。
     ioInter = new IOROS();
     ctrlPlat = CtrlPlatform::GAZEBO;
 #endif // COMPILE_WITH_SIMULATION
 
 #ifdef COMPILE_WITH_REAL_ROBOT
-    // 真机模式：使用 Unitree SDK。当前比赛仿真默认不走这条分支。
     ioInter = new IOSDK();
     ctrlPlat = CtrlPlatform::REALROBOT;
 #endif // COMPILE_WITH_REAL_ROBOT
     IOFREEDOGSDK *ioInter_freedog;
     ioInter_freedog = new IOFREEDOGSDK();
-    // CtrlComponents 是 Unitree 控制框架的共享上下文，FSM 各状态都会读写它。
     CtrlComponents *ctrlComp = new CtrlComponents(ioInter,ioInter_freedog);
     ctrlComp->ctrlPlatform = ctrlPlat;
     ctrlComp->dt = readControllerDt();
@@ -127,7 +146,6 @@ int main(int argc, char **argv)
 
     ctrlComp->geneObj();
 
-    // ControlFrame 持有 FSM，run() 每个控制周期执行一次当前状态逻辑。
     ControlFrame ctrlFrame(ctrlComp);
 
     signal(SIGINT, ShutDown);

@@ -68,7 +68,7 @@ roslaunch danger_search danger_search_smoke.launch
 - 前沿目标默认先找更安全的内部 free cell，而不是直接贴着 frontier 边缘落点；`frontier/frontier_obstacle_clearance`、`frontier/frontier_unknown_standoff` 和 `frontier/frontier_min_information_gain` 分别控制离障碍余量、离 unknown 边缘退让和最小信息增益。
 - 默认使用 `/real_sense/rgb/image_raw` 和 `/real_sense/depth/image_raw` 做红球识别。
 - Mapper 只维护 free / occupied / unknown 占据栅格，不编码门、电梯或房间入口语义；普通点云射线不会擦除已知静态障碍。
-- 动态门只在局部传感器检测到近距离可见门候选后才匹配服务 ID 并执行 `OpenDoorAndPass`；开门成功后按门 yaw、metadata 门宽和 `mission/door_clear_radius` 条带深度清理门洞内动态障碍残留，并按 `mission/door_pass_offset`、`mission/door_commit_distance` 继续深入门后，再在 `mission/door_transition_duration` 和 `mission/door_transition_hold_distance` 约束下短时抑制回头选回门前侧目标，不会把 `layout_metadata.json` 中的门坐标作为探索目标。
+- 动态门只能由局部传感器发现后才允许建立空间目标；`team_scene_info.json` 仅提供公开 ID，不提供门宽、朝向或坐标，运行时绝不读取 `layout_metadata.json`。
 - 房间入口不视为动态门，不调用 `/set_door_state`；普通探索依靠 Frontier 自然进入。
 - 电梯门不走普通开门逻辑，只在 `CHANGE_FLOOR` 状态下由 `TakeElevator` 状态机处理。
 - `local_semantic/use_truth_proximity_detector` 仅用于调试，默认关闭。
@@ -131,7 +131,7 @@ results/runs/<时间戳>_seed_<seed>/
     └── competition_gazebo.log
 ```
 
-算法启动前会检查 `/Odometry_gazebo` 和 `/livox/Pointcloud2` 是否收到首帧数据；若没有点云，会提前失败并归档 `logs/health_check.log`、Gazebo 和控制器日志。
+算法启动前只检查初始文档允许的 `/scan`、`/trunk_imu`，然后检查参赛方内部 `/danger_search/localization/odom` 是否可用；不订阅 `/Odometry_gazebo`。
 
 如果外层 `run_seed.py` 达到 `--timeout` 后中断算法，归档中的 `mission_summary.json` 会写入 `external_timeout=true`、`completed=false`，并用 `result_written` 单独表示是否已经落盘 `detected_danger.json`。
 
@@ -177,7 +177,7 @@ frontier/current_region_radius: 1.2
 - `mission/door_transition_hold_distance`
 - `frontier/door_front_half_plane_penalty`
 
-注意：`danger_search_node` 运行期间不会读取 `danger_truth.json`。`run_seed.py` 只在算法退出后调用 `evaluate_danger.py` 做离线评测，此阶段才读取真值并写入 `evaluation.json`。
+注意：`danger_search_node` 运行期间不会读取 `danger_truth.json`。`run_seed.py` 仅在显式传入 `--offline-evaluate` 时才调用 `evaluate_danger.py` 做离线评测。
 
 ## EXIT_CABIN 外部诊断
 

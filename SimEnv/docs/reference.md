@@ -210,7 +210,6 @@ GUI=false ./auto.sh
 | 接口 | 类型 | 说明 |
 |------|------|------|
 | `/cmd_vel` | `geometry_msgs/Twist` | 机器人速度指令输入 |
-| `/Odometry_gazebo` | `nav_msgs/Odometry` | 仿真里程计输出 |
 | `/scan` | `sensor_msgs/PointCloud2` | Livox Mid-360 点云数据 |
 | `/livox/Pointcloud2` | `sensor_msgs/PointCloud2` | 点云转换节点输出，开启时可用 |
 | `/livox/lidar2` | `unitree_guide/CustomMsg` | Livox 风格点云消息，开启时可用 |
@@ -228,9 +227,7 @@ GUI=false ./auto.sh
 
 参赛算法不应读取 `results/danger_truth.json`、`generated_building/danger_truth.json`、`generated_building/layout_metadata.json`、`generated_building/building_config.json` 或 `generated_building/scene_manifest.json`。这些文件用于裁判评估、环境启动或本地自检。
 
-`/Odometry_gazebo` 是仿真里程计输出，可作为正式比赛算法输入。
-
-`/ground_truth/base_w`、`/ground_truth/base_trunk` 和 `/ground_truth/*_foot` 是 Gazebo 真值通道，不作为正式比赛算法输入。即使本地调试时能够看到这些话题，参赛算法也不得订阅或读取。
+`/Odometry_gazebo`、`/ground_truth/base_w`、`/ground_truth/base_trunk` 和 `/ground_truth/*_foot` 是 Gazebo 真值通道，不作为正式比赛算法输入。即使本地调试时能够看到这些话题，参赛算法也不得订阅或读取。
 
 ## 门与电梯控制
 
@@ -422,17 +419,11 @@ python3 ./src/building_obstacles/scripts/evaulate_danger.py
 |---------|---------|---------|------|
 | `/trunk_imu` | `sensor_msgs/Imu` | 1000 Hz | 躯干IMU数据（加速度、角速度、姿态） |
 | `/livox/imu` | `sensor_msgs/Imu` | 1000 Hz | Livox雷达内置IMU数据 |
-| `/ground_truth/base_trunk` | `nav_msgs/Odometry` | 100 Hz | base相对于trunk的真值位姿（用于调试） |
-| `/ground_truth/base_w` | `nav_msgs/Odometry` | 100 Hz | base相对于world的真值位姿 |
 
 ### 2. 足端状态真值
 
 | 话题名称 | 消息类型 | 发布频率 | 说明 |
 |---------|---------|---------|------|
-| `/ground_truth/FL_foot` | `nav_msgs/Odometry` | 100 Hz | 左前足(FL)相对于base的位姿与速度 |
-| `/ground_truth/FR_foot` | `nav_msgs/Odometry` | 100 Hz | 右前足(FR)相对于base的位姿与速度 |
-| `/ground_truth/RL_foot` | `nav_msgs/Odometry` | 100 Hz | 左后足(RL)相对于base的位姿与速度 |
-| `/ground_truth/RR_foot` | `nav_msgs/Odometry` | 100 Hz | 右后足(RR)相对于base的位姿与速度 |
 
 ### 3. 足端接触力
 

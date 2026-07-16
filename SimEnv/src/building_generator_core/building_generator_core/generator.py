@@ -1,11 +1,3 @@
-"""随机楼栋布局生成器。
-
-本文件负责把 BuildingConstraints 转换成 BuildingLayout：
-1. 根据 seed 决定楼层数和每层房间数。
-2. 在固定楼栋尺寸内规划大厅、走廊、楼梯、电梯井和左右两侧房间。
-3. 为房间添加家具、门位和导航目标点。
-4. 生成门/电梯抽象配置，供 exporter.py 输出 Gazebo 模型与控制配置。
-"""
 from __future__ import annotations
 
 import hashlib
@@ -41,7 +33,6 @@ STAIR_ENTRY_LANDING_LENGTH = 1.0
 
 
 def generate_layout(constraints: BuildingConstraints) -> BuildingLayout:
-    """生成一栋可导出到 Gazebo 的多楼层建筑布局。"""
     rng = random.Random(constraints.seed)
     floor_count = constraints.floor_count.sample(rng)
     room_counts = [constraints.rooms_per_floor.sample(rng) for _ in range(floor_count)]
@@ -54,8 +45,6 @@ def generate_layout(constraints: BuildingConstraints) -> BuildingLayout:
     if room_depth < 3.6:
         raise ValueError("building footprint too narrow for corridor and rooms")
 
-    # 楼梯和电梯属于核心交通区，固定放在入口大厅附近。
-    # 后续房间只会排布在 core_zone_end_y 之后，避免房间挤占楼梯/电梯空间。
     shaft_bounds = Rect2D(
         x_min=CORRIDOR_WIDTH / 2.0 + 0.55,
         x_max=CORRIDOR_WIDTH / 2.0 + 0.55 + ELEVATOR_CLEAR_WIDTH,
@@ -107,8 +96,6 @@ def generate_layout(constraints: BuildingConstraints) -> BuildingLayout:
             y_max=corridor_end_y,
         )
 
-        # 每层的房间沿走廊左右交替排布。room_count 控制总房间数，
-        # segment_count 控制走廊方向被切成多少段。
         rooms = _build_rooms(
             floor_index=floor_index,
             elevation=elevation,
@@ -119,7 +106,6 @@ def generate_layout(constraints: BuildingConstraints) -> BuildingLayout:
             rng=rng,
         )
 
-        # 电梯门的位置同时用于生成动态门、导航目标点和电梯服务配置。
         elevator_door_pose = (
             shaft_bounds.x_min,
             (shaft_bounds.y_min + shaft_bounds.y_max) / 2.0,
@@ -168,7 +154,6 @@ def generate_layout(constraints: BuildingConstraints) -> BuildingLayout:
         for room in rooms:
             target_points["rooms"][room.id] = list(room.goal_pose)
 
-        # FloorLayout 是这一层所有静态几何和可达性元数据的集合。
         floors.append(
             FloorLayout(
                 floor_index=floor_index,
@@ -186,7 +171,6 @@ def generate_layout(constraints: BuildingConstraints) -> BuildingLayout:
             )
         )
 
-    # 当前项目生成一个贯通所有楼层的电梯，控制服务通过 floor_poses 移动轿厢。
     elevator_specs = [
         ElevatorSpec(
             id="elevator_main",
@@ -208,7 +192,6 @@ def generate_layout(constraints: BuildingConstraints) -> BuildingLayout:
         "connectivity": "stairs_and_elevator",
     }
 
-    # signature 用于把布局和门/电梯配置绑定起来，方便检查配置是否来自同一次生成。
     signature = _build_signature(
         footprint={
             "width": footprint_width,
@@ -248,7 +231,6 @@ def _build_rooms(
     constraints: BuildingConstraints,
     rng: random.Random,
 ) -> list[RoomSpec]:
-    """沿走廊生成左右交替的房间。"""
     rooms: list[RoomSpec] = []
     segment_count = math.ceil(room_count / 2.0)
     segment_length = corridor_bounds.length / max(segment_count, 1)
@@ -261,7 +243,6 @@ def _build_rooms(
         segment_index = room_index // 2
         y_min = corridor_bounds.y_min + segment_index * segment_length
         y_max = y_min + segment_length
-        # 左侧房间的门朝东，右侧房间的门朝西，因此 yaw 不同。
         if side == "left":
             bounds = Rect2D(
                 x_min=-CORRIDOR_WIDTH / 2.0 - room_depth,
@@ -311,7 +292,6 @@ def _build_rooms(
                 0.0,
             )
 
-        # 房间类型决定家具组合；家具会影响危险源放置避让。
         room_type = rng.choices(room_types, weights=weights, k=1)[0]
         furniture = _build_furniture(
             room_id=f"floor_{floor_index}_room_{room_index}",
@@ -341,10 +321,6 @@ def _build_furniture(
     bounds: Rect2D,
     elevation: float,
 ) -> list[FurnitureSpec]:
-    """按房间类型生成一组简化家具。
-
-    家具只用 box 表示，目的是提供导航障碍和视觉干扰，不追求精细建模。
-    """
     x_center, y_center = bounds.center
     base_z = elevation + 0.45
     x_span = max(bounds.width - 1.6, 1.2)
@@ -509,7 +485,6 @@ def _build_signature(
     elevator_specs: list[ElevatorSpec],
     metadata: dict[str, Any],
 ) -> str:
-    """为本次生成结果计算短签名，绑定布局和配置文件。"""
     payload = {
         "footprint": footprint,
         "floors": [floor.as_dict() for floor in floors],

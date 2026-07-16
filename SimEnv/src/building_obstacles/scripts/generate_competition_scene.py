@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""比赛场景生成入口。
-
-本脚本由 auto.sh 调用，是“随机参数 -> Gazebo world -> 裁判真值”的总装配层。
-它不直接设计楼栋几何，而是调用 building_generator_core 生成楼栋布局并导出
-SDF，再把危险源和干扰源追加进 world，同时写出 truth/manifest/config 文件。
-"""
 from __future__ import annotations
 
 import argparse
@@ -19,11 +13,6 @@ import xml.etree.ElementTree as ET
 
 
 def _ensure_generator_on_path() -> None:
-    """兼容 rosrun 和直接 python3 执行两种方式。
-
-    catkin 环境正常时，building_generator_core 已经在 PYTHONPATH 中；
-    直接执行脚本时，则临时把兄弟包路径插入 sys.path。
-    """
     try:
         import building_generator_core  # noqa: F401
         return
@@ -54,6 +43,44 @@ SOURCE_CLEARANCE = 0.35
 DOOR_KEEP_OUT_DEPTH = 1.55
 DOOR_KEEP_OUT_HALF_WIDTH = 1.05
 MAX_PLACEMENT_ATTEMPTS = 8000
+TRUTH_FILENAME = "danger_truth.json"
+TEAM_DETECTION_FILENAME = "detected_danger.json"
+TEAM_SCENE_INFO_FILENAME = "team_scene_info.json"
+REFEREE_ODOM_TOPIC = "/Odometry_gazebo"
+ALLOWED_TEAM_TOPICS = [
+    "/clock",
+    "/cmd_vel",
+    "/scan",
+    "/livox/Pointcloud2",
+    "/livox/lidar2",
+    "/trunk_imu",
+    "/livox/imu",
+    "/real_sense/rgb/image_raw",
+    "/real_sense/rgb/camera_info",
+    "/real_sense/depth/image_raw",
+    "/real_sense/depth/camera_info",
+    "/real_sense/depth/points",
+]
+ALLOWED_TEAM_SERVICES = [
+    "/set_door_state",
+    "/call_elevator",
+]
+REFEREE_ONLY_TOPICS = [
+    REFEREE_ODOM_TOPIC,
+    "/ground_truth/base_w",
+    "/ground_truth/base_trunk",
+    "/ground_truth/FL_foot",
+    "/ground_truth/FR_foot",
+    "/ground_truth/RL_foot",
+    "/ground_truth/RR_foot",
+]
+REFEREE_ONLY_FILES = [
+    "generated_building/layout_metadata.json",
+    "generated_building/building_config.json",
+    "generated_building/scene_manifest.json",
+    f"generated_building/{TRUTH_FILENAME}",
+    f"results/{TRUTH_FILENAME}",
+]
 
 
 @dataclass(frozen=True)
@@ -140,11 +167,20 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     seed = args.seed if args.seed is not None else random.SystemRandom().randint(1, 2**31 - 1)
     output_dir = Path(args.output_dir).resolve()
-    results_dir = Path(args.results_dir).resolve() if args.results_dir else output_dir.parent / "results"
+    team_results_dir = Path(args.results_dir).resolve() if args.results_dir else output_dir.parent / "results"
+    referee_results_dir = (
+        Path(args.referee_results_dir).resolve()
+        if args.referee_results_dir
+        else team_results_dir
+    )
+    team_info_dir = Path(args.team_info_dir).resolve() if args.team_info_dir else output_dir
+    team_detection_path = team_results_dir / TEAM_DETECTION_FILENAME
+    robot_start = _robot_start_from_args(args)
     output_dir.mkdir(parents=True, exist_ok=True)
-    results_dir.mkdir(parents=True, exist_ok=True)
+    team_results_dir.mkdir(parents=True, exist_ok=True)
+    referee_results_dir.mkdir(parents=True, exist_ok=True)
+    team_info_dir.mkdir(parents=True, exist_ok=True)
 
-    # 第一阶段：把命令行参数收敛成楼栋生成器需要的约束对象。
     constraints = BuildingConstraints.from_dict(
         {
             "seed": seed,
@@ -156,32 +192,30 @@ def main(argv: list[str] | None = None) -> int:
             },
         }
     )
-    # 第二阶段：生成抽象楼栋布局，再导出 Gazebo Classic 可加载的 SDF 和配置文件。
     layout = generate_layout(constraints)
     artifact_paths = export_sdf(layout, target="gazebo_classic", output_dir=output_dir)
 
-    # 第三阶段：在房间内部布置危险源/干扰源。使用 seed 派生出的随机数，
-    # 这样楼栋结构和源位置都可复现，但二者随机序列互不干扰。
     obstacle_rng = random.Random(seed ^ 0x5EED5EED)
     danger_count = _sample_count(args.danger_count, obstacle_rng)
     distractor_count = _sample_count(args.distractor_count, obstacle_rng)
     sources = _place_sources(layout, obstacle_rng, danger_count, distractor_count)
 
-    # 第四阶段：把源模型追加到 world 中。model.sdf 仍表示裸楼栋，
-    # competition_scene.world/world.sdf 表示完整比赛世界。
     world_path = output_dir / "competition_scene.world"
-    _write_world_with_sources(Path(artifact_paths.world_sdf), world_path, sources)
+    physics_config = _physics_config_from_args(args)
+    _write_world_with_sources(Path(artifact_paths.world_sdf), world_path, sources, physics_config)
     # Keep world.sdf as the full competition world as well; model.sdf remains the bare building model.
     Path(artifact_paths.world_sdf).write_text(world_path.read_text(encoding="utf-8"), encoding="utf-8")
 
-    # 第五阶段：写裁判真值。算法不应读取 danger_truth.json，
-    # 它只用于赛后评估 detected_danger.json。
     truth_data = _build_truth_data(layout, seed, sources)
-    truth_path = results_dir / "danger_truth.json"
-    output_truth_path = output_dir / "danger_truth.json"
+    truth_path = referee_results_dir / TRUTH_FILENAME
+    output_truth_path = output_dir / TRUTH_FILENAME
+    generated_truth_copy = str(output_truth_path) if args.write_generated_truth_copy else None
     truth_json = json.dumps(truth_data, indent=2, ensure_ascii=False) + "\n"
     truth_path.write_text(truth_json, encoding="utf-8")
-    output_truth_path.write_text(truth_json, encoding="utf-8")
+    if args.write_generated_truth_copy:
+        output_truth_path.write_text(truth_json, encoding="utf-8")
+    elif output_truth_path != truth_path and output_truth_path.exists():
+        output_truth_path.unlink()
 
     building_config_path = output_dir / "building_config.json"
     building_config_path.write_text(
@@ -189,7 +223,13 @@ def main(argv: list[str] | None = None) -> int:
         encoding="utf-8",
     )
 
-    # manifest 是一次启动的索引文件，方便 auto.sh 和用户定位本次生成的所有产物。
+    team_scene_info_path = team_info_dir / TEAM_SCENE_INFO_FILENAME
+    team_scene_info = _build_team_scene_info(layout, robot_start, team_detection_path)
+    team_scene_info_path.write_text(
+        json.dumps(team_scene_info, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
     manifest = {
         "schema": "competition_scene_manifest_v1",
         "seed": seed,
@@ -199,22 +239,26 @@ def main(argv: list[str] | None = None) -> int:
         "door_config": artifact_paths.door_config,
         "elevator_config": artifact_paths.elevator_config,
         "validation_report": artifact_paths.validation_report,
+        "team_scene_info": str(team_scene_info_path),
         "truth_file": str(truth_path),
-        "output_truth_file": str(output_truth_path),
+        "output_truth_file": generated_truth_copy,
         "danger_count": danger_count,
         "distractor_count": distractor_count,
         "source_count": len(sources),
-        "robot_start": {
-            "x": args.robot_x,
-            "y": args.robot_y,
-            "z": args.robot_z,
-            "yaw": args.robot_yaw,
-        },
+        "robot_start": robot_start,
+        "gazebo_physics": physics_config,
         "competition_interfaces": {
             "velocity_command_topic": "/cmd_vel",
-            "odometry_topic": "/Odometry_gazebo",
-            "truth_file_for_referee": str(truth_path),
-            "team_detection_file": str(results_dir / "detected_danger.json"),
+            "allowed_team_topics": ALLOWED_TEAM_TOPICS,
+            "allowed_team_services": ALLOWED_TEAM_SERVICES,
+            "team_scene_info_file": str(team_scene_info_path),
+            "team_detection_file": str(team_detection_path),
+        },
+        "referee_only": {
+            "truth_file": str(truth_path),
+            "generated_truth_copy": generated_truth_copy,
+            "odometry_topic": REFEREE_ODOM_TOPIC,
+            "referee_only_topics": REFEREE_ONLY_TOPICS,
         },
     }
     manifest_path = output_dir / "scene_manifest.json"
@@ -229,7 +273,12 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Generate a competition Gazebo world with one random building and colocated source objects."
     )
     parser.add_argument("--output-dir", required=True, help="Directory for generated world and metadata.")
-    parser.add_argument("--results-dir", help="Directory for referee truth and team result files.")
+    parser.add_argument(
+        "--results-dir",
+        help="Directory for team result files. Also stores referee truth unless --referee-results-dir is set.",
+    )
+    parser.add_argument("--referee-results-dir", help="Directory for referee-only truth files.")
+    parser.add_argument("--team-info-dir", help="Directory for the public team_scene_info.json file.")
     parser.add_argument("--seed", type=int, help="Scene seed. If omitted, a random seed is selected and recorded.")
     parser.add_argument("--floor-count", default="3", help="Exact value or min:max range.")
     parser.add_argument("--rooms-per-floor", default="4", help="Exact value or min:max range.")
@@ -238,9 +287,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--danger-count", default="3:6", help="Exact value or min:max range.")
     parser.add_argument("--distractor-count", default="4:8", help="Exact value or min:max range.")
     parser.add_argument("--robot-x", type=float, default=0.0)
-    parser.add_argument("--robot-y", type=float, default=-2.2)
+    parser.add_argument("--robot-y", type=float, default=-3.2)
     parser.add_argument("--robot-z", type=float, default=0.6)
     parser.add_argument("--robot-yaw", type=float, default=1.5708)
+    parser.add_argument("--physics-max-step-size", type=float, default=0.001)
+    parser.add_argument("--physics-real-time-update-rate", type=int, default=1000)
+    parser.add_argument("--physics-ode-iters", type=int, default=50)
+    parser.add_argument("--physics-contact-max-correcting-vel", type=float, default=10.0)
+    parser.add_argument(
+        "--no-generated-truth-copy",
+        dest="write_generated_truth_copy",
+        action="store_false",
+        help=f"Do not mirror {TRUTH_FILENAME} into output-dir; keep referee truth in results-dir only.",
+    )
+    parser.set_defaults(write_generated_truth_copy=True)
     return parser
 
 
@@ -265,11 +325,6 @@ def _place_sources(
     danger_count: int,
     distractor_count: int,
 ) -> list[PlacedSource]:
-    """按数量计划在所有房间中随机放置源。
-
-    这里先决定“本次有哪些源”，再逐个调用 _place_one_source 找合法位置。
-    合法性包括避开墙、家具、门口保留区和已经放置的其他源。
-    """
     rooms = [room for floor in layout.floors for room in floor.rooms]
     if not rooms:
         raise ValueError("cannot place sources: generated building has no rooms")
@@ -301,11 +356,6 @@ def _place_one_source(
     source_kind: SourceKind,
     placed: list[PlacedSource],
 ) -> PlacedSource:
-    """为单个源采样一个合法位置。
-
-    该函数是比赛规则落地的位置：源只能在房间内部，且不能堵门、
-    不能穿家具、不能和其他源重叠。失败会抛出错误，避免生成不可用场景。
-    """
     radius = source_kind.placement_radius
     margin = ROOM_WALL_CLEARANCE + radius
     for _ in range(MAX_PLACEMENT_ATTEMPTS):
@@ -339,7 +389,6 @@ def _place_one_source(
 
 
 def _blocks_room_door(room: RoomSpec, x: float, y: float, radius: float) -> bool:
-    """判断候选点是否落入房门前保留区。"""
     door_x = float(room.door_pose[0])
     door_y = float(room.door_pose[1])
     half_width = DOOR_KEEP_OUT_HALF_WIDTH + radius
@@ -374,15 +423,56 @@ def _overlaps_existing_sources(candidate: PlacedSource, placed: list[PlacedSourc
     return False
 
 
-def _write_world_with_sources(source_world: Path, destination_world: Path, sources: list[PlacedSource]) -> None:
-    """把危险源和干扰源作为静态 Gazebo model 追加到已有 world。"""
+def _physics_config_from_args(args: argparse.Namespace) -> dict[str, float | int]:
+    return {
+        "max_step_size": args.physics_max_step_size,
+        "real_time_factor": 1.0,
+        "real_time_update_rate": args.physics_real_time_update_rate,
+        "ode_iters": args.physics_ode_iters,
+        "contact_max_correcting_vel": args.physics_contact_max_correcting_vel,
+    }
+
+
+def _write_world_with_sources(
+    source_world: Path,
+    destination_world: Path,
+    sources: list[PlacedSource],
+    physics_config: dict[str, float | int],
+) -> None:
     root = ET.parse(source_world).getroot()
     world = root.find("world")
     if world is None:
         raise ValueError(f"world element not found in {source_world}")
+    _set_world_physics(world, physics_config)
     for source in sources:
         world.append(_build_source_model(source))
     destination_world.write_text(_to_pretty_xml(root), encoding="utf-8")
+
+
+def _set_world_physics(world: ET.Element, physics_config: dict[str, float | int]) -> None:
+    for existing in list(world.findall("physics")):
+        world.remove(existing)
+
+    physics = ET.Element("physics", {"name": "default_physics", "default": "0", "type": "ode"})
+    ET.SubElement(physics, "max_step_size").text = f"{float(physics_config['max_step_size']):.6f}"
+    ET.SubElement(physics, "real_time_factor").text = f"{float(physics_config['real_time_factor']):.6f}"
+    ET.SubElement(physics, "real_time_update_rate").text = str(int(physics_config["real_time_update_rate"]))
+    ET.SubElement(physics, "gravity").text = "0 0 -9.81"
+
+    ode = ET.SubElement(physics, "ode")
+    solver = ET.SubElement(ode, "solver")
+    ET.SubElement(solver, "type").text = "quick"
+    ET.SubElement(solver, "iters").text = str(int(physics_config["ode_iters"]))
+    ET.SubElement(solver, "sor").text = "1.3"
+    constraints = ET.SubElement(ode, "constraints")
+    ET.SubElement(constraints, "cfm").text = "0.0"
+    ET.SubElement(constraints, "erp").text = "0.2"
+    ET.SubElement(constraints, "contact_max_correcting_vel").text = (
+        f"{float(physics_config['contact_max_correcting_vel']):.6f}"
+    )
+    ET.SubElement(constraints, "contact_surface_layer").text = "0.001"
+
+    world.insert(0, physics)
 
 
 def _build_source_model(source: PlacedSource) -> ET.Element:
@@ -424,7 +514,6 @@ def _source_color(color: str) -> str:
 
 
 def _build_truth_data(layout: BuildingLayout, seed: int, sources: list[PlacedSource]) -> dict[str, object]:
-    """生成裁判评估使用的真值结构。"""
     danger_sources = [source.as_truth_entry() for source in sources if source.source_kind.is_danger]
     distraction_sources = [source.as_truth_entry() for source in sources if not source.source_kind.is_danger]
     return {
@@ -446,13 +535,61 @@ def _build_truth_data(layout: BuildingLayout, seed: int, sources: list[PlacedSou
     }
 
 
+def _build_team_scene_info(
+    layout: BuildingLayout,
+    robot_start: dict[str, float],
+    team_detection_path: Path,
+) -> dict[str, object]:
+    return {
+        "schema": "team_scene_info_v1",
+        "coordinate_frame": "world",
+        "robot_start": robot_start,
+        "public_scene": {
+            "door_ids": [
+                {
+                    "id": door.id,
+                    "kind": door.kind,
+                    "floor_index": door.floor_index,
+                    "initial_open": door.initial_open,
+                }
+                for door in layout.door_specs
+            ],
+            "elevators": [
+                {
+                    "id": elevator.id,
+                    "served_floors": list(elevator.served_floors),
+                    "current_floor": elevator.current_floor,
+                }
+                for elevator in layout.elevator_specs
+            ],
+        },
+        "allowed_interfaces": {
+            "topics": ALLOWED_TEAM_TOPICS,
+            "services": ALLOWED_TEAM_SERVICES,
+            "result_file": str(team_detection_path),
+        },
+        "referee_only": {
+            "forbidden_files": REFEREE_ONLY_FILES,
+            "forbidden_topics": REFEREE_ONLY_TOPICS,
+        },
+    }
+
+
+def _robot_start_from_args(args: argparse.Namespace) -> dict[str, float]:
+    return {
+        "x": args.robot_x,
+        "y": args.robot_y,
+        "z": args.robot_z,
+        "yaw": args.robot_yaw,
+    }
+
+
 def _build_building_config(
     layout: BuildingLayout,
     seed: int,
     world_path: Path,
     sources: list[PlacedSource],
 ) -> dict[str, object]:
-    """生成兼容旧工具的 building_config.json。"""
     return {
         "schema": "competition_building_config_v1",
         "seed": seed,

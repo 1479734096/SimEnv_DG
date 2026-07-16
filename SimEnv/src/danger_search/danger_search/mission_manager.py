@@ -49,12 +49,11 @@ from danger_search.red_sphere_detector import RedSphereDetector
 from danger_search.result_writer import ResultWriter
 from danger_search.sensor_buffer import (
     SensorBuffer,
-    odom_angular_speed,
-    odom_planar_speed,
-    odom_pose_xy_yaw,
-    odom_rotation_matrix,
-    odom_xyz,
 )
+from danger_search.pose_provider import PoseProvider
+from danger_search.pose_provider import PoseSample
+from danger_search.interface_policy import require_allowed_topic, require_internal_topic
+from danger_search.building_feature_provider import BuildingFeatureProvider
 from danger_search.support_shadow import ShadowSupportConfig, ShadowSupportGrid
 
 
@@ -313,12 +312,12 @@ class MissionManager:
         self._load_params()
         self._status_publisher = None
         self.sensor_buffer = SensorBuffer(
-            odom_topic=self.odom_topic,
             cloud_topic=self.cloud_topic,
             rgb_topic=self.rgb_topic,
             depth_topic=self.depth_topic,
             camera_info_topic=self.camera_info_topic,
         )
+        self.pose_provider = PoseProvider(self.localization_odom_topic)
         self.mapper = MultiFloorGridMap(**self.map_params)
         self.explorer = FrontierExplorer(**self.frontier_params)
         self.controller = PathFollower(
@@ -332,11 +331,14 @@ class MissionManager:
         self.detector = RedSphereDetector(**self.detection_params)
         self.local_detector = LocalSemanticDetector(**self.local_detection_params)
         self.tracker = DetectionTracker(**self.tracker_params)
-        metadata_abs_path = str(Path(__file__).resolve().parents[3] / "generated_building" / "layout_metadata.json")
         self.building_client = BuildingControlClient(
-            metadata_path=metadata_abs_path,
             service_timeout=self.floor_params.get("service_timeout", 5.0),
         )
+        if self.building_features is not None:
+            self.building_client.set_public_features(
+                door_ids=self.building_features.door_ids,
+                elevators=self.building_features.elevators,
+            )
         self._progress_monitor = _ProgressMonitor(
             goal_tolerance=float(self.controller_params.get("goal_tolerance", 0.35)),
             window=self.progress_monitor_window,
@@ -402,10 +404,10 @@ class MissionManager:
         )
         self._ground_support_gate = GroundSupportSafetyGate(gate_config)
         self._ground_support_grid = ShadowSupportGrid(support_config)
-        self.sensor_buffer.enable_cloud_odom_matching()
         self.controller.set_command_gate(self._ground_support_gate)
 
     def start(self) -> None:
+        self.pose_provider.start()
         self.sensor_buffer.start()
         self.controller.start()
         if self.max_floor > 1 or self.building_client.has_controllable_doors():
@@ -415,7 +417,7 @@ class MissionManager:
             self._map_publisher = rospy.Publisher(self.map_topic, OccupancyGrid, queue_size=1, latch=True)
         else:
             self._map_publisher = None
-        if PoseStamped is not None:
+        if self.manual_goal_enabled and PoseStamped is not None:
             self._goal_subscriber = rospy.Subscriber(self.goal_topic, PoseStamped, self._goal_callback)
         self._timer = rospy.Timer(rospy.Duration(0.1), self._on_timer)
         if self._ground_support_gate is not None:
@@ -487,28 +489,83 @@ class MissionManager:
             )
 
     def _load_params(self) -> None:
-        self.cmd_vel_topic = _param("topics/cmd_vel", "/cmd_vel")
-        self.odom_topic = _param("topics/odom", "/Odometry_gazebo")
-        self.cloud_topic = _param("topics/cloud", "/livox/Pointcloud2")
-        self.rgb_topic = _param("topics/rgb", "/real_sense/rgb/image_raw")
-        self.depth_topic = _param("topics/depth", "/real_sense/depth/image_raw")
-        self.camera_info_topic = _param("topics/camera_info", "/real_sense/rgb/camera_info")
-        self.status_topic = _param("topics/status", "/nav/status")
-        self.goal_topic = _param("topics/goal", "/nav/goal")
-        self.map_topic = _param("topics/map", "/nav/map_debug")
-        self.path_raw_topic = _param("topics/path_raw", "/danger_search/path_raw")
-        self.path_followed_topic = _param(
+        self.runtime_profile = str(_param("runtime/profile", "formal")).strip().lower()
+        if self.runtime_profile not in {"formal", "diagnostic"}:
+            raise ValueError("runtime/profile 只能是 formal 或 diagnostic")
+        scene_info_path = _param(
+            "localization/team_scene_info_path",
+            os.path.join(os.getcwd(), "generated_building", "team_scene_info.json"),
+        )
+        self.building_features = (
+            BuildingFeatureProvider.load(scene_info_path, purpose="正式任务场景信息")
+            if self.runtime_profile == "formal"
+            else None
+        )
+        if self.building_features is not None:
+            for service in ("/set_door_state", "/call_elevator"):
+                self.building_features.require_service(service, purpose="建筑控制服务")
+
+        def external_topic(topic: str, purpose: str) -> str:
+            normalized = require_allowed_topic(topic, purpose=purpose)
+            if self.building_features is not None:
+                self.building_features.require_topic(normalized, purpose=purpose)
+            return normalized
+
+        self.cmd_vel_topic = require_allowed_topic(
+            _param("topics/cmd_vel", "/cmd_vel"),
+            purpose="导航控制输出",
+        )
+        if self.building_features is not None:
+            self.building_features.require_topic(self.cmd_vel_topic, purpose="导航控制输出")
+        self.localization_odom_topic = require_internal_topic(_param(
+            "topics/localization_odom",
+            "/danger_search/localization/odom",
+        ), purpose="参赛方定位输出")
+        self.cloud_topic = require_internal_topic(_param(
+            "topics/cloud",
+            "/danger_search/localization/cloud_registered",
+        ), purpose="参赛方配准点云")
+        self.rgb_topic = external_topic(
+            _param("topics/rgb", "/real_sense/rgb/image_raw"),
+            purpose="危险源 RGB 输入",
+        )
+        self.depth_topic = external_topic(
+            _param("topics/depth", "/real_sense/depth/image_raw"),
+            purpose="危险源深度输入",
+        )
+        self.camera_info_topic = external_topic(
+            _param("topics/camera_info", "/real_sense/rgb/camera_info"),
+            purpose="危险源相机标定输入",
+        )
+        self.manual_goal_enabled = bool(_param("mission/manual_goal_enabled", False))
+        if self.runtime_profile == "formal" and self.manual_goal_enabled:
+            raise ValueError("正式运行不允许启用未在初始接口文档中的 /nav/goal")
+        self.camera_mount_xyz = tuple(
+            float(value)
+            for value in _param("localization/base_to_camera_xyz", [0.28, 0.0, 0.043])
+        )
+        self.camera_mount_rpy = tuple(
+            float(value)
+            for value in _param("localization/base_to_camera_rpy", [0.0, 0.0, 0.0])
+        )
+        self.status_topic = require_internal_topic(_param("topics/status", "/nav/status"), purpose="任务状态")
+        self.goal_topic = require_internal_topic(_param("topics/goal", "/nav/goal"), purpose="诊断目标")
+        self.map_topic = require_internal_topic(_param("topics/map", "/nav/map_debug"), purpose="地图调试")
+        self.path_raw_topic = require_internal_topic(_param("topics/path_raw", "/danger_search/path_raw"), purpose="原始路径调试")
+        self.path_followed_topic = require_internal_topic(_param(
             "topics/path_followed",
             "/danger_search/path_followed",
-        )
-        self.local_target_topic = _param(
+        ), purpose="跟踪路径调试")
+        self.local_target_topic = require_internal_topic(_param(
             "topics/local_target",
             "/danger_search/local_target",
-        )
+        ), purpose="局部目标调试")
 
         self.startup_delay = float(_param("mission/startup_delay", 2.0))
         self.max_runtime = float(_param("mission/max_runtime", 590.0))
         self.max_floor = int(_param("mission/max_floor", 1))
+        if self.runtime_profile == "formal" and self.max_floor != 1:
+            raise ValueError("当前合规基线仅支持单层；多层需要公开空间定位与合法换层方案")
         self.floor_timeout = float(_param("mission/floor_timeout", 180.0))
         self.last_floor_uses_global_budget = bool(
             _param("mission/last_floor_uses_global_budget", True)
@@ -556,8 +613,17 @@ class MissionManager:
         self.exit_cabin_backoff_enabled = bool(
             _param("mission/exit_cabin_backoff_enabled", False)
         )
-        self.result_file = str(_param("result_file", os.path.join(os.getcwd(), "results", "detected_danger.json")))
-        self.mission_summary_file = str(_param("mission_summary_file", ""))
+        configured_result = str(_param("result_file", "")).strip()
+        self.mission_summary_file = str(_param("mission_summary_file", "")).strip()
+        if self.building_features is not None:
+            public_result = self.building_features.result_file
+            if configured_result and Path(configured_result).resolve() != public_result.resolve():
+                raise ValueError("正式运行结果文件必须使用 team_scene_info.json 公布的路径")
+            if self.mission_summary_file:
+                raise ValueError("正式运行不得写入额外 mission_summary_file")
+            self.result_file = str(public_result)
+        else:
+            self.result_file = configured_result or os.path.join(os.getcwd(), "results", "detected_danger.json")
 
         self.map_params = {
             "resolution": float(_param("map/resolution", 0.10)),
@@ -698,6 +764,15 @@ class MissionManager:
             "sensor_frame": str(
                 _param("ground_support/sensor_frame", "laser_livox")
             ),
+            # 初始 docs/sensors-and-topics.md 公布的固定 Livox 外参；正式链不查询 TF。
+            "base_to_livox_xyz": tuple(
+                float(value)
+                for value in _param("localization/base_to_livox_xyz", [0.2, 0.0, 0.08])
+            ),
+            "base_to_livox_rpy": tuple(
+                float(value)
+                for value in _param("localization/base_to_livox_rpy", [0.0, 0.785, 0.0])
+            ),
         }
         self.frontier_params = {
             "min_cluster_size": int(_param("frontier/min_cluster_size", 8)),
@@ -778,6 +853,10 @@ class MissionManager:
             "max_evidence_height": float(_param("local_semantic/max_door_evidence_height", 1.80)),
             "use_truth_proximity_detector": bool(_param("local_semantic/use_truth_proximity_detector", False)),
         }
+        if self.runtime_profile == "formal" and self.local_detection_params[
+            "use_truth_proximity_detector"
+        ]:
+            raise ValueError("正式运行禁止启用 truth_proximity_debug 门检测回退")
         self.tracker_params = {
             "association_radius": float(_param("tracker/association_radius", 0.45)),
             "confirmation_window": float(_param("tracker/confirmation_window", 10.0)),
@@ -844,23 +923,19 @@ class MissionManager:
             self._request_shutdown(f"danger_search mission {outcome}")
             return
 
-        snapshot_factory = getattr(
-            self.sensor_buffer,
-            "ground_support_snapshot",
-            self.sensor_buffer.snapshot,
-        )
-        snapshot = snapshot_factory()
-        pose = odom_pose_xy_yaw(snapshot.odom_msg)
-        xyz = odom_xyz(snapshot.odom_msg)
-        if pose is None or xyz is None:
+        snapshot = self.sensor_buffer.snapshot()
+        pose_sample = self.pose_provider.latest()
+        if pose_sample is None:
             self.controller.stop()
             return
+        pose = pose_sample.xy_yaw
+        xyz = pose_sample.xyz
 
         self._last_xyz = xyz
         self._update_pose_progress(pose)
         self._sync_ground_support_task_context()
-        self._update_ground_support_odometry(snapshot)
-        self._update_mapping_and_detection(snapshot, pose, xyz)
+        self._update_ground_support_odometry(pose_sample)
+        self._update_mapping_and_detection(snapshot, pose, xyz, pose_sample)
         if self._handle_ground_support_control(pose):
             return
 
@@ -942,7 +1017,12 @@ class MissionManager:
         elif self.state == RETURN_HOME:
             self._tick_return_home(pose)
 
-    def _floor_scoped_updates_are_blocked(self, snapshot, estimated_floor: int) -> bool:
+    def _floor_scoped_updates_are_blocked(
+        self,
+        snapshot,
+        estimated_floor: int,
+        pose_sample: PoseSample | None = None,
+    ) -> bool:
         """更新换层锁存，并返回当前 tick 是否应暂停楼层相关点云处理。"""
         current_floor = int(self.current_floor)
         current_task = getattr(self, "current_task", None)
@@ -953,7 +1033,7 @@ class MissionManager:
         ):
             return False
 
-        odom_stamp = _message_stamp_seconds(getattr(snapshot, "odom_msg", None))
+        odom_stamp = pose_sample.stamp if pose_sample is not None else None
         if odom_stamp is not None and not math.isfinite(odom_stamp):
             odom_stamp = None
         now = float(self._elapsed())
@@ -1137,13 +1217,20 @@ class MissionManager:
             }
         )
 
-    def _update_mapping_and_detection(self, snapshot, pose, xyz) -> None:
+    def _update_mapping_and_detection(self, snapshot, pose, xyz, pose_sample=None) -> None:
         cloud_stamp = _message_stamp_seconds(snapshot.cloud_msg)
+        if pose_sample is None:
+            pose_sample = _pose_sample_from_values(
+                stamp=cloud_stamp if cloud_stamp is not None else 0.0,
+                pose=pose,
+                xyz=xyz,
+            )
         cloud_is_new = cloud_stamp is None or cloud_stamp != getattr(self, "_last_cloud_stamp", None)
         estimated_floor = self.mapper.estimate_floor_from_z(xyz[2])
         floor_scoped_updates_blocked = self._floor_scoped_updates_are_blocked(
             snapshot,
             estimated_floor,
+            pose_sample,
         )
         if estimated_floor == self.current_floor:
             self._last_floor_alignment_mismatch_key = None
@@ -1222,8 +1309,22 @@ class MissionManager:
         if stamp is not None and self._last_image_stamp == stamp:
             return
         self._last_image_stamp = stamp
-        camera_frame = bundle.rgb_msg.header.frame_id
-        camera_to_world = self.sensor_buffer.camera_to_target_matrix(camera_frame, bundle.rgb_msg.header.stamp)
+        image_stamp = _message_stamp_seconds(bundle.rgb_msg)
+        provider = getattr(self, "pose_provider", None)
+        image_pose = provider.at(image_stamp) if provider is not None else None
+        image_pose = image_pose or pose_sample
+        if provider is not None:
+            camera_to_world = provider.sensor_to_world_matrix(
+                image_pose,
+                base_to_sensor_xyz=self.camera_mount_xyz,
+                base_to_sensor_rpy=self.camera_mount_rpy,
+            )
+        else:
+            camera_to_world = _camera_to_world_matrix(
+                image_pose,
+                getattr(self, "camera_mount_xyz", (0.28, 0.0, 0.043)),
+                getattr(self, "camera_mount_rpy", (0.0, 0.0, 0.0)),
+            )
         if camera_to_world is not None and self.depth_frame_is_optical:
             camera_to_world = camera_to_world @ _ros_link_from_optical_matrix()
         candidates = self.detector.detect_messages(
@@ -1236,16 +1337,14 @@ class MissionManager:
         if candidates:
             self.tracker.update(candidates, now=get_time())
 
-    def _update_ground_support_odometry(self, snapshot) -> None:
+    def _update_ground_support_odometry(self, pose_sample) -> None:
         gate = getattr(self, "_ground_support_gate", None)
         if gate is None:
             return
-        linear_speed = odom_planar_speed(snapshot.odom_msg)
-        angular_speed = odom_angular_speed(snapshot.odom_msg)
         gate.observe_odometry(
-            _message_stamp_seconds(snapshot.odom_msg),
-            linear_speed=linear_speed if linear_speed is not None else 0.0,
-            angular_speed=angular_speed if angular_speed is not None else 0.0,
+            pose_sample.stamp,
+            linear_speed=pose_sample.planar_speed,
+            angular_speed=pose_sample.angular_speed,
             wall_time=time.monotonic(),
         )
 
@@ -1263,10 +1362,12 @@ class MissionManager:
             return
         # 支撑层有独立消费游标。即使本帧因换层歧义或 TF 缺失跳过，也不得重放旧帧。
         self._last_ground_support_cloud_stamp = cloud_stamp
-        pose = odom_pose_xy_yaw(snapshot.odom_msg)
-        xyz = odom_xyz(snapshot.odom_msg)
-        if pose is None or xyz is None:
+        pose_provider = getattr(self, "pose_provider", None)
+        pose_sample = pose_provider.at(cloud_stamp) if pose_provider is not None else None
+        if pose_sample is None:
             return
+        pose = pose_sample.xy_yaw
+        xyz = pose_sample.xyz
         estimated_floor = self.mapper.estimate_floor_from_z(xyz[2])
         current_task = getattr(self, "current_task", None)
         transition_ambiguous = (
@@ -1288,6 +1389,7 @@ class MissionManager:
             snapshot,
             pose,
             xyz,
+            pose_sample,
             points,
             cloud_stamp,
         )
@@ -1297,6 +1399,7 @@ class MissionManager:
         snapshot,
         pose: tuple[float, float, float],
         xyz: tuple[float, float, float],
+        pose_sample: PoseSample,
         points,
         cloud_stamp: float | None,
     ) -> None:
@@ -1304,23 +1407,16 @@ class MissionManager:
         grid = getattr(self, "_ground_support_grid", None)
         if gate is None or grid is None or cloud_stamp is None:
             return
-        if getattr(self, "_ground_support_sensor_mount", None) is None:
-            transform = getattr(self.sensor_buffer, "frame_transform_matrix", None)
-            if callable(transform):
-                self._ground_support_sensor_mount = transform(
-                    self.ground_support_params["base_frame"],
-                    self.ground_support_params["sensor_frame"],
-                    rospy.Time(0),
-                    allow_latest=True,
-                )
-        mount = self._ground_support_sensor_mount
-        body_rotation = odom_rotation_matrix(snapshot.odom_msg)
-        if mount is None or body_rotation is None:
+        provider = getattr(self, "pose_provider", None)
+        if provider is None:
             return
-
-        robot_position = np.asarray(xyz, dtype=float)
-        sensor_origin = robot_position + body_rotation @ mount[:3, 3]
-        sensor_rotation = body_rotation @ mount[:3, :3]
+        sensor_to_world = provider.sensor_to_world_matrix(
+            pose_sample,
+            base_to_sensor_xyz=self.ground_support_params["base_to_livox_xyz"],
+            base_to_sensor_rpy=self.ground_support_params["base_to_livox_rpy"],
+        )
+        sensor_origin = sensor_to_world[:3, 3]
+        sensor_rotation = sensor_to_world[:3, :3]
         followed_path = [
             np.asarray(point, dtype=float)
             for point in self.controller.followed_path_snapshot()
@@ -1345,7 +1441,7 @@ class MissionManager:
         payload = result.get("local_corridor_assessment")
         if not isinstance(payload, dict):
             return
-        odom_stamp = _message_stamp_seconds(snapshot.odom_msg)
+        odom_stamp = pose_sample.stamp
         ros_now = float(rospy.get_time())
         data_age = _ground_support_data_age(
             cloud_stamp=float(cloud_stamp),
@@ -3051,6 +3147,27 @@ def _message_stamp_seconds(message) -> float | None:
         return None
     to_sec = getattr(stamp, "to_sec", None)
     return float(to_sec()) if callable(to_sec) else None
+
+
+def _pose_sample_from_values(*, stamp: float, pose, xyz) -> PoseSample:
+    half_yaw = float(pose[2]) * 0.5
+    return PoseSample(
+        stamp=float(stamp),
+        xyz=(float(xyz[0]), float(xyz[1]), float(xyz[2])),
+        quaternion_xyzw=(0.0, 0.0, math.sin(half_yaw), math.cos(half_yaw)),
+        linear_xyz=(0.0, 0.0, 0.0),
+        angular_xyz=(0.0, 0.0, 0.0),
+    )
+
+
+def _camera_to_world_matrix(sample: PoseSample, xyz, rpy) -> np.ndarray:
+    """轻量测试对象未安装 PoseProvider 时复用同一固定外参计算。"""
+    provider = PoseProvider.__new__(PoseProvider)
+    return provider.sensor_to_world_matrix(
+        sample,
+        base_to_sensor_xyz=xyz,
+        base_to_sensor_rpy=rpy,
+    )
 
 
 def _ground_support_unknown_hold_enabled(task, *, configured: bool = True) -> bool:

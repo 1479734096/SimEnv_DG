@@ -1,7 +1,6 @@
 """ROS 传感器非阻塞缓存。"""
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 from threading import Lock
 from typing import Iterable
@@ -12,15 +11,12 @@ try:
     import message_filters
     import rospy
     import sensor_msgs.point_cloud2 as pc2
-    import tf
-    from nav_msgs.msg import Odometry
     from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 except ImportError:  # pragma: no cover - 离线语法检查环境可能没有 ROS
     message_filters = None
     rospy = None
     pc2 = None
-    tf = None
-    Odometry = CameraInfo = Image = PointCloud2 = None
+    CameraInfo = Image = PointCloud2 = None
 
 
 @dataclass
@@ -32,7 +28,6 @@ class ImageBundle:
 
 @dataclass
 class SensorSnapshot:
-    odom_msg: object | None
     cloud_msg: object | None
     image_bundle: ImageBundle | None
 
@@ -43,37 +38,28 @@ class SensorBuffer:
     def __init__(
         self,
         *,
-        odom_topic: str,
         cloud_topic: str,
         rgb_topic: str,
         depth_topic: str,
         camera_info_topic: str,
         sync_slop: float = 0.08,
         sync_queue_size: int = 10,
-        target_frame: str = "odom",
     ):
-        self.odom_topic = odom_topic
         self.cloud_topic = cloud_topic
         self.rgb_topic = rgb_topic
         self.depth_topic = depth_topic
         self.camera_info_topic = camera_info_topic
         self.sync_slop = float(sync_slop)
         self.sync_queue_size = int(sync_queue_size)
-        self.target_frame = target_frame
         self._lock = Lock()
-        self._odom_msg = None
-        self._odom_history = None
         self._cloud_msg = None
         self._image_bundle: ImageBundle | None = None
-        self._tf_listener = None
         self._subscribers = []
 
     def start(self) -> None:
         if rospy is None:
             raise RuntimeError("当前环境没有 rospy，无法启动 SensorBuffer")
 
-        self._tf_listener = tf.TransformListener()
-        self._subscribers.append(rospy.Subscriber(self.odom_topic, Odometry, self._on_odom, queue_size=5))
         self._subscribers.append(rospy.Subscriber(self.cloud_topic, PointCloud2, self._on_cloud, queue_size=2))
 
         rgb_sub = message_filters.Subscriber(self.rgb_topic, Image)
@@ -90,75 +76,9 @@ class SensorBuffer:
     def snapshot(self) -> SensorSnapshot:
         with self._lock:
             return SensorSnapshot(
-                odom_msg=self._odom_msg,
                 cloud_msg=self._cloud_msg,
                 image_bundle=self._image_bundle,
             )
-
-    def enable_cloud_odom_matching(self, *, max_samples: int = 256) -> None:
-        """仅在生产支撑门开启时保留短 odom 历史，供点云时间匹配。"""
-        with self._lock:
-            history = deque(maxlen=max(2, int(max_samples)))
-            if self._odom_msg is not None:
-                history.append(self._odom_msg)
-            self._odom_history = history
-
-    def ground_support_snapshot(self) -> SensorSnapshot:
-        """返回最新点云与时间戳最接近的 odom；普通快照语义保持不变。"""
-        with self._lock:
-            cloud_msg = self._cloud_msg
-            odom_msg = self._odom_msg
-            cloud_stamp = _message_stamp_seconds(cloud_msg)
-            if cloud_stamp is not None and self._odom_history:
-                stamped = [
-                    (abs(stamp - cloud_stamp), message)
-                    for message in self._odom_history
-                    for stamp in [_message_stamp_seconds(message)]
-                    if stamp is not None
-                ]
-                if stamped:
-                    odom_msg = min(stamped, key=lambda item: item[0])[1]
-            return SensorSnapshot(
-                odom_msg=odom_msg,
-                cloud_msg=cloud_msg,
-                image_bundle=self._image_bundle,
-            )
-
-    def camera_to_target_matrix(self, camera_frame: str, stamp) -> np.ndarray | None:
-        return self.frame_transform_matrix(
-            self.target_frame,
-            camera_frame,
-            stamp,
-            allow_latest=True,
-        )
-
-    def frame_transform_matrix(
-        self,
-        target_frame: str,
-        source_frame: str,
-        stamp,
-        *,
-        allow_latest: bool = False,
-    ) -> np.ndarray | None:
-        """读取指定坐标变换；生产安全门只在显式启用后调用。"""
-        if self._tf_listener is None:
-            return None
-        try:
-            trans, quat = self._tf_listener.lookupTransform(target_frame, source_frame, stamp)
-        except Exception:
-            if not allow_latest or rospy is None:
-                return None
-            try:
-                trans, quat = self._tf_listener.lookupTransform(
-                    target_frame,
-                    source_frame,
-                    rospy.Time(0),
-                )
-            except Exception:
-                return None
-        matrix = tf.transformations.quaternion_matrix(quat)
-        matrix[:3, 3] = np.array(trans, dtype=float)
-        return matrix
 
     def read_cloud_xyz(self, cloud_msg, *, max_points: int = 25000, stride: int = 1) -> list[tuple[float, float, float]]:
         if pc2 is None or cloud_msg is None:
@@ -172,12 +92,6 @@ class SensorBuffer:
             if len(points) >= max_points:
                 break
         return points
-
-    def _on_odom(self, msg) -> None:
-        with self._lock:
-            self._odom_msg = msg
-            if self._odom_history is not None:
-                self._odom_history.append(msg)
 
     def _on_cloud(self, msg) -> None:
         with self._lock:
