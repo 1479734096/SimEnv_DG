@@ -14,6 +14,14 @@ DIAGNOSTIC_RATE=2.0
 GROUND_SUPPORT_CAPTURE=0
 GROUND_SUPPORT_SHADOW=0
 DIAGNOSTIC_STOP_LATCH=0
+DIAGNOSTIC_BRAKE_SPEED=""
+DIAGNOSTIC_BRAKE_RELAY=0
+DIAGNOSTIC_BRAKE_LINEAR_X=0.60
+DIAGNOSTIC_BRAKE_LINEAR_Y=0.35
+DIAGNOSTIC_BRAKE_READY_HOLD=4.0
+DIAGNOSTIC_BRAKE_PRETURN_RADIANS=0.0
+DIAGNOSTIC_BRAKE_PRETURN_ANGULAR=1.0
+DIAGNOSTIC_BRAKE_PRETURN_TIMEOUT=8.0
 SHADOW_SWEEP_HALF_WIDTH=""
 SHADOW_THRESHOLD_WIDTHS=""
 KILL_ONLY_SIM_TIME=""
@@ -65,6 +73,40 @@ while [ "$#" -gt 0 ]; do
     --diagnostic-stop-latch)
       DIAGNOSTIC_STOP_LATCH=1
       shift
+      ;;
+    --diagnostic-brake-speed)
+      DIAGNOSTIC_STOP_LATCH=1
+      DIAGNOSTIC_BRAKE_SPEED="$2"
+      shift 2
+      ;;
+    --diagnostic-brake-relay)
+      DIAGNOSTIC_STOP_LATCH=1
+      DIAGNOSTIC_BRAKE_RELAY=1
+      shift
+      ;;
+    --diagnostic-brake-linear-x)
+      DIAGNOSTIC_BRAKE_LINEAR_X="$2"
+      shift 2
+      ;;
+    --diagnostic-brake-linear-y)
+      DIAGNOSTIC_BRAKE_LINEAR_Y="$2"
+      shift 2
+      ;;
+    --diagnostic-brake-ready-hold)
+      DIAGNOSTIC_BRAKE_READY_HOLD="$2"
+      shift 2
+      ;;
+    --diagnostic-brake-preturn-radians)
+      DIAGNOSTIC_BRAKE_PRETURN_RADIANS="$2"
+      shift 2
+      ;;
+    --diagnostic-brake-preturn-angular)
+      DIAGNOSTIC_BRAKE_PRETURN_ANGULAR="$2"
+      shift 2
+      ;;
+    --diagnostic-brake-preturn-timeout)
+      DIAGNOSTIC_BRAKE_PRETURN_TIMEOUT="$2"
+      shift 2
       ;;
     --shadow-sweep-half-width)
       SHADOW_SWEEP_HALF_WIDTH="$2"
@@ -138,9 +180,18 @@ if [ "$GROUND_SUPPORT_SHADOW" = "1" ] && [ "$GROUND_SUPPORT_CAPTURE" != "1" ]; t
   echo "--ground-support-shadow 必须与 --ground-support-capture 同时使用" >&2
   exit 2
 fi
+if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ] && [ "$GROUND_SUPPORT_CAPTURE" != "1" ]; then
+  echo "诊断停车锁存必须与 --ground-support-capture 同时使用" >&2
+  exit 2
+fi
 if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ] \
-  && { [ "$GROUND_SUPPORT_CAPTURE" != "1" ] || [ "$GROUND_SUPPORT_SHADOW" != "1" ]; }; then
-  echo "--diagnostic-stop-latch 必须与原始采集及 shadow 同时使用" >&2
+  && [ -z "$DIAGNOSTIC_BRAKE_SPEED" ] \
+  && [ "$GROUND_SUPPORT_SHADOW" != "1" ]; then
+  echo "--diagnostic-stop-latch 的告警模式必须与 shadow 同时使用" >&2
+  exit 2
+fi
+if [ "$DIAGNOSTIC_BRAKE_RELAY" = "1" ] && [ -z "$DIAGNOSTIC_BRAKE_SPEED" ]; then
+  echo "--diagnostic-brake-relay 必须同时配置 --diagnostic-brake-speed" >&2
   exit 2
 fi
 if [ -n "$SHADOW_SWEEP_HALF_WIDTH$SHADOW_THRESHOLD_WIDTHS" ] \
@@ -174,14 +225,18 @@ SCENE_REQUEST_MARKER="$SIM_DIR/logs/observation_${STAMP}_seed_${SEED}.scene_requ
 SOURCE_PARAMS="$PARAMS"
 DIAGNOSTIC_PARAMS=""
 RAW_COMMAND_TOPIC="/danger_search/diagnostic_cmd_vel_raw"
+ALGORITHM_COMMAND_TOPIC="$RAW_COMMAND_TOPIC"
+if [ -n "$DIAGNOSTIC_BRAKE_SPEED" ] && [ "$DIAGNOSTIC_BRAKE_RELAY" != "1" ]; then
+  ALGORITHM_COMMAND_TOPIC="/danger_search/diagnostic_cmd_vel_ignored"
+fi
 if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ]; then
   DIAGNOSTIC_PARAMS="$SIM_DIR/logs/ground_support_stop_params_${STAMP}.yaml"
-  python3 - "$SOURCE_PARAMS" "$DIAGNOSTIC_PARAMS" "$RAW_COMMAND_TOPIC" <<'PY'
+  python3 - "$SOURCE_PARAMS" "$DIAGNOSTIC_PARAMS" "$ALGORITHM_COMMAND_TOPIC" <<'PY'
 import sys
 from pathlib import Path
 import yaml
 
-source, output, raw_topic = sys.argv[1:]
+source, output, command_topic = sys.argv[1:]
 payload = {}
 if source:
     loaded = yaml.safe_load(Path(source).read_text(encoding="utf-8"))
@@ -190,7 +245,7 @@ if source:
 topics = payload.setdefault("topics", {})
 if not isinstance(topics, dict):
     raise SystemExit("参数文件中的 topics 必须是映射")
-topics["cmd_vel"] = raw_topic
+topics["cmd_vel"] = command_topic
 Path(output).write_text(
     yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
     encoding="utf-8",
@@ -408,6 +463,14 @@ write_manifest() {
     "  \"ground_support_capture\": $GROUND_SUPPORT_CAPTURE," \
     "  \"ground_support_shadow\": $GROUND_SUPPORT_SHADOW," \
     "  \"diagnostic_stop_latch\": $DIAGNOSTIC_STOP_LATCH," \
+    "  \"diagnostic_brake_speed\": ${DIAGNOSTIC_BRAKE_SPEED:-null}," \
+    "  \"diagnostic_brake_relay\": $DIAGNOSTIC_BRAKE_RELAY," \
+    "  \"diagnostic_brake_linear_x\": $DIAGNOSTIC_BRAKE_LINEAR_X," \
+    "  \"diagnostic_brake_linear_y\": $DIAGNOSTIC_BRAKE_LINEAR_Y," \
+    "  \"diagnostic_brake_ready_hold\": $DIAGNOSTIC_BRAKE_READY_HOLD," \
+    "  \"diagnostic_brake_preturn_radians\": $DIAGNOSTIC_BRAKE_PRETURN_RADIANS," \
+    "  \"diagnostic_brake_preturn_angular\": $DIAGNOSTIC_BRAKE_PRETURN_ANGULAR," \
+    "  \"diagnostic_brake_preturn_timeout\": $DIAGNOSTIC_BRAKE_PRETURN_TIMEOUT," \
     "  \"shadow_sweep_half_width\": ${SHADOW_SWEEP_HALF_WIDTH:-null}," \
     "  \"shadow_threshold_widths\": \"$SHADOW_THRESHOLD_WIDTHS\"," \
     "  \"kill_only_sim_time\": ${KILL_ONLY_SIM_TIME:-null}," \
@@ -543,17 +606,40 @@ fi
 ROS_RUN_ID="$(rosparam get /run_id 2>/dev/null || true)"
 
 SHADOW_ALERT_STATE="$OBS_DIR/ground_support_shadow_alert_state.json"
-STOP_LATCH_MARKER="$OBS_DIR/ground_support_diagnostic_stop_complete.json"
+if [ -n "$DIAGNOSTIC_BRAKE_SPEED" ]; then
+  STOP_LATCH_MARKER="$OBS_DIR/diagnostic_brake_stop_complete.json"
+  STOP_LATCH_EVENT_LOG="$OBS_DIR/diagnostic_brake_stop.jsonl"
+  STOP_LATCH_LOG="$OBS_DIR/diagnostic_brake_stop.log"
+else
+  STOP_LATCH_MARKER="$OBS_DIR/ground_support_diagnostic_stop_complete.json"
+  STOP_LATCH_EVENT_LOG="$OBS_DIR/ground_support_diagnostic_stop.jsonl"
+  STOP_LATCH_LOG="$OBS_DIR/ground_support_diagnostic_stop.log"
+fi
 if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ]; then
+  STOP_LATCH_ARGS=()
+  if [ -n "$DIAGNOSTIC_BRAKE_SPEED" ]; then
+    STOP_LATCH_ARGS+=(--brake-trigger-speed "$DIAGNOSTIC_BRAKE_SPEED")
+    if [ "$DIAGNOSTIC_BRAKE_RELAY" = "1" ]; then
+      STOP_LATCH_ARGS+=(--brake-relay-before-trigger)
+    fi
+    STOP_LATCH_ARGS+=(--brake-command-linear-x "$DIAGNOSTIC_BRAKE_LINEAR_X")
+    STOP_LATCH_ARGS+=(--brake-command-linear-y "$DIAGNOSTIC_BRAKE_LINEAR_Y")
+    STOP_LATCH_ARGS+=(--brake-ready-hold "$DIAGNOSTIC_BRAKE_READY_HOLD")
+    STOP_LATCH_ARGS+=(--brake-preturn-radians "$DIAGNOSTIC_BRAKE_PRETURN_RADIANS")
+    STOP_LATCH_ARGS+=(--brake-preturn-angular "$DIAGNOSTIC_BRAKE_PRETURN_ANGULAR")
+    STOP_LATCH_ARGS+=(--brake-preturn-timeout "$DIAGNOSTIC_BRAKE_PRETURN_TIMEOUT")
+  else
+    STOP_LATCH_ARGS+=(--alert-state "$SHADOW_ALERT_STATE")
+  fi
   (
     trap - INT TERM
     exec python3 "$SCRIPT_DIR/ground_support_stop_latch.py" \
-      --alert-state "$SHADOW_ALERT_STATE" \
-      --event-log "$OBS_DIR/ground_support_diagnostic_stop.jsonl" \
+      "${STOP_LATCH_ARGS[@]}" \
+      --event-log "$STOP_LATCH_EVENT_LOG" \
       --stop-marker "$STOP_LATCH_MARKER" \
       --raw-command-topic "$RAW_COMMAND_TOPIC" \
       --output-command-topic /cmd_vel
-  ) > "$OBS_DIR/ground_support_diagnostic_stop.log" 2>&1 &
+  ) > "$STOP_LATCH_LOG" 2>&1 &
   STOP_LATCH_PID=$!
   sleep 1
   if ! kill -0 "$STOP_LATCH_PID" 2>/dev/null; then
@@ -569,6 +655,7 @@ if [ "$GROUND_SUPPORT_CAPTURE" = "1" ]; then
       /clock \
       /cmd_vel \
       /danger_search/diagnostic_cmd_vel_raw \
+      /danger_search/diagnostic_cmd_vel_ignored \
       /Odometry_gazebo \
       /scan \
       /livox/Pointcloud2 \
@@ -617,7 +704,7 @@ if [ "$GROUND_SUPPORT_CAPTURE" = "1" ]; then
         SHADOW_ARGS+=(--threshold-width "$threshold_width")
       done
     fi
-    if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ]; then
+    if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ] && [ -z "$DIAGNOSTIC_BRAKE_SPEED" ]; then
       SHADOW_ARGS+=(--alert-state "$SHADOW_ALERT_STATE")
     fi
     (
@@ -795,7 +882,7 @@ if [ ! -s "$OBS_DIR/gazebo.mkv" ] || [ ! -f "$ACTIVE_BAG" ]; then
 fi
 if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ]; then
   for _ in $(seq 1 60); do
-    if rostopic info "$RAW_COMMAND_TOPIC" 2>/dev/null \
+    if rostopic info "$ALGORITHM_COMMAND_TOPIC" 2>/dev/null \
       | grep -A 5 '^Publishers:' \
       | grep -q '^ \* /danger_search '; then
       break
@@ -807,9 +894,10 @@ if [ "$DIAGNOSTIC_STOP_LATCH" = "1" ]; then
   done
   rostopic info /cmd_vel > "$OBS_DIR/diagnostic_cmd_vel_output_info.txt" 2>&1 || true
   rostopic info "$RAW_COMMAND_TOPIC" > "$OBS_DIR/diagnostic_cmd_vel_raw_info.txt" 2>&1 || true
-  if ! grep -A 5 '^Publishers:' "$OBS_DIR/diagnostic_cmd_vel_raw_info.txt" \
+  rostopic info "$ALGORITHM_COMMAND_TOPIC" > "$OBS_DIR/diagnostic_algorithm_cmd_vel_info.txt" 2>&1 || true
+  if ! grep -A 5 '^Publishers:' "$OBS_DIR/diagnostic_algorithm_cmd_vel_info.txt" \
       | grep -q '^ \* /danger_search '; then
-    echo "生产控制器没有发布到诊断 raw 命令话题" >&2
+    echo "生产控制器没有发布到隔离后的诊断命令话题" >&2
     exit 1
   fi
   output_publisher_count="$(
@@ -840,7 +928,11 @@ while kill -0 "$RUN_PID" 2>/dev/null; do
     break
   fi
   if stop_latch_completed; then
-    STOP_REASON="ground_support_diagnostic_stop_complete"
+    if [ -n "$DIAGNOSTIC_BRAKE_SPEED" ]; then
+      STOP_REASON="diagnostic_brake_stop_complete"
+    else
+      STOP_REASON="ground_support_diagnostic_stop_complete"
+    fi
     cp "$STOP_LATCH_MARKER" "$OBS_DIR/abort_reason.txt"
     kill -INT "$RUN_PID" 2>/dev/null || true
     break
@@ -870,7 +962,11 @@ if guard_has_fired; then
   STOP_REASON="ground_support_kill_only_guard"
   RUN_STATUS=0
 elif stop_latch_completed; then
-  STOP_REASON="ground_support_diagnostic_stop_complete"
+  if [ -n "$DIAGNOSTIC_BRAKE_SPEED" ]; then
+    STOP_REASON="diagnostic_brake_stop_complete"
+  else
+    STOP_REASON="ground_support_diagnostic_stop_complete"
+  fi
   RUN_STATUS=0
 fi
 set -e

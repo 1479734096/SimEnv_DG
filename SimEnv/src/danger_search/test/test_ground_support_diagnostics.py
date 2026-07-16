@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -42,6 +43,8 @@ from danger_search.support_shadow import (  # noqa: E402
     ShadowSupportConfig,
     ShadowSupportGrid,
     SweepWidthComponents,
+    _future_polyline,
+    _planned_motion_footprint_polyline,
 )
 
 
@@ -321,10 +324,157 @@ class DiagnosticStopLatchTest(unittest.TestCase):
         self.assertFalse(state.observe_motion(now=1.55, speed=0.01, position=(0.105, 0.0)))
         self.assertTrue(state.observe_motion(now=1.72, speed=0.01, position=(0.106, 0.0)))
 
+    def test_diagnostic_brake_triggers_only_at_measured_speed_with_translation(self):
+        state = self.stop_latch.StopLatchState(
+            minimum_trigger_speed=0.10,
+            maximum_alert_age=0.25,
+            stop_speed_threshold=0.02,
+            stop_hold_seconds=0.50,
+            stop_position_tolerance=0.01,
+            brake_trigger_speed=0.65,
+        )
+
+        self.assertFalse(
+            state.consider_brake_trigger(
+                now=2.0,
+                speed=0.64,
+                position=(0.0, 0.0),
+                command=(0.60, 0.0, 0.0),
+            )
+        )
+        self.assertFalse(
+            state.consider_brake_trigger(
+                now=2.1,
+                speed=0.66,
+                position=(0.0, 0.0),
+                command=(0.0, 0.0, 1.0),
+            )
+        )
+        self.assertTrue(
+            state.consider_brake_trigger(
+                now=2.2,
+                speed=0.66,
+                position=(1.0, 2.0),
+                command=(0.60, 0.0, 0.0),
+            )
+        )
+        self.assertEqual(state.trigger_source, "measured_speed")
+        self.assertEqual(state.output_command((0.60, 0.0, 0.0)), (0.0, 0.0, 0.0))
+
+    def test_diagnostic_preturn_angle_distance_handles_wraparound(self):
+        self.assertAlmostEqual(
+            self.stop_latch._angle_distance(-1.50, 1.60),
+            3.10,
+            places=6,
+        )
+
+    def test_high_rate_odom_callback_latches_brake_transient_immediately(self):
+        latch = self.stop_latch.DiagnosticStopLatch.__new__(
+            self.stop_latch.DiagnosticStopLatch
+        )
+        latch.args = SimpleNamespace(brake_trigger_speed=0.65)
+        latch.state = self.stop_latch.StopLatchState(
+            minimum_trigger_speed=0.10,
+            maximum_alert_age=0.25,
+            stop_speed_threshold=0.02,
+            stop_hold_seconds=0.50,
+            stop_position_tolerance=0.01,
+            brake_trigger_speed=0.65,
+        )
+        latch._lock = self.stop_latch.Lock()
+        latch._brake_command_started_at = 1.0
+        latch._last_raw_command = (0.60, 0.40, 0.0)
+        latch._odom = None
+        latch._pending_latch_event = False
+        latch._first_zero_publish_time = None
+        latch._zero_publish_count = 0
+        published = []
+        events = []
+        latch._publish_tuple = published.append
+        latch._write_event = lambda event, **payload: events.append((event, payload))
+        message = SimpleNamespace(
+            pose=SimpleNamespace(
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=1.0, y=2.0, z=0.4),
+                    orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+                )
+            ),
+            twist=SimpleNamespace(
+                twist=SimpleNamespace(
+                    linear=SimpleNamespace(x=0.66, y=0.0),
+                )
+            ),
+        )
+        original_rospy = self.stop_latch.rospy
+        self.stop_latch.rospy = SimpleNamespace(get_time=lambda: 3.7)
+        try:
+            latch.on_odom(message)
+        finally:
+            self.stop_latch.rospy = original_rospy
+
+        self.assertTrue(latch.state.latched)
+        self.assertTrue(latch._pending_latch_event)
+        self.assertEqual(latch.state.trigger_source, "measured_speed")
+        self.assertEqual(published, [(0.0, 0.0, 0.0)])
+        self.assertEqual(events[0][0], "first_zero_published")
+
+    def test_high_rate_odom_can_latch_relayed_production_command(self):
+        latch = self.stop_latch.DiagnosticStopLatch.__new__(
+            self.stop_latch.DiagnosticStopLatch
+        )
+        latch.args = SimpleNamespace(
+            brake_trigger_speed=0.70,
+            brake_relay_before_trigger=True,
+        )
+        latch.state = self.stop_latch.StopLatchState(
+            minimum_trigger_speed=0.10,
+            maximum_alert_age=0.25,
+            stop_speed_threshold=0.02,
+            stop_hold_seconds=0.50,
+            stop_position_tolerance=0.01,
+            brake_trigger_speed=0.70,
+        )
+        latch._lock = self.stop_latch.Lock()
+        latch._brake_command_started_at = None
+        latch._last_raw_command = (0.58, 0.01, 0.02)
+        latch._odom = None
+        latch._pending_latch_event = False
+        latch._first_zero_publish_time = None
+        latch._zero_publish_count = 0
+        published = []
+        latch._publish_tuple = published.append
+        latch._write_event = lambda event, **payload: None
+        message = SimpleNamespace(
+            pose=SimpleNamespace(
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=1.0, y=2.0, z=0.4),
+                    orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+                )
+            ),
+            twist=SimpleNamespace(
+                twist=SimpleNamespace(
+                    linear=SimpleNamespace(x=0.71, y=0.0),
+                )
+            ),
+        )
+        original_rospy = self.stop_latch.rospy
+        self.stop_latch.rospy = SimpleNamespace(get_time=lambda: 3.7)
+        try:
+            latch.on_odom(message)
+        finally:
+            self.stop_latch.rospy = original_rospy
+
+        self.assertTrue(latch.state.latched)
+        self.assertEqual(latch.state.trigger_source, "measured_speed")
+        self.assertEqual(published, [(0.0, 0.0, 0.0)])
+
     def test_wrapper_remaps_production_command_through_test_only_gate(self):
         source = (TOOLS_DIR / "run_observation.sh").read_text(encoding="utf-8")
 
         self.assertIn("--diagnostic-stop-latch", source)
+        self.assertIn("--diagnostic-brake-speed", source)
+        self.assertIn("--diagnostic-brake-relay", source)
+        self.assertIn("--diagnostic-brake-preturn-radians", source)
         self.assertIn("/danger_search/diagnostic_cmd_vel_raw", source)
         self.assertIn("ground_support_stop_latch.py", source)
 
@@ -549,6 +699,11 @@ def _shadow_config(**overrides):
         "required_consecutive_frames": 2,
         "minimum_alert_cells": 1,
         "sweep_half_width": 0.12,
+        "foot_band_center_offset": 0.08,
+        "foot_band_half_width": 0.04,
+        "minimum_foot_band_coverage": 0.50,
+        "maximum_longitudinal_unknown_gap": 0.11,
+        "minimum_longitudinal_support_ratio": 0.75,
         "snapshot_period": 0.5,
         "threshold_widths": (0.12, 0.18),
         "threshold_hit_counts": (1, 2, 3),
@@ -565,7 +720,7 @@ class ShadowSupportGridTest(unittest.TestCase):
         self.robot_xy = np.array([0.0, 0.0])
         self.path = [np.array([0.0, 0.0]), np.array([1.0, 0.0])]
 
-    def _process(self, grid, stamp, points, *, ambiguous=False):
+    def _process(self, grid, stamp, points, *, ambiguous=False, local_only=False):
         return grid.process_frame(
             stamp=stamp,
             floor=0,
@@ -577,7 +732,25 @@ class ShadowSupportGridTest(unittest.TestCase):
             path=self.path,
             command_linear=0.2,
             ambiguous=ambiguous,
+            local_only=local_only,
         )
+
+    @staticmethod
+    def _floor_points(
+        *,
+        x_start=0.0,
+        x_end=0.9,
+        omitted_x=None,
+        y_values=(-0.15, -0.05, 0.05, 0.15),
+    ):
+        omitted_x = omitted_x or ()
+        points = []
+        x = float(x_start) + 0.025
+        while x <= float(x_end) + 1e-9:
+            if not any(start <= x <= end for start, end in omitted_x):
+                points.extend([[x, y, 0.0] for y in y_values])
+            x += 0.025
+        return points
 
     def test_direct_floor_return_marks_supported(self):
         grid = ShadowSupportGrid(_shadow_config())
@@ -670,6 +843,295 @@ class ShadowSupportGridTest(unittest.TestCase):
         self.assertIn("w0.12_h1_c1", result["threshold_sensitivity"])
         self.assertIn("w0.18_h3_c3", result["threshold_sensitivity"])
         self.assertEqual(grid.cell_state(0, (4, 0)), UNKNOWN_SUPPORT)
+
+    def test_local_only_does_not_accumulate_evidence_outside_local_support_radius(self):
+        grid = ShadowSupportGrid(
+            _shadow_config(
+                minimum_cell_hits=1,
+                local_support_evidence_radius=0.8,
+            )
+        )
+
+        self._process(
+            grid,
+            1.0,
+            [[0.45, 0.02, 0.0], [0.45, 2.0, 0.0]],
+            local_only=True,
+        )
+
+        self.assertEqual(grid.cell_state(0, (4, 0)), SUPPORTED)
+        self.assertEqual(grid.cell_state(0, (4, 20)), UNKNOWN_SUPPORT)
+        self.assertNotIn(
+            [4, 20],
+            [item["cell"] for item in grid.sparse_grid_snapshot()["0"]],
+        )
+
+    def test_local_only_keeps_nearby_explicit_support_outside_current_sweep(self):
+        grid = ShadowSupportGrid(
+            _shadow_config(
+                minimum_cell_hits=1,
+                local_support_evidence_radius=3.0,
+            )
+        )
+
+        self._process(
+            grid,
+            1.0,
+            [[0.45, 2.0, 0.0]],
+            local_only=True,
+        )
+
+        self.assertEqual(grid.cell_state(0, (4, 20)), SUPPORTED)
+
+    def test_consecutive_drop_evidence_refreshes_stamp_after_saturation(self):
+        grid = ShadowSupportGrid(
+            _shadow_config(
+                required_consecutive_frames=2,
+                threshold_consecutive_frames=(1, 2),
+            )
+        )
+        points = [[0.9, 0.01, -0.4], [0.92, 0.02, -0.42]]
+
+        self._process(grid, 1.0, points)
+        self._process(grid, 1.1, points)
+        self._process(grid, 1.2, points)
+
+        self.assertEqual(grid.cell_snapshot(0, (4, 0))["last_stamp"], 1.2)
+
+    def test_frame_reports_fresh_drop_and_supported_prefix(self):
+        grid = ShadowSupportGrid(
+            _shadow_config(
+                minimum_cell_hits=1,
+                required_consecutive_frames=1,
+                fov_min_elevation_deg=-90.0,
+                fov_max_elevation_deg=90.0,
+                footprint_front_reach=0.0,
+                minimum_frame_points=1,
+            )
+        )
+
+        result = self._process(
+            grid,
+            1.0,
+            [
+                [0.05, -0.05, 0.0],
+                [0.05, 0.05, 0.0],
+                [0.15, -0.05, 0.0],
+                [0.15, 0.05, 0.0],
+                [0.9, 0.01, -0.4],
+                [0.92, 0.02, -0.42],
+            ],
+            local_only=True,
+        )
+
+        assessment = result["local_corridor_assessment"]
+        self.assertTrue(assessment["drop_confirmed"])
+        self.assertTrue(assessment["drop_intersects_sweep"])
+        self.assertTrue(assessment["observation_adequate"])
+        self.assertIsNotNone(assessment["drop_direction_world"])
+        self.assertGreaterEqual(assessment["supported_distance"], 0.0)
+
+    def test_fully_supported_corridor_is_adequate_for_hold_release(self):
+        grid = ShadowSupportGrid(
+            _shadow_config(
+                minimum_cell_hits=1,
+                fov_min_elevation_deg=-90.0,
+                fov_max_elevation_deg=90.0,
+                footprint_front_reach=0.0,
+                minimum_frame_points=1,
+            )
+        )
+        points = [
+            [(gx + 0.5) * 0.1, (gy + 0.5) * 0.1, 0.0]
+            for gx in range(0, 7)
+            for gy in range(-2, 2)
+        ]
+
+        result = self._process(grid, 1.0, points, local_only=True)
+
+        assessment = result["local_corridor_assessment"]
+        self.assertTrue(assessment["current_footprint_supported"])
+        self.assertTrue(assessment["observation_adequate"])
+        self.assertGreaterEqual(assessment["supported_distance"], 0.45)
+
+    def test_short_path_endpoint_does_not_masquerade_as_support_boundary(self):
+        """路径数组结束不是地面结束，仍需检查终点前方的机身与制动扫掠区。"""
+        grid = ShadowSupportGrid(
+            _shadow_config(
+                minimum_cell_hits=1,
+                fov_min_elevation_deg=-90.0,
+                fov_max_elevation_deg=90.0,
+                footprint_front_reach=0.30,
+                minimum_frame_points=1,
+            )
+        )
+        self.path = [np.array([0.0, 0.0]), np.array([0.40, 0.0])]
+        points = [
+            [(gx + 0.5) * 0.1, (gy + 0.5) * 0.1, 0.0]
+            for gx in range(0, 7)
+            for gy in range(-2, 2)
+        ]
+
+        result = self._process(grid, 1.0, points, local_only=True)
+
+        assessment = result["local_corridor_assessment"]
+        self.assertTrue(assessment["current_footprint_supported"])
+        self.assertTrue(assessment["observation_adequate"])
+        self.assertGreaterEqual(assessment["supported_distance"], 0.0)
+        self.assertFalse(assessment["support_boundary_detected"])
+
+    def test_positive_support_horizon_stops_at_controller_goal_tolerance(self):
+        path = [
+            np.array([0.0, -0.95]),
+            np.array([0.0, 0.05]),
+            np.array([-0.10, 0.15]),
+        ]
+
+        polyline = _planned_motion_footprint_polyline(
+            np.array([0.0, -0.23]),
+            math.pi / 2.0,
+            path,
+            distance=0.60,
+            footprint_front_reach=0.30,
+            goal_tolerance=0.35,
+        )
+
+        # 控制器会在进入末点 0.35 m 到达圆后停车；正支撑走廊不得继续拐向尾段。
+        self.assertTrue(all(abs(float(point[0])) <= 1e-9 for point in polyline))
+        self.assertLess(float(polyline[-1][1]), 0.15)
+
+    def test_drop_horizon_does_not_spend_longitudinal_budget_on_cross_track_error(self):
+        polyline = _future_polyline(
+            np.array([0.0, 0.05]),
+            0.0,
+            [np.array([0.0, 0.0]), np.array([0.20, 0.0])],
+            0.50,
+        )
+
+        # 横向归拢误差已经计入物理扫掠不确定性，DROP 前视仍须保留完整纵向预算。
+        length = sum(
+            float(np.linalg.norm(end - start))
+            for start, end in zip(polyline, polyline[1:])
+        )
+        self.assertAlmostEqual(length, 0.55)
+
+    def test_outer_unknown_cell_does_not_exhaust_foot_band_supported_prefix(self):
+        grid = ShadowSupportGrid(
+            _shadow_config(
+                minimum_cell_hits=1,
+                sweep_half_width=0.435393,
+                foot_band_center_offset=0.14,
+                foot_band_half_width=0.10,
+                fov_min_elevation_deg=-90.0,
+                fov_max_elevation_deg=90.0,
+                footprint_front_reach=0.0,
+                minimum_frame_points=1,
+            )
+        )
+
+        result = self._process(
+            grid,
+            1.0,
+            self._floor_points(),
+            local_only=True,
+        )
+
+        assessment = result["local_corridor_assessment"]
+        self.assertGreaterEqual(assessment["supported_distance"], 0.45)
+        self.assertGreaterEqual(assessment["minimum_left_foot_band_coverage"], 0.5)
+        self.assertGreaterEqual(assessment["minimum_right_foot_band_coverage"], 0.5)
+        self.assertGreater(
+            result["path_footprint_sweep"]["state_counts"].get(UNKNOWN_SUPPORT, 0),
+            0,
+        )
+
+    def test_short_internal_unknown_gap_is_bridged_only_with_downstream_support(self):
+        grid = ShadowSupportGrid(
+            _shadow_config(
+                minimum_cell_hits=1,
+                sweep_half_width=0.435393,
+                foot_band_center_offset=0.14,
+                foot_band_half_width=0.10,
+                fov_min_elevation_deg=-90.0,
+                fov_max_elevation_deg=90.0,
+                footprint_front_reach=0.0,
+                minimum_frame_points=1,
+            )
+        )
+
+        result = self._process(
+            grid,
+            1.0,
+            self._floor_points(omitted_x=((0.30, 0.39),)),
+            local_only=True,
+        )
+
+        assessment = result["local_corridor_assessment"]
+        self.assertGreaterEqual(assessment["supported_distance"], 0.45)
+        self.assertGreater(assessment["maximum_bridged_unknown_gap"], 0.0)
+        self.assertLessEqual(assessment["maximum_bridged_unknown_gap"], 0.11 + 1e-9)
+
+    def test_long_or_trailing_unknown_gap_still_ends_supported_prefix(self):
+        grid = ShadowSupportGrid(
+            _shadow_config(
+                minimum_cell_hits=1,
+                sweep_half_width=0.435393,
+                foot_band_center_offset=0.14,
+                foot_band_half_width=0.10,
+                fov_min_elevation_deg=-90.0,
+                fov_max_elevation_deg=90.0,
+                footprint_front_reach=0.0,
+                minimum_frame_points=1,
+            )
+        )
+
+        result = self._process(
+            grid,
+            1.0,
+            self._floor_points(omitted_x=((0.30, 0.70),)),
+            local_only=True,
+        )
+
+        assessment = result["local_corridor_assessment"]
+        self.assertLess(assessment["supported_distance"], 0.35)
+        self.assertGreater(assessment["boundary_cell_count"], 0)
+
+    def test_foot_band_prefix_is_stable_across_grid_path_and_width_neighborhood(self):
+        supported_distances = []
+        for origin_x in (-0.05, 0.0, 0.05):
+            for origin_y in (-0.05, 0.0, 0.05):
+                for path_y in (-0.02, 0.0, 0.02):
+                    for width in (0.415393, 0.435393, 0.455393):
+                        config = _shadow_config(
+                            origin_x=origin_x,
+                            origin_y=origin_y,
+                            minimum_cell_hits=1,
+                            sweep_half_width=width,
+                            foot_band_center_offset=0.14,
+                            foot_band_half_width=0.10,
+                            fov_min_elevation_deg=-90.0,
+                            fov_max_elevation_deg=90.0,
+                            footprint_front_reach=0.0,
+                            minimum_frame_points=1,
+                        )
+                        grid = ShadowSupportGrid(config)
+                        self.robot_xy = np.array([0.0, path_y])
+                        self.path = [
+                            np.array([0.0, path_y]),
+                            np.array([1.0, path_y]),
+                        ]
+                        result = self._process(
+                            grid,
+                            1.0,
+                            self._floor_points(
+                                y_values=(-0.25, -0.15, -0.05, 0.05, 0.15, 0.25)
+                            ),
+                            local_only=True,
+                        )
+                        supported_distances.append(
+                            result["local_corridor_assessment"]["supported_distance"]
+                        )
+        self.assertGreaterEqual(min(supported_distances), 0.45)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """ROS 传感器非阻塞缓存。"""
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from threading import Lock
 from typing import Iterable
@@ -61,6 +62,7 @@ class SensorBuffer:
         self.target_frame = target_frame
         self._lock = Lock()
         self._odom_msg = None
+        self._odom_history = None
         self._cloud_msg = None
         self._image_bundle: ImageBundle | None = None
         self._tf_listener = None
@@ -93,14 +95,65 @@ class SensorBuffer:
                 image_bundle=self._image_bundle,
             )
 
+    def enable_cloud_odom_matching(self, *, max_samples: int = 256) -> None:
+        """仅在生产支撑门开启时保留短 odom 历史，供点云时间匹配。"""
+        with self._lock:
+            history = deque(maxlen=max(2, int(max_samples)))
+            if self._odom_msg is not None:
+                history.append(self._odom_msg)
+            self._odom_history = history
+
+    def ground_support_snapshot(self) -> SensorSnapshot:
+        """返回最新点云与时间戳最接近的 odom；普通快照语义保持不变。"""
+        with self._lock:
+            cloud_msg = self._cloud_msg
+            odom_msg = self._odom_msg
+            cloud_stamp = _message_stamp_seconds(cloud_msg)
+            if cloud_stamp is not None and self._odom_history:
+                stamped = [
+                    (abs(stamp - cloud_stamp), message)
+                    for message in self._odom_history
+                    for stamp in [_message_stamp_seconds(message)]
+                    if stamp is not None
+                ]
+                if stamped:
+                    odom_msg = min(stamped, key=lambda item: item[0])[1]
+            return SensorSnapshot(
+                odom_msg=odom_msg,
+                cloud_msg=cloud_msg,
+                image_bundle=self._image_bundle,
+            )
+
     def camera_to_target_matrix(self, camera_frame: str, stamp) -> np.ndarray | None:
+        return self.frame_transform_matrix(
+            self.target_frame,
+            camera_frame,
+            stamp,
+            allow_latest=True,
+        )
+
+    def frame_transform_matrix(
+        self,
+        target_frame: str,
+        source_frame: str,
+        stamp,
+        *,
+        allow_latest: bool = False,
+    ) -> np.ndarray | None:
+        """读取指定坐标变换；生产安全门只在显式启用后调用。"""
         if self._tf_listener is None:
             return None
         try:
-            trans, quat = self._tf_listener.lookupTransform(self.target_frame, camera_frame, stamp)
+            trans, quat = self._tf_listener.lookupTransform(target_frame, source_frame, stamp)
         except Exception:
+            if not allow_latest or rospy is None:
+                return None
             try:
-                trans, quat = self._tf_listener.lookupTransform(self.target_frame, camera_frame, rospy.Time(0))
+                trans, quat = self._tf_listener.lookupTransform(
+                    target_frame,
+                    source_frame,
+                    rospy.Time(0),
+                )
             except Exception:
                 return None
         matrix = tf.transformations.quaternion_matrix(quat)
@@ -123,6 +176,8 @@ class SensorBuffer:
     def _on_odom(self, msg) -> None:
         with self._lock:
             self._odom_msg = msg
+            if self._odom_history is not None:
+                self._odom_history.append(msg)
 
     def _on_cloud(self, msg) -> None:
         with self._lock:
@@ -153,7 +208,54 @@ def odom_xyz(odom_msg) -> tuple[float, float, float] | None:
     return (float(position.x), float(position.y), float(position.z))
 
 
+def odom_planar_speed(odom_msg) -> float | None:
+    if odom_msg is None:
+        return None
+    linear = odom_msg.twist.twist.linear
+    return float(np.hypot(float(linear.x), float(linear.y)))
+
+
+def odom_angular_speed(odom_msg) -> float | None:
+    if odom_msg is None:
+        return None
+    angular = odom_msg.twist.twist.angular
+    return float(
+        np.linalg.norm([float(angular.x), float(angular.y), float(angular.z)])
+    )
+
+
+def odom_rotation_matrix(odom_msg) -> np.ndarray | None:
+    if odom_msg is None:
+        return None
+    orientation = odom_msg.pose.pose.orientation
+    quaternion = np.asarray(
+        [orientation.x, orientation.y, orientation.z, orientation.w],
+        dtype=float,
+    )
+    norm = float(np.linalg.norm(quaternion))
+    if norm <= 1e-12:
+        return np.eye(3)
+    x, y, z, w = quaternion / norm
+    return np.asarray(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=float,
+    )
+
+
 def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     return float(np.arctan2(siny_cosp, cosy_cosp))
+
+
+def _message_stamp_seconds(message) -> float | None:
+    stamp = getattr(getattr(message, "header", None), "stamp", None)
+    to_sec = getattr(stamp, "to_sec", None)
+    if not callable(to_sec):
+        return None
+    value = float(to_sec())
+    return value if np.isfinite(value) else None

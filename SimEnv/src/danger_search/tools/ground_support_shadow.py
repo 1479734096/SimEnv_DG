@@ -218,6 +218,36 @@ class GroundSupportShadowRecorder:
             minimum_lookahead=resolved_minimum_lookahead,
             maximum_lookahead=resolved_maximum_lookahead,
             sweep_half_width=resolved_sweep_half_width,
+            foot_band_center_offset=float(
+                rospy.get_param(
+                    "/danger_search/ground_support/foot_band_center_offset",
+                    defaults.foot_band_center_offset,
+                )
+            ),
+            foot_band_half_width=float(
+                rospy.get_param(
+                    "/danger_search/ground_support/foot_band_half_width",
+                    defaults.foot_band_half_width,
+                )
+            ),
+            minimum_foot_band_coverage=float(
+                rospy.get_param(
+                    "/danger_search/ground_support/minimum_foot_band_coverage",
+                    defaults.minimum_foot_band_coverage,
+                )
+            ),
+            maximum_longitudinal_unknown_gap=float(
+                rospy.get_param(
+                    "/danger_search/ground_support/maximum_longitudinal_unknown_gap",
+                    defaults.maximum_longitudinal_unknown_gap,
+                )
+            ),
+            minimum_longitudinal_support_ratio=float(
+                rospy.get_param(
+                    "/danger_search/ground_support/minimum_longitudinal_support_ratio",
+                    defaults.minimum_longitudinal_support_ratio,
+                )
+            ),
             threshold_widths=resolved_threshold_widths,
         )
         self.grid = ShadowSupportGrid(config)

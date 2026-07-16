@@ -61,6 +61,8 @@ def _structured_log(message: str) -> dict[str, object] | None:
 def replay(args: argparse.Namespace) -> dict[str, object]:
     config_payload = yaml.safe_load(args.config.read_text(encoding="utf-8")) or {}
     map_config = config_payload.get("map", {})
+    controller_config = config_payload.get("controller", {})
+    support_config = config_payload.get("ground_support", {})
     resolution = float(map_config.get("resolution", 0.1))
     base_origin_x = float(map_config.get("origin_x", -14.0))
     base_origin_y = float(map_config.get("origin_y", -6.0))
@@ -90,6 +92,30 @@ def replay(args: argparse.Namespace) -> dict[str, object]:
                             cloud_stride=int(map_config.get("cloud_stride", 3)),
                             cloud_max_points=int(map_config.get("cloud_max_points", 18000)),
                             sweep_half_width=width,
+                            foot_band_center_offset=float(
+                                support_config.get("foot_band_center_offset", 0.14)
+                            ),
+                            foot_band_half_width=float(
+                                support_config.get("foot_band_half_width", 0.10)
+                            ),
+                            minimum_foot_band_coverage=float(
+                                support_config.get("minimum_foot_band_coverage", 0.60)
+                            ),
+                            maximum_longitudinal_unknown_gap=float(
+                                support_config.get(
+                                    "maximum_longitudinal_unknown_gap",
+                                    0.10,
+                                )
+                            ),
+                            minimum_longitudinal_support_ratio=float(
+                                support_config.get(
+                                    "minimum_longitudinal_support_ratio",
+                                    0.75,
+                                )
+                            ),
+                            path_goal_tolerance=float(
+                                controller_config.get("goal_tolerance", 0.35)
+                            ),
                             threshold_widths=(width,),
                             snapshot_period=0.0,
                         )
@@ -101,6 +127,11 @@ def replay(args: argparse.Namespace) -> dict[str, object]:
                     "current_active_run": 0,
                     "maximum_inactive_gap_frames": 0,
                     "current_inactive_run": 0,
+                    "supported_distances": [],
+                    "current_footprint_supported_frames": 0,
+                    "left_band_coverages": [],
+                    "right_band_coverages": [],
+                    "corridor_samples": [],
                 }
 
     odom = None
@@ -180,6 +211,53 @@ def replay(args: argparse.Namespace) -> dict[str, object]:
                     if stamp < args.start or result.get("action") != "update":
                         continue
                     active = bool(result["hypothetical_alert"]["active"])
+                    assessment = result.get("local_corridor_assessment", {})
+                    supported_distance = assessment.get("supported_distance")
+                    if isinstance(supported_distance, (int, float)):
+                        variant["supported_distances"].append(float(supported_distance))
+                    if bool(assessment.get("current_footprint_supported", False)):
+                        variant["current_footprint_supported_frames"] += 1
+                    for key, output_key in (
+                        ("minimum_left_foot_band_coverage", "left_band_coverages"),
+                        ("minimum_right_foot_band_coverage", "right_band_coverages"),
+                    ):
+                        value = assessment.get(key)
+                        if isinstance(value, (int, float)):
+                            variant[output_key].append(float(value))
+                    if args.include_corridor_samples:
+                        variant["corridor_samples"].append(
+                            {
+                                "stamp": stamp,
+                                "robot_xy": robot_position[:2].tolist(),
+                                "command_linear": command_linear,
+                                "path_points": len(path),
+                                "supported_distance": supported_distance,
+                                "support_boundary_detected": bool(
+                                    assessment.get(
+                                        "support_boundary_detected",
+                                        False,
+                                    )
+                                ),
+                                "positive_support_lookahead_distance": result.get(
+                                    "positive_support_lookahead_distance"
+                                ),
+                                "current_footprint_supported": bool(
+                                    assessment.get(
+                                        "current_footprint_supported",
+                                        False,
+                                    )
+                                ),
+                                "left_band_coverage": assessment.get(
+                                    "minimum_left_foot_band_coverage"
+                                ),
+                                "right_band_coverage": assessment.get(
+                                    "minimum_right_foot_band_coverage"
+                                ),
+                                "maximum_bridged_unknown_gap": assessment.get(
+                                    "maximum_bridged_unknown_gap"
+                                ),
+                            }
+                        )
                     variant["evaluated"] += 1
                     if active:
                         variant["active"] += 1
@@ -200,6 +278,9 @@ def replay(args: argparse.Namespace) -> dict[str, object]:
     results = []
     for key, variant in variants.items():
         evaluated = int(variant["evaluated"])
+        supported_distances = variant["supported_distances"]
+        left_band_coverages = variant["left_band_coverages"]
+        right_band_coverages = variant["right_band_coverages"]
         results.append(
             {
                 "key": key,
@@ -211,6 +292,33 @@ def replay(args: argparse.Namespace) -> dict[str, object]:
                 "first_alert_cloud_stamp": variant["first_alert"],
                 "longest_active_run_frames": int(variant["longest_active_run"]),
                 "maximum_inactive_gap_frames": int(variant["maximum_inactive_gap_frames"]),
+                "supported_distance_min": (
+                    min(supported_distances) if supported_distances else None
+                ),
+                "supported_distance_median": (
+                    float(np.median(supported_distances))
+                    if supported_distances
+                    else None
+                ),
+                "supported_distance_max": (
+                    max(supported_distances) if supported_distances else None
+                ),
+                "current_footprint_supported_ratio": (
+                    float(variant["current_footprint_supported_frames"] / evaluated)
+                    if evaluated
+                    else 0.0
+                ),
+                "minimum_left_foot_band_coverage": (
+                    min(left_band_coverages) if left_band_coverages else None
+                ),
+                "minimum_right_foot_band_coverage": (
+                    min(right_band_coverages) if right_band_coverages else None
+                ),
+                **(
+                    {"corridor_samples": variant["corridor_samples"]}
+                    if args.include_corridor_samples
+                    else {}
+                ),
             }
         )
     return {
@@ -238,6 +346,11 @@ def main() -> int:
     parser.add_argument("--warmup-start", type=float, default=115.0)
     parser.add_argument("--start", type=float, default=120.165)
     parser.add_argument("--end", type=float, default=133.965)
+    parser.add_argument(
+        "--include-corridor-samples",
+        action="store_true",
+        help="输出时间窗内逐帧足迹带正支撑摘要，仅供短窗口诊断",
+    )
     args = parser.parse_args()
     if rosbag is None or point_cloud2 is None:
         raise SystemExit("当前环境没有 ROS bag/PointCloud2 Python 依赖")

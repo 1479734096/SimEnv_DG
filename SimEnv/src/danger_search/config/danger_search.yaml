@@ -19,6 +19,9 @@ mission:
   max_runtime: 590.0
   max_floor: 1
   floor_timeout: 180.0
+  # 非最后一层仍以 floor_timeout 保护后续楼层；最后一层由全局返航预算收口。
+  # 设为 false 可立即恢复“所有楼层到时即结束”的旧语义。
+  last_floor_uses_global_budget: true
   min_floor_explore_time: 20.0
   min_floor_travel_distance: 6.0
   min_known_area: 45.0
@@ -139,6 +142,60 @@ controller:
   obstacle_stop_distance: 0.50
   obstacle_slow_distance: 1.00
   progress_distance: 0.25
+
+# 局部地面支撑安全门。默认关闭；开启后只消费未来足迹走廊，不改占据地图。
+ground_support:
+  production_gate_enabled: false
+  # UNKNOWN 临时观察停车可独立关闭；显式低层回波 DROP 仍会锁存停车。
+  # 默认保留完整语义，门/电梯闭环回归可用覆盖配置验证 explicit-DROP-only 模式。
+  unknown_support_hold_enabled: true
+  # 明确 DROP 停稳后仅让当前路径失效，并用现有 BLACK 栅格有界重规划。
+  negative_obstacle_replan_enabled: true
+  maximum_negative_obstacle_replans: 3
+  # 按实测速度上界查保守停车距离，不插值、不向表外外推；有效速度上限取最后一档。
+  # 扩速时新增实测档位并同步复验前视距离，无需修改门控代码或全局控制器速度。
+  stop_distance_table:
+    - [0.60, 0.09337727739487302]
+    - [0.651, 0.10195826367975175]
+    - [0.80, 0.13]
+  # 正支撑只看左右足迹带；完整物理宽度仍专用于明确 DROP 检测。
+  foot_band_center_offset: 0.14
+  foot_band_half_width: 0.10
+  minimum_foot_band_coverage: 0.60
+  # 仅允许被下游正支撑封闭的短内部缺口，末端 UNKNOWN 不桥接。
+  maximum_longitudinal_unknown_gap: 0.10
+  minimum_longitudinal_support_ratio: 0.75
+  sweep_half_width: 0.435393
+  minimum_lookahead: 0.50
+  # 该前视上限只对当前已验证速度负责；扩速前必须重新验证完整安全包络。
+  maximum_lookahead: 0.80
+  footprint_front_reach: 0.30
+  support_band: 0.08
+  minimum_drop: 0.30
+  minimum_cell_hits: 2
+  required_consecutive_frames: 2
+  minimum_alert_cells: 3
+  minimum_frame_points: 50
+  # 仅稀疏积累局部邻域内的明确楼面回波；负证据和安全消费仍只看未来扫掠区。
+  local_support_evidence_radius: 3.0
+  # 独立消费最新 cloud，避免 10Hz 任务 tick 固定晚一帧；不改变任务/控制节拍。
+  assessment_period: 0.02
+  # 由停车余量反推的 DROP 证据硬上限；0.25s 陈旧证据明确无效。
+  drop_evidence_max_age: 0.05
+  decision_period: 0.10
+  rl_receive_delay: 0.009
+  required_margin: 0.02
+  release_hysteresis: 0.10
+  release_supported_frames: 2
+  observation_hold_timeout: 2.0
+  safety_stop_timeout: 3.0
+  stop_linear_threshold: 0.02
+  stop_angular_threshold: 0.05
+  stop_confirmation_samples: 3
+  # UNKNOWN 超时仅清当前 follower 路径，同一父任务 phase 最多重规划两次。
+  maximum_same_phase_replans: 2
+  base_frame: base
+  sensor_frame: laser_livox
 
 detection:
   min_area: 35

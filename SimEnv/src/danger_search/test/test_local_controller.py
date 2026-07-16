@@ -4,6 +4,12 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from danger_search.ground_support_gate import (
+    DROP_STOPPING,
+    GroundSupportAssessment,
+    GroundSupportGateConfig,
+    GroundSupportSafetyGate,
+)
 from danger_search.navigator import PathFollower, compute_tracking_command, RUNNING, STUCK
 
 
@@ -402,6 +408,67 @@ class LocalControllerTest(unittest.TestCase):
         follower.set_path([(0.0, 0.0), (0.0, 1.0), (0.0, 2.0)])
 
         self.assertFalse(follower._is_turn_vertex(1))
+
+    def test_safety_latch_clamps_every_command_entry_and_keepalive(self):
+        class FakeTwist:
+            def __init__(self):
+                self.linear = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+                self.angular = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+        class FakePublisher:
+            def __init__(self):
+                self.messages = []
+
+            def publish(self, message):
+                self.messages.append(message)
+
+        gate = GroundSupportSafetyGate(
+            GroundSupportGateConfig(
+                enabled=True,
+                validated_max_speed=0.60,
+                stop_distance_table=((0.60, 0.09337727739487302),),
+            )
+        )
+        gate.update_assessment(
+            GroundSupportAssessment(
+                stamp=1.0,
+                received_wall_time=1.0,
+                data_age=0.01,
+                supported_distance=0.8,
+                current_footprint_supported=True,
+                observation_adequate=True,
+                drop_confirmed=True,
+                drop_intersects_sweep=True,
+                drop_distance=0.4,
+                drop_direction_world=(1.0, 0.0),
+            )
+        )
+        follower = PathFollower(cmd_vel_topic="/cmd_vel", command_keepalive_period=0.1)
+        follower.set_command_gate(gate)
+        follower._publisher = FakePublisher()
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+
+        with patch("danger_search.navigator.Twist", FakeTwist), patch(
+            "danger_search.navigator.time.monotonic",
+            return_value=1.0,
+        ), patch("danger_search.navigator.get_time", return_value=1.0):
+            follower.tick((0.0, 0.0, 0.0))
+            self.assertEqual(gate.state, DROP_STOPPING)
+            follower.rotate_in_place(0.5)
+            follower.reverse_straight(reason="test_reverse")
+            follower.recover(reason="test_recover")
+            follower._last_command_wall_time = 0.0
+            follower._on_keepalive_timer(None)
+
+        self.assertGreaterEqual(len(follower._publisher.messages), 5)
+        for message in follower._publisher.messages:
+            self.assertEqual(message.linear.x, 0.0)
+            self.assertEqual(message.linear.y, 0.0)
+            self.assertEqual(message.angular.z, 0.0)
+        snapshot = follower.tracking_debug_snapshot()
+        self.assertEqual(snapshot["requested_linear_command"], 0.0)
+        self.assertEqual(snapshot["linear_command"], 0.0)
+        self.assertEqual(snapshot["safety_gate"]["state"], DROP_STOPPING)
 
 
 if __name__ == "__main__":

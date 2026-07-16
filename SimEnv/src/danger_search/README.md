@@ -55,6 +55,7 @@ roslaunch danger_search danger_search_smoke.launch
 - 检测结果使用多帧确认后才输出，优先降低虚警率。
 - 楼层结束需要同时满足最小探索时间、最大离家距离、最小已知面积、覆盖率和连续无可达前沿确认次数；不会再因为 `len(frontiers) <= 1` 直接结束，避免启动后小已知区域 coverage 虚高导致没搜走廊/房间就返航。
 - 楼层探索至少持续 `mission/min_floor_explore_time`，最大离家距离至少达到 `mission/min_floor_travel_distance`，已知面积至少达到 `mission/min_known_area`；`mission/no_reachable_frontier_confirmations` 控制无可达前沿需连续确认的次数，`mission/min_corridor_progress_distance` 可选限制走廊主方向已知范围。
+- `mission/floor_timeout` 作为非最后一层的探索配额，为后续换层保留时间；默认启用 `mission/last_floor_uses_global_budget`，最后一层仍有可达前沿或地图收益时继续探索，并由预计返航时间、`mission/return_safety_buffer` 与 `mission/max_runtime` 共同决定预算退出。关闭该开关可恢复所有楼层到达配额即结束的旧语义。
 - 无前沿且无远处 FREE 目标时，会从机器人当前位置按 `mission/probe_distance` 做短距离探测前进，再重新建图；默认 `mission/probe_yaw=1.5708`，沿比赛入口到房间的全局 +Y 方向探测，避免起立后的机体 yaw 抖动把探测方向带反。探测段如果穿过已知障碍或黑名单栅格，会跳过该目标。
 - Frontier 选择带短期惯性：当前区域仍可达时，新目标分数需要高出 `frontier/switch_score_margin` 才会切换；日志会记录每次选择的分数、距离、门侧、fallback 和切换原因。
 - 过门后除了短时间抑制回头，还会在门后推进距离和门后侧已知面积达到 `mission/post_door_min_distance`、`mission/post_door_min_known_area` 前持续优先门后侧目标，减少刚进门又回头；临时和永久禁区都只在门口有限半径内完全跳过，远处仅按距离衰减降分，避免用无限半平面把整片可达区域永久屏蔽。
@@ -247,6 +248,22 @@ kill-only 工具只订阅状态和 odom，命中边界后向 runner 发送 `SIGI
 
 平地制动包络可额外使用 `--kill-only-min-speed` 约束触发速度。独立楼梯诊断可配置 `--kill-only-minimum-z`、`--kill-only-maximum-abs-roll`、`--kill-only-maximum-abs-pitch` 和 `--kill-only-posture-active-after-sim`；任一姿态危险条件成立即只终止 runner。手动 `/nav/goal` 只能作为明确归档的非生产测试输入，不能写入比赛策略或由真值在正式运行时触发。
 
+需要测量正常导航链路的制动距离时，可让诊断锁存器中继生产算法命令，并在 odom 实测平移速度达到阈值后保持零速：
+
+```bash
+src/danger_search/tools/run_observation.sh \
+  --seed 42 \
+  --max-floor 1 \
+  --params src/danger_search/config/danger_search.yaml \
+  --timeout 180 \
+  --ground-support-capture \
+  --diagnostic-brake-speed 0.70 \
+  --diagnostic-brake-relay \
+  --kill-only-sim-time 20
+```
+
+该模式只属于非生产制动采集：它不注入平移或转向命令，触发前原样中继 Planner、PathFollower 和 RL 的现有命令，触发后仅保持零速。未达到阈值、姿态保护提前终止或 bag 未记录到完全停止的运行都不能扩展停车包络。
+
 离线分析命令如下：
 
 ```bash
@@ -260,3 +277,32 @@ python3 src/danger_search/tools/analyze_ground_support.py \
 分析器区分 `SUPPORTED`、`UNKNOWN_SUPPORT` 和 `NO_SUPPORT_EVIDENCE`。视场外、遮挡、点数不足、从未观测以及单纯“没有点”均保持 `UNKNOWN_SUPPORT`；只有明确穿过当前楼面并命中更低表面的回波才作为缺失支撑正证据。历史路径和 `offline_scene/` 几何只用于离线真值对照，不得成为运行时输入。
 
 Mapper 回放按 10 Hz 推断 tick、最新 cloud/odom 快照、cloud stamp 消费、点云抽样、当前楼层和楼层歧义跳帧近似生产语义。只要回放与实时 `map_debug` 不完全一致，就必须标记为近似回放，并禁止归因某个栅格的具体写入来源。
+
+## 负障碍首版生产停车门
+
+`ground_support/production_gate_enabled` 默认是 `false`。关闭时不创建支撑网格、不查询额外 TF，也不改变命令、任务状态或超时语义。工程回归可通过以下覆盖文件显式启用：
+
+```bash
+python3 src/danger_search/tools/run_seed.py --seed 42 --gui --max-floor 1 \
+  --params src/danger_search/config/ground_support_gate_test.yaml \
+  --timeout <wall秒数>
+```
+
+启用后的首版只在 `PathFollower` 的最终 `/cmd_vel` 出口钳制速度，不修改 `FREE/VISITED`、A*、Frontier、目标和全局速度：
+
+- 新鲜且充分的低层回波连续确认与未来足迹走廊相交，并且命令朝危险方向平移时，锁存零速；完全停止后以 `negative_obstacle` 结束本次运行。
+- `UNKNOWN_SUPPORT` 不等同于悬崖。只有即将驶出最近确认支撑范围时才临时观察停车；连续新鲜支撑恢复后自动继续，超时只报告当前支撑路径不可用。
+- 支撑数据陈旧也只在接近确认支撑边界时临时停车，不按固定点云帧间隔全局停走。
+- 正支撑前缀按左右足迹带的覆盖率和纵向连续性计算；完整 `sweep_half_width` 仍只用于明确 DROP 检测。外缘单个 UNKNOWN 格不会截断前缀，短内部 UNKNOWN 也只有在下游重新出现正支撑且整体覆盖率满足要求时才桥接，末端 UNKNOWN 不桥接。
+- `support_path_unavailable` 只清除当前 follower 路径，保留同一个 `OpenDoorAndPass` 实例、phase、方向、门状态和目标；同一 phase 重规划有界，耗尽后以专用原因结束，不进入普通 recover。
+- 停车后三份新 odom 达到停止阈值即完成。正常观察和停车上限都按仿真时间推进；wall time 仅监视 `/clock`/odom 停止推进并负责进程退出 watchdog。
+
+安全门开启时，用独立的 0.02 s 仿真周期及时消费每个新 Livox cloud，不改变 10 Hz 任务状态机和 PathFollower 节拍。`drop_evidence_max_age=0.05` 约束的是评估时的 cloud/odom 采集年龄，评估后的等待由 `decision_period=0.10` 单独计入停车包络，二者不会重复计费。正支撑只稀疏积累机器人周围 `local_support_evidence_radius=3.0` m 内的明确楼面回波；负支撑更新和门控消费仍严格限定在最长 0.8 m 的未来足迹走廊，不扫描全地图。
+
+`ground_support/unknown_support_hold_enabled` 只控制 UNKNOWN 边界的临时观察停车，不影响明确低层回波 DROP 的锁存停车。默认保持开启；完整任务回归若需要隔离门口 UNKNOWN 误停，可在测试覆盖中关闭并验证 explicit-DROP-only 模式，不能把 UNKNOWN 记成负障碍。
+
+明确 DROP 停稳后，`ground_support/negative_obstacle_replan_enabled` 控制是否把触发点周围按现有物理扫掠半宽写成局部 `BLACK`，仅清除当前 follower 路径并交回原有 A* 重规划；门、电梯父任务、停车超时和速度包络异常仍保持 fail-closed。`maximum_negative_obstacle_replans` 为单次任务提供有界保护，关闭该开关即可恢复“发现 DROP 后结束任务”的旧行为。
+
+停车包络使用 `ground_support/stop_distance_table` 的速度上界保守查表，不插值，有效速度上限直接取表格最后一档。现有表包含平地 0.60/0.651 m/s 制动样本，以及正常 EXIT 中 0.7944 m/s 实际路径方向峰值到完全停车的 0.125 m 实测上界（保守记为 0.80→0.13 m）；超过最后一档时不会外推，而是锁存零速并报告 `support_speed_out_of_envelope`。这不会修改全局 `controller/max_linear`；未来提速只需在补测停车距离、前视距离、数据年龄、横向误差和物理扫掠宽度后扩展配置表，不修改门控状态机。
+
+生产门回归时不得同时启用 `ground_support_stop_latch.py`。后者是外部诊断实验的独立 `/cmd_vel` 中继，会破坏“生产算法只有一个最终速度发布源”的验收前提。

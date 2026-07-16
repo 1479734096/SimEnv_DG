@@ -1,0 +1,9 @@
+# 负障碍生产门定向 Gazebo 回归覆盖。
+# 仅缩短首层等待以复用已验证的 1 层空带测试路径；正式任务时间预算不变。
+mission:
+  max_runtime: 300.0
+  floor_timeout: 30.0
+  min_floor_explore_time: 5.0
+
+ground_support:
+  production_gate_enabled: true

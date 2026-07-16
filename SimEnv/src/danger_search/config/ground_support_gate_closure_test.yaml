@@ -1,0 +1,14 @@
+# 负障碍生产门控的两层闭环回归覆盖。
+# 压缩总探索窗口，但保留生产默认返航余量和换层耗时估计。
+mission:
+  max_runtime: 180.0
+  floor_timeout: 12.0
+  min_floor_explore_time: 5.0
+  floor_finish_time_ratio: 0.65
+  exploration_progress_window: 8.0
+  min_exploration_progress_cells: 15
+
+ground_support:
+  production_gate_enabled: true
+  # 闭环阶段只验证明确 DROP 拦截，避免已知门口 UNKNOWN 造成任务级误停。
+  unknown_support_hold_enabled: false

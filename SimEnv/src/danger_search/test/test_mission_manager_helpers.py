@@ -7,7 +7,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from danger_search.local_semantic_detector import DoorCandidate
-from danger_search.mapper import MultiFloorGridMap
+from danger_search.ground_support_gate import (
+    CLEAR as GROUND_SUPPORT_CLEAR,
+    DROP_STOPPING,
+    SAFETY_BLOCKED,
+    SAFETY_STOP_TIMEOUT,
+    SUPPORT_PATH_UNAVAILABLE,
+    GroundSupportAssessment,
+    GroundSupportGateConfig,
+    GroundSupportSafetyGate,
+)
+from danger_search.mapper import BLACK, MultiFloorGridMap
 import danger_search.mission_manager as mission_manager_module
 from danger_search.mission_manager import (
     EXPLORE_FLOOR,
@@ -23,9 +33,111 @@ from danger_search.mission_manager import probe_target_for_attempt
 from danger_search.navigation_tasks import OpenDoorAndPass, TakeElevator, FAILED
 from danger_search.navigator import STUCK
 from danger_search.planner import PlanResult, BUDGET_EXHAUSTED
+from danger_search.sensor_buffer import SensorBuffer
 
 
 class MissionManagerHelperTest(unittest.TestCase):
+    def test_only_elevator_threshold_crossing_disables_unknown_support_hold(self):
+        task = TakeElevator(0, 1)
+        for phase in ("ENTER_CABIN", "EXIT_CABIN"):
+            task.phase = phase
+            self.assertFalse(
+                mission_manager_module._ground_support_unknown_hold_enabled(task)
+            )
+
+        for phase in ("WAIT_TARGET_DOOR_OPEN", "CLOSE_TARGET_FLOOR_DOOR"):
+            task.phase = phase
+            self.assertTrue(
+                mission_manager_module._ground_support_unknown_hold_enabled(task)
+            )
+
+        door_task = OpenDoorAndPass("main_entrance")
+        door_task.phase = "GO_PASS_POINT"
+        self.assertTrue(
+            mission_manager_module._ground_support_unknown_hold_enabled(door_task)
+        )
+
+    def test_unknown_support_hold_can_be_disabled_without_task_special_cases(self):
+        """显式 DROP-only 回归模式应允许全局关闭 UNKNOWN 临时停车。"""
+        self.assertFalse(
+            mission_manager_module._ground_support_unknown_hold_enabled(
+                None,
+                configured=False,
+            )
+        )
+        self.assertFalse(
+            mission_manager_module._ground_support_unknown_hold_enabled(
+                OpenDoorAndPass("main_entrance"),
+                configured=False,
+            )
+        )
+
+    def test_sync_ground_support_context_combines_config_and_task_phase(self):
+        values = []
+        manager = MissionManager.__new__(MissionManager)
+        manager.ground_support_params = {"unknown_support_hold_enabled": False}
+        manager._ground_support_gate = SimpleNamespace(
+            set_unknown_support_hold_enabled=values.append
+        )
+        manager.current_task = None
+
+        manager._sync_ground_support_task_context()
+
+        self.assertEqual(values, [False])
+
+    def test_ground_support_data_age_does_not_double_count_nominal_decision_cycle(self):
+        self.assertAlmostEqual(
+            mission_manager_module._ground_support_data_age(
+                cloud_stamp=10.0,
+                odom_stamp=10.002,
+                control_time=10.10,
+                decision_period=0.10,
+            ),
+            0.002,
+        )
+        self.assertAlmostEqual(
+            mission_manager_module._ground_support_data_age(
+                cloud_stamp=10.0,
+                odom_stamp=10.002,
+                control_time=10.14,
+                decision_period=0.10,
+            ),
+            0.04,
+        )
+
+    def test_ground_support_snapshot_uses_opt_in_nearest_odom_without_changing_latest(self):
+        buffer = SensorBuffer(
+            odom_topic="/odom",
+            cloud_topic="/cloud",
+            rgb_topic="/rgb",
+            depth_topic="/depth",
+            camera_info_topic="/camera_info",
+        )
+        buffer.enable_cloud_odom_matching(max_samples=8)
+        for stamp in (1.0, 1.02, 1.04):
+            buffer._on_odom(self._odom_message(stamp))
+        buffer._on_cloud(self._stamped_message(1.021))
+
+        matched = buffer.ground_support_snapshot()
+        latest = buffer.snapshot()
+
+        self.assertAlmostEqual(
+            matched.odom_msg.header.stamp.to_sec(),
+            1.02,
+        )
+        self.assertAlmostEqual(
+            latest.odom_msg.header.stamp.to_sec(),
+            1.04,
+        )
+
+    def test_stop_distance_table_parser_preserves_replaceable_breakpoints(self):
+        self.assertEqual(
+            mission_manager_module._parse_stop_distance_table(
+                [[0.30, 0.06], [0.60, 0.09337727739487302]]
+            ),
+            ((0.30, 0.06), (0.60, 0.09337727739487302)),
+        )
+
     def test_optional_exit_cap_uses_zero_as_ros_safe_disabled_value(self):
         self.assertIsNone(
             mission_manager_module._optional_positive_float(
@@ -46,12 +158,397 @@ class MissionManagerHelperTest(unittest.TestCase):
                 "controller/exit_first_max_linear",
             )
 
+    def test_disabled_ground_support_path_does_not_query_tf_or_change_control(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager._ground_support_gate = None
+        manager._ground_support_grid = None
+        manager.sensor_buffer = SimpleNamespace(
+            frame_transform_matrix=lambda *args, **kwargs: self.fail("关闭时不得查询 TF")
+        )
+
+        manager._update_ground_support_assessment(
+            SimpleNamespace(odom_msg=None),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0),
+            [],
+            1.0,
+        )
+
+    def test_ground_support_timer_consumes_each_new_cloud_once(self):
+        updates = []
+        reads = []
+        cloud = self._stamped_message(1.0)
+        odom = self._odom_message(1.01)
+        snapshot = SimpleNamespace(odom_msg=odom, cloud_msg=cloud, image_bundle=None)
+        manager = MissionManager.__new__(MissionManager)
+        manager._ground_support_gate = object()
+        manager._ground_support_grid = object()
+        manager._last_ground_support_cloud_stamp = None
+        manager._floor_transition_guard = None
+        manager.current_floor = 0
+        manager.current_task = None
+        manager.cloud_max_points = 100
+        manager.cloud_stride = 1
+        manager.mapper = SimpleNamespace(estimate_floor_from_z=lambda _z: 0)
+        manager.sensor_buffer = SimpleNamespace(
+            snapshot=lambda: snapshot,
+            read_cloud_xyz=lambda *args, **kwargs: reads.append(True) or [(0.0, 0.0, 0.0)],
+        )
+        manager._update_ground_support_assessment = (
+            lambda _snapshot, _pose, _xyz, _points, stamp: updates.append(stamp)
+        )
+
+        manager._on_ground_support_timer(None)
+        manager._on_ground_support_timer(None)
+
+        self.assertEqual(reads, [True])
+        self.assertEqual(updates, [1.0])
+
+    def test_negative_obstacle_ends_without_ordinary_stuck_or_recover(self):
+        transitions = []
+        failures = []
+        controller_calls = []
+        manager = MissionManager.__new__(MissionManager)
+        manager._ground_support_gate = SimpleNamespace(
+            state=SAFETY_BLOCKED,
+            reason_code="negative_obstacle",
+            check_wall_timeout=lambda _now: None,
+            snapshot=lambda: {"state": SAFETY_BLOCKED},
+        )
+        manager._ground_support_last_state = SAFETY_BLOCKED
+        manager.ground_support_params = {"negative_obstacle_replan_enabled": False}
+        manager.state = EXPLORE_FLOOR
+        manager._mission_success_eligible = True
+        manager.controller = SimpleNamespace(
+            reset_progress_timer=lambda pose: controller_calls.append(("reset", pose)),
+            stop=lambda **kwargs: controller_calls.append(("stop", kwargs)),
+        )
+        manager._record_failure = lambda reason: failures.append(reason)
+        manager._transition_state = lambda state, **kwargs: transitions.append((state, kwargs))
+
+        handled = manager._handle_ground_support_control((1.0, 2.0, 0.0))
+
+        self.assertTrue(handled)
+        self.assertEqual(failures, ["negative_obstacle"])
+        self.assertEqual(transitions[0][0], WRITE_RESULT)
+        self.assertEqual(transitions[0][1]["reason_code"], "negative_obstacle")
+        self.assertFalse(manager._mission_success_eligible)
+        self.assertNotIn("recover", [item[0] for item in controller_calls])
+
+    def test_negative_obstacle_can_mark_local_black_and_replan_without_recover(self):
+        failures = []
+        transitions = []
+        logs = []
+        controller_calls = []
+        gate = GroundSupportSafetyGate(
+            GroundSupportGateConfig(
+                enabled=True,
+                validated_max_speed=0.60,
+                stop_distance_table=((0.60, 0.10),),
+                stop_confirmation_samples=1,
+            )
+        )
+        gate.update_assessment(
+            GroundSupportAssessment(
+                stamp=10.0,
+                received_wall_time=100.0,
+                data_age=0.01,
+                supported_distance=0.5,
+                current_footprint_supported=True,
+                observation_adequate=True,
+                drop_confirmed=True,
+                drop_intersects_sweep=True,
+                drop_distance=0.7,
+                drop_direction_world=(1.0, 0.0),
+                received_control_time=100.0,
+                drop_point_world=(1.0, 0.0),
+            )
+        )
+        gate.filter_command(
+            (0.3, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.0,
+            control_time=100.0,
+        )
+        gate.observe_odometry(
+            1.0,
+            linear_speed=0.0,
+            angular_speed=0.0,
+            wall_time=100.1,
+        )
+        self.assertEqual(gate.state, SAFETY_BLOCKED)
+
+        manager = MissionManager.__new__(MissionManager)
+        manager._ground_support_gate = gate
+        manager._ground_support_last_state = SAFETY_BLOCKED
+        manager._ground_support_negative_replan_count = 0
+        manager.ground_support_params = {
+            "negative_obstacle_replan_enabled": True,
+            "maximum_negative_obstacle_replans": 2,
+            "sweep_half_width": 0.4,
+        }
+        manager.map_params = {"resolution": 0.1}
+        manager.mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        )
+        manager.current_floor = 0
+        manager.state = EXPLORE_FLOOR
+        manager.current_task = None
+        manager.current_frontier = SimpleNamespace(centroid=(2.0, 0.0))
+        manager._last_frontier_target = (2.0, 0.0)
+        manager._last_frontier_score = 1.0
+        manager._last_frontier_used_fallback = False
+        manager.controller = SimpleNamespace(
+            reset_progress_timer=lambda pose: controller_calls.append(("reset", pose)),
+            stop=lambda **kwargs: controller_calls.append(("stop", kwargs)),
+            clear_path=lambda **kwargs: controller_calls.append(("clear", kwargs)),
+        )
+        manager._record_failure = failures.append
+        manager._transition_state = lambda state, **kwargs: transitions.append((state, kwargs))
+        manager._elapsed = lambda: 12.0
+        manager._log_structured = logs.append
+
+        handled = manager._handle_ground_support_control((0.0, 0.0, 0.0))
+
+        drop_cell = manager.mapper.floor(0).world_to_grid(1.0, 0.0)
+        self.assertTrue(handled)
+        self.assertEqual(manager.mapper.floor(0).data[drop_cell[1], drop_cell[0]], BLACK)
+        manager.mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(1.0, 0.0, 0.6),
+            points=[],
+        )
+        self.assertNotEqual(manager.mapper.floor(0).data[drop_cell[1], drop_cell[0]], BLACK)
+        manager._reapply_ground_support_black_marks(0)
+        self.assertEqual(manager.mapper.floor(0).data[drop_cell[1], drop_cell[0]], BLACK)
+        self.assertEqual(gate.state, GROUND_SUPPORT_CLEAR)
+        self.assertIsNone(manager.current_frontier)
+        self.assertIsNone(manager._last_frontier_target)
+        self.assertEqual(failures, [])
+        self.assertEqual(transitions, [])
+        self.assertFalse(any(call[0] == "recover" for call in controller_calls))
+        self.assertEqual(logs[-1]["event"], "negative_obstacle_local_replan")
+
+    def test_wall_watch_ends_runner_when_sim_clock_cannot_advance(self):
+        failures = []
+        stop_reasons = []
+        shutdown_reasons = []
+
+        class TimeoutGate:
+            state = DROP_STOPPING
+            reason_code = "negative_obstacle"
+
+            def check_wall_timeout(self, _wall_time):
+                self.state = SAFETY_STOP_TIMEOUT
+                self.reason_code = "ground_support_safety_stop_timeout"
+
+        manager = MissionManager.__new__(MissionManager)
+        manager._ground_support_gate = TimeoutGate()
+        manager._ground_support_wall_stop = SimpleNamespace(wait=lambda _timeout: False)
+        manager._ground_support_forced_shutdown_reason = None
+        manager._shutdown_requested = False
+        manager._mission_success_eligible = True
+        manager._record_failure = lambda reason: failures.append(reason)
+        manager.controller = SimpleNamespace(
+            stop=lambda **kwargs: stop_reasons.append(kwargs.get("reason"))
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(signal_shutdown=lambda reason: shutdown_reasons.append(reason)),
+        ):
+            manager._ground_support_wall_watch()
+
+        self.assertEqual(failures, ["ground_support_safety_stop_timeout"])
+        self.assertEqual(stop_reasons, ["ground_support_safety_stop_timeout"])
+        self.assertEqual(shutdown_reasons, ["ground_support_safety_stop_timeout"])
+        self.assertEqual(
+            manager._ground_support_forced_shutdown_reason,
+            "ground_support_safety_stop_timeout",
+        )
+        self.assertTrue(manager._shutdown_requested)
+        self.assertFalse(manager._mission_success_eligible)
+
+    def test_unknown_timeout_fails_only_current_path_without_discarding_frontier(self):
+        cleared = []
+        failures = []
+        gate = GroundSupportSafetyGate(
+            GroundSupportGateConfig(
+                enabled=True,
+                validated_max_speed=0.60,
+                stop_distance_table=((0.60, 0.09337727739487302),),
+            )
+        )
+        gate.state = SUPPORT_PATH_UNAVAILABLE
+        gate.reason_code = "ground_support_path_unavailable"
+        manager = MissionManager.__new__(MissionManager)
+        manager._ground_support_gate = gate
+        manager._ground_support_last_state = SUPPORT_PATH_UNAVAILABLE
+        manager.state = EXPLORE_FLOOR
+        manager.current_task = None
+        manager.active_door = None
+        manager.current_frontier = SimpleNamespace(centroid=(3.0, 4.0))
+        manager._last_frontier_target = (3.0, 4.0)
+        manager._last_frontier_score = 1.0
+        manager._last_frontier_used_fallback = False
+        manager._ground_support_path_retry_key = None
+        manager._ground_support_path_retry_count = 0
+        manager.ground_support_params = {"maximum_same_phase_replans": 2}
+        manager.controller = SimpleNamespace(
+            reset_progress_timer=lambda pose: None,
+            stop=lambda **kwargs: None,
+            clear_path=lambda **kwargs: cleared.append(kwargs),
+        )
+        manager._record_failure = lambda reason: failures.append(reason)
+        manager._log_structured = lambda payload: None
+
+        handled = manager._handle_ground_support_control((0.0, 0.0, 0.0))
+
+        self.assertTrue(handled)
+        self.assertEqual(cleared, [{"reason": "ground_support_path_unavailable"}])
+        self.assertEqual(failures, [])
+        self.assertIsNotNone(manager.current_frontier)
+        self.assertEqual(manager._last_frontier_target, (3.0, 4.0))
+        self.assertEqual(gate.state, GROUND_SUPPORT_CLEAR)
+
+    def test_unknown_timeout_preserves_open_door_parent_and_phase(self):
+        cleared = []
+        gate = GroundSupportSafetyGate(
+            GroundSupportGateConfig(
+                enabled=True,
+                validated_max_speed=0.60,
+                stop_distance_table=((0.60, 0.09337727739487302),),
+            )
+        )
+        gate.state = SUPPORT_PATH_UNAVAILABLE
+        gate.reason_code = "ground_support_path_unavailable"
+        task = OpenDoorAndPass("main_entrance")
+        task.phase = "GO_PASS_POINT"
+        task._wait_point = (0.0, 0.0)
+        task._pass_point = (1.0, 0.0)
+        task._commit_point = (2.0, 0.0)
+        manager = MissionManager.__new__(MissionManager)
+        manager._ground_support_gate = gate
+        manager._ground_support_last_state = SUPPORT_PATH_UNAVAILABLE
+        manager._ground_support_path_retry_key = None
+        manager._ground_support_path_retry_count = 0
+        manager.ground_support_params = {"maximum_same_phase_replans": 2}
+        manager.state = EXPLORE_FLOOR
+        manager.current_task = task
+        manager.active_door = "main_entrance"
+        manager.current_frontier = None
+        manager._last_frontier_target = None
+        manager.controller = SimpleNamespace(
+            reset_progress_timer=lambda pose: None,
+            stop=lambda **kwargs: None,
+            clear_path=lambda **kwargs: cleared.append(kwargs),
+        )
+        manager._log_structured = lambda payload: None
+
+        handled = manager._handle_ground_support_control((0.0, 0.0, 0.0))
+
+        self.assertTrue(handled)
+        self.assertIs(manager.current_task, task)
+        self.assertEqual(task.phase, "GO_PASS_POINT")
+        self.assertEqual(manager.active_door, "main_entrance")
+        self.assertEqual(task.pass_point, (1.0, 0.0))
+        self.assertEqual(cleared, [{"reason": "ground_support_path_unavailable"}])
+
+    def test_same_open_door_phase_replan_is_bounded_without_recover(self):
+        transitions = []
+        failures = []
+        recover_calls = []
+        task = OpenDoorAndPass("main_entrance")
+        task.phase = "GO_PASS_POINT"
+        manager = MissionManager.__new__(MissionManager)
+        manager._ground_support_last_state = SUPPORT_PATH_UNAVAILABLE
+        manager._ground_support_path_retry_key = None
+        manager._ground_support_path_retry_count = 0
+        manager.ground_support_params = {"maximum_same_phase_replans": 2}
+        manager.state = EXPLORE_FLOOR
+        manager.current_task = task
+        manager.active_door = "main_entrance"
+        manager.current_frontier = None
+        manager._last_frontier_target = None
+        manager._mission_success_eligible = True
+        manager.controller = SimpleNamespace(
+            reset_progress_timer=lambda pose: None,
+            stop=lambda **kwargs: None,
+            clear_path=lambda **kwargs: None,
+            recover=lambda: recover_calls.append(True),
+        )
+        manager._record_failure = lambda reason: failures.append(reason)
+        manager._transition_state = lambda state, **kwargs: transitions.append((state, kwargs))
+        manager._log_structured = lambda payload: None
+
+        for _attempt in range(3):
+            gate = GroundSupportSafetyGate(
+                GroundSupportGateConfig(
+                    enabled=True,
+                    validated_max_speed=0.60,
+                    stop_distance_table=((0.60, 0.09337727739487302),),
+                )
+            )
+            gate.state = SUPPORT_PATH_UNAVAILABLE
+            gate.reason_code = "ground_support_path_unavailable"
+            manager._ground_support_gate = gate
+            manager._ground_support_last_state = SUPPORT_PATH_UNAVAILABLE
+            manager._handle_ground_support_control((0.0, 0.0, 0.0))
+
+        self.assertIs(manager.current_task, task)
+        self.assertEqual(task.phase, "GO_PASS_POINT")
+        self.assertEqual(recover_calls, [])
+        self.assertEqual(failures, ["ground_support_path_replan_exhausted"])
+        self.assertEqual(transitions[-1][0], WRITE_RESULT)
+
+    def test_floor_transition_invalidates_old_floor_support_assessment(self):
+        manager, _, _, reads, map_updates, _ = self._make_floor_transition_manager()
+        invalidations = []
+        manager._ground_support_gate = SimpleNamespace(
+            invalidate_assessment=lambda: invalidations.append(True)
+        )
+
+        manager._update_mapping_and_detection(
+            self._mapping_snapshot(cloud_stamp=1.0, odom_stamp=1.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 2.6),
+        )
+
+        self.assertEqual(invalidations, [True])
+        self.assertEqual(reads, [])
+        self.assertEqual(map_updates, [])
+
     @staticmethod
     def _stamped_message(stamp: float):
         return SimpleNamespace(
             header=SimpleNamespace(
                 stamp=SimpleNamespace(to_sec=lambda value=stamp: value),
             )
+        )
+
+    @staticmethod
+    def _odom_message(stamp: float):
+        return SimpleNamespace(
+            header=SimpleNamespace(
+                stamp=SimpleNamespace(to_sec=lambda value=stamp: value),
+            ),
+            pose=SimpleNamespace(
+                pose=SimpleNamespace(
+                    position=SimpleNamespace(x=0.0, y=0.0, z=0.39),
+                    orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+                )
+            ),
+            twist=SimpleNamespace(
+                twist=SimpleNamespace(
+                    linear=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                    angular=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                )
+            ),
         )
 
     def _make_floor_transition_manager(self):
@@ -525,6 +1022,9 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.state = EXPLORE_FLOOR
         manager.start_time = 0.0
         manager.floor_timeout = 180.0
+        manager.max_floor = 1
+        manager.min_floor_explore_time = 20.0
+        manager.last_floor_uses_global_budget = True
         manager.current_floor = 0
         manager.current_task = None
         manager.current_frontier = SimpleNamespace(centroid=(2.0, 1.0))
@@ -559,7 +1059,14 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertFalse(manager._return_home_started)
         self.assertTrue(manager._mission_success_eligible)
         self.assertEqual(len(logged_payloads), 1)
-        self.assertEqual(logged_payloads[0]["action"], "continue_until_min_floor_time")
+        self.assertEqual(
+            logged_payloads[0]["action"],
+            "continue_until_global_return_boundary",
+        )
+        self.assertEqual(
+            logged_payloads[0]["reason_code"],
+            "last_floor_continues_under_global_budget",
+        )
         self.assertEqual(logged_payloads[0]["last_reachable_frontier_count"], 6)
 
     def test_successful_single_floor_completion_requires_return_home(self):
@@ -1448,6 +1955,9 @@ class TimeBudgetDecisionTest(unittest.TestCase):
         manager.max_floor = overrides.get("max_floor", 1)
         manager.max_runtime = overrides.get("max_runtime", 120.0)
         manager.floor_timeout = overrides.get("floor_timeout", 40.0)
+        manager.last_floor_uses_global_budget = overrides.get(
+            "last_floor_uses_global_budget", True
+        )
         manager.min_floor_explore_time = overrides.get("min_floor_explore_time", 5.0)
         manager.return_safety_buffer = overrides.get("return_safety_buffer", 10.0)
         manager.return_speed_estimate = overrides.get("return_speed_estimate", 0.5)
@@ -1496,18 +2006,50 @@ class TimeBudgetDecisionTest(unittest.TestCase):
         self.assertEqual(action, "CONTINUE")
         self.assertEqual(reason, "budget_allows_continue")
 
-    def test_floor_timeout_single_floor_returns_home(self):
-        """单层场景下楼超时后应返航。"""
+    def test_floor_timeout_single_floor_uses_global_budget(self):
+        """单层仍有收益且返航时间充足时，不应浪费剩余总预算。"""
         manager = self._make_manager(max_floor=1, max_runtime=120.0, floor_timeout=40.0)
         action, reason = manager._decide_mission_action(
             (3.0, 0.0, 0.0),
             manager.mapper.floor(0),
-            [SimpleNamespace(centroid=(5.0, 0.0))],
+            [SimpleNamespace(centroid=(5.0, 0.0))] * 3,
+            floor_elapsed=45.0,
+            mission_elapsed=50.0,
+        )
+        self.assertEqual(action, "CONTINUE")
+        self.assertEqual(reason, "last_floor_uses_global_budget")
+
+    def test_floor_timeout_legacy_switch_returns_home(self):
+        """关闭新语义时，单层到达原楼层上限后仍立即返航。"""
+        manager = self._make_manager(
+            max_floor=1,
+            max_runtime=120.0,
+            floor_timeout=40.0,
+            last_floor_uses_global_budget=False,
+        )
+        action, reason = manager._decide_mission_action(
+            (3.0, 0.0, 0.0),
+            manager.mapper.floor(0),
+            [SimpleNamespace(centroid=(5.0, 0.0))] * 3,
             floor_elapsed=45.0,
             mission_elapsed=50.0,
         )
         self.assertEqual(action, "RETURN_HOME")
         self.assertEqual(reason, "floor_timeout_return_home")
+
+    def test_last_floor_of_multi_floor_uses_global_budget(self):
+        """多层任务的最后一层同样由全局返航边界收口。"""
+        manager = self._make_manager(max_floor=3, max_runtime=200.0, floor_timeout=40.0)
+        manager.current_floor = 2
+        action, reason = manager._decide_mission_action(
+            (1.0, 0.0, 0.0),
+            manager.mapper.floor(0),
+            [SimpleNamespace(centroid=(5.0, 0.0))] * 3,
+            floor_elapsed=45.0,
+            mission_elapsed=80.0,
+        )
+        self.assertEqual(action, "CONTINUE")
+        self.assertEqual(reason, "last_floor_uses_global_budget")
 
     def test_floor_timeout_multi_floor_with_elevator_changes_floor(self):
         """多楼层且存在可用电梯、剩余时间足够时，楼超时后换层。"""

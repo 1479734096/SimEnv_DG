@@ -7,6 +7,7 @@ import os
 from collections import deque
 from dataclasses import dataclass, replace
 from pathlib import Path
+from threading import Event, Thread
 import time
 
 import numpy as np
@@ -26,6 +27,19 @@ from danger_search.detection_tracker import DetectionTracker
 from danger_search.building_control_client import BuildingControlClient, DoorInfo
 from danger_search.navigation_tasks import NavigationTask, TakeElevator, OpenDoorAndPass, NavigateToPose, FAILED
 from danger_search.frontier import Frontier, FrontierExplorer, FrontierSelectionContext
+from danger_search.ground_support_gate import (
+    CLEAR as GROUND_SUPPORT_CLEAR,
+    DROP_STOPPING,
+    OBSERVATION_HOLD,
+    SAFETY_BLOCKED,
+    SAFETY_STOP_TIMEOUT,
+    SPEED_OUT_OF_ENVELOPE_STOPPING,
+    STALE_DATA_HOLD,
+    SUPPORT_PATH_UNAVAILABLE,
+    GroundSupportAssessment,
+    GroundSupportGateConfig,
+    GroundSupportSafetyGate,
+)
 from .time_utils import get_time
 from danger_search.local_semantic_detector import DoorCandidate, LocalSemanticDetector
 from danger_search.navigator import DONE, IDLE, STUCK, PathFollower
@@ -33,7 +47,15 @@ from danger_search.planner import BUDGET_EXHAUSTED, astar_path, astar_plan, path
 from danger_search.mapper import FREE, UNKNOWN, VISITED, MultiFloorGridMap
 from danger_search.red_sphere_detector import RedSphereDetector
 from danger_search.result_writer import ResultWriter
-from danger_search.sensor_buffer import SensorBuffer, odom_pose_xy_yaw, odom_xyz
+from danger_search.sensor_buffer import (
+    SensorBuffer,
+    odom_angular_speed,
+    odom_planar_speed,
+    odom_pose_xy_yaw,
+    odom_rotation_matrix,
+    odom_xyz,
+)
+from danger_search.support_shadow import ShadowSupportConfig, ShadowSupportGrid
 
 
 INIT = "INIT"
@@ -272,6 +294,21 @@ class MissionManager:
         self._progress_history: list[dict[str, object]] = []
         self._last_budget_decision: tuple[str, str] | None = None
         self._last_budget_decision_time: float = 0.0
+        self._ground_support_gate: GroundSupportSafetyGate | None = None
+        self._ground_support_grid: ShadowSupportGrid | None = None
+        self._ground_support_sensor_mount: np.ndarray | None = None
+        self._last_ground_support_cloud_stamp: float | None = None
+        self._ground_support_timer = None
+        self._ground_support_last_state = GROUND_SUPPORT_CLEAR
+        self._ground_support_wall_stop = Event()
+        self._ground_support_wall_thread: Thread | None = None
+        self._ground_support_forced_shutdown_reason: str | None = None
+        self._ground_support_path_retry_key = None
+        self._ground_support_path_retry_count = 0
+        self._ground_support_negative_replan_count = 0
+        self._ground_support_negative_obstacle_marks: list[
+            tuple[int, float, float, float]
+        ] = []
 
         self._load_params()
         self._status_publisher = None
@@ -291,6 +328,7 @@ class MissionManager:
             local_target_topic=self.local_target_topic,
             **self.controller_params,
         )
+        self._configure_ground_support_gate()
         self.detector = RedSphereDetector(**self.detection_params)
         self.local_detector = LocalSemanticDetector(**self.local_detection_params)
         self.tracker = DetectionTracker(**self.tracker_params)
@@ -308,6 +346,65 @@ class MissionManager:
         )
         self.result_writer = ResultWriter(self.result_file)
 
+    def _configure_ground_support_gate(self) -> None:
+        params = self.ground_support_params
+        if not params["production_gate_enabled"]:
+            return
+        gate_config = GroundSupportGateConfig(
+            enabled=True,
+            validated_max_speed=params["validated_max_speed"],
+            stop_distance_table=params["stop_distance_table"],
+            drop_evidence_max_age=params["drop_evidence_max_age"],
+            decision_period=params["decision_period"],
+            rl_receive_delay=params["rl_receive_delay"],
+            required_margin=params["required_margin"],
+            release_hysteresis=params["release_hysteresis"],
+            release_supported_frames=params["release_supported_frames"],
+            observation_hold_timeout=params["observation_hold_timeout"],
+            safety_stop_timeout=params["safety_stop_timeout"],
+            stop_linear_threshold=params["stop_linear_threshold"],
+            stop_angular_threshold=params["stop_angular_threshold"],
+            stop_confirmation_samples=params["stop_confirmation_samples"],
+        )
+        sweep_half_width = params["sweep_half_width"]
+        support_config = ShadowSupportConfig(
+            resolution=self.map_params["resolution"],
+            origin_x=self.map_params["origin_x"],
+            origin_y=self.map_params["origin_y"],
+            floor_height=self.map_params["floor_height"],
+            # MissionManager 已按生产建图配置抽样，禁止在安全门内重复降采样。
+            cloud_stride=1,
+            cloud_max_points=self.cloud_max_points,
+            support_band=params["support_band"],
+            minimum_drop=params["minimum_drop"],
+            minimum_cell_hits=params["minimum_cell_hits"],
+            required_consecutive_frames=params["required_consecutive_frames"],
+            minimum_alert_cells=params["minimum_alert_cells"],
+            sweep_half_width=sweep_half_width,
+            foot_band_center_offset=params["foot_band_center_offset"],
+            foot_band_half_width=params["foot_band_half_width"],
+            minimum_foot_band_coverage=params["minimum_foot_band_coverage"],
+            maximum_longitudinal_unknown_gap=params[
+                "maximum_longitudinal_unknown_gap"
+            ],
+            minimum_longitudinal_support_ratio=params[
+                "minimum_longitudinal_support_ratio"
+            ],
+            minimum_lookahead=params["minimum_lookahead"],
+            maximum_lookahead=params["maximum_lookahead"],
+            footprint_front_reach=params["footprint_front_reach"],
+            path_goal_tolerance=self.controller.goal_tolerance,
+            obstacle_min_height=self.map_params["obstacle_min_z"],
+            obstacle_max_height=self.map_params["obstacle_max_z"],
+            minimum_frame_points=params["minimum_frame_points"],
+            local_support_evidence_radius=params["local_support_evidence_radius"],
+            threshold_widths=(sweep_half_width,),
+        )
+        self._ground_support_gate = GroundSupportSafetyGate(gate_config)
+        self._ground_support_grid = ShadowSupportGrid(support_config)
+        self.sensor_buffer.enable_cloud_odom_matching()
+        self.controller.set_command_gate(self._ground_support_gate)
+
     def start(self) -> None:
         self.sensor_buffer.start()
         self.controller.start()
@@ -321,6 +418,17 @@ class MissionManager:
         if PoseStamped is not None:
             self._goal_subscriber = rospy.Subscriber(self.goal_topic, PoseStamped, self._goal_callback)
         self._timer = rospy.Timer(rospy.Duration(0.1), self._on_timer)
+        if self._ground_support_gate is not None:
+            self._ground_support_timer = rospy.Timer(
+                rospy.Duration(self.ground_support_params["assessment_period"]),
+                self._on_ground_support_timer,
+            )
+            self._ground_support_wall_thread = Thread(
+                target=self._ground_support_wall_watch,
+                name="ground-support-wall-watch",
+                daemon=True,
+            )
+            self._ground_support_wall_thread.start()
         rospy.on_shutdown(self.shutdown)
         rospy.loginfo("danger_search 已启动，等待传感器数据")
 
@@ -333,9 +441,29 @@ class MissionManager:
         self.current_frontier = None
         rospy.loginfo("收到新的手动导航目标点: (%.2f, %.2f)，已切换到手动目标模式！", self.manual_goal[0], self.manual_goal[1])
 
+    def _ground_support_wall_watch(self) -> None:
+        """仿真时钟冻结时仍能执行安全停车异常上限。"""
+        gate = self._ground_support_gate
+        while gate is not None and not self._ground_support_wall_stop.wait(0.05):
+            gate.check_wall_timeout(time.monotonic())
+            if gate.state != SAFETY_STOP_TIMEOUT:
+                continue
+            reason = gate.reason_code or "ground_support_safety_stop_timeout"
+            self._ground_support_forced_shutdown_reason = reason
+            self._mission_success_eligible = False
+            self._record_failure(reason)
+            self.controller.stop(reason=reason)
+            self._shutdown_requested = True
+            rospy.signal_shutdown(reason)
+            return
+
     def shutdown(self) -> None:
+        wall_stop = getattr(self, "_ground_support_wall_stop", None)
+        if wall_stop is not None:
+            wall_stop.set()
         write_reason = (
-            "mission_requested_shutdown"
+            getattr(self, "_ground_support_forced_shutdown_reason", None)
+            or "mission_requested_shutdown"
             if bool(getattr(self, "_shutdown_requested", False))
             else "external_ros_shutdown"
         )
@@ -382,6 +510,9 @@ class MissionManager:
         self.max_runtime = float(_param("mission/max_runtime", 590.0))
         self.max_floor = int(_param("mission/max_floor", 1))
         self.floor_timeout = float(_param("mission/floor_timeout", 180.0))
+        self.last_floor_uses_global_budget = bool(
+            _param("mission/last_floor_uses_global_budget", True)
+        )
         self.min_floor_explore_time = float(_param("mission/min_floor_explore_time", 20.0))
 
         # 方案 C：全局时间预算参数
@@ -451,6 +582,123 @@ class MissionManager:
         }
         self.cloud_stride = int(_param("map/cloud_stride", 3))
         self.cloud_max_points = int(_param("map/cloud_max_points", 18000))
+        stop_distance_table = _parse_stop_distance_table(
+            _param(
+                "ground_support/stop_distance_table",
+                [
+                    [0.60, 0.09337727739487302],
+                    [0.651, 0.10195826367975175],
+                    [0.80, 0.13],
+                ],
+            )
+        )
+        self.ground_support_params = {
+            "production_gate_enabled": bool(
+                _param("ground_support/production_gate_enabled", False)
+            ),
+            "unknown_support_hold_enabled": bool(
+                _param("ground_support/unknown_support_hold_enabled", True)
+            ),
+            "negative_obstacle_replan_enabled": bool(
+                _param("ground_support/negative_obstacle_replan_enabled", True)
+            ),
+            # 有效速度域由可替换停车表最后一档决定，避免扩速时双参数漂移。
+            "validated_max_speed": float(stop_distance_table[-1][0]),
+            "stop_distance_table": stop_distance_table,
+            "sweep_half_width": float(
+                _param("ground_support/sweep_half_width", 0.435393)
+            ),
+            "foot_band_center_offset": float(
+                _param("ground_support/foot_band_center_offset", 0.14)
+            ),
+            "foot_band_half_width": float(
+                _param("ground_support/foot_band_half_width", 0.10)
+            ),
+            "minimum_foot_band_coverage": float(
+                _param("ground_support/minimum_foot_band_coverage", 0.60)
+            ),
+            "maximum_longitudinal_unknown_gap": float(
+                _param("ground_support/maximum_longitudinal_unknown_gap", 0.10)
+            ),
+            "minimum_longitudinal_support_ratio": float(
+                _param("ground_support/minimum_longitudinal_support_ratio", 0.75)
+            ),
+            "minimum_lookahead": float(
+                _param("ground_support/minimum_lookahead", 0.50)
+            ),
+            "maximum_lookahead": float(
+                _param("ground_support/maximum_lookahead", 0.80)
+            ),
+            "footprint_front_reach": float(
+                _param("ground_support/footprint_front_reach", 0.30)
+            ),
+            "support_band": float(_param("ground_support/support_band", 0.08)),
+            "minimum_drop": float(_param("ground_support/minimum_drop", 0.30)),
+            "minimum_cell_hits": int(
+                _param("ground_support/minimum_cell_hits", 2)
+            ),
+            "required_consecutive_frames": int(
+                _param("ground_support/required_consecutive_frames", 2)
+            ),
+            "minimum_alert_cells": int(
+                _param("ground_support/minimum_alert_cells", 3)
+            ),
+            "minimum_frame_points": int(
+                _param("ground_support/minimum_frame_points", 50)
+            ),
+            "local_support_evidence_radius": float(
+                _param("ground_support/local_support_evidence_radius", 3.0)
+            ),
+            "assessment_period": max(
+                0.005,
+                float(_param("ground_support/assessment_period", 0.02)),
+            ),
+            "drop_evidence_max_age": float(
+                _param("ground_support/drop_evidence_max_age", 0.05)
+            ),
+            "decision_period": float(
+                _param("ground_support/decision_period", 0.10)
+            ),
+            "rl_receive_delay": float(
+                _param("ground_support/rl_receive_delay", 0.009)
+            ),
+            "required_margin": float(
+                _param("ground_support/required_margin", 0.02)
+            ),
+            "release_hysteresis": float(
+                _param("ground_support/release_hysteresis", 0.10)
+            ),
+            "release_supported_frames": int(
+                _param("ground_support/release_supported_frames", 2)
+            ),
+            "observation_hold_timeout": float(
+                _param("ground_support/observation_hold_timeout", 2.0)
+            ),
+            "safety_stop_timeout": float(
+                _param("ground_support/safety_stop_timeout", 3.0)
+            ),
+            "stop_linear_threshold": float(
+                _param("ground_support/stop_linear_threshold", 0.02)
+            ),
+            "stop_angular_threshold": float(
+                _param("ground_support/stop_angular_threshold", 0.05)
+            ),
+            "stop_confirmation_samples": int(
+                _param("ground_support/stop_confirmation_samples", 3)
+            ),
+            "maximum_same_phase_replans": max(
+                0,
+                int(_param("ground_support/maximum_same_phase_replans", 2)),
+            ),
+            "maximum_negative_obstacle_replans": max(
+                0,
+                int(_param("ground_support/maximum_negative_obstacle_replans", 3)),
+            ),
+            "base_frame": str(_param("ground_support/base_frame", "base")),
+            "sensor_frame": str(
+                _param("ground_support/sensor_frame", "laser_livox")
+            ),
+        }
         self.frontier_params = {
             "min_cluster_size": int(_param("frontier/min_cluster_size", 8)),
             "blacklist_ttl": float(_param("frontier/blacklist_ttl", 60.0)),
@@ -596,7 +844,12 @@ class MissionManager:
             self._request_shutdown(f"danger_search mission {outcome}")
             return
 
-        snapshot = self.sensor_buffer.snapshot()
+        snapshot_factory = getattr(
+            self.sensor_buffer,
+            "ground_support_snapshot",
+            self.sensor_buffer.snapshot,
+        )
+        snapshot = snapshot_factory()
         pose = odom_pose_xy_yaw(snapshot.odom_msg)
         xyz = odom_xyz(snapshot.odom_msg)
         if pose is None or xyz is None:
@@ -605,7 +858,11 @@ class MissionManager:
 
         self._last_xyz = xyz
         self._update_pose_progress(pose)
+        self._sync_ground_support_task_context()
+        self._update_ground_support_odometry(snapshot)
         self._update_mapping_and_detection(snapshot, pose, xyz)
+        if self._handle_ground_support_control(pose):
+            return
 
         if self.current_task is not None:
             status = self.current_task.tick(self, pose)
@@ -713,6 +970,10 @@ class MissionManager:
                 last_mismatch_odom_stamp=odom_stamp,
             )
             self._floor_transition_guard = guard
+            support_gate = getattr(self, "_ground_support_gate", None)
+            invalidate_support = getattr(support_gate, "invalidate_assessment", None)
+            if callable(invalidate_support):
+                invalidate_support()
             self._log_structured(
                 {
                     "event": "floor_transition_ambiguous_enter",
@@ -907,6 +1168,8 @@ class MissionManager:
                     robot_xyz=xyz,
                     points=points,
                 )
+                if getattr(self, "_ground_support_gate", None) is not None:
+                    self._reapply_ground_support_black_marks(self.current_floor)
                 if estimated_floor != self.current_floor:
                     current_task = getattr(self, "current_task", None)
                     mismatch_key = (
@@ -972,6 +1235,397 @@ class MissionManager:
         )
         if candidates:
             self.tracker.update(candidates, now=get_time())
+
+    def _update_ground_support_odometry(self, snapshot) -> None:
+        gate = getattr(self, "_ground_support_gate", None)
+        if gate is None:
+            return
+        linear_speed = odom_planar_speed(snapshot.odom_msg)
+        angular_speed = odom_angular_speed(snapshot.odom_msg)
+        gate.observe_odometry(
+            _message_stamp_seconds(snapshot.odom_msg),
+            linear_speed=linear_speed if linear_speed is not None else 0.0,
+            angular_speed=angular_speed if angular_speed is not None else 0.0,
+            wall_time=time.monotonic(),
+        )
+
+    def _on_ground_support_timer(self, _event) -> None:
+        """只在安全门开启时及时消费新点云，不改变 10 Hz 任务状态机节拍。"""
+        gate = getattr(self, "_ground_support_gate", None)
+        grid = getattr(self, "_ground_support_grid", None)
+        if gate is None or grid is None:
+            return
+        snapshot = self.sensor_buffer.snapshot()
+        cloud_stamp = _message_stamp_seconds(snapshot.cloud_msg)
+        if cloud_stamp is None or cloud_stamp <= (
+            getattr(self, "_last_ground_support_cloud_stamp", None) or -math.inf
+        ):
+            return
+        # 支撑层有独立消费游标。即使本帧因换层歧义或 TF 缺失跳过，也不得重放旧帧。
+        self._last_ground_support_cloud_stamp = cloud_stamp
+        pose = odom_pose_xy_yaw(snapshot.odom_msg)
+        xyz = odom_xyz(snapshot.odom_msg)
+        if pose is None or xyz is None:
+            return
+        estimated_floor = self.mapper.estimate_floor_from_z(xyz[2])
+        current_task = getattr(self, "current_task", None)
+        transition_ambiguous = (
+            getattr(self, "_floor_transition_guard", None) is not None
+            or (
+                isinstance(current_task, TakeElevator)
+                and int(estimated_floor) != int(self.current_floor)
+            )
+        )
+        if transition_ambiguous:
+            gate.invalidate_assessment()
+            return
+        points = self.sensor_buffer.read_cloud_xyz(
+            snapshot.cloud_msg,
+            max_points=self.cloud_max_points,
+            stride=self.cloud_stride,
+        )
+        self._update_ground_support_assessment(
+            snapshot,
+            pose,
+            xyz,
+            points,
+            cloud_stamp,
+        )
+
+    def _update_ground_support_assessment(
+        self,
+        snapshot,
+        pose: tuple[float, float, float],
+        xyz: tuple[float, float, float],
+        points,
+        cloud_stamp: float | None,
+    ) -> None:
+        gate = getattr(self, "_ground_support_gate", None)
+        grid = getattr(self, "_ground_support_grid", None)
+        if gate is None or grid is None or cloud_stamp is None:
+            return
+        if getattr(self, "_ground_support_sensor_mount", None) is None:
+            transform = getattr(self.sensor_buffer, "frame_transform_matrix", None)
+            if callable(transform):
+                self._ground_support_sensor_mount = transform(
+                    self.ground_support_params["base_frame"],
+                    self.ground_support_params["sensor_frame"],
+                    rospy.Time(0),
+                    allow_latest=True,
+                )
+        mount = self._ground_support_sensor_mount
+        body_rotation = odom_rotation_matrix(snapshot.odom_msg)
+        if mount is None or body_rotation is None:
+            return
+
+        robot_position = np.asarray(xyz, dtype=float)
+        sensor_origin = robot_position + body_rotation @ mount[:3, 3]
+        sensor_rotation = body_rotation @ mount[:3, :3]
+        followed_path = [
+            np.asarray(point, dtype=float)
+            for point in self.controller.followed_path_snapshot()
+        ]
+        emitted = getattr(self.controller, "last_command", (0.0, 0.0, 0.0))
+        command_linear = math.hypot(float(emitted[0]), float(emitted[1]))
+        result = grid.process_frame(
+            stamp=cloud_stamp,
+            floor=self.current_floor,
+            robot_xy=np.asarray(pose[:2], dtype=float),
+            robot_yaw=pose[2],
+            sensor_origin=sensor_origin,
+            sensor_rotation=sensor_rotation,
+            points=np.asarray(points, dtype=float),
+            path=followed_path,
+            command_linear=command_linear,
+            ambiguous=False,
+            local_only=True,
+        )
+        if result.get("action") != "update":
+            return
+        payload = result.get("local_corridor_assessment")
+        if not isinstance(payload, dict):
+            return
+        odom_stamp = _message_stamp_seconds(snapshot.odom_msg)
+        ros_now = float(rospy.get_time())
+        data_age = _ground_support_data_age(
+            cloud_stamp=float(cloud_stamp),
+            odom_stamp=odom_stamp,
+            control_time=ros_now,
+            decision_period=self.ground_support_params["decision_period"],
+        )
+        direction = payload.get("drop_direction_world")
+        drop_point_world = None
+        if isinstance(direction, (list, tuple)) and len(direction) >= 2:
+            drop_point_world = (
+                float(pose[0]) + float(direction[0]),
+                float(pose[1]) + float(direction[1]),
+            )
+        gate.update_assessment(
+            GroundSupportAssessment(
+                stamp=float(cloud_stamp),
+                received_wall_time=time.monotonic(),
+                data_age=float(data_age),
+                supported_distance=_optional_finite(payload.get("supported_distance")),
+                support_boundary_detected=bool(
+                    payload.get("support_boundary_detected", False)
+                ),
+                current_footprint_supported=bool(
+                    payload.get("current_footprint_supported", False)
+                ),
+                observation_adequate=bool(
+                    payload.get("observation_adequate", False)
+                ),
+                drop_confirmed=bool(payload.get("drop_confirmed", False)),
+                drop_intersects_sweep=bool(
+                    payload.get("drop_intersects_sweep", False)
+                ),
+                drop_distance=_optional_finite(payload.get("drop_distance")),
+                drop_direction_world=(
+                    (float(direction[0]), float(direction[1]))
+                    if isinstance(direction, (list, tuple)) and len(direction) >= 2
+                    else None
+                ),
+                received_control_time=ros_now,
+                drop_point_world=drop_point_world,
+            )
+        )
+        requested_snapshot = getattr(self.controller, "requested_command_snapshot", None)
+        requested = (
+            requested_snapshot()
+            if callable(requested_snapshot)
+            else (0.0, 0.0, 0.0)
+        )
+        if gate.evaluate_latest_drop(
+            requested,
+            pose_yaw=pose[2],
+            wall_time=time.monotonic(),
+            control_time=ros_now,
+        ):
+            self.controller.stop(reason="negative_obstacle")
+
+    def _handle_ground_support_control(
+        self,
+        pose: tuple[float, float, float],
+    ) -> bool:
+        gate = getattr(self, "_ground_support_gate", None)
+        if gate is None:
+            return False
+        check_control_timeout = getattr(gate, "check_control_timeout", None)
+        if callable(check_control_timeout):
+            check_control_timeout(
+                float(get_time()),
+                wall_time=time.monotonic(),
+            )
+        state = gate.state
+        last_state = getattr(self, "_ground_support_last_state", GROUND_SUPPORT_CLEAR)
+        if state != last_state:
+            self._log_structured(
+                {
+                    "event": "ground_support_gate_transition",
+                    "elapsed": round(float(self._elapsed()), 3),
+                    "old_state": last_state,
+                    "new_state": state,
+                    "reason_code": gate.reason_code,
+                    "gate": gate.snapshot(),
+                }
+            )
+            self._ground_support_last_state = state
+        if state == GROUND_SUPPORT_CLEAR:
+            return False
+
+        reset_progress = getattr(self.controller, "reset_progress_timer", None)
+        if callable(reset_progress):
+            reset_progress(pose)
+        self.controller.stop(reason=gate.reason_code or "ground_support_hold")
+        # 临时 hold 和停车过程都在任务 tick 之前截断，普通 STUCK/recover 无法接管。
+        if state in {
+            OBSERVATION_HOLD,
+            STALE_DATA_HOLD,
+            DROP_STOPPING,
+            SPEED_OUT_OF_ENVELOPE_STOPPING,
+        }:
+            return True
+
+        reason = gate.reason_code or "ground_support_safety_failure"
+        if (
+            state == SAFETY_BLOCKED
+            and reason == "negative_obstacle"
+            and self._resume_after_negative_obstacle(pose, gate)
+        ):
+            return True
+        if state in {SAFETY_BLOCKED, SAFETY_STOP_TIMEOUT} or (
+            state == SUPPORT_PATH_UNAVAILABLE
+            and reason == "support_speed_out_of_envelope"
+        ):
+            self._record_failure(reason)
+            self._mission_success_eligible = False
+            if self.state not in (WRITE_RESULT, FINISH, MISSION_FAILED):
+                self._transition_state(
+                    WRITE_RESULT,
+                    reason_code=reason,
+                    call_site="MissionManager._handle_ground_support_control",
+                )
+            return True
+
+        if state == SUPPORT_PATH_UNAVAILABLE:
+            interrupted_task = self.current_task
+            task_phase = getattr(interrupted_task, "phase", None)
+            if interrupted_task is not None:
+                retry_key = ("task", id(interrupted_task), task_phase)
+            elif self._last_frontier_target is not None:
+                retry_key = (
+                    "frontier",
+                    round(float(self._last_frontier_target[0]), 3),
+                    round(float(self._last_frontier_target[1]), 3),
+                )
+            else:
+                retry_key = ("state", self.state)
+            if retry_key == getattr(self, "_ground_support_path_retry_key", None):
+                self._ground_support_path_retry_count = (
+                    getattr(self, "_ground_support_path_retry_count", 0) + 1
+                )
+            else:
+                self._ground_support_path_retry_key = retry_key
+                self._ground_support_path_retry_count = 1
+
+            self.controller.clear_path(reason=reason)
+            maximum_replans = max(
+                0,
+                int(
+                    getattr(self, "ground_support_params", {}).get(
+                        "maximum_same_phase_replans",
+                        2,
+                    )
+                ),
+            )
+            log_structured = getattr(self, "_log_structured", None)
+            if callable(log_structured):
+                log_structured(
+                    {
+                        "event": "ground_support_path_replan",
+                        "reason_code": reason,
+                        "task": getattr(interrupted_task, "name", None),
+                        "task_phase": task_phase,
+                        "active_door": self.active_door,
+                        "attempt": self._ground_support_path_retry_count,
+                        "maximum_same_phase_replans": maximum_replans,
+                        "parent_task_preserved": interrupted_task is not None,
+                    }
+                )
+            if self._ground_support_path_retry_count > maximum_replans:
+                exhausted_reason = "ground_support_path_replan_exhausted"
+                self._record_failure(exhausted_reason)
+                self._mission_success_eligible = False
+                if self.state not in (WRITE_RESULT, FINISH, MISSION_FAILED):
+                    self._transition_state(
+                        WRITE_RESULT,
+                        reason_code=exhausted_reason,
+                        call_site=(
+                            "MissionManager._handle_ground_support_control:"
+                            "path_replan_exhausted"
+                        ),
+                        diagnostic_context={
+                            "task": getattr(interrupted_task, "name", None),
+                            "task_phase": task_phase,
+                            "active_door": self.active_door,
+                            "attempt": self._ground_support_path_retry_count,
+                        },
+                    )
+                return True
+            gate.reset_path_unavailable()
+            self._ground_support_last_state = gate.state
+            return True
+        return True
+
+    def _resume_after_negative_obstacle(
+        self,
+        pose: tuple[float, float, float],
+        gate: GroundSupportSafetyGate,
+    ) -> bool:
+        """把已确认空带写入现有禁行栅格，再让当前楼层任务重新规划。"""
+        params = getattr(self, "ground_support_params", {})
+        if not bool(params.get("negative_obstacle_replan_enabled", True)):
+            return False
+        if self.current_task is not None or self.state not in {EXPLORE_FLOOR, RETURN_HOME}:
+            return False
+        point = getattr(gate, "latched_drop_point_world", None)
+        if point is None or not all(math.isfinite(float(value)) for value in point):
+            return False
+        maximum = max(0, int(params.get("maximum_negative_obstacle_replans", 3)))
+        count = int(getattr(self, "_ground_support_negative_replan_count", 0))
+        if count >= maximum:
+            return False
+
+        radius = max(
+            float(self.map_params["resolution"]),
+            float(params["sweep_half_width"]),
+        )
+        grid = self.mapper.floor(self.current_floor)
+        if grid.world_to_grid(float(point[0]), float(point[1])) is None:
+            return False
+
+        self.mapper.mark_black(
+            self.current_floor,
+            float(point[0]),
+            float(point[1]),
+            radius,
+        )
+        marks = getattr(self, "_ground_support_negative_obstacle_marks", None)
+        if marks is None:
+            marks = []
+            self._ground_support_negative_obstacle_marks = marks
+        marks.append((self.current_floor, float(point[0]), float(point[1]), radius))
+        self.controller.clear_path(reason="negative_obstacle_replan")
+        self.current_frontier = None
+        self._last_frontier_target = None
+        self._last_frontier_score = None
+        self._last_frontier_used_fallback = False
+        if not gate.reset_negative_obstacle_after_replan():
+            return False
+
+        self._ground_support_negative_replan_count = count + 1
+        self._ground_support_last_state = gate.state
+        self._log_structured(
+            {
+                "event": "negative_obstacle_local_replan",
+                "elapsed": round(float(self._elapsed()), 3),
+                "floor": self.current_floor,
+                "mission_state": self.state,
+                "drop_point_world": [float(point[0]), float(point[1])],
+                "black_radius": radius,
+                "attempt": self._ground_support_negative_replan_count,
+                "maximum_attempts": maximum,
+                "ordinary_recover_called": False,
+            }
+        )
+        return True
+
+    def _reapply_ground_support_black_marks(self, floor_index: int) -> None:
+        """仅在生产安全门登记过空带后，防止建图把局部禁行区重新清空。"""
+        for floor, x, y, radius in getattr(
+            self,
+            "_ground_support_negative_obstacle_marks",
+            (),
+        ):
+            if floor == floor_index:
+                self.mapper.mark_black(floor, x, y, radius)
+
+    def _sync_ground_support_task_context(self) -> None:
+        """仅为受控电梯门槛跨越关闭 UNKNOWN hold，显式 DROP 仍由安全门处理。"""
+        gate = getattr(self, "_ground_support_gate", None)
+        setter = getattr(gate, "set_unknown_support_hold_enabled", None)
+        if callable(setter):
+            configured = bool(
+                getattr(self, "ground_support_params", {}).get(
+                    "unknown_support_hold_enabled", True
+                )
+            )
+            setter(
+                _ground_support_unknown_hold_enabled(
+                    self.current_task,
+                    configured=configured,
+                )
+            )
 
     # ------------------------------------------------------------------
     # 方案 C：全局时间预算与楼层/返航决策层
@@ -1099,6 +1753,10 @@ class MissionManager:
         min_remaining_frontiers = int(getattr(self, "min_remaining_frontiers", 2))
         max_floor = int(getattr(self, "max_floor", 1))
         current_floor = int(getattr(self, "current_floor", 0))
+        last_floor_uses_global_budget = bool(
+            getattr(self, "last_floor_uses_global_budget", True)
+        )
+        has_next_floor = current_floor + 1 < max_floor
 
         # 起点尚未记录时不做返航决策（通常在 INIT 后才有 home_pose）
         if getattr(self, "home_pose", None) is None:
@@ -1111,13 +1769,17 @@ class MissionManager:
         if mission_elapsed + return_time + return_safety_buffer >= max_runtime:
             return "RETURN_HOME", "mission_insufficient_time_for_return"
 
-        # 2. 楼层硬超时
+        # 2. 非最后一层的硬上限用于给后续楼层留出时间。最后一层没有
+        # 换层配额需要保护，由全局返航边界决定何时结束，避免在仍有
+        # 可达前沿时浪费比赛总时间。
         if floor_elapsed >= floor_timeout:
-            if current_floor + 1 < max_floor:
+            if has_next_floor:
                 change_time = self._estimate_floor_change_time(current_floor + 1, pose)
                 if change_time + return_time + return_safety_buffer < remaining:
                     return "FINISH_FLOOR", "floor_timeout_change_floor"
-            return "RETURN_HOME", "floor_timeout_return_home"
+                return "RETURN_HOME", "floor_timeout_return_home"
+            if not last_floor_uses_global_budget:
+                return "RETURN_HOME", "floor_timeout_return_home"
 
         # 3. 楼层软超时：检查是否仍有探索收益
         if floor_elapsed >= floor_timeout * floor_finish_time_ratio:
@@ -1127,14 +1789,17 @@ class MissionManager:
             has_frontiers = len(frontiers) >= min_remaining_frontiers
 
             if not has_progress and not has_frontiers:
-                if current_floor + 1 < max_floor:
+                if has_next_floor:
                     change_time = self._estimate_floor_change_time(current_floor + 1, pose)
                     if change_time + return_time + return_safety_buffer < remaining:
                         return "FINISH_FLOOR", "floor_low_progress_change_floor"
                 # 剩余时间还够继续探索其他楼层或返航，但当前层已无收益
                 return "RETURN_HOME", "floor_low_progress_return_home"
 
-        # 4. 继续当前层探索
+        # 4. 继续当前层探索。最后一层越过楼层配额后仍由步骤 1 的
+        # 全局返航预算约束，不会越过 max_runtime。
+        if floor_elapsed >= floor_timeout and not has_next_floor:
+            return "CONTINUE", "last_floor_uses_global_budget"
         return "CONTINUE", "budget_allows_continue"
 
     @staticmethod
@@ -1916,19 +2581,31 @@ class MissionManager:
         )
 
     def _log_floor_budget_exhausted(self, floor_elapsed: float) -> None:
-        """楼层硬预算已到，但尚未满足最小探索时间时的过渡日志。"""
+        """记录楼层配额到期后仍继续探索的原因。"""
         if getattr(self, "_floor_timeout_logged", False):
             return
         self._floor_timeout_logged = True
         diagnostic = self._mission_diagnostic_snapshot()
+        waiting_for_minimum = floor_elapsed < float(
+            getattr(self, "min_floor_explore_time", 0.0)
+        )
+        if waiting_for_minimum:
+            reason_code = "floor_timeout_before_min_explore_time"
+            action = "continue_until_min_floor_time"
+        else:
+            reason_code = "last_floor_continues_under_global_budget"
+            action = "continue_until_global_return_boundary"
         diagnostic.update(
             {
                 "event": "mission_floor_budget_exhausted",
-                "reason_code": "floor_timeout_before_min_explore_time",
+                "reason_code": reason_code,
                 "floor_elapsed": round(float(floor_elapsed), 3),
                 "floor_timeout": self.floor_timeout,
                 "min_floor_explore_time": getattr(self, "min_floor_explore_time", 0.0),
-                "action": "continue_until_min_floor_time",
+                "last_floor_uses_global_budget": bool(
+                    getattr(self, "last_floor_uses_global_budget", True)
+                ),
+                "action": action,
             }
         )
         self._log_structured(diagnostic)
@@ -2220,6 +2897,8 @@ class MissionManager:
             except (TypeError, ValueError):
                 elapsed = None
         floor_transition_guard = getattr(self, "_floor_transition_guard", None)
+        support_gate = getattr(self, "_ground_support_gate", None)
+        support_snapshot = getattr(support_gate, "snapshot", None)
         return {
             "state": getattr(self, "state", None),
             "elapsed": elapsed,
@@ -2239,6 +2918,9 @@ class MissionManager:
                 floor_transition_guard.skipped_cloud_count
                 if floor_transition_guard is not None
                 else 0
+            ),
+            "ground_support_gate": (
+                support_snapshot() if callable(support_snapshot) else None
             ),
             "return_home_started": bool(getattr(self, "_return_home_started", False)),
             "return_home_completed": bool(
@@ -2316,6 +2998,11 @@ class MissionManager:
             "known_area": round(grid.known_area(), 2),
             "visited_area": round(grid.visited_area(), 2),
             "controller_debug": self.controller.command_debug_summary(),
+            "ground_support_gate": (
+                self._ground_support_gate.snapshot()
+                if getattr(self, "_ground_support_gate", None) is not None
+                else None
+            ),
             "result_file": str(result_path),
         }
         summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -2366,6 +3053,36 @@ def _message_stamp_seconds(message) -> float | None:
     return float(to_sec()) if callable(to_sec) else None
 
 
+def _ground_support_unknown_hold_enabled(task, *, configured: bool = True) -> bool:
+    """返回当前任务是否启用 UNKNOWN 临时停车；显式 DROP 不受此值影响。"""
+    if not configured:
+        return False
+    return not (
+        isinstance(task, TakeElevator)
+        and getattr(task, "phase", None) in {"ENTER_CABIN", "EXIT_CABIN"}
+    )
+
+
+def _ground_support_data_age(
+    *,
+    cloud_stamp: float,
+    odom_stamp: float | None,
+    control_time: float,
+    decision_period: float,
+) -> float:
+    """返回决策周期之外的额外陈旧量，并保留 cloud/odom 配准误差。"""
+    alignment_age = (
+        abs(float(odom_stamp) - float(cloud_stamp))
+        if odom_stamp is not None
+        else math.inf
+    )
+    excess_source_age = max(
+        0.0,
+        float(control_time) - float(cloud_stamp) - max(0.0, float(decision_period)),
+    )
+    return max(alignment_age, excess_source_age)
+
+
 def _optional_positive_float(value, name: str) -> float | None:
     if value is None or value == "":
         return None
@@ -2375,6 +3092,23 @@ def _optional_positive_float(value, name: str) -> float | None:
     if not math.isfinite(parsed) or parsed < 0.0:
         raise ValueError(f"{name} 必须为非负有限数")
     return parsed
+
+
+def _parse_stop_distance_table(value) -> tuple[tuple[float, float], ...]:
+    try:
+        table = tuple((float(item[0]), float(item[1])) for item in value)
+    except (TypeError, ValueError, IndexError) as exc:
+        raise ValueError("ground_support/stop_distance_table 必须是 [[速度, 距离], ...]") from exc
+    if not table:
+        raise ValueError("ground_support/stop_distance_table 不能为空")
+    return table
+
+
+def _optional_finite(value) -> float | None:
+    if value is None:
+        return None
+    numeric = float(value)
+    return numeric if math.isfinite(numeric) else None
 
 
 def _param(path: str, default):

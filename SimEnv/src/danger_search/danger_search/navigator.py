@@ -84,6 +84,8 @@ class PathFollower:
     _debug_recover_reason: str | None = field(default=None, init=False)
     _debug_zero_command_reason: str | None = field(default=None, init=False)
     _last_requested_command: tuple[float, float, float] = field(default=(0.0, 0.0, 0.0), init=False)
+    _last_emitted_command: tuple[float, float, float] = field(default=(0.0, 0.0, 0.0), init=False)
+    _command_gate: object | None = field(default=None, init=False)
     _last_command_wall_time: float | None = field(default=None, init=False)
     keepalive_publish_count: int = field(default=0, init=False)
 
@@ -139,6 +141,20 @@ class PathFollower:
             self._nearest_obstacle_distance = None
         else:
             self._nearest_obstacle_distance = max(0.0, float(distance))
+
+    def set_command_gate(self, gate: object | None) -> None:
+        """设置最终速度出口的可选安全门；None 保持原有命令链完全透明。"""
+        self._command_gate = gate
+
+    def reset_progress_timer(
+        self,
+        pose_xy_yaw: tuple[float, float, float] | None = None,
+    ) -> None:
+        """安全观察暂停期间冻结普通 STUCK 计时，不改路径和目标。"""
+        self._last_progress_time = get_time()
+        self._debug_stuck_elapsed = 0.0
+        if pose_xy_yaw is not None:
+            self._last_progress_pose = tuple(float(value) for value in pose_xy_yaw)
 
     def clear_path(self, reason: str = "path_cleared") -> None:
         self._raw_path = []
@@ -397,14 +413,34 @@ class PathFollower:
     ) -> None:
         requested = (float(linear_x), float(linear_y), float(angular_z))
         self._last_requested_command = requested
-        if all(abs(value) <= 1e-4 for value in requested):
+        emitted = requested
+        gate = self._command_gate
+        wall_now = time.monotonic()
+        if gate is not None:
+            filter_command = getattr(gate, "filter_command", None)
+            if callable(filter_command):
+                pose_yaw = self._debug_pose[2] if self._debug_pose is not None else 0.0
+                emitted = tuple(
+                    float(value)
+                    for value in filter_command(
+                        requested,
+                        pose_yaw=pose_yaw,
+                        wall_time=wall_now,
+                        control_time=get_time(),
+                    )
+                )
+        self._last_emitted_command = emitted
+        if all(abs(value) <= 1e-4 for value in emitted):
+            if emitted != requested and gate is not None:
+                reason = getattr(gate, "reason_code", None) or "ground_support_gate"
+                zero_reason = f"ground_support_gate:{reason}"
             self._debug_zero_command_reason = str(zero_reason or "zero_command")
         else:
             self._debug_zero_command_reason = None
         if self._publisher is None or Twist is None:
             return
         msg = Twist()
-        msg.linear.x, msg.linear.y, msg.angular.z = requested
+        msg.linear.x, msg.linear.y, msg.angular.z = emitted
         self.command_count += 1
         if abs(msg.linear.x) > 1e-4 or abs(msg.linear.y) > 1e-4:
             self.nonzero_linear_count += 1
@@ -412,7 +448,7 @@ class PathFollower:
         self.max_abs_linear_y = max(self.max_abs_linear_y, abs(msg.linear.y))
         self.max_abs_angular_z = max(self.max_abs_angular_z, abs(msg.angular.z))
         self.last_command = (msg.linear.x, msg.linear.y, msg.angular.z)
-        self._last_command_wall_time = time.monotonic()
+        self._last_command_wall_time = wall_now
         self._publisher.publish(msg)
 
     def _on_keepalive_timer(self, _event) -> None:
@@ -425,7 +461,9 @@ class PathFollower:
         minimum_age = max(0.02, self.command_keepalive_period * 0.8)
         if now - self._last_command_wall_time < minimum_age:
             return
-        linear_x, linear_y, angular_z = self._last_requested_command
+        # 只重发上一次真正下发的安全命令；临时 hold 解除后必须等新的控制 tick，
+        # 不能由 keepalive 重放 hold 前的旧非零命令。
+        linear_x, linear_y, angular_z = self._last_emitted_command
         self.keepalive_publish_count += 1
         self._publish(
             linear_x,
@@ -439,6 +477,9 @@ class PathFollower:
 
     def followed_path_snapshot(self) -> list[tuple[float, float]]:
         return list(self._path)
+
+    def requested_command_snapshot(self) -> tuple[float, float, float]:
+        return tuple(self._last_requested_command)
 
     def _publish_path_diagnostics(self) -> None:
         if rospy is None or PathMessage is None or PoseStamped is None:
@@ -482,7 +523,9 @@ class PathFollower:
             if self._last_command_wall_time is not None
             else None
         )
-        linear_x, linear_y, angular_z = self._last_requested_command
+        requested_linear_x, requested_linear_y, requested_angular_z = self._last_requested_command
+        linear_x, linear_y, angular_z = self._last_emitted_command
+        gate_snapshot = getattr(self._command_gate, "snapshot", None)
         return {
             "pose": _point_list(self._debug_pose),
             "path_active": bool(self._path),
@@ -499,6 +542,10 @@ class PathFollower:
             "linear_command": linear_x,
             "lateral_command": linear_y,
             "angular_command": angular_z,
+            "requested_linear_command": requested_linear_x,
+            "requested_lateral_command": requested_linear_y,
+            "requested_angular_command": requested_angular_z,
+            "safety_gate": gate_snapshot() if callable(gate_snapshot) else None,
             "zero_command_reason": self._debug_zero_command_reason,
             "stuck_elapsed": _finite_or_none(self._debug_stuck_elapsed),
             "no_progress_timeout": self.no_progress_timeout,
