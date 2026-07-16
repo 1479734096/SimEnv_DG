@@ -4,14 +4,17 @@
 #include <Eigen/Geometry>
 #include <cmath>
 #include <filesystem>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <danger_search_localization/velocity_transform.hpp>
 #include <geometry_msgs/TransformStamped.h>
 #include <nav_msgs/Odometry.h>
+#include <ros/package.h>
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud.h>
 #include <sensor_msgs/PointCloud2.h>
@@ -58,13 +61,45 @@ struct StartPose {
   bool relative = false;
 };
 
+std::filesystem::path ExpectedSceneInfoPath() {
+  const std::string package = ros::package::getPath("danger_search");
+  if (package.empty()) {
+    throw std::runtime_error("无法定位 danger_search ROS 包");
+  }
+  const auto package_path = std::filesystem::absolute(package).lexically_normal();
+  return (package_path.parent_path().parent_path() / "generated_building" /
+          "team_scene_info.json").lexically_normal();
+}
+
+std::filesystem::path ValidateSceneInfoPath(const std::string &raw) {
+  if (!raw.empty() && raw.front() == '~') {
+    throw std::runtime_error("正式定位场景文件路径不支持 shell 缩写");
+  }
+  const auto supplied = std::filesystem::absolute(raw).lexically_normal();
+  const auto expected = std::filesystem::absolute(ExpectedSceneInfoPath()).lexically_normal();
+  if (supplied != expected) {
+    throw std::runtime_error("正式定位场景文件路径不合法: " + supplied.string());
+  }
+  if (std::filesystem::is_symlink(supplied.parent_path()) ||
+      std::filesystem::is_symlink(supplied)) {
+    throw std::runtime_error("公开场景文件及其目录不能是符号链接: " + supplied.string());
+  }
+  if (!std::filesystem::is_regular_file(supplied)) {
+    throw std::runtime_error("公开场景文件必须是真实普通文件: " + supplied.string());
+  }
+  const auto supplied_canonical = std::filesystem::canonical(supplied);
+  const auto expected_canonical = std::filesystem::canonical(expected);
+  if (supplied_canonical != expected_canonical) {
+    throw std::runtime_error("公开场景文件规范路径不一致: " + supplied_canonical.string());
+  }
+  return supplied_canonical;
+}
+
 StartPose ReadPublicStartPose(const std::string &path, bool require_info, bool allow_relative) {
   boost::property_tree::ptree tree;
   try {
-    if (std::filesystem::path(path).filename() != "team_scene_info.json") {
-      throw std::runtime_error("正式定位只能读取 team_scene_info.json");
-    }
-    boost::property_tree::read_json(path, tree);
+    const auto validated_path = ValidateSceneInfoPath(path);
+    boost::property_tree::read_json(validated_path.string(), tree);
     if (tree.get<std::string>("schema") != "team_scene_info_v1") {
       throw std::runtime_error("team_scene_info schema 不是 team_scene_info_v1");
     }
@@ -194,10 +229,14 @@ class ScanLocalizationNode {
 
     if (!previous_stamp_.isZero() && stamp > previous_stamp_) {
       const double dt = (stamp - previous_stamp_).toSec();
-      const Eigen::Vector3d velocity = (translation - previous_translation_) / dt;
-      message.twist.twist.linear.x = velocity.x();
-      message.twist.twist.linear.y = velocity.y();
-      message.twist.twist.linear.z = velocity.z();
+      const Eigen::Vector3d velocity_world = (translation - previous_translation_) / dt;
+      // 里程计 twist 在 child_frame_id="base" 下表达，需将世界系速度转换到 base 系。
+      const Eigen::Vector3d velocity_base =
+          danger_search_localization::WorldVelocityToBase(
+              velocity_world, world_base.rotationMatrix());
+      message.twist.twist.linear.x = velocity_base.x();
+      message.twist.twist.linear.y = velocity_base.y();
+      message.twist.twist.linear.z = velocity_base.z();
       message.twist.twist.angular.z = WrapAngle(
           YawFromRotation(world_base.rotationMatrix()) - previous_yaw_) / dt;
     }
@@ -253,6 +292,9 @@ int main(int argc, char **argv) {
     ScanLocalizationNode node;
     ros::spin();
   } catch (const std::exception &error) {
+    // 节点在 ROS 日志连接完成前退出时，ROS_FATAL 可能来不及落盘；
+    // 同步写入标准错误，确保正式 runner 能归档真实启动原因。
+    std::cerr << "scan_localization 无法启动：" << error.what() << std::endl;
     ROS_FATAL("scan_localization 无法启动：%s", error.what());
     return 1;
   }

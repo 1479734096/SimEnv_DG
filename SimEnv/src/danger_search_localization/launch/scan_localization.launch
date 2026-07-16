@@ -16,7 +16,7 @@
     <param name="min_range" value="0.5"/>
     <param name="max_range" value="15.0"/>
     <param name="voxel_size" value="0.15"/>
-    <param name="base_to_livox_xyz" value="[0.2, 0.0, 0.08]"/>
-    <param name="base_to_livox_rpy" value="[0.0, 0.785, 0.0]"/>
+    <rosparam param="base_to_livox_xyz">[0.2, 0.0, 0.08]</rosparam>
+    <rosparam param="base_to_livox_rpy">[0.0, 0.785, 0.0]</rosparam>
   </node>
 </launch>

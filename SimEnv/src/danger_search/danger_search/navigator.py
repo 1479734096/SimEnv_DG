@@ -484,9 +484,18 @@ class PathFollower:
         return tuple(self._last_requested_command)
 
     def _publish_path_diagnostics(self) -> None:
-        if rospy is None or PathMessage is None or PoseStamped is None:
+        publishers = (self._raw_path_publisher, self._followed_path_publisher)
+        if (
+            rospy is None
+            or PathMessage is None
+            or PoseStamped is None
+            or all(pub is None for pub in publishers)
+        ):
             return
-        stamp = rospy.Time.now()
+        try:
+            stamp = rospy.Time.now()
+        except rospy.exceptions.ROSInitException:
+            return
         for publisher, points in (
             (self._raw_path_publisher, self._raw_path),
             (self._followed_path_publisher, self._path),

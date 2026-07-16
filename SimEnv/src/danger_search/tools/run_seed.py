@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import datetime
 from dataclasses import dataclass
+import json
 import math
 import os
 import shutil
@@ -61,6 +62,32 @@ class RunTermination:
     kind: str
     reason: str
     component: str
+
+
+def environment_launch_overrides(
+    *,
+    seed: int,
+    gui_enabled: bool,
+    max_floor: int,
+    run_pid_dir: Path,
+) -> dict[str, str]:
+    """构造本轮仿真环境变量。
+
+    Gazebo 必须先暂停完成 A1、Livox 射线和 ros_control 的装载。runner 会在
+    junior_ctrl 的 RL 模型加载完成后显式解除暂停，再发送起立指令，既避免物理
+    线程与模型装载并发，也保证起立时已有有效关节反馈。
+    """
+    return {
+        "SEED": str(seed),
+        "GUI": "true" if gui_enabled else "false",
+        "PAUSED": "true",
+        "AUTO_UNPAUSE": "false",
+        "CONTROLLER_FOREGROUND": "1",
+        "START_CONTROLLER": "1",
+        "START_BUILDING_CONTROL": "1",
+        "FLOOR_COUNT": str(max_floor),
+        "RUN_PID_DIR": str(run_pid_dir),
+    }
 
 
 def _running_processes() -> list[tuple[int, str, str]]:
@@ -196,6 +223,12 @@ def stop_environment(child) -> None:
     child.close(force=True)
 
 
+def abort_environment_startup(child) -> None:
+    """启动失败时按本轮 PID/PGID 快照清理，避免只关闭 PTY 后遗留 ROS 进程。"""
+    child.owned_environment_processes = capture_environment_processes(child.pid)
+    stop_environment(child)
+
+
 def resolve_gui_enabled(args: argparse.Namespace) -> bool:
     if args.gui:
         if not os.environ.get("DISPLAY"):
@@ -207,6 +240,30 @@ def resolve_gui_enabled(args: argparse.Namespace) -> bool:
     if args.headless:
         return False
     return bool(os.environ.get("DISPLAY"))
+
+
+def unpause_environment_physics(workspace_dir: Path, *, timeout: int = 15) -> None:
+    """在模型与控制器装载完成后显式启动物理仿真。"""
+    command = " ".join(
+        [
+            "source /opt/ros/noetic/setup.bash",
+            "&&",
+            f"source {shlex.quote(str(workspace_dir / 'devel' / 'setup.bash'))}",
+            "&&",
+            "rosservice call /gazebo/unpause_physics",
+        ]
+    )
+    try:
+        subprocess.run(
+            ["bash", "-lc", command],
+            cwd=str(workspace_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=True,
+        )
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
+        raise RuntimeError("Gazebo 物理解除暂停失败") from exc
 
 
 def run_environment(
@@ -224,18 +281,15 @@ def run_environment(
     except ImportError as exc:
         raise RuntimeError("缺少 pexpect，无法自动给 junior_ctrl 输入 2/6") from exc
 
+    effective_pid_dir = run_pid_dir or (workspace_dir / "logs" / "run_pids")
     env = os.environ.copy()
     env.update(
-        {
-            "SEED": str(seed),
-            "GUI": "true" if gui_enabled else "false",
-            "PAUSED": "false",
-            "CONTROLLER_FOREGROUND": "1",
-            "START_CONTROLLER": "1",
-            "START_BUILDING_CONTROL": "1",
-            "FLOOR_COUNT": str(max_floor),
-            "RUN_PID_DIR": str(run_pid_dir or (workspace_dir / "logs" / "run_pids")),
-        }
+        environment_launch_overrides(
+            seed=seed,
+            gui_enabled=gui_enabled,
+            max_floor=max_floor,
+            run_pid_dir=effective_pid_dir,
+        )
     )
 
     print(f"[{datetime.datetime.now().time()}] 启动仿真环境 auto.sh ...")
@@ -250,10 +304,15 @@ def run_environment(
         child.expect("Use keyboard input in this terminal", timeout=120)
         print(f"[{datetime.datetime.now().time()}] 控制器进程已启动，等待 RL 模型加载完成")
         child.expect("load model to device!", timeout=120)
-        print(f"[{datetime.datetime.now().time()}] RL 模型已加载，发送 2 进入站立")
+        print(f"[{datetime.datetime.now().time()}] RL 模型已加载，解除 Gazebo 暂停")
+        unpause_environment_physics(workspace_dir)
+        # 先让 ros_control 发布一小段有效关节反馈；暂停状态下直接起立会使
+        # junior_ctrl 偶发在状态尚未初始化时退出。
+        time.sleep(1.0)
+        print(f"[{datetime.datetime.now().time()}] Gazebo 已运行，发送 2 进入站立")
         child.send("2")
         child.expect("Switched from passive to fixed stand", timeout=30)
-        print(f"[{datetime.datetime.now().time()}] 已进入站立，等待起立完成后发送 6 进入 RL 模式")
+        print(f"[{datetime.datetime.now().time()}] 已进入 fixed-stand，等待起立完成后发送 6 进入 RL 模式")
         time.sleep(5.0)
         child.send("6")
         child.expect("Switched from fixed stand to RL", timeout=30)
@@ -268,11 +327,14 @@ def run_environment(
             )
         print(f"[{datetime.datetime.now().time()}] 仿真环境准备完毕，控制器已进入 RL 模式")
     except pexpect.TIMEOUT:
-        child.close(force=True)
+        abort_environment_startup(child)
         raise RuntimeError("启动仿真环境超时")
     except pexpect.EOF:
-        child.close(force=True)
+        abort_environment_startup(child)
         raise RuntimeError("auto.sh 意外退出")
+    except Exception:
+        abort_environment_startup(child)
+        raise
     return child
 
 
@@ -414,29 +476,35 @@ def check_startup_health(
                 raise RuntimeError(
                     f"启动健康检查失败：未收到 {topic} 数据，详见 logs/health_check.log"
                 ) from exc
-        health_log.write("\n检查机器人姿态（只读采样 /trunk_imu）\n")
-        health_log.flush()
-        posture: dict | None = None
-        try:
-            posture = _probe_robot_posture(POSTURE_SAMPLE_SECONDS)
-        except Exception as exc:
-            health_log.write(f"姿态采样异常（跳过姿态门禁）: {exc}\n")
+        if require_localization:
+            # 同一 runner 进程中的 rospy 节点在 signal_shutdown 后不能重新初始化。
+            # 姿态已在环境阶段检查一次；算法阶段只验证新启动的内部定位链。
+            health_log.write("\n机器人姿态已在环境启动阶段检查，本阶段不重复采样\n")
             health_log.flush()
-        if posture is not None:
-            health_log.write(
-                f"姿态采样: samples={posture['samples']} "
-                f"max_abs_roll={posture['max_abs_roll']:.4f} "
-                f"max_abs_pitch={posture['max_abs_pitch']:.4f} "
-                "高度真值不参与正式健康检查\n"
-            )
+        else:
+            health_log.write("\n检查机器人姿态（只读采样 /trunk_imu）\n")
             health_log.flush()
-            detail = _posture_breach_detail(posture)
-            if detail is not None:
-                health_log.write(f"姿态门禁失败：{detail}\n")
+            posture: dict | None = None
+            try:
+                posture = _probe_robot_posture(POSTURE_SAMPLE_SECONDS)
+            except Exception as exc:
+                health_log.write(f"姿态采样异常（跳过姿态门禁）: {exc}\n")
                 health_log.flush()
-                raise RuntimeError(detail)
-            health_log.write("姿态门禁通过\n")
-            health_log.flush()
+            if posture is not None:
+                health_log.write(
+                    f"姿态采样: samples={posture['samples']} "
+                    f"max_abs_roll={posture['max_abs_roll']:.4f} "
+                    f"max_abs_pitch={posture['max_abs_pitch']:.4f} "
+                    "高度真值不参与正式健康检查\n"
+                )
+                health_log.flush()
+                detail = _posture_breach_detail(posture)
+                if detail is not None:
+                    health_log.write(f"姿态门禁失败：{detail}\n")
+                    health_log.flush()
+                    raise RuntimeError(detail)
+                health_log.write("姿态门禁通过\n")
+                health_log.flush()
         health_log.write(f"\n启动健康检查通过: {datetime.datetime.now().isoformat()}\n")
 
 
@@ -451,17 +519,18 @@ def run_danger_search(
     environment_process,
     gui_enabled: bool,
 ) -> RunTermination:
-    launch_cmd = " ".join(
-        [
-            "source /opt/ros/noetic/setup.bash",
-            "&&",
-            f"source {shlex.quote(str(workspace_dir / 'devel' / 'setup.bash'))}",
-            "&&",
-            "roslaunch danger_search danger_search.launch",
-            f"config:={shlex.quote(str(run_config_path))}",
-            f"max_floor:={int(max_floor)}",
-        ]
-    )
+    launch_args = [
+        "source /opt/ros/noetic/setup.bash",
+        "&&",
+        f"source {shlex.quote(str(workspace_dir / 'devel' / 'setup.bash'))}",
+        "&&",
+        "roslaunch danger_search danger_search.launch",
+        f"config:={shlex.quote(str(run_config_path))}",
+        f"max_floor:={int(max_floor)}",
+    ]
+    if mission_summary_file is not None:
+        launch_args.append(f"mission_summary_file:={shlex.quote(str(mission_summary_file))}")
+    launch_cmd = " ".join(launch_args)
     with log_path.open("w", encoding="utf-8") as log_file:
         process = subprocess.Popen(
             ["bash", "-lc", launch_cmd],
@@ -500,6 +569,12 @@ def run_danger_search(
                 time.sleep(1.0)
         except KeyboardInterrupt:
             termination = RunTermination(-1, "runner_interrupt", "keyboard_interrupt", "run_seed.py")
+        except Exception:
+            # 健康检查异常发生在正常终止循环之前，也必须回收本轮算法进程组，
+            # 否则会遗留 roslaunch/节点并污染下一次测试。
+            if process.poll() is None:
+                stop_owned_process(process, label="danger_search")
+            raise
 
         assert termination is not None
         if process.poll() is None:
@@ -530,6 +605,46 @@ def runtime_completed_successfully(runtime_summary: dict) -> bool:
         and runtime_summary.get("return_home_success") is True
         and runtime_summary.get("timeout_triggered") is False
     )
+
+
+def read_and_validate_summary(path: Path) -> dict | None:
+    """读取并校验 mission_runtime_summary.json 是否包含判定闭环完成所需的字段。"""
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return None
+        summary = json.loads(raw)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(summary, dict):
+        return None
+    required_fields = (
+        "completed",
+        "terminal_outcome",
+        "terminal_state",
+        "terminal_reason",
+        "return_home_started",
+        "return_home_completed",
+        "return_home_success",
+        "timeout_triggered",
+    )
+    for field in required_fields:
+        if field not in summary:
+            return None
+    return summary
+
+
+def archive_existing_public_result(public_result: Path, run_dir: Path) -> None:
+    """若存在上轮参赛方输出，先归档再只删除该文件；不得触碰 truth、metadata 等环境文件。"""
+    if not public_result.exists():
+        return
+    if public_result.name != "detected_danger.json" or public_result.parent.name != "results":
+        raise ValueError(f"拒绝归档或删除非参赛方结果文件: {public_result}")
+    archive_path = run_dir / "preexisting_detected_danger.json"
+    shutil.copy2(public_result, archive_path)
+    public_result.unlink()
 
 
 def evaluate_run(workspace_dir: Path, run_dir: Path, result_file: Path) -> bool:
@@ -641,6 +756,7 @@ def main() -> int:
     termination: RunTermination | None = None
     evaluation_completed = False
     production_result_file: Path | None = None
+    public_result_was_archived = False
     started_at = datetime.datetime.now()
 
     try:
@@ -655,11 +771,14 @@ def main() -> int:
                 run_pid_dir=logs_dir / "processes",
             )
             production_result_file = public_result_file(workspace_dir)
+            # 在算法启动前归档并删除上轮参赛方输出，避免旧结果污染本轮判断。
+            archive_existing_public_result(production_result_file, run_dir)
+            public_result_was_archived = True
             termination = run_danger_search(
                 workspace_dir=workspace_dir,
                 run_config_path=run_config_path,
                 result_file=None,
-                mission_summary_file=None,
+                mission_summary_file=runtime_summary_file,
                 max_floor=args.max_floor,
                 timeout=args.timeout,
                 log_path=logs_dir / "danger_search.log",
@@ -689,11 +808,15 @@ def main() -> int:
     write_json(run_dir / "detection_debug.json", {"status": "not_collected", "source": "logs/danger_search.log"})
     write_json(run_dir / "planner_debug.json", {"status": "not_collected", "source": "logs/danger_search.log"})
 
-    runtime_summary = read_json(runtime_summary_file, default={}) or {}
-    runtime_failures = runtime_summary.get("failure_reason", [])
-    if isinstance(runtime_failures, str):
-        runtime_failures = [runtime_failures]
-    failure_reason.extend(str(item) for item in runtime_failures if item)
+    runtime_summary = read_and_validate_summary(runtime_summary_file)
+    runtime_summary_valid = runtime_summary is not None
+    if not runtime_summary_valid:
+        failure_reason.append("缺少或损坏 mission_runtime_summary.json")
+    else:
+        runtime_failures = runtime_summary.get("failure_reason", [])
+        if isinstance(runtime_failures, str):
+            runtime_failures = [runtime_failures]
+        failure_reason.extend(str(item) for item in runtime_failures if item)
     if termination is not None and termination.kind == "runner_timeout":
         failure_reason.append("外部超时")
     if termination is not None and termination.kind not in ("algorithm_exit",):
@@ -702,17 +825,26 @@ def main() -> int:
         )
     failure_reason = list(dict.fromkeys(failure_reason))
     result_written = result_file.exists()
-    normal_runtime_completion = runtime_completed_successfully(runtime_summary)
+    # 若本轮已归档并删除了旧结果，则赛后该文件存在即代表算法本轮新写，不依赖 mtime。
+    result_written_this_run = (
+        public_result_was_archived
+        and production_result_file is not None
+        and production_result_file.exists()
+    )
+    normal_runtime_completion = (
+        runtime_summary_valid and runtime_completed_successfully(runtime_summary)
+    )
+    # 算法零退出码只代表进程正常退出，不代表任务成功；必须同时有本轮新结果和成功返航闭环。
     mission_completed = bool(
-        result_written
+        result_written_this_run
         and termination is not None
         and termination.kind == "algorithm_exit"
         and termination.return_code == 0
-        and (normal_runtime_completion or not runtime_summary)
+        and normal_runtime_completion
     )
     if result_written and not normal_runtime_completion:
         failure_reason.append(
-            f"任务未正常完成: {runtime_summary.get('terminal_reason', 'missing_runtime_outcome')}"
+            f"任务未正常完成: {runtime_summary.get('terminal_reason', 'missing_runtime_outcome') if runtime_summary else 'missing_runtime_summary'}"
         )
     failure_reason = list(dict.fromkeys(failure_reason))
 
@@ -734,16 +866,24 @@ def main() -> int:
         "evaluation_completed": evaluation_completed,
         "algo_return_code": termination.return_code if termination is not None else None,
         "runtime_completed": normal_runtime_completion,
-        "runtime_terminal_state": runtime_summary.get("terminal_state", ""),
-        "runtime_terminal_outcome": runtime_summary.get("terminal_outcome", ""),
-        "runtime_terminal_reason": runtime_summary.get("terminal_reason", ""),
-        "return_home_success": runtime_summary.get("return_home_success", ""),
-        "elevator_success": runtime_summary.get("elevator_success", ""),
-        "exploration_time": runtime_summary.get("exploration_time", ""),
-        "timeout_triggered": runtime_summary.get("timeout_triggered", ""),
-        "current_floor": runtime_summary.get("current_floor", ""),
-        "confirmed_count": runtime_summary.get("confirmed_count", ""),
-        "track_count": runtime_summary.get("track_count", ""),
+        "runtime_exploration_completed": (
+            runtime_summary.get("exploration_completed", False) if runtime_summary else False
+        ),
+        "runtime_terminal_state": runtime_summary.get("terminal_state", "") if runtime_summary else "",
+        "runtime_terminal_outcome": runtime_summary.get("terminal_outcome", "") if runtime_summary else "",
+        "runtime_terminal_reason": runtime_summary.get("terminal_reason", "") if runtime_summary else "",
+        "normal_budget_return": bool(
+            normal_runtime_completion
+            and runtime_summary is not None
+            and runtime_summary.get("exploration_completed") is not True
+        ),
+        "return_home_success": runtime_summary.get("return_home_success", "") if runtime_summary else "",
+        "elevator_success": runtime_summary.get("elevator_success", "") if runtime_summary else "",
+        "exploration_time": runtime_summary.get("exploration_time", "") if runtime_summary else "",
+        "timeout_triggered": runtime_summary.get("timeout_triggered", "") if runtime_summary else "",
+        "current_floor": runtime_summary.get("current_floor", "") if runtime_summary else "",
+        "confirmed_count": runtime_summary.get("confirmed_count", "") if runtime_summary else "",
+        "track_count": runtime_summary.get("track_count", "") if runtime_summary else "",
         "started_at": started_at.isoformat(),
         "timestamp": datetime.datetime.now().isoformat(),
         "elapsed_wall_time": round((datetime.datetime.now() - started_at).total_seconds(), 3),

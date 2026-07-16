@@ -67,6 +67,48 @@ FINISH = "FINISH"
 MISSION_FAILED = "FAILED"
 PROBE_LATERAL_OFFSETS = (0.0, -1.0, 1.0, -2.0, 2.0)
 FLOOR_ALIGNMENT_REQUIRED_ODOM_SAMPLES = 2
+EXPLORATION_COMPLETE_RETURN_REASONS = frozenset(
+    {"floor_completion_ready", "floor_completion_ready_return_home"}
+)
+
+
+def _validate_summary_output_path(path: str | Path, public_result: Path) -> Path:
+    """正式 mission summary 只能写入公开结果目录下的 runs/<run-id>/mission_runtime_summary.json。
+
+    禁止 summary 路径指向 generated_building、truth、metadata、任意系统目录或符号链接。
+    """
+    summary_path = Path(path)
+    if not summary_path.is_absolute():
+        raise ValueError("mission summary 必须使用绝对路径")
+    if summary_path.name != "mission_runtime_summary.json":
+        raise ValueError("mission summary 文件名必须是 mission_runtime_summary.json")
+    if summary_path.is_symlink():
+        raise ValueError("mission summary 路径不能是符号链接")
+    allowed_root = public_result.parent / "runs"
+    try:
+        summary_path.parent.resolve(strict=False).relative_to(
+            allowed_root.resolve(strict=False)
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"mission summary 输出越出参赛方运行归档目录: {summary_path}"
+        ) from exc
+    return summary_path
+
+
+def _return_reason_indicates_exploration_complete(reason: str | None) -> bool:
+    """只有完整扫描确认的返航才表示探索完成，预算返航只表示闭环完成。"""
+    return reason in EXPLORATION_COMPLETE_RETURN_REASONS
+
+
+def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+    """使用同目录临时文件加 os.replace() 原子写 JSON，防止 runner 读取半截文件。"""
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temp_path, path)
 
 
 @dataclass
@@ -247,6 +289,7 @@ class MissionManager:
         self._transition_history: list[dict[str, object]] = []
         self._return_home_started = False
         self._return_home_completed = False
+        self._return_home_reason: str | None = None
         self._mission_success_eligible = True
         self._normal_completion = False
         self._terminal_outcome = "running"
@@ -620,7 +663,9 @@ class MissionManager:
             if configured_result and Path(configured_result).resolve() != public_result.resolve():
                 raise ValueError("正式运行结果文件必须使用 team_scene_info.json 公布的路径")
             if self.mission_summary_file:
-                raise ValueError("正式运行不得写入额外 mission_summary_file")
+                self.mission_summary_file = str(
+                    _validate_summary_output_path(self.mission_summary_file, public_result)
+                )
             self.result_file = str(public_result)
         else:
             self.result_file = configured_result or os.path.join(os.getcwd(), "results", "detected_danger.json")
@@ -1311,8 +1356,26 @@ class MissionManager:
         self._last_image_stamp = stamp
         image_stamp = _message_stamp_seconds(bundle.rgb_msg)
         provider = getattr(self, "pose_provider", None)
-        image_pose = provider.at(image_stamp) if provider is not None else None
-        image_pose = image_pose or pose_sample
+        image_pose = (
+            provider.at(image_stamp)
+            if provider is not None and image_stamp is not None
+            else None
+        )
+        if image_pose is None:
+            # 不使用最近云帧位姿、TF 或 Gazebo 真值兜底，避免 RGB-D 检测
+            # 与彩色图像不同步导致伪目标。
+            now = get_time()
+            if now - getattr(self, "_last_rgbd_pose_lookup_log_time", 0.0) > 5.0:
+                self._last_rgbd_pose_lookup_log_time = now
+                self._log_structured(
+                    {
+                        "event": "rgbd_pose_lookup_skipped",
+                        "elapsed": round(float(self._elapsed()), 3),
+                        "image_stamp": image_stamp,
+                        "reason": "no_time_matched_localization_sample",
+                    }
+                )
+            return
         if provider is not None:
             camera_to_world = provider.sensor_to_world_matrix(
                 image_pose,
@@ -2816,6 +2879,14 @@ class MissionManager:
             and getattr(self, "_return_home_completed", False)
             and getattr(self, "_return_home_success", False)
         )
+        # 时间预算不足导致的返航闭环成功，不能标记为“探索完成”。
+        self._exploration_completed = bool(
+            self._normal_completion
+            and not getattr(self, "_timeout_triggered", False)
+            and _return_reason_indicates_exploration_complete(
+                getattr(self, "_return_home_reason", None)
+            )
+        )
         self._terminal_outcome = "success" if self._normal_completion else "failed"
         self._terminal_reason = resolved_reason
         self._terminal_state = FINISH if self._normal_completion else MISSION_FAILED
@@ -2941,6 +3012,10 @@ class MissionManager:
         old_state = getattr(self, "state", None)
         self.state = new_state
         if new_state == RETURN_HOME:
+            if not getattr(self, "_return_home_started", False) or not getattr(
+                self, "_return_home_reason", None
+            ):
+                self._return_home_reason = reason_code
             self._return_home_started = True
         if new_state == WRITE_RESULT:
             self._pending_result_write_reason = reason_code
@@ -3067,6 +3142,10 @@ class MissionManager:
             "terminal_outcome": getattr(self, "_terminal_outcome", "failed"),
             "terminal_reason": getattr(self, "_terminal_reason", None),
             "completed": bool(getattr(self, "_normal_completion", False)),
+            "exploration_completed": bool(
+                getattr(self, "_exploration_completed", False)
+            ),
+            "return_home_reason": getattr(self, "_return_home_reason", None),
             "mission_success_eligible": bool(
                 getattr(self, "_mission_success_eligible", True)
             ),
@@ -3101,7 +3180,7 @@ class MissionManager:
             ),
             "result_file": str(result_path),
         }
-        summary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _atomic_write_json(summary_path, payload)
 
 
 def nearest_forward_obstacle_distance(

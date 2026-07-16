@@ -1,5 +1,6 @@
 import json
 import math
+import numpy as np
 from pathlib import Path
 import tempfile
 import unittest
@@ -37,6 +38,47 @@ from danger_search.sensor_buffer import SensorBuffer
 
 
 class MissionManagerHelperTest(unittest.TestCase):
+    def test_summary_output_accepts_not_yet_created_run_directory(self):
+        """先验证路径再创建目录，不能要求 run-id 目录已存在。"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            public_result = root / "results" / "detected_danger.json"
+            public_result.parent.mkdir()
+            summary = (
+                public_result.parent
+                / "runs"
+                / "new_run"
+                / "mission_runtime_summary.json"
+            )
+
+            validated = mission_manager_module._validate_summary_output_path(
+                summary,
+                public_result,
+            )
+
+            self.assertEqual(validated, summary)
+            self.assertFalse(summary.parent.exists())
+
+    def test_summary_output_rejects_symlinked_parent_outside_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runs = root / "results" / "runs"
+            runs.mkdir(parents=True)
+            outside = root / "outside"
+            outside.mkdir()
+            linked_run = runs / "linked_run"
+            try:
+                linked_run.symlink_to(outside, target_is_directory=True)
+            except OSError:
+                self.skipTest("当前环境无法创建目录符号链接")
+            summary = linked_run / "mission_runtime_summary.json"
+
+            with self.assertRaises(ValueError):
+                mission_manager_module._validate_summary_output_path(
+                    summary,
+                    root / "results" / "detected_danger.json",
+                )
+
     def test_only_elevator_threshold_crossing_disables_unknown_support_hold(self):
         task = TakeElevator(0, 1)
         for phase in ("ENTER_CABIN", "EXIT_CABIN"):
@@ -881,6 +923,21 @@ class MissionManagerHelperTest(unittest.TestCase):
             detect_messages=lambda *args, **kwargs: detections.append(True) or [],
         )
         manager.tracker = SimpleNamespace(update=lambda *args, **kwargs: None)
+        manager.camera_mount_xyz = (0.28, 0.0, 0.043)
+        manager.camera_mount_rpy = (0.0, 0.0, 0.0)
+        # 楼层过渡门控只暂停点云建图，不应阻止 RGB-D 检测；仍需要时间匹配位姿。
+        manager.pose_provider = SimpleNamespace(
+            at=lambda stamp: mission_manager_module.PoseSample(
+                stamp=float(stamp or 0.0),
+                xyz=(0.0, 0.0, 0.39),
+                quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                linear_xyz=(0.0, 0.0, 0.0),
+                angular_xyz=(0.0, 0.0, 0.0),
+            )
+            if stamp == 1.0
+            else None,
+            sensor_to_world_matrix=lambda sample, **kwargs: np.eye(4),
+        )
         rgb_msg = SimpleNamespace(
             header=SimpleNamespace(
                 stamp=SimpleNamespace(to_sec=lambda: 1.0),
@@ -907,6 +964,116 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertEqual(map_updates, [])
         self.assertEqual(obstacle_updates, [])
         self.assertEqual(detections, [True])
+
+    def test_rgb_detection_uses_time_matched_pose_not_cloud_pose(self):
+        """RGB-D 检测应使用与彩色图像时间戳匹配的内部定位位姿。"""
+        from danger_search.pose_provider import PoseProvider
+
+        manager, _clock, diagnostics, reads, map_updates, obstacle_updates = (
+            self._make_floor_transition_manager()
+        )
+        manager.current_task = None
+        manager.camera_mount_xyz = (0.28, 0.0, 0.043)
+        manager.camera_mount_rpy = (0.0, 0.0, 0.0)
+        camera_to_world_matrices = []
+        manager.detector = SimpleNamespace(
+            detect_messages=lambda *args, **kwargs: camera_to_world_matrices.append(
+                args[3]
+            )
+            or [],
+        )
+        manager.tracker = SimpleNamespace(update=lambda *args, **kwargs: None)
+
+        provider = PoseProvider("/danger_search/localization/odom", max_samples=8)
+        # 云帧位姿在 x=0.5；图像时间戳位姿在 x=1.0
+        provider._on_odometry(self._odom_message(1.0))
+        matched_sample = mission_manager_module.PoseSample(
+            stamp=2.0,
+            xyz=(1.0, 0.0, 0.39),
+            quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+            linear_xyz=(0.0, 0.0, 0.0),
+            angular_xyz=(0.0, 0.0, 0.0),
+        )
+        provider._samples.append(matched_sample)
+        manager.pose_provider = provider
+
+        rgb_msg = SimpleNamespace(
+            header=SimpleNamespace(
+                stamp=SimpleNamespace(to_sec=lambda: 2.0),
+                frame_id="camera",
+            )
+        )
+        bundle = SimpleNamespace(
+            rgb_msg=rgb_msg,
+            depth_msg=SimpleNamespace(),
+            camera_info_msg=SimpleNamespace(),
+        )
+
+        manager._update_mapping_and_detection(
+            self._mapping_snapshot(
+                cloud_stamp=1.0,
+                odom_stamp=1.0,
+                image_bundle=bundle,
+            ),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.316),
+        )
+
+        self.assertEqual(len(camera_to_world_matrices), 1)
+        self.assertAlmostEqual(
+            camera_to_world_matrices[0][0, 3],
+            1.0 + 0.28,  # 时间匹配位姿 x + camera_mount_xyz x
+            places=3,
+        )
+
+    def test_rgb_detection_skips_frame_when_time_matched_pose_missing(self):
+        """没有匹配时间戳的内部定位位姿时，应跳过该帧检测，不得回退。"""
+        manager, _clock, diagnostics, reads, map_updates, obstacle_updates = (
+            self._make_floor_transition_manager()
+        )
+        manager.current_task = None
+        detections = []
+        manager.detector = SimpleNamespace(
+            detect_messages=lambda *args, **kwargs: detections.append(True) or [],
+        )
+        manager.tracker = SimpleNamespace(update=lambda *args, **kwargs: None)
+        manager.pose_provider = SimpleNamespace(
+            at=lambda _stamp: None,
+            sensor_to_world_matrix=lambda *args, **kwargs: self.fail(
+                "不存在匹配位姿时不应构造相机外参矩阵"
+            ),
+        )
+
+        rgb_msg = SimpleNamespace(
+            header=SimpleNamespace(
+                stamp=SimpleNamespace(to_sec=lambda: 2.0),
+                frame_id="camera",
+            )
+        )
+        bundle = SimpleNamespace(
+            rgb_msg=rgb_msg,
+            depth_msg=SimpleNamespace(),
+            camera_info_msg=SimpleNamespace(),
+        )
+
+        manager._update_mapping_and_detection(
+            self._mapping_snapshot(
+                cloud_stamp=1.0,
+                odom_stamp=1.0,
+                image_bundle=bundle,
+            ),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.316),
+        )
+
+        self.assertEqual(detections, [])
+        self.assertTrue(
+            any(
+                payload.get("event") == "rgbd_pose_lookup_skipped"
+                for payload in diagnostics
+            ),
+            diagnostics,
+        )
 
     def test_transition_state_records_structured_diagnostics_for_new_object(self):
         """轻量构造的 manager 也应记录完整状态转换上下文。"""
@@ -1129,8 +1296,86 @@ class MissionManagerHelperTest(unittest.TestCase):
             manager._write_result(reason_code=manager._pending_result_write_reason)
 
         self.assertTrue(manager._normal_completion)
+        self.assertTrue(manager._exploration_completed)
         self.assertEqual(manager._terminal_state, FINISH)
         self.assertEqual(manager._terminal_outcome, "success")
+
+    def test_budget_and_low_progress_returns_are_not_exploration_complete(self):
+        """返航闭环可以成功，但预算或低收益退出不能伪装成探索完成。"""
+        for return_reason in (
+            "mission_insufficient_time_for_return",
+            "floor_timeout_return_home",
+            "floor_low_progress_return_home",
+            "floor_timeout_change_floor_return_home",
+        ):
+            with self.subTest(return_reason=return_reason):
+                manager = MissionManager.__new__(MissionManager)
+                manager.state = RETURN_HOME
+                manager.start_time = 0.0
+                manager.current_floor = 0
+                manager.max_floor = 1
+                manager.current_task = None
+                manager.current_frontier = None
+                manager._no_reachable_frontier_confirmations = 0
+                manager._transition_history = []
+                manager._return_home_started = True
+                manager._return_home_completed = True
+                manager._return_home_success = True
+                manager._return_home_reason = return_reason
+                manager._mission_success_eligible = True
+                manager._timeout_triggered = False
+                manager._failure_reasons = []
+                manager._finished = False
+                manager.mission_summary_file = ""
+                manager.controller = SimpleNamespace(stop=lambda *args, **kwargs: None)
+                manager.tracker = SimpleNamespace(
+                    confirmed_positions=lambda now: [],
+                    tracks=[],
+                )
+                manager.result_writer = SimpleNamespace(
+                    write=lambda elapsed, positions: Path("result.json")
+                )
+
+                with patch.object(
+                    mission_manager_module,
+                    "get_time",
+                    return_value=10.0,
+                ), patch.object(
+                    mission_manager_module,
+                    "rospy",
+                    SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+                ):
+                    manager._write_result(reason_code="return_home_completed")
+
+                self.assertTrue(manager._normal_completion)
+                self.assertFalse(manager._exploration_completed)
+
+    def test_floor_change_back_to_home_preserves_original_return_reason(self):
+        """返航途中完成换层不能覆盖最初的预算或探索完成原因。"""
+        manager = MissionManager.__new__(MissionManager)
+        manager.state = RETURN_HOME
+        manager.current_floor = 0
+        manager.current_task = None
+        manager.current_frontier = None
+        manager._no_reachable_frontier_confirmations = 0
+        manager._transition_history = []
+        manager._return_home_started = True
+        manager._return_home_completed = False
+        manager._return_home_reason = "floor_timeout_return_home"
+        manager.explorer = SimpleNamespace(last_selection_debug=None)
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ):
+            manager._transition_state(
+                RETURN_HOME,
+                reason_code="floor_change_completed_return_home",
+                call_site="test.floor_change",
+            )
+
+        self.assertEqual(manager._return_home_reason, "floor_timeout_return_home")
 
     def test_probe_targets_sweep_lanes_before_extending_forward(self):
         base_pose = (0.0, 0.0, 0.0)

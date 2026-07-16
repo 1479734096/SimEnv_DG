@@ -210,7 +210,7 @@ GUI=false ./auto.sh
 | 接口 | 类型 | 说明 |
 |------|------|------|
 | `/cmd_vel` | `geometry_msgs/Twist` | 机器人速度指令输入 |
-| `/scan` | `sensor_msgs/PointCloud2` | Livox Mid-360 点云数据 |
+| `/scan` | `sensor_msgs/PointCloud` | Livox Mid-360 原始点云数据 |
 | `/livox/Pointcloud2` | `sensor_msgs/PointCloud2` | 点云转换节点输出，开启时可用 |
 | `/livox/lidar2` | `unitree_guide/CustomMsg` | Livox 风格点云消息，开启时可用 |
 | `/livox/imu` | `sensor_msgs/Imu` | Livox 内置 IMU |

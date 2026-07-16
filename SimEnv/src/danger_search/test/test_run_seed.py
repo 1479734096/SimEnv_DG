@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import signal
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -18,7 +20,127 @@ sys.modules[SPEC.name] = run_seed
 SPEC.loader.exec_module(run_seed)
 
 
+def _make_run_summary(
+    *,
+    completed: bool = True,
+    exploration_completed: bool = True,
+    terminal_reason: str = "return_home_completed",
+    timeout_triggered: bool = False,
+) -> dict:
+    return {
+        "completed": completed,
+        "exploration_completed": exploration_completed,
+        "terminal_outcome": "success" if completed else "failed",
+        "terminal_state": "FINISH" if completed else "FAILED",
+        "terminal_reason": terminal_reason,
+        "return_home_started": True,
+        "return_home_completed": True,
+        "return_home_success": True,
+        "timeout_triggered": timeout_triggered,
+    }
+
+
+def _make_fake_env_process():
+    return SimpleNamespace(
+        pid=12345,
+        isalive=lambda: True,
+        close=lambda force: None,
+        owned_environment_processes=[],
+    )
+
+
 class RunSeedCompletionTest(unittest.TestCase):
+    def test_environment_launch_starts_paused_without_auto_unpause(self):
+        overrides = run_seed.environment_launch_overrides(
+            seed=42,
+            gui_enabled=False,
+            max_floor=1,
+            run_pid_dir=Path("/tmp/run-pids"),
+        )
+
+        self.assertEqual(overrides["PAUSED"], "true")
+        self.assertEqual(overrides["AUTO_UNPAUSE"], "false")
+        self.assertEqual(overrides["SEED"], "42")
+        self.assertEqual(overrides["FLOOR_COUNT"], "1")
+
+    def test_environment_unpauses_after_model_load_before_fixed_stand(self):
+        events = []
+
+        class FakeChild:
+            pid = 12345
+
+            def expect(self, pattern, timeout):
+                events.append(("expect", pattern))
+
+            def send(self, value):
+                events.append(("send", value))
+
+            def isalive(self):
+                return True
+
+            def close(self, force):
+                events.append(("close", force))
+
+        child = FakeChild()
+
+        def fake_unpause(_workspace):
+            events.append(("unpause", None))
+
+        with patch("pexpect.spawn", return_value=child) as spawn, patch.object(
+            run_seed, "unpause_environment_physics", side_effect=fake_unpause
+        ), patch.object(run_seed, "check_startup_health"), patch.object(
+            run_seed, "capture_environment_processes", return_value=[]
+        ), patch.object(run_seed.time, "sleep"):
+            returned = run_seed.run_environment(
+                42,
+                Path("/workspace"),
+                log_file=None,
+                gui_enabled=False,
+                health_log_path=Path("/workspace/health.log"),
+                max_floor=1,
+            )
+
+        self.assertIs(returned, child)
+        spawn_env = spawn.call_args.kwargs["env"]
+        self.assertEqual(spawn_env["PAUSED"], "true")
+        self.assertEqual(spawn_env["AUTO_UNPAUSE"], "false")
+        self.assertLess(events.index(("unpause", None)), events.index(("send", "2")))
+        self.assertLess(events.index(("send", "2")), events.index(("send", "6")))
+
+    def test_unpause_uses_gazebo_service_with_timeout(self):
+        with patch.object(run_seed.subprocess, "run") as call:
+            run_seed.unpause_environment_physics(Path("/workspace"), timeout=7)
+
+        command = call.call_args.args[0]
+        self.assertEqual(command[:2], ["bash", "-lc"])
+        self.assertIn("rosservice call /gazebo/unpause_physics", command[2])
+        self.assertEqual(call.call_args.kwargs["timeout"], 7)
+        self.assertTrue(call.call_args.kwargs["check"])
+
+    def test_algorithm_health_failure_stops_owned_launch_process(self):
+        process = SimpleNamespace(poll=lambda: None)
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            run_seed.subprocess, "Popen", return_value=process
+        ), patch.object(
+            run_seed,
+            "check_startup_health",
+            side_effect=RuntimeError("定位健康检查失败"),
+        ), patch.object(run_seed, "stop_owned_process") as stop_process:
+            with self.assertRaisesRegex(RuntimeError, "定位健康检查失败"):
+                run_seed.run_danger_search(
+                    workspace_dir=Path(temp_dir),
+                    run_config_path=Path(temp_dir) / "params.yaml",
+                    result_file=None,
+                    mission_summary_file=None,
+                    max_floor=1,
+                    timeout=30,
+                    log_path=Path(temp_dir) / "danger_search.log",
+                    environment_process=_make_fake_env_process(),
+                    gui_enabled=False,
+                )
+
+        stop_process.assert_called_once_with(process, label="danger_search")
+
     def test_environment_cleanup_uses_recorded_group_after_shell_exit(self):
         child = SimpleNamespace(
             pid=12345,
@@ -71,21 +193,205 @@ class RunSeedCompletionTest(unittest.TestCase):
         )
 
     def test_only_successful_return_home_is_completed(self):
-        summary = {
-            "completed": True,
-            "terminal_outcome": "success",
-            "terminal_state": "FINISH",
-            "terminal_reason": "return_home_completed",
-            "return_home_started": True,
-            "return_home_completed": True,
-            "return_home_success": True,
-            "timeout_triggered": False,
-        }
+        summary = _make_run_summary()
 
         self.assertTrue(run_seed.runtime_completed_successfully(summary))
 
+    def test_corrupted_summary_is_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mission_runtime_summary.json"
+            path.write_text("not json", encoding="utf-8")
+            self.assertIsNone(run_seed.read_and_validate_summary(path))
+
+    def test_archive_existing_public_result_only_touches_result_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            results_dir = Path(directory) / "results"
+            results_dir.mkdir()
+            public_result = results_dir / "detected_danger.json"
+            public_result.write_text("{}", encoding="utf-8")
+            # 模拟一个不应被碰的环境文件
+            metadata = Path(directory) / "generated_building" / "layout_metadata.json"
+            metadata.parent.mkdir()
+            metadata.write_text("{}", encoding="utf-8")
+            run_dir = Path(directory) / "run"
+            run_dir.mkdir()
+
+            run_seed.archive_existing_public_result(public_result, run_dir)
+
+            self.assertTrue((run_dir / "preexisting_detected_danger.json").exists())
+            self.assertFalse(public_result.exists())
+            self.assertTrue(metadata.exists())
+
+    def test_archive_refuses_non_result_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bad_file = Path(directory) / "danger_truth.json"
+            bad_file.write_text("{}", encoding="utf-8")
+            run_dir = Path(directory) / "run"
+            run_dir.mkdir()
+            with self.assertRaises(ValueError):
+                run_seed.archive_existing_public_result(bad_file, run_dir)
+
+    def _run_main_with_mocks(
+        self,
+        workspace: Path,
+        run_danger_search_return: run_seed.RunTermination,
+        write_result: bool = False,
+        write_summary: dict | None = None,
+    ) -> dict:
+        """在最小临时工作区上运行 run_seed.main() 并返回 mission_summary。"""
+        run_dir = workspace / "results" / "runs" / "20260716_120000_seed_42"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "logs").mkdir(parents=True, exist_ok=True)
+        public_result = workspace / "results" / "detected_danger.json"
+        public_result.parent.mkdir(parents=True, exist_ok=True)
+        summary_path = run_dir / "mission_runtime_summary.json"
+        config_path = run_dir / "params.yaml"
+
+        def fake_run_danger_search(*args, **kwargs):
+            if write_result:
+                public_result.write_text(json.dumps({"detected": True}), encoding="utf-8")
+            if write_summary is not None:
+                summary_path.write_text(json.dumps(write_summary), encoding="utf-8")
+            return run_danger_search_return
+
+        with patch.object(sys, "argv", ["run_seed.py", "--seed", "42", "--headless"]), patch.object(
+            run_seed, "find_workspace_dir", return_value=workspace
+        ), patch.object(run_seed, "create_run_dir", return_value=run_dir), patch.object(
+            run_seed, "find_conflicting_processes", return_value=[]
+        ), patch.object(run_seed, "run_environment", return_value=_make_fake_env_process()), patch.object(
+            run_seed, "run_danger_search", side_effect=fake_run_danger_search
+        ), patch.object(run_seed, "public_result_file", return_value=public_result), patch.object(
+            run_seed, "write_effective_config", return_value={}
+        ), patch.object(run_seed, "write_yaml", return_value=None), patch.object(
+            run_seed, "copy_runtime_logs", return_value=None
+        ), patch.object(run_seed, "evaluate_run", return_value=False):
+            returncode = run_seed.main()
+
+        self.assertTrue((run_dir / "mission_summary.json").exists())
+        summary = json.loads((run_dir / "mission_summary.json").read_text(encoding="utf-8"))
+        summary["_returncode"] = returncode
+        return summary
+
+    def test_main_archives_old_result_and_deletes_only_result_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            public_result = workspace / "results" / "detected_danger.json"
+            public_result.parent.mkdir(parents=True, exist_ok=True)
+            public_result.write_text("old", encoding="utf-8")
+            termination = run_seed.RunTermination(0, "algorithm_exit", "algorithm_exit", "danger_search")
+            summary = self._run_main_with_mocks(workspace, termination, write_result=False)
+            run_dir = workspace / "results" / "runs" / "20260716_120000_seed_42"
+            self.assertTrue((run_dir / "preexisting_detected_danger.json").exists())
+            self.assertFalse(public_result.exists())
+            self.assertFalse(summary["completed"])
+
+    def test_missing_summary_with_zero_exit_and_result_is_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            termination = run_seed.RunTermination(0, "algorithm_exit", "algorithm_exit", "danger_search")
+            summary = self._run_main_with_mocks(workspace, termination, write_result=True)
+            self.assertFalse(summary["completed"])
+            self.assertIn("缺少或损坏 mission_runtime_summary.json", summary["failure_reason"])
+
+    def test_corrupted_summary_is_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            run_dir = workspace / "results" / "runs" / "20260716_120000_seed_42"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = run_dir / "mission_runtime_summary.json"
+            summary_path.write_text("bad json", encoding="utf-8")
+            termination = run_seed.RunTermination(0, "algorithm_exit", "algorithm_exit", "danger_search")
+            summary = self._run_main_with_mocks(workspace, termination, write_result=True)
+            self.assertFalse(summary["completed"])
+            self.assertIn("缺少或损坏 mission_runtime_summary.json", summary["failure_reason"])
+
+    def test_failure_summary_is_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            termination = run_seed.RunTermination(0, "algorithm_exit", "algorithm_exit", "danger_search")
+            summary = self._run_main_with_mocks(
+                workspace,
+                termination,
+                write_result=True,
+                write_summary=_make_run_summary(completed=False),
+            )
+            self.assertFalse(summary["completed"])
+
+    def test_runner_timeout_is_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            termination = run_seed.RunTermination(-1, "runner_timeout", "wall_timeout", "run_seed.py")
+            summary = self._run_main_with_mocks(
+                workspace,
+                termination,
+                write_result=True,
+                write_summary=_make_run_summary(),
+            )
+            self.assertFalse(summary["completed"])
+            self.assertTrue(summary["external_timeout"])
+
+    def test_return_home_completed_is_mission_completed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            termination = run_seed.RunTermination(0, "algorithm_exit", "algorithm_exit", "danger_search")
+            summary = self._run_main_with_mocks(
+                workspace,
+                termination,
+                write_result=True,
+                write_summary=_make_run_summary(),
+            )
+            self.assertTrue(summary["completed"])
+            self.assertTrue(summary["runtime_completed"])
+            self.assertTrue(summary["runtime_exploration_completed"])
+            self.assertFalse(summary["normal_budget_return"])
+
+    def test_old_result_not_reused_when_not_rewritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            public_result = workspace / "results" / "detected_danger.json"
+            public_result.parent.mkdir(parents=True, exist_ok=True)
+            public_result.write_text("old", encoding="utf-8")
+            termination = run_seed.RunTermination(0, "algorithm_exit", "algorithm_exit", "danger_search")
+            summary = self._run_main_with_mocks(workspace, termination, write_result=False)
+            self.assertFalse(summary["completed"])
+            self.assertFalse(summary["result_written"])
+
+    def test_budget_return_is_closed_loop_but_not_exploration_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            termination = run_seed.RunTermination(0, "algorithm_exit", "algorithm_exit", "danger_search")
+            summary = self._run_main_with_mocks(
+                workspace,
+                termination,
+                write_result=True,
+                write_summary=_make_run_summary(
+                    exploration_completed=False,
+                    terminal_reason="return_home_completed",
+                ),
+            )
+            self.assertTrue(summary["completed"])
+            self.assertTrue(summary["runtime_completed"])
+            self.assertFalse(summary["runtime_exploration_completed"])
+            self.assertTrue(summary["normal_budget_return"])
+
 
 class StartupPostureGateTest(unittest.TestCase):
+    def test_algorithm_health_does_not_repeat_rospy_posture_probe(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            run_seed, "wait_for_ros_topic"
+        ) as wait_topic, patch.object(run_seed, "_probe_robot_posture") as posture_probe:
+            log_path = Path(temp_dir) / "algorithm_health_check.log"
+            run_seed.check_startup_health(
+                Path(temp_dir),
+                log_path,
+                require_localization=True,
+            )
+            log_content = log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(wait_topic.call_count, 2)
+        posture_probe.assert_not_called()
+        self.assertIn("不重复采样", log_content)
+
     def test_identity_quaternion_is_zero_rpy(self):
         roll, pitch = run_seed._quaternion_to_rpy(0.0, 0.0, 0.0, 1.0)
         self.assertAlmostEqual(roll, 0.0, places=6)

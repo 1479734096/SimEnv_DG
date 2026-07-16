@@ -332,6 +332,46 @@ class LocalControllerTest(unittest.TestCase):
         self.assertGreaterEqual(snapshot["wall_command_age"], 0.0)
         json.dumps(follower.command_debug_summary(), allow_nan=False)
 
+    def test_path_diagnostics_are_noop_without_publishers(self):
+        """rospy 已导入但未 init_node、publisher 为 None 时 set_path 不得报错。"""
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+        self.assertEqual(follower.raw_path_snapshot(), [(0.0, 0.0), (1.0, 0.0)])
+
+    def test_path_diagnostics_are_published_when_publishers_exist(self):
+        """诊断 publisher 存在且 ROS 时钟可用时，set_path 仍发布 raw/followed path。"""
+        import rospy
+
+        class FakePublisher:
+            def __init__(self):
+                self.messages = []
+
+            def publish(self, message):
+                self.messages.append(message)
+
+        class FakePoseStamped:
+            def __init__(self):
+                self.header = SimpleNamespace()
+                self.pose = SimpleNamespace(position=SimpleNamespace(), orientation=SimpleNamespace())
+
+        class FakePathMessage:
+            def __init__(self):
+                self.header = SimpleNamespace()
+                self.poses = []
+
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower._raw_path_publisher = FakePublisher()
+        follower._followed_path_publisher = FakePublisher()
+        with patch("danger_search.navigator.PathMessage", FakePathMessage), patch(
+            "danger_search.navigator.PoseStamped", FakePoseStamped
+        ), patch.object(rospy.Time, "now", return_value=SimpleNamespace()):
+            follower.set_path([(0.0, 0.0), (0.5, 0.0), (1.0, 0.0)])
+
+        self.assertEqual(len(follower._raw_path_publisher.messages), 1)
+        self.assertEqual(len(follower._followed_path_publisher.messages), 1)
+        self.assertEqual(len(follower._raw_path_publisher.messages[0].poses), 3)
+        self.assertEqual(len(follower._followed_path_publisher.messages[0].poses), 2)
+
     def test_lookahead_uses_path_distance_not_euclidean(self):
         """直角路径上，lookahead 应落在第一段路径上，而不是直接看穿墙角。"""
         follower = PathFollower(

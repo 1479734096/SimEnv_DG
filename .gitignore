@@ -2,6 +2,8 @@
 SimEnv/build/
 SimEnv/devel/
 SimEnv/install/
+SimEnv/build_fix_compliance/
+SimEnv/devel_fix_compliance/
 SimEnv/.catkin_tools/
 
 # 运行日志和结果

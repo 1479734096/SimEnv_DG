@@ -106,7 +106,7 @@ ENABLE_SENSOR_DATA=0 ENABLE_LIVOX=1 ./auto.sh
 | `ENABLE_FRONT_CAMERA` | `0` | 是否启用可选前视 RGB 相机 |
 | `ENABLE_POINTCLOUD_CONVERTER` | 跟随 `ENABLE_LIVOX` | 是否将 `/scan` 转换为 `/livox/Pointcloud2` 和 `/livox/lidar2` |
 | `ENABLE_GROUND_TRUTH` | `1` | 是否发布 Gazebo 真值调试话题 |
-| `ENABLE_REFEREE_ODOM` | `1` | 是否发布 `/Odometry_gazebo` 和 `odom -> base` TF |
+| `ENABLE_REFEREE_ODOM` | `1` | 是否发布 `/Odometry_gazebo` 和 `odom -> base` TF（仅裁判/调试使用；参赛算法不得订阅） |
 | `ENABLE_FOOT_CONTACT_SENSOR` | `0` | 是否启用四个足端 ContactSensor 及接触力话题 |
 | `START_VIRTUAL_JOY` | `0` | 是否启动虚拟手柄，通常需要 `uinput` 权限 |
 | `ROBOT_X` | `0.0` | 机器人出生点 x |
