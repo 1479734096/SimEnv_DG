@@ -1,0 +1,8 @@
+prefix=/home/xbh/tzb26/codeDG/SimEnv/devel_mapper_range_red
+
+Name: danger_search_localization
+Description: Description of danger_search_localization
+Version: 0.1.0
+Cflags: -I/home/xbh/tzb26/codeDG/SimEnv/src/danger_search_localization/include
+Libs: -L${prefix}/lib 
+Requires: geometry_msgs nav_msgs roslib roscpp sensor_msgs std_msgs

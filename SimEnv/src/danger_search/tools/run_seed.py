@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+from collections import deque
 from dataclasses import dataclass
 import json
 import math
@@ -52,8 +53,18 @@ DEFAULT_HEALTH_CHECK_TIMEOUT = 120
 # 翻倒 run 实测 max_abs_roll≈3.14、z<0.1，阈值在两者间留充足余量。
 POSTURE_MAX_ABS_ROLL = 0.5
 POSTURE_MAX_ABS_PITCH = 0.5
+POSTURE_SETTLED_MAX_ABS_ROLL = 0.25
+POSTURE_SETTLED_MAX_ABS_PITCH = 0.25
 POSTURE_MIN_Z = 0.10
 POSTURE_SAMPLE_SECONDS = 5.0
+# fixed-stand 自身有约 3.5 秒的起立/增益过渡。传感器观察使用仿真时间，
+# wall time 只承担 /clock 或进程冻结的 watchdog，避免低 RTF 下误判。
+FIXED_STAND_MIN_SECONDS = 4.0
+FIXED_STAND_MAX_WAIT_SECONDS = 30.0
+FIXED_STAND_STABLE_WINDOW_SECONDS = 1.0
+FIXED_STAND_STABLE_MAX_ABS_ROLL = 0.20
+FIXED_STAND_STABLE_MAX_ABS_PITCH = 0.20
+FIXED_STAND_MAX_IMU_GAP_SECONDS = 0.20
 
 
 @dataclass(frozen=True)
@@ -62,6 +73,23 @@ class RunTermination:
     kind: str
     reason: str
     component: str
+
+
+def configure_workspace_ros_package_path(workspace_dir: Path) -> None:
+    """让直接运行的 Python runner 与其子 shell 使用同一 ROS 工作区。
+
+    README 允许直接执行本脚本，不要求调用者预先 source ``devel/setup.bash``。
+    runner 自身也会通过 rospkg 校验公开场景文件，因此必须先显式加入当前
+    工作区源码路径；保留调用者已有路径，且重复调用不产生重复项。
+    """
+    source_path = str(Path(workspace_dir) / "src")
+    existing = [
+        item for item in os.environ.get("ROS_PACKAGE_PATH", "").split(os.pathsep)
+        if item
+    ]
+    os.environ["ROS_PACKAGE_PATH"] = os.pathsep.join(
+        [source_path, *(item for item in existing if item != source_path)]
+    )
 
 
 def environment_launch_overrides(
@@ -73,9 +101,9 @@ def environment_launch_overrides(
 ) -> dict[str, str]:
     """构造本轮仿真环境变量。
 
-    Gazebo 必须先暂停完成 A1、Livox 射线和 ros_control 的装载。runner 会在
-    junior_ctrl 的 RL 模型加载完成后显式解除暂停，再发送起立指令，既避免物理
-    线程与模型装载并发，也保证起立时已有有效关节反馈。
+    Gazebo 必须先暂停完成 A1 和 Livox 射线装载。runner 会在 ``/scan`` 发布器
+    就绪后立即解除暂停，使 ros_control 在首个物理步之后读取正确的关节角周期
+    分支；随后仍按原接口启动 junior_ctrl 并发送起立指令。
     """
     return {
         "SEED": str(seed),
@@ -87,6 +115,14 @@ def environment_launch_overrides(
         "START_BUILDING_CONTROL": "1",
         "FLOOR_COUNT": str(max_floor),
         "RUN_PID_DIR": str(run_pid_dir),
+        # 赛方转换节点默认会订阅 /Odometry_gazebo；正式 runner 必须显式关闭，
+        # 不能依赖调用者恰好设置了同名环境变量。
+        "POINTCLOUD_USE_GROUND_TRUTH_ODOM": "false",
+        "ENABLE_REFEREE_ODOM": "false",
+        # 初始环境的受保护 RL 控制器以 referee-only 的 /ground_truth/base_w
+        # 构造策略观测。规则禁止参赛算法订阅这些话题，不禁止裁判环境发布；
+        # 关闭发布会让 RL 收到 /cmd_vel 却无法形成正常步态。
+        "ENABLE_GROUND_TRUTH": "true",
     }
 
 
@@ -243,7 +279,7 @@ def resolve_gui_enabled(args: argparse.Namespace) -> bool:
 
 
 def unpause_environment_physics(workspace_dir: Path, *, timeout: int = 15) -> None:
-    """在模型与控制器装载完成后显式启动物理仿真。"""
+    """在 Livox 装载完成、关节控制器初始化前显式启动物理仿真。"""
     command = " ".join(
         [
             "source /opt/ros/noetic/setup.bash",
@@ -264,6 +300,36 @@ def unpause_environment_physics(workspace_dir: Path, *, timeout: int = 15) -> No
         )
     except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as exc:
         raise RuntimeError("Gazebo 物理解除暂停失败") from exc
+
+
+def wait_for_ros_topic_publisher(topic: str, *, timeout: float = 120.0) -> None:
+    """等待 ROS master 上出现指定话题发布器，不要求话题已经产生数据帧。
+
+    暂停状态下 Livox 不会发布点云帧，但其插件完成初始化后会注册 ``/scan``。
+    这里仅查询 ROS master，不订阅任何话题，也不会初始化 ``rospy`` 节点。
+    """
+    try:
+        from rosgraph.masterapi import Master
+    except ImportError as exc:
+        raise RuntimeError("缺少 rosgraph，无法检查 Livox 启动状态") from exc
+
+    master = Master("/danger_search_runner_startup")
+    deadline = time.monotonic() + float(timeout)
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            publishers, _, _ = master.getSystemState()
+            if any(name == topic and nodes for name, nodes in publishers):
+                return
+            last_error = None
+        except Exception as exc:  # ROS master 在 auto.sh 启动初期尚不可达
+            last_error = exc
+        time.sleep(0.05)
+
+    detail = ""
+    if last_error is not None:
+        detail = f"，最后错误：{last_error}"
+    raise RuntimeError(f"等待 {topic} 发布器超时{detail}")
 
 
 def run_environment(
@@ -301,23 +367,29 @@ def run_environment(
         cwd=str(workspace_dir),
     )
     try:
+        # 不能等 junior_ctrl 加载完成后才解除暂停。Gazebo 在暂停状态下初始化
+        # ros_control 时，小腿关节可能以 +2*pi 的等价角度上报，fixed-stand
+        # 随后跨周期插值会让 A1 趴地漂移。/scan 发布器出现说明 Livox 已完成
+        # 装载，此时排队解除暂停既避开 Livox 并发崩溃，也让关节控制器在首个
+        # 物理步之后取得正确角度。
+        print(f"[{datetime.datetime.now().time()}] 等待 Livox 发布器完成装载")
+        wait_for_ros_topic_publisher("/scan", timeout=120.0)
+        print(f"[{datetime.datetime.now().time()}] Livox 已就绪，解除 Gazebo 暂停")
+        unpause_environment_physics(workspace_dir)
         child.expect("Use keyboard input in this terminal", timeout=120)
         print(f"[{datetime.datetime.now().time()}] 控制器进程已启动，等待 RL 模型加载完成")
         child.expect("load model to device!", timeout=120)
-        print(f"[{datetime.datetime.now().time()}] RL 模型已加载，解除 Gazebo 暂停")
-        unpause_environment_physics(workspace_dir)
-        # 先让 ros_control 发布一小段有效关节反馈；暂停状态下直接起立会使
-        # junior_ctrl 偶发在状态尚未初始化时退出。
-        time.sleep(1.0)
-        print(f"[{datetime.datetime.now().time()}] Gazebo 已运行，发送 2 进入站立")
+        print(f"[{datetime.datetime.now().time()}] RL 模型已加载，发送 2 进入站立")
         child.send("2")
         child.expect("Switched from passive to fixed stand", timeout=30)
-        print(f"[{datetime.datetime.now().time()}] 已进入 fixed-stand，等待起立完成后发送 6 进入 RL 模式")
-        time.sleep(5.0)
+        print(f"[{datetime.datetime.now().time()}] 已进入 fixed-stand，等待 IMU 连续稳定后发送 6 进入 RL 模式")
+        posture = wait_for_fixed_stand_posture()
+        if not posture["stable"]:
+            raise RuntimeError(_fixed_stand_failure_detail(posture))
         child.send("6")
         child.expect("Switched from fixed stand to RL", timeout=30)
         print(f"[{datetime.datetime.now().time()}] 控制器已进入 RL，开始启动健康检查")
-        check_startup_health(workspace_dir, health_log_path)
+        check_startup_health(workspace_dir, health_log_path, posture=posture)
         time.sleep(1.0)
         child.owned_environment_processes = capture_environment_processes(child.pid)
         if run_pid_dir is not None:
@@ -390,6 +462,8 @@ def _probe_robot_posture(sample_seconds: float) -> dict:
     stats = {
         "max_abs_roll": 0.0,
         "max_abs_pitch": 0.0,
+        "last_abs_roll": 0.0,
+        "last_abs_pitch": 0.0,
         "samples": 0,
         "sample_seconds": float(sample_seconds),
     }
@@ -406,6 +480,8 @@ def _probe_robot_posture(sample_seconds: float) -> dict:
         )
         stats["max_abs_roll"] = max(stats["max_abs_roll"], abs(roll))
         stats["max_abs_pitch"] = max(stats["max_abs_pitch"], abs(pitch))
+        stats["last_abs_roll"] = abs(roll)
+        stats["last_abs_pitch"] = abs(pitch)
         stats["samples"] += 1
 
     rospy.init_node("startup_posture_probe", anonymous=True, disable_signals=True)
@@ -421,21 +497,151 @@ def _probe_robot_posture(sample_seconds: float) -> dict:
     return stats
 
 
+def _is_stable_posture_window(
+    samples: list[tuple[float, float, float]],
+    *,
+    now: float,
+    window_seconds: float = FIXED_STAND_STABLE_WINDOW_SECONDS,
+) -> tuple[bool, int]:
+    """判断最近连续 IMU 窗口是否稳定，保持为纯函数以便离线单元测试。"""
+    window_start = now - float(window_seconds)
+    start_indices = [index for index, sample in enumerate(samples) if sample[0] <= window_start]
+    if not start_indices:
+        return False, len([sample for sample in samples if sample[0] >= window_start])
+    window = samples[start_indices[-1]:]
+    if not window or now - window[-1][0] > FIXED_STAND_MAX_IMU_GAP_SECONDS:
+        return False, len(window)
+    if any(
+        current[0] - previous[0] > FIXED_STAND_MAX_IMU_GAP_SECONDS
+        for previous, current in zip(window, window[1:])
+    ):
+        return False, len(window)
+    stable = all(
+        roll <= FIXED_STAND_STABLE_MAX_ABS_ROLL
+        and pitch <= FIXED_STAND_STABLE_MAX_ABS_PITCH
+        for _, roll, pitch in window
+    )
+    return stable, len(window)
+
+
+def wait_for_fixed_stand_posture(
+    *,
+    min_stand_seconds: float = FIXED_STAND_MIN_SECONDS,
+    max_wait_seconds: float = FIXED_STAND_MAX_WAIT_SECONDS,
+    stable_window_seconds: float = FIXED_STAND_STABLE_WINDOW_SECONDS,
+) -> dict:
+    """在 fixed-stand 阶段只读等待连续稳定的 /trunk_imu 姿态。
+
+    这是 runner 的启动前健康握手，不向控制器发送命令，也不进入参赛算法。
+    稳定时长使用 IMU header stamp；max_wait_seconds 仅是 wall-time watchdog。
+    同一 Python 进程中 rospy 只能初始化一次，因此后续健康检查复用本统计。
+    """
+    import rospy
+    from sensor_msgs.msg import Imu
+
+    stats = {
+        "max_abs_roll": 0.0,
+        "max_abs_pitch": 0.0,
+        "last_abs_roll": 0.0,
+        "last_abs_pitch": 0.0,
+        "samples": 0,
+        "sample_seconds": 0.0,
+        "stable": False,
+        "stable_window_samples": 0,
+    }
+    samples: deque[tuple[float, float, float]] = deque()
+    finished = {"done": False}
+
+    def _on_imu(msg) -> None:
+        if finished["done"]:
+            return
+        roll, pitch = _quaternion_to_rpy(
+            msg.orientation.x,
+            msg.orientation.y,
+            msg.orientation.z,
+            msg.orientation.w,
+        )
+        sensor_stamp = float(msg.header.stamp.to_sec())
+        if not math.isfinite(sensor_stamp) or sensor_stamp <= 0.0:
+            return
+        abs_roll, abs_pitch = abs(roll), abs(pitch)
+        samples.append((sensor_stamp, abs_roll, abs_pitch))
+        while samples and samples[0][0] < sensor_stamp - stable_window_seconds - 1.0:
+            samples.popleft()
+        stats["max_abs_roll"] = max(stats["max_abs_roll"], abs_roll)
+        stats["max_abs_pitch"] = max(stats["max_abs_pitch"], abs_pitch)
+        stats["last_abs_roll"] = abs_roll
+        stats["last_abs_pitch"] = abs_pitch
+        stats["samples"] += 1
+        if "first_sensor_stamp" not in stats:
+            stats["first_sensor_stamp"] = sensor_stamp
+        stats["last_sensor_stamp"] = sensor_stamp
+        stats["sensor_elapsed"] = max(
+            0.0, sensor_stamp - float(stats["first_sensor_stamp"])
+        )
+
+    rospy.init_node("fixed_stand_posture_probe", anonymous=True, disable_signals=True)
+    subscriber = rospy.Subscriber("/trunk_imu", Imu, _on_imu, queue_size=200)
+    started = time.monotonic()
+    try:
+        deadline = started + float(max_wait_seconds)
+        while time.monotonic() < deadline and not rospy.is_shutdown():
+            sensor_elapsed = float(stats.get("sensor_elapsed", 0.0))
+            sensor_now = stats.get("last_sensor_stamp")
+            if sensor_now is not None and sensor_elapsed >= float(min_stand_seconds):
+                stable, window_samples = _is_stable_posture_window(
+                    list(samples),
+                    now=float(sensor_now),
+                    window_seconds=stable_window_seconds,
+                )
+                stats["stable_window_samples"] = window_samples
+                if stable:
+                    stats["stable"] = True
+                    break
+            time.sleep(0.05)
+    finally:
+        stats["sample_seconds"] = time.monotonic() - started
+        finished["done"] = True
+        subscriber.unregister()
+        rospy.signal_shutdown("fixed_stand_posture_probe_done")
+    return stats
+
+
 def _posture_breach_detail(stats: dict) -> str | None:
     """姿态统计超阈值时返回 startup_posture_failure 详情字符串，否则返回 None。"""
     samples = int(stats.get("samples", 0))
     roll = float(stats.get("max_abs_roll", 0.0))
     pitch = float(stats.get("max_abs_pitch", 0.0))
+    settled_roll = float(stats.get("last_abs_roll", 0.0))
+    settled_pitch = float(stats.get("last_abs_pitch", 0.0))
     breached = (
         samples == 0
         or roll > POSTURE_MAX_ABS_ROLL
         or pitch > POSTURE_MAX_ABS_PITCH
+        or settled_roll > POSTURE_SETTLED_MAX_ABS_ROLL
+        or settled_pitch > POSTURE_SETTLED_MAX_ABS_PITCH
     )
     if not breached:
         return None
     return (
         f"startup_posture_failure: samples={samples}"
         f" max_abs_roll={roll:.4f} max_abs_pitch={pitch:.4f}"
+        f" last_abs_roll={settled_roll:.4f} last_abs_pitch={settled_pitch:.4f}"
+    )
+
+
+def _fixed_stand_failure_detail(stats: dict) -> str:
+    """固定站立未形成稳定窗口时给出可审计的启动失败原因。"""
+    return (
+        "startup_posture_failure: fixed_stand_not_stable"
+        f" samples={int(stats.get('samples', 0))}"
+        f" sample_seconds={float(stats.get('sample_seconds', 0.0)):.2f}"
+        f" sensor_elapsed={float(stats.get('sensor_elapsed', 0.0)):.2f}"
+        f" max_abs_roll={float(stats.get('max_abs_roll', 0.0)):.4f}"
+        f" max_abs_pitch={float(stats.get('max_abs_pitch', 0.0)):.4f}"
+        f" last_abs_roll={float(stats.get('last_abs_roll', 0.0)):.4f}"
+        f" last_abs_pitch={float(stats.get('last_abs_pitch', 0.0)):.4f}"
+        f" stable_window_samples={int(stats.get('stable_window_samples', 0))}"
     )
 
 
@@ -444,6 +650,7 @@ def check_startup_health(
     health_log_path: Path,
     *,
     require_localization: bool = False,
+    posture: dict | None = None,
 ) -> None:
     """分两阶段检查，避免在定位节点尚未启动时错误判定环境失败。"""
     required_topics = [("/scan", "Livox 原始点云")]
@@ -484,17 +691,20 @@ def check_startup_health(
         else:
             health_log.write("\n检查机器人姿态（只读采样 /trunk_imu）\n")
             health_log.flush()
-            posture: dict | None = None
-            try:
-                posture = _probe_robot_posture(POSTURE_SAMPLE_SECONDS)
-            except Exception as exc:
-                health_log.write(f"姿态采样异常（跳过姿态门禁）: {exc}\n")
-                health_log.flush()
+            if posture is None:
+                try:
+                    posture = _probe_robot_posture(POSTURE_SAMPLE_SECONDS)
+                except Exception as exc:
+                    health_log.write(f"姿态采样异常（跳过姿态门禁）: {exc}\n")
+                    health_log.flush()
             if posture is not None:
                 health_log.write(
                     f"姿态采样: samples={posture['samples']} "
                     f"max_abs_roll={posture['max_abs_roll']:.4f} "
                     f"max_abs_pitch={posture['max_abs_pitch']:.4f} "
+                    f"last_abs_roll={posture['last_abs_roll']:.4f} "
+                    f"last_abs_pitch={posture['last_abs_pitch']:.4f} "
+                    f"stable={posture.get('stable', 'n/a')} "
                     "高度真值不参与正式健康检查\n"
                 )
                 health_log.flush()
@@ -724,6 +934,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     workspace_dir = find_workspace_dir(args.workspace or Path(__file__))
+    configure_workspace_ros_package_path(workspace_dir)
     try:
         gui_enabled = resolve_gui_enabled(args)
     except RuntimeError as exc:

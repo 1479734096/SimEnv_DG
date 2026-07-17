@@ -1,7 +1,8 @@
 """参赛方统一位姿入口。
 
 生产模式仅订阅参赛方 ``scan_localization_node`` 发布的内部里程计；该节点
-唯一外部输入为初始接口文档授权的 ``/scan``。这里不订阅 TF 或 Gazebo 真值。
+只使用初始接口文档授权的 ``/scan`` 与 ``/trunk_imu``。这里不订阅 TF 或
+Gazebo 真值。
 """
 from __future__ import annotations
 
@@ -62,6 +63,20 @@ class PoseSample:
         )
 
 
+POSE_MATCHED = "MATCHED"
+POSE_PENDING = "PENDING"
+POSE_EXPIRED = "EXPIRED"
+
+
+@dataclass(frozen=True)
+class PoseLookup:
+    """某个传感器时间戳的内部定位查询结果。"""
+
+    status: str
+    sample: PoseSample | None
+    delta: float | None
+
+
 class PoseProvider:
     """保存内部定位历史，并提供时间匹配的位姿快照。"""
 
@@ -80,16 +95,56 @@ class PoseProvider:
         with self._lock:
             return self._samples[-1] if self._samples else None
 
+    def observed_period(self, *, default: float = 0.1, max_intervals: int = 32) -> float:
+        """返回近期定位样本的稳健周期，用于判断定位新鲜度。"""
+        fallback = float(default)
+        if not np.isfinite(fallback) or fallback <= 0.0:
+            raise ValueError("默认定位周期必须为正有限数")
+        with self._lock:
+            stamps = [sample.stamp for sample in self._samples]
+        intervals = [
+            later - earlier
+            for earlier, later in zip(stamps, stamps[1:])
+            if np.isfinite(later - earlier) and later > earlier
+        ]
+        if not intervals:
+            return fallback
+        window = intervals[-max(1, int(max_intervals)):]
+        return float(np.median(np.asarray(window, dtype=float)))
+
     def at(self, stamp: float | None, *, max_delta: float = 0.08) -> PoseSample | None:
+        """兼容旧调用：只返回已时间匹配的样本。"""
+        return self.lookup(stamp, max_delta=max_delta).sample
+
+    def lookup(self, stamp: float | None, *, max_delta: float = 0.08) -> PoseLookup:
+        """按传感器时间戳查询，区分可等待与已过期的定位缺口。
+
+        ``PENDING`` 只表示最新定位尚可能覆盖该时间戳，调用方应保留最新
+        传感器帧等待；一旦定位历史已越过容差窗口仍无法匹配，才返回
+        ``EXPIRED`` 并允许消费该帧。
+        """
         if stamp is None:
-            return self.latest()
+            sample = self.latest()
+            return PoseLookup(
+                POSE_MATCHED if sample is not None else POSE_PENDING,
+                sample,
+                None,
+            )
+        target = float(stamp)
+        tolerance = float(max_delta)
+        if tolerance < 0.0:
+            raise ValueError("max_delta 必须非负")
         with self._lock:
             if not self._samples:
-                return None
-            nearest = min(self._samples, key=lambda sample: abs(sample.stamp - float(stamp)))
-        if abs(nearest.stamp - float(stamp)) > float(max_delta):
-            return None
-        return nearest
+                return PoseLookup(POSE_PENDING, None, None)
+            nearest = min(self._samples, key=lambda sample: abs(sample.stamp - target))
+            latest_stamp = self._samples[-1].stamp
+        delta = abs(nearest.stamp - target)
+        if delta <= tolerance:
+            return PoseLookup(POSE_MATCHED, nearest, delta)
+        if latest_stamp < target + tolerance:
+            return PoseLookup(POSE_PENDING, None, delta)
+        return PoseLookup(POSE_EXPIRED, None, delta)
 
     def sensor_to_world_matrix(
         self,

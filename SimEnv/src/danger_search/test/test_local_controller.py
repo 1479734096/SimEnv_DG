@@ -27,6 +27,19 @@ class LocalControllerTest(unittest.TestCase):
         self.assertGreater(linear_y, 0.0)
         self.assertAlmostEqual(angular, 0.9)
 
+    def test_large_heading_uses_only_compatibility_creep(self):
+        """大偏角不得同时下发高线速度和饱和转向。"""
+        linear_x, _, angular = compute_tracking_command(
+            1.35,
+            max_linear=0.60,
+            max_lateral=0.25,
+            max_angular=1.2,
+            min_linear_fraction=0.35,
+        )
+
+        self.assertLess(linear_x, 0.02)
+        self.assertAlmostEqual(angular, 1.2)
+
     def test_straight_target_uses_full_linear_speed(self):
         linear_x, linear_y, angular = compute_tracking_command(
             0.0,

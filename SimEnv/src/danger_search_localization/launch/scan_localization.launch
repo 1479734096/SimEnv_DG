@@ -1,5 +1,7 @@
 <launch>
   <arg name="raw_cloud_topic" default="/scan"/>
+  <arg name="depth_cloud_topic" default="/real_sense/depth/points"/>
+  <arg name="localization_backend" default="kiss_icp"/>
   <arg name="team_scene_info_path" default="$(find danger_search)/../../generated_building/team_scene_info.json"/>
   <arg name="require_team_scene_info" default="true"/>
   <arg name="allow_relative_origin" default="false"/>
@@ -10,13 +12,19 @@
         required="true"
         output="screen">
     <param name="raw_cloud_topic" value="$(arg raw_cloud_topic)"/>
+    <param name="depth_cloud_topic" value="$(arg depth_cloud_topic)"/>
+    <param name="localization_backend" value="$(arg localization_backend)"/>
     <param name="team_scene_info_path" value="$(arg team_scene_info_path)"/>
     <param name="require_team_scene_info" value="$(arg require_team_scene_info)"/>
     <param name="allow_relative_origin" value="$(arg allow_relative_origin)"/>
     <param name="min_range" value="0.5"/>
     <param name="max_range" value="15.0"/>
     <param name="voxel_size" value="0.15"/>
+    <!-- 控制先验只用于点云退化方向的 GICP 初值，可由后续实测替换。 -->
+    <param name="command_velocity_scale" value="1.0"/>
     <rosparam param="base_to_livox_xyz">[0.2, 0.0, 0.08]</rosparam>
     <rosparam param="base_to_livox_rpy">[0.0, 0.785, 0.0]</rosparam>
+    <rosparam param="base_to_depth_xyz">[0.28, 0.0, 0.043]</rosparam>
+    <rosparam param="base_to_depth_rpy">[-1.57079632679, 0.0, -1.57079632679]</rosparam>
   </node>
 </launch>

@@ -659,6 +659,9 @@ if [ "$GROUND_SUPPORT_CAPTURE" = "1" ]; then
       /Odometry_gazebo \
       /scan \
       /livox/Pointcloud2 \
+      /danger_search/localization/odom \
+      /danger_search/localization/cloud_registered \
+      /trunk_imu \
       /real_sense/depth/image_raw \
       /real_sense/depth/camera_info \
       /real_sense/rgb/camera_info \

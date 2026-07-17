@@ -63,6 +63,9 @@ class NavigateToPose(NavigationTask):
 
 
 class OpenDoorAndPass(NavigationTask):
+    _PASS_ALIGN_TOLERANCE = 0.10
+    _PASS_ALIGN_CONFIRMATIONS = 2
+
     def __init__(self, door_id: str, *, pass_offset: float = 0.8, commit_distance: float = 1.8):
         super().__init__(f"OpenDoorAndPass({door_id})")
         self.door_id = door_id
@@ -75,6 +78,11 @@ class OpenDoorAndPass(NavigationTask):
         self._service_task: AsyncServiceCall | None = None
         self._retry_count = 0
         self._last_navigation_blocked = False
+        self._last_navigation_stuck = False
+        self._pass_retry_start_time: float | None = None
+        self._pass_retry_timeout = 3.0
+        self._pass_alignment_count = 0
+        self._pass_path_started = False
         self._commit_retry_count = 0
         self._commit_retry_start_time: float | None = None
         self._commit_retry_limit = 30
@@ -122,19 +130,7 @@ class OpenDoorAndPass(NavigationTask):
             return RUNNING
 
         if self.phase == "GO_PASS_POINT":
-            if self._navigate_to(manager, pose, self._pass_point, allow_direct_fallback=True):
-                self.phase = "GO_COMMIT_POINT"
-                return RUNNING
-            # 门开后若规划失败（A* 不可达/预算耗尽/路径被清），主动清理门区并
-            # 尝试直连；直连也被栅格阻塞时触发原地恢复，避免永久停在门口。
-            if not manager.controller.has_path():
-                _clear_opened_door_area(manager, self.door_id)
-                grid = manager.mapper.floor(manager.current_floor)
-                if not _segment_crosses_blocked_cell(grid, (pose[0], pose[1]), self._pass_point):
-                    manager.controller.set_path([(pose[0], pose[1]), self._pass_point])
-                else:
-                    manager.controller.recover()
-            return RUNNING
+            return self._tick_active_pass(manager, pose)
 
         if self.phase == "GO_COMMIT_POINT":
             advanced = self._navigate_to(
@@ -161,12 +157,111 @@ class OpenDoorAndPass(NavigationTask):
                     )
                 self.phase = "DONE"
                 return DONE
+            if self._last_navigation_stuck:
+                return self._fail_crossing(manager, "过门深入阶段有命令但无有效位移")
             if self._last_navigation_blocked:
                 return self._handle_commit_blocked(manager)
             self._commit_retry_count = 0
             self._commit_retry_start_time = None
             return RUNNING
 
+        return DONE
+
+    def _tick_active_pass(
+        self,
+        manager: MissionManager,
+        pose: tuple[float, float, float],
+    ) -> str:
+        """门洞中心对准后直线通过，并以真实位姿确认完整通过。"""
+        if self._pass_point is None:
+            return self._fail_crossing(manager, "缺少过门通过点")
+
+        goal_tolerance = max(1e-3, float(manager.controller.goal_tolerance))
+        corner_tolerance = float(
+            getattr(manager.controller, "corner_tolerance", goal_tolerance)
+        )
+        if not math.isfinite(corner_tolerance) or corner_tolerance <= 0.0:
+            corner_tolerance = goal_tolerance
+        crossing_tolerance = min(goal_tolerance, corner_tolerance)
+
+        if not self._pass_path_started:
+            target_yaw = math.atan2(
+                self._pass_point[1] - pose[1],
+                self._pass_point[0] - pose[0],
+            )
+            yaw_error = _angle_wrap(target_yaw - pose[2])
+            if abs(yaw_error) > self._PASS_ALIGN_TOLERANCE:
+                self._pass_alignment_count = 0
+                angular_limit = abs(float(getattr(manager.controller, "max_angular", 0.0)))
+                minimum_speed = abs(
+                    float(getattr(manager.controller, "recover_angular_speed", 0.0))
+                )
+                angular_speed = min(
+                    angular_limit,
+                    max(abs(1.7 * yaw_error), minimum_speed),
+                )
+                manager.controller.rotate_in_place(math.copysign(angular_speed, yaw_error))
+                return RUNNING
+
+            manager.controller.stop(reason="door_pass_alignment_hold")
+            self._pass_alignment_count += 1
+            if self._pass_alignment_count < self._PASS_ALIGN_CONFIRMATIONS:
+                return RUNNING
+
+            _clear_opened_door_area(manager, self.door_id)
+            grid = manager.mapper.floor(manager.current_floor)
+            if _segment_crosses_blocked_cell(
+                grid,
+                (pose[0], pose[1]),
+                self._pass_point,
+            ):
+                return self._handle_pass_blocked(manager)
+
+            manager.controller.set_path([(pose[0], pose[1]), self._pass_point])
+            self._pass_path_started = True
+            self._pass_retry_start_time = None
+            return RUNNING
+
+        endpoint_distance = math.hypot(
+            self._pass_point[0] - pose[0],
+            self._pass_point[1] - pose[1],
+        )
+        if endpoint_distance <= crossing_tolerance:
+            manager.controller.clear_path(reason="door_pass_completed")
+            return self._finish_pass(pose)
+        if not manager.controller.has_path():
+            return self._fail_crossing(manager, "过门直线路径意外丢失")
+
+        status = manager.controller.tick(pose, goal_tolerance=crossing_tolerance)
+        if status == DONE:
+            endpoint_distance = math.hypot(
+                self._pass_point[0] - pose[0],
+                self._pass_point[1] - pose[1],
+            )
+            if endpoint_distance <= crossing_tolerance:
+                return self._finish_pass(pose)
+            return self._fail_crossing(manager, "控制器提前结束过门路径")
+        if status in (STUCK, IDLE):
+            return self._fail_crossing(manager, "过门通过阶段有命令但无有效位移")
+        return RUNNING
+
+    def _finish_pass(self, pose: tuple[float, float, float]) -> str:
+        if rospy is not None and self._wait_point is not None and self._pass_point is not None:
+            rospy.loginfo(
+                "[%s] 完成过门：door_id=%s wait_point=(%.2f, %.2f) pass_point=(%.2f, %.2f) commit_point=(%.2f, %.2f) pose=(%.2f, %.2f, %.2f)",
+                self.name,
+                self.door_id,
+                self._wait_point[0],
+                self._wait_point[1],
+                self._pass_point[0],
+                self._pass_point[1],
+                self._commit_point[0] if self._commit_point is not None else self._pass_point[0],
+                self._commit_point[1] if self._commit_point is not None else self._pass_point[1],
+                pose[0],
+                pose[1],
+                pose[2],
+            )
+        self.phase = "DONE"
         return DONE
 
     def _navigate_to(
@@ -178,6 +273,7 @@ class OpenDoorAndPass(NavigationTask):
         allow_direct_fallback: bool = False,
     ) -> bool:
         self._last_navigation_blocked = False
+        self._last_navigation_stuck = False
         if math.hypot(target_xy[0] - pose[0], target_xy[1] - pose[1]) <= manager.controller.goal_tolerance:
             manager.controller.clear_path()
             return True
@@ -199,8 +295,30 @@ class OpenDoorAndPass(NavigationTask):
 
         status = manager.controller.tick(pose)
         if status == STUCK:
-            manager.controller.recover()
+            if self.phase in ("GO_PASS_POINT", "GO_COMMIT_POINT"):
+                self._last_navigation_stuck = True
+            else:
+                manager.controller.recover()
         return status == DONE
+
+    def _handle_pass_blocked(self, manager: MissionManager) -> str:
+        manager.controller.stop(reason="door_pass_blocked")
+        now = get_time()
+        if self._pass_retry_start_time is None:
+            self._pass_retry_start_time = now
+            return RUNNING
+        if now - self._pass_retry_start_time < self._pass_retry_timeout:
+            return RUNNING
+        return self._fail_crossing(manager, "过门通过点持续被地图阻塞")
+
+    def _fail_crossing(self, manager: MissionManager, reason: str) -> str:
+        manager.controller.clear_path(reason="door_crossing_failed")
+        record_failure = getattr(manager, "_record_failure", None)
+        if callable(record_failure):
+            record_failure(reason)
+        if rospy is not None:
+            rospy.logwarn("[%s] %s，终止本次过门任务", self.name, reason)
+        return FAILED
 
     def _handle_commit_blocked(self, manager: MissionManager) -> str:
         _clear_opened_door_area(manager, self.door_id)
@@ -322,8 +440,12 @@ class TakeElevator(NavigationTask):
             rospy.logerr(f"TakeElevator 失败: {e}")
             return FAILED
             
-        current_door_id = f"elevator_floor_{self.current_floor}"
-        target_door_id = f"elevator_floor_{self.target_floor}"
+        try:
+            current_door_id = client.elevator_door_id(self.current_floor)
+            target_door_id = client.elevator_door_id(self.target_floor)
+        except ValueError as e:
+            rospy.logerr(f"TakeElevator 失败: {e}")
+            return FAILED
 
         if self.phase == "GO_TO_ELEVATOR_DOOR":
             if self._navigate_to(manager, pose, current_wait):

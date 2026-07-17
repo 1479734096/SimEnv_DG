@@ -18,6 +18,25 @@ from danger_search.interface_policy import (
 
 
 @dataclass(frozen=True)
+class PublicDoorFeature:
+    """公开门的非空间属性。"""
+
+    door_id: str
+    kind: str
+    floor_index: int
+    initial_open: bool
+
+
+@dataclass(frozen=True)
+class PublicElevatorFeature:
+    """公开电梯的非空间属性。"""
+
+    elevator_id: str
+    current_floor: int
+    served_floors: frozenset[int]
+
+
+@dataclass(frozen=True)
 class BuildingFeatureProvider:
     """经白名单校验后的公开场景能力描述。"""
 
@@ -25,6 +44,8 @@ class BuildingFeatureProvider:
     robot_start: tuple[float, float, float, float]
     door_ids: frozenset[str]
     elevators: dict[str, frozenset[int]]
+    doors: dict[str, PublicDoorFeature]
+    elevator_features: dict[str, PublicElevatorFeature]
     allowed_topics: frozenset[str]
     allowed_services: frozenset[str]
     result_file: Path
@@ -34,42 +55,105 @@ class BuildingFeatureProvider:
         scene_path = require_public_scene_info(path, purpose=purpose)
         with scene_path.open("r", encoding="utf-8") as stream:
             raw = json.load(stream)
+        if not isinstance(raw, dict):
+            raise ValueError("公开场景信息根节点必须是对象")
         if raw.get("schema") != "team_scene_info_v1":
             raise ValueError("公开场景信息 schema 必须为 team_scene_info_v1")
         if raw.get("coordinate_frame") != "world":
             raise ValueError("公开场景信息坐标系必须是 world")
         start = raw.get("robot_start", {})
+        if not isinstance(start, dict):
+            raise ValueError("公开场景信息的 robot_start 必须是对象")
         try:
-            robot_start = tuple(float(start[key]) for key in ("x", "y", "z", "yaw"))
+            start_values = tuple(start[key] for key in ("x", "y", "z", "yaw"))
+            if any(type(value) not in (int, float) for value in start_values):
+                raise ValueError("robot_start 必须使用 JSON 数值")
+            robot_start = tuple(float(value) for value in start_values)
             if not all(math.isfinite(value) for value in robot_start):
                 raise ValueError("robot_start 包含非有限数值")
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("公开场景信息缺少合法 robot_start") from exc
         public_scene = raw.get("public_scene", {})
+        if not isinstance(public_scene, dict):
+            raise ValueError("公开场景信息的 public_scene 必须是对象")
         door_ids = []
-        for item in public_scene.get("door_ids", []):
-            if not isinstance(item, dict) or not item.get("id"):
+        door_features: dict[str, PublicDoorFeature] = {}
+        raw_doors = public_scene.get("door_ids")
+        if not isinstance(raw_doors, list):
+            raise ValueError("door_ids 必须是列表")
+        for item in raw_doors:
+            if not isinstance(item, dict):
                 raise ValueError("door_ids 包含非法条目")
-            door_ids.append(str(item["id"]))
+            door_id = item.get("id")
+            kind = item.get("kind")
+            floor_index = item.get("floor_index")
+            initial_open = item.get("initial_open")
+            if not isinstance(door_id, str) or not door_id.strip():
+                raise ValueError("door_ids 包含非法 ID")
+            if not isinstance(kind, str) or not kind.strip():
+                raise ValueError("door_ids 缺少合法 kind")
+            if type(floor_index) is not int or floor_index < 0:
+                raise ValueError("door_ids 的 floor_index 必须为非负整数")
+            if type(initial_open) is not bool:
+                raise ValueError("door_ids 的 initial_open 必须为布尔值")
+            door_ids.append(door_id)
+            door_features[door_id] = PublicDoorFeature(
+                door_id=door_id,
+                kind=kind,
+                floor_index=floor_index,
+                initial_open=initial_open,
+            )
         if len(door_ids) != len(set(door_ids)):
             raise ValueError("door_ids 存在重复 ID")
         doors = frozenset(door_ids)
         elevator_ids = []
         elevators: dict[str, frozenset[int]] = {}
-        for item in public_scene.get("elevators", []):
-            if not isinstance(item, dict) or not item.get("id"):
+        elevator_features: dict[str, PublicElevatorFeature] = {}
+        raw_elevators = public_scene.get("elevators")
+        if not isinstance(raw_elevators, list):
+            raise ValueError("elevators 必须是列表")
+        for item in raw_elevators:
+            if not isinstance(item, dict):
                 raise ValueError("elevators 包含非法条目")
-            elevator_id = str(item["id"])
+            elevator_id = item.get("id")
+            current_floor = item.get("current_floor")
+            raw_floors = item.get("served_floors")
+            if not isinstance(elevator_id, str) or not elevator_id.strip():
+                raise ValueError("elevators 包含非法 ID")
+            if type(current_floor) is not int or current_floor < 0:
+                raise ValueError("elevators 的 current_floor 必须为非负整数")
+            if not isinstance(raw_floors, list) or not raw_floors:
+                raise ValueError("served_floors 必须为非空列表")
+            if any(type(floor) is not int or floor < 0 for floor in raw_floors):
+                raise ValueError("served_floors 必须为非负整数")
+            floors = frozenset(raw_floors)
+            if len(floors) != len(raw_floors):
+                raise ValueError("served_floors 存在重复楼层")
+            if current_floor not in floors:
+                raise ValueError("current_floor 必须位于 served_floors")
             elevator_ids.append(elevator_id)
-            floors = frozenset(int(floor) for floor in item.get("served_floors", []))
-            if any(floor < 0 for floor in floors):
-                raise ValueError("served_floors 必须为为非负整数")
             elevators[elevator_id] = floors
+            elevator_features[elevator_id] = PublicElevatorFeature(
+                elevator_id=elevator_id,
+                current_floor=current_floor,
+                served_floors=floors,
+            )
         if len(elevator_ids) != len(set(elevator_ids)):
             raise ValueError("elevators 存在重复 ID")
         interfaces = raw.get("allowed_interfaces", {})
-        topics = frozenset(str(value) for value in interfaces.get("topics", []))
-        services = frozenset(str(value) for value in interfaces.get("services", []))
+        if not isinstance(interfaces, dict):
+            raise ValueError("公开场景信息的 allowed_interfaces 必须是对象")
+        raw_topics = interfaces.get("topics", [])
+        raw_services = interfaces.get("services", [])
+        if (
+            not isinstance(raw_topics, list)
+            or not isinstance(raw_services, list)
+            or any(not isinstance(value, str) or not value.strip() for value in raw_topics)
+            or any(not isinstance(value, str) or not value.strip() for value in raw_services)
+        ):
+            raise ValueError("公开场景信息的接口列表必须包含非空字符串")
+        topics = frozenset(raw_topics)
+        services = frozenset(raw_services)
         if not topics or not topics.issubset(ALLOWED_TOPICS):
             raise ValueError("公开场景信息包含未授权的话题")
         if not services.issubset(ALLOWED_SERVICES):
@@ -92,6 +176,8 @@ class BuildingFeatureProvider:
             robot_start=robot_start,
             door_ids=doors,
             elevators=elevators,
+            doors=door_features,
+            elevator_features=elevator_features,
             allowed_topics=topics,
             allowed_services=services,
             result_file=result_file,

@@ -116,9 +116,10 @@ class OpenDoorAndPassTest(unittest.TestCase):
         self.assertEqual(cleared_paths, [True])
         self.assertEqual(cleared_doors, ["main_entrance"])
 
-    def test_pass_point_budget_exhausted_falls_back_to_direct_path(self):
-        """GO_PASS_POINT A* 预算耗尽且未留路径时，应主动清理门区并直连 pass_point。"""
+    def test_pass_point_aligns_then_uses_direct_path_without_astar(self):
+        """门洞通过阶段应稳定对准后直连真实 pass_point，不接受 A* 替代终点。"""
         recorded_paths = []
+        stopped = []
         cleared_doors = []
         path_active = [False]
         task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
@@ -146,28 +147,44 @@ class OpenDoorAndPassTest(unittest.TestCase):
             current_floor=0,
             controller=SimpleNamespace(
                 goal_tolerance=0.35,
+                corner_tolerance=0.15,
+                max_angular=1.2,
+                recover_angular_speed=0.55,
                 has_path=lambda: path_active[0],
                 set_path=set_path,
-                clear_path=lambda: path_active.__setitem__(0, False),
-                tick=lambda pose: RUNNING,
+                clear_path=lambda **kwargs: path_active.__setitem__(0, False),
+                tick=lambda pose, **kwargs: RUNNING,
                 recover=lambda: None,
+                rotate_in_place=lambda angular: None,
+                stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
             ),
             clear_opened_door_area=lambda door_id: cleared_doors.append(door_id),
         )
+        pose = (0.2, -1.1, math.atan2(1.9, -0.2))
 
-        with patch("danger_search.navigation_tasks.astar_plan", return_value=PlanResult(status=BUDGET_EXHAUSTED)):
-            status = task.tick(manager, (0.2, -1.1, 2.3))
+        with patch("danger_search.navigation_tasks.astar_plan") as astar:
+            first = task.tick(manager, pose)
+            second = task.tick(manager, pose)
 
-        self.assertEqual(status, RUNNING)
+        self.assertEqual(first, RUNNING)
+        self.assertEqual(second, RUNNING)
         self.assertEqual(task.phase, "GO_PASS_POINT")
         self.assertEqual(len(recorded_paths), 1)
         self.assertEqual(recorded_paths[0][0], (0.2, -1.1))
         self.assertEqual(recorded_paths[0][-1], (0.0, 0.8))
         self.assertEqual(cleared_doors, ["main_entrance"])
+        self.assertEqual(
+            stopped,
+            ["door_pass_alignment_hold", "door_pass_alignment_hold"],
+        )
+        astar.assert_not_called()
 
-    def test_pass_point_blocked_and_line_blocked_triggers_recover(self):
-        """GO_PASS_POINT 规划失败且直连也被阻塞时，应清理门区并触发恢复转向。"""
+    def test_pass_point_blocked_and_line_blocked_fails_bounded_without_recover(self):
+        """GO_PASS_POINT 持续阻塞应明确失败，不能由通用 recover 改变过门方向。"""
         recovered = []
+        stopped = []
+        failures = []
+        cleared_paths = []
         cleared_doors = []
         task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
         task.phase = "GO_PASS_POINT"
@@ -190,22 +207,100 @@ class OpenDoorAndPassTest(unittest.TestCase):
             current_floor=0,
             controller=SimpleNamespace(
                 goal_tolerance=0.35,
+                corner_tolerance=0.15,
+                max_angular=1.2,
+                recover_angular_speed=0.55,
                 has_path=lambda: False,
                 set_path=lambda path: None,
-                clear_path=lambda: None,
-                tick=lambda pose: RUNNING,
+                clear_path=lambda **kwargs: cleared_paths.append(kwargs.get("reason")),
+                tick=lambda pose, **kwargs: RUNNING,
                 recover=lambda: recovered.append(True),
+                rotate_in_place=lambda angular: None,
+                stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
             ),
             clear_opened_door_area=lambda door_id: cleared_doors.append(door_id),
+            _record_failure=lambda reason: failures.append(reason),
         )
 
-        with patch("danger_search.navigation_tasks.astar_plan", return_value=PlanResult(status=UNREACHABLE)):
-            status = task.tick(manager, (0.2, -1.1, 2.3))
+        pose = (0.2, -1.1, math.atan2(1.9, -0.2))
+        with patch("danger_search.navigation_tasks.get_time", side_effect=[10.0, 13.1]):
+            align = task.tick(manager, pose)
+            first = task.tick(manager, pose)
+            second = task.tick(manager, pose)
 
-        self.assertEqual(status, RUNNING)
+        self.assertEqual(align, RUNNING)
+        self.assertEqual(first, RUNNING)
+        self.assertEqual(second, FAILED)
         self.assertEqual(task.phase, "GO_PASS_POINT")
-        self.assertEqual(recovered, [True])
-        self.assertEqual(cleared_doors, ["main_entrance"])
+        self.assertEqual(recovered, [])
+        self.assertEqual(
+            stopped,
+            [
+                "door_pass_alignment_hold",
+                "door_pass_alignment_hold",
+                "door_pass_blocked",
+                "door_pass_alignment_hold",
+                "door_pass_blocked",
+            ],
+        )
+        self.assertEqual(cleared_doors, ["main_entrance", "main_entrance"])
+        self.assertEqual(cleared_paths, ["door_crossing_failed"])
+        self.assertEqual(failures, ["过门通过点持续被地图阻塞"])
+
+    def test_pass_point_stuck_fails_without_generic_recover(self):
+        recovered = []
+        failures = []
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "GO_PASS_POINT"
+        task._wait_point = (0.0, -0.8)
+        task._pass_point = (0.0, 0.8)
+        task._commit_point = (0.0, 1.8)
+        task._pass_path_started = True
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(),
+            current_floor=0,
+            controller=SimpleNamespace(
+                goal_tolerance=0.35,
+                corner_tolerance=0.15,
+                has_path=lambda: True,
+                tick=lambda pose, **kwargs: STUCK,
+                recover=lambda: recovered.append(True),
+                clear_path=lambda **kwargs: None,
+            ),
+            _record_failure=lambda reason: failures.append(reason),
+        )
+
+        status = task.tick(manager, (0.0, -0.8, math.pi / 2.0))
+
+        self.assertEqual(status, FAILED)
+        self.assertEqual(recovered, [])
+        self.assertEqual(failures, ["过门通过阶段有命令但无有效位移"])
+
+    def test_pass_point_does_not_accept_controller_done_outside_crossing_tolerance(self):
+        failures = []
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "GO_PASS_POINT"
+        task._wait_point = (0.0, -0.8)
+        task._pass_point = (0.0, 0.8)
+        task._commit_point = (0.0, 1.8)
+        task._pass_path_started = True
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(),
+            current_floor=0,
+            controller=SimpleNamespace(
+                goal_tolerance=0.35,
+                corner_tolerance=0.15,
+                has_path=lambda: True,
+                tick=lambda pose, **kwargs: DONE,
+                clear_path=lambda **kwargs: None,
+            ),
+            _record_failure=lambda reason: failures.append(reason),
+        )
+
+        status = task.tick(manager, (0.0, 0.61, math.pi / 2.0))
+
+        self.assertEqual(status, FAILED)
+        self.assertEqual(failures, ["控制器提前结束过门路径"])
 
 
 class TakeElevatorTest(unittest.TestCase):
@@ -259,11 +354,16 @@ class TakeElevatorTest(unittest.TestCase):
                 self.recover_reasons.append(reason)
 
         controller = Controller()
+        elevator_door_ids = {
+            0: "lift_door_ground",
+            1: "lift_door_upper",
+        }
         client = SimpleNamespace(
             get_elevator_points=lambda elevator_id, floor: (
                 (0.85, 2.60),
                 (2.60, 2.60),
-            )
+            ),
+            elevator_door_id=lambda floor: elevator_door_ids[int(floor)],
         )
         return SimpleNamespace(
             building_client=client,
@@ -645,6 +745,7 @@ class TakeElevatorTest(unittest.TestCase):
         manager = SimpleNamespace(
             building_client=SimpleNamespace(
                 get_elevator_points=lambda elevator_id, floor: ((0.0, 0.0), (0.0, 1.0)),
+                elevator_door_id=lambda floor: f"lift_door_{int(floor)}",
                 close_door=lambda door_id: _FailedService("jammed"),
             ),
             controller=SimpleNamespace(stop=lambda: None),
@@ -671,6 +772,7 @@ class TakeElevatorTest(unittest.TestCase):
         manager = SimpleNamespace(
             building_client=SimpleNamespace(
                 get_elevator_points=lambda elevator_id, floor: ((0.0, 0.0), (0.0, 1.0)),
+                elevator_door_id=lambda floor: f"lift_door_{int(floor)}",
             ),
             mapper=SimpleNamespace(floor=lambda floor_index: grid),
             current_floor=0,
@@ -686,7 +788,7 @@ class TakeElevatorTest(unittest.TestCase):
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(task.phase, "WAIT_CURRENT_DOOR_OPEN")
-        self.assertEqual(cleared, ["elevator_floor_0"])
+        self.assertEqual(cleared, ["lift_door_0"])
 
 
 if __name__ == "__main__":

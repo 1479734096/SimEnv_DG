@@ -1,0 +1,3 @@
+repository='external project URL'
+module='https://github.com/nachovizzo/eigen/archive/refs/tags/3.4.90.tar.gz'
+tag=''

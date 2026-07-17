@@ -23,6 +23,9 @@ localization:
   allow_relative_origin: false
   base_to_camera_xyz: [0.28, 0.0, 0.043]
   base_to_camera_rpy: [0.0, 0.0, 0.0]
+  # Livox 名义 10 Hz；短暂陈旧先停车，持续 3 秒无新定位则显式失败。
+  stale_minimum: 0.4
+  unavailable_timeout: 3.0
 
 mission:
   startup_delay: 2.0
@@ -48,6 +51,13 @@ mission:
   no_frontier_scan_duration: 4.0
   probe_distance: 1.2
   probe_yaw: 1.5708
+  # 起点存在公开主入口时，先沿当前朝向上由传感器确认的 FREE 走廊深入。
+  # 仅限制局部探测上限，不包含门坐标或场景特例。
+  initial_entry_max_distance: 5.0
+  initial_entry_corridor_half_width: 0.20
+  initial_entry_opening_confirmations: 2
+  initial_entry_opening_max_distance: 1.20
+  initial_entry_geometry_tolerance: 0.25
   # 过门后先深入到门后，避免刚过门就把 frontier 选择权交回门口。
   door_pass_offset: 0.8
   door_commit_distance: 1.8
@@ -137,7 +147,9 @@ controller:
   max_linear: 0.60
   # 0 保持既有全局上限；正数仅限制首次 EXIT_CABIN 通过尝试。
   exit_first_max_linear: 0.0
-  max_lateral: 0.25
+  # 当前 RL 的横移与转向耦合会抵消 yaw 响应；首版只用 v+omega 跟踪。
+  # 保留参数入口，后续若重训/标定横移控制可直接恢复，不改控制器代码。
+  max_lateral: 0.0
   max_angular: 1.2
   min_linear_fraction: 0.35
   goal_tolerance: 0.35
@@ -232,6 +244,11 @@ local_semantic:
   min_door_evidence_points: 6
   min_door_evidence_height: 0.15
   max_door_evidence_height: 1.80
+  # 仅以局部点云中两侧竖直回波之间的净空注册门洞，不使用布局坐标。
+  opening_min_width: 0.65
+  opening_max_width: 2.50
+  opening_plane_depth: 0.30
+  opening_min_side_height_span: 0.50
   # 仅用于调试：关闭时必须有局部传感器证据，不能只靠 metadata 近距判断开门。
   use_truth_proximity_detector: false
 

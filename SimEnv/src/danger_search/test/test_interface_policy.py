@@ -29,8 +29,17 @@ def _make_official_scene_info(directory: Path):
                 "coordinate_frame": "world",
                 "robot_start": {"x": 1, "y": 2, "z": 0, "yaw": 0},
                 "public_scene": {
-                    "door_ids": [{"id": "main_entrance"}],
-                    "elevators": [{"id": "elevator_main", "served_floors": [0]}],
+                    "door_ids": [{
+                        "id": "main_entrance",
+                        "kind": "main_entrance",
+                        "floor_index": 0,
+                        "initial_open": True,
+                    }],
+                    "elevators": [{
+                        "id": "elevator_main",
+                        "current_floor": 0,
+                        "served_floors": [0],
+                    }],
                 },
                 "allowed_interfaces": {
                     "topics": list(ALLOWED_TOPICS),
@@ -203,6 +212,9 @@ class InterfacePolicyTest(unittest.TestCase):
                 provider = BuildingFeatureProvider.load(path, purpose="测试")
             self.assertEqual(provider.robot_start, (1.0, 2.0, 0.0, 0.0))
             self.assertEqual(provider.elevators["elevator_main"], frozenset({0}))
+            self.assertEqual(provider.doors["main_entrance"].kind, "main_entrance")
+            self.assertTrue(provider.doors["main_entrance"].initial_open)
+            self.assertEqual(provider.elevator_features["elevator_main"].current_floor, 0)
             self.assertFalse(hasattr(provider, "door_positions"))
 
     def test_public_scene_provider_rejects_result_file_outside_workspace(self):
@@ -255,6 +267,32 @@ class InterfacePolicyTest(unittest.TestCase):
             ):
                 with self.assertRaises(ValueError):
                     BuildingFeatureProvider.load(path, purpose="测试")
+
+    def test_public_scene_provider_rejects_incomplete_or_coerced_public_features(self):
+        invalid_mutations = (
+            lambda data: data["robot_start"].update({"x": True}),
+            lambda data: data["robot_start"].update({"yaw": "0.0"}),
+            lambda data: data["public_scene"]["door_ids"][0].pop("kind"),
+            lambda data: data["public_scene"]["door_ids"][0].update({"floor_index": True}),
+            lambda data: data["public_scene"]["door_ids"][0].update({"initial_open": 1}),
+            lambda data: data["public_scene"]["elevators"][0].update({"served_floors": ["0"]}),
+            lambda data: data["public_scene"]["elevators"][0].update({"current_floor": 1}),
+            lambda data: data.update({"public_scene": []}),
+            lambda data: data.update({"allowed_interfaces": []}),
+        )
+        for mutate in invalid_mutations:
+            with self.subTest(mutate=mutate):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = _make_official_scene_info(Path(directory))
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    mutate(data)
+                    path.write_text(json.dumps(data), encoding="utf-8")
+                    with patch(
+                        "danger_search.interface_policy.official_scene_info_path",
+                        return_value=path,
+                    ):
+                        with self.assertRaises(ValueError):
+                            BuildingFeatureProvider.load(path, purpose="测试")
 
         with tempfile.TemporaryDirectory() as directory:
             path = _make_official_scene_info(Path(directory))

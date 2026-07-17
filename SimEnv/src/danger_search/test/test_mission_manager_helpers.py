@@ -7,7 +7,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from danger_search.local_semantic_detector import DoorCandidate
+from danger_search.building_control_client import BuildingControlClient
+from danger_search.building_feature_provider import PublicElevatorFeature
+from danger_search.local_semantic_detector import DoorCandidate, OpeningObservation
 from danger_search.ground_support_gate import (
     CLEAR as GROUND_SUPPORT_CLEAR,
     DROP_STOPPING,
@@ -148,7 +150,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
 
     def test_pose_provider_uses_nearest_internal_localization_sample(self):
-        from danger_search.pose_provider import PoseProvider
+        from danger_search.pose_provider import POSE_EXPIRED, POSE_MATCHED, POSE_PENDING, PoseProvider
 
         provider = PoseProvider("/danger_search/localization/odom", max_samples=8)
         for stamp in (1.0, 1.02, 1.04):
@@ -165,6 +167,94 @@ class MissionManagerHelperTest(unittest.TestCase):
             latest.stamp,
             1.04,
         )
+
+        pending = provider.lookup(1.20)
+        self.assertEqual(pending.status, POSE_PENDING)
+        provider._on_odometry(self._odom_message(1.30))
+        expired = provider.lookup(1.20)
+        self.assertEqual(expired.status, POSE_EXPIRED)
+        self.assertIsNone(expired.sample)
+        self.assertEqual(provider.lookup(1.021).status, POSE_MATCHED)
+
+    def test_pose_provider_estimates_nominal_period_from_recent_samples(self):
+        from danger_search.pose_provider import PoseProvider
+
+        provider = PoseProvider("/danger_search/localization/odom", max_samples=8)
+        for stamp in (1.0, 1.1, 1.2, 1.3):
+            provider._on_odometry(self._odom_message(stamp))
+
+        self.assertAlmostEqual(provider.observed_period(default=0.1), 0.1)
+
+    def test_localization_stale_stops_and_then_fails_without_advancing_task(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.localization_stale_minimum = 0.4
+        manager.localization_unavailable_timeout = 3.0
+        manager._localization_unavailable_since = None
+        manager._localization_stale_reported = False
+        manager._localization_failure_reported = False
+        manager._mission_success_eligible = True
+        manager.state = EXPLORE_FLOOR
+        manager.pose_provider = SimpleNamespace(observed_period=lambda **_kwargs: 0.1)
+        stopped = []
+        reset = []
+        transitions = []
+        failures = []
+        diagnostics = []
+        manager.controller = SimpleNamespace(
+            stop=lambda **kwargs: stopped.append(kwargs),
+            reset_progress_timer=lambda pose=None: reset.append(pose),
+        )
+        manager._transition_state = lambda state, **kwargs: transitions.append((state, kwargs))
+        manager._record_failure = failures.append
+        manager._log_structured = diagnostics.append
+        sample = mission_manager_module.PoseSample(
+            stamp=10.0,
+            xyz=(1.0, 2.0, 0.39),
+            quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+            linear_xyz=(0.0, 0.0, 0.0),
+            angular_xyz=(0.0, 0.0, 0.0),
+        )
+
+        self.assertFalse(manager._localization_allows_progress(sample, now=10.5))
+        self.assertEqual(len(stopped), 1)
+        self.assertEqual(reset, [sample.xy_yaw])
+        self.assertEqual(transitions, [])
+
+        self.assertFalse(manager._localization_allows_progress(sample, now=13.6))
+        self.assertEqual(failures, ["定位数据持续不可用"])
+        self.assertEqual(transitions[0][0], WRITE_RESULT)
+        self.assertEqual(
+            transitions[0][1]["reason_code"],
+            "localization_unavailable",
+        )
+        self.assertFalse(manager._mission_success_eligible)
+
+    def test_localization_recovers_before_failure_and_clears_hold(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.localization_stale_minimum = 0.4
+        manager.localization_unavailable_timeout = 3.0
+        manager._localization_unavailable_since = 10.5
+        manager._localization_stale_reported = True
+        manager._localization_failure_reported = False
+        manager.pose_provider = SimpleNamespace(observed_period=lambda **_kwargs: 0.1)
+        diagnostics = []
+        manager.controller = SimpleNamespace(
+            stop=lambda **_kwargs: self.fail("新鲜定位不应停车"),
+            reset_progress_timer=lambda _pose=None: None,
+        )
+        manager._log_structured = diagnostics.append
+        sample = mission_manager_module.PoseSample(
+            stamp=10.8,
+            xyz=(1.0, 2.0, 0.39),
+            quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+            linear_xyz=(0.0, 0.0, 0.0),
+            angular_xyz=(0.0, 0.0, 0.0),
+        )
+
+        self.assertTrue(manager._localization_allows_progress(sample, now=10.9))
+        self.assertIsNone(manager._localization_unavailable_since)
+        self.assertFalse(manager._localization_stale_reported)
+        self.assertEqual(diagnostics[-1]["event"], "localization_recovered")
 
     def test_stop_distance_table_parser_preserves_replaceable_breakpoints(self):
         self.assertEqual(
@@ -715,6 +805,94 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         self.assertEqual(len(read_count), 1)
         self.assertEqual(len(map_count), 1)
+
+    def test_cloud_mapping_uses_cloud_stamp_matched_pose_not_latest_pose(self):
+        from danger_search.pose_provider import PoseProvider
+
+        manager, _clock, _diagnostics, _reads, map_updates, _obstacle_updates = (
+            self._make_floor_transition_manager()
+        )
+        manager.current_task = None
+        provider = PoseProvider("/danger_search/localization/odom", max_samples=8)
+        provider._samples.append(
+            mission_manager_module.PoseSample(
+                stamp=1.0,
+                xyz=(1.0, 0.0, 0.39),
+                quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                linear_xyz=(0.0, 0.0, 0.0),
+                angular_xyz=(0.0, 0.0, 0.0),
+            )
+        )
+        provider._samples.append(
+            mission_manager_module.PoseSample(
+                stamp=2.0,
+                xyz=(9.0, 0.0, 0.39),
+                quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                linear_xyz=(0.0, 0.0, 0.0),
+                angular_xyz=(0.0, 0.0, 0.0),
+            )
+        )
+        manager.pose_provider = provider
+
+        manager._update_mapping_and_detection(
+            self._mapping_snapshot(cloud_stamp=1.0, odom_stamp=2.0),
+            (9.0, 0.0, 0.0),
+            (9.0, 0.0, 0.39),
+        )
+
+        self.assertEqual(map_updates[0]["robot_xyz"], (1.0, 0.0, 0.39))
+
+    def test_rgbd_pending_pose_is_retried_before_frame_is_consumed(self):
+        from danger_search.pose_provider import PoseProvider
+
+        manager, _clock, _diagnostics, _reads, _map_updates, _obstacle_updates = (
+            self._make_floor_transition_manager()
+        )
+        manager.current_task = None
+        manager.camera_mount_xyz = (0.28, 0.0, 0.043)
+        manager.camera_mount_rpy = (0.0, 0.0, 0.0)
+        detections = []
+        manager.detector = SimpleNamespace(
+            detect_messages=lambda *args, **kwargs: detections.append(args[3]) or [],
+        )
+        manager.tracker = SimpleNamespace(update=lambda *args, **kwargs: None)
+        provider = PoseProvider("/danger_search/localization/odom", max_samples=8)
+        provider._on_odometry(self._odom_message(1.0))
+        manager.pose_provider = provider
+        rgb_msg = SimpleNamespace(
+            header=SimpleNamespace(
+                stamp=SimpleNamespace(to_sec=lambda: 2.0),
+                frame_id="camera",
+            )
+        )
+        bundle = SimpleNamespace(
+            rgb_msg=rgb_msg,
+            depth_msg=SimpleNamespace(),
+            camera_info_msg=SimpleNamespace(),
+        )
+        snapshot = self._mapping_snapshot(
+            cloud_stamp=1.0,
+            odom_stamp=1.0,
+            image_bundle=bundle,
+        )
+
+        manager._update_mapping_and_detection(snapshot, (0.0, 0.0, 0.0), (0.0, 0.0, 0.39))
+        self.assertIsNone(manager._last_image_stamp)
+        self.assertEqual(detections, [])
+
+        provider._samples.append(
+            mission_manager_module.PoseSample(
+                stamp=2.0,
+                xyz=(1.0, 0.0, 0.39),
+                quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                linear_xyz=(0.0, 0.0, 0.0),
+                angular_xyz=(0.0, 0.0, 0.0),
+            )
+        )
+        manager._update_mapping_and_detection(snapshot, (0.0, 0.0, 0.0), (0.0, 0.0, 0.39))
+
+        self.assertEqual(manager._last_image_stamp, 2.0)
+        self.assertEqual(len(detections), 1)
 
     def test_floor_transition_latch_pauses_floor_scoped_cloud_processing(self):
         manager, _clock, diagnostics, reads, map_updates, obstacle_updates = (
@@ -1396,6 +1574,362 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         self.assertEqual(target, (0.05, 0.0))
 
+    def test_initial_forward_target_requires_confirmed_free_foot_lanes(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=8.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        ).floor(0)
+        for x in (-0.2, 0.0, 0.2):
+            for index in range(1, 46):
+                cell = grid.world_to_grid(x, 0.1 * index)
+                grid.mark_free(*cell)
+
+        target = mission_manager_module.initial_forward_free_target(
+            grid,
+            (0.0, 0.0, math.pi / 2.0),
+            max_distance=5.0,
+            corridor_half_width=0.2,
+            minimum_distance=1.2,
+        )
+
+        self.assertIsNotNone(target)
+        self.assertAlmostEqual(target[0], 0.0, places=6)
+        self.assertAlmostEqual(target[1], 4.4, places=6)
+
+    def test_initial_forward_target_does_not_cross_unknown_gap(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        ).floor(0)
+        for x in (-0.2, 0.0, 0.2):
+            for index in range(1, 8):
+                cell = grid.world_to_grid(0.1 * index, x)
+                grid.mark_free(*cell)
+
+        target = mission_manager_module.initial_forward_free_target(
+            grid,
+            (0.0, 0.0, 0.0),
+            max_distance=3.0,
+            corridor_half_width=0.2,
+            minimum_distance=1.2,
+        )
+
+        self.assertIsNone(target)
+
+    def test_initial_entry_registers_sensor_opening_after_two_new_clouds(self):
+        cleared_reasons = []
+        manager = MissionManager.__new__(MissionManager)
+        manager.current_floor = 0
+        manager.current_task = None
+        manager.current_frontier = object()
+        manager.active_door = None
+        manager._last_frontier_target = (1.0, 1.0)
+        manager._last_frontier_score = 1.0
+        manager._last_frontier_used_fallback = True
+        manager._latest_cloud_points = [(0.0, 0.0, 0.5)]
+        manager._last_cloud_stamp = 1.0
+        manager._initial_entry_last_opening_stamp = None
+        manager._initial_entry_opening_confirmations = 0
+        manager._initial_entry_opening_observation = None
+        manager.initial_entry_opening_confirmations = 2
+        manager.initial_entry_geometry_tolerance = 0.25
+        manager.initial_entry_opening_max_distance = 1.2
+        manager.door_pass_offset = 0.8
+        manager.door_commit_distance = 1.8
+        manager.mapper = SimpleNamespace(floor_height=2.6)
+        manager.controller = SimpleNamespace(
+            clear_path=lambda **kwargs: cleared_reasons.append(kwargs.get("reason"))
+        )
+        manager.building_client = SimpleNamespace(doors={})
+        observation = OpeningObservation(
+            distance=0.8,
+            world_xy=(0.0, 0.0),
+            yaw=math.pi / 2.0,
+            width=0.80,
+            evidence_count=30,
+        )
+        manager.local_detector = SimpleNamespace(
+            detect_opening_ahead=lambda **kwargs: observation
+        )
+        entrance = SimpleNamespace(
+            door_id="main_entrance",
+            kind="main_entrance",
+            floor_index=0,
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ):
+            self.assertFalse(
+                manager._try_start_initial_entry_door_task(
+                    (0.0, -0.8, math.pi / 2.0), entrance
+                )
+            )
+            # 同一份 cloud 不得重复累计确认。
+            self.assertFalse(
+                manager._try_start_initial_entry_door_task(
+                    (0.0, -0.8, math.pi / 2.0), entrance
+                )
+            )
+            manager._last_cloud_stamp = 1.1
+            self.assertTrue(
+                manager._try_start_initial_entry_door_task(
+                    (0.0, -0.8, math.pi / 2.0), entrance
+                )
+            )
+
+        registered = manager.building_client.doors["main_entrance"]
+        self.assertAlmostEqual(registered.x, 0.0)
+        self.assertAlmostEqual(registered.y, 0.0)
+        self.assertAlmostEqual(registered.width, 0.80)
+        self.assertIsInstance(manager.current_task, OpenDoorAndPass)
+        self.assertEqual(manager.active_door, "main_entrance")
+        self.assertEqual(cleared_reasons, ["initial_entry_opening_confirmed"])
+
+    def test_initial_entry_does_not_register_distant_rough_opening(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.current_floor = 0
+        manager.current_task = None
+        manager._latest_cloud_points = [(0.0, 0.0, 0.5)]
+        manager._last_cloud_stamp = 1.0
+        manager._initial_entry_last_opening_stamp = None
+        manager._initial_entry_opening_confirmations = 0
+        manager._initial_entry_opening_observation = None
+        manager.initial_entry_opening_confirmations = 1
+        manager.initial_entry_geometry_tolerance = 0.25
+        manager.initial_entry_opening_max_distance = 1.2
+        manager.mapper = SimpleNamespace(floor_height=2.6)
+        manager.local_detector = SimpleNamespace(
+            detect_opening_ahead=lambda **kwargs: OpeningObservation(
+                distance=2.2,
+                world_xy=(0.3, 0.0),
+                yaw=math.pi / 2.0,
+                width=1.4,
+                evidence_count=20,
+            )
+        )
+        entrance = SimpleNamespace(
+            door_id="main_entrance",
+            kind="main_entrance",
+            floor_index=0,
+        )
+
+        self.assertFalse(
+            manager._try_start_initial_entry_door_task(
+                (0.0, -2.2, math.pi / 2.0), entrance
+            )
+        )
+
+    def test_elevator_registration_uses_sensor_geometry_and_public_ids(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.max_floor = 2
+        manager.current_floor = 0
+        manager.current_task = None
+        manager._last_cloud_stamp = 1.0
+        manager._elevator_opening_last_stamp = None
+        manager._elevator_opening_last_scan_stamp = None
+        manager._elevator_opening_observation = None
+        manager._elevator_opening_confirmations = 0
+        manager._latest_cloud_points = [(2.0, 3.0, 0.5)]
+        manager.initial_entry_geometry_tolerance = 0.25
+        manager.main_entrance_xy = (0.0, 0.0)
+        manager.door_pass_offset = 0.8
+        manager.mapper = SimpleNamespace(floor_height=2.6)
+        manager.floor_params = {}
+        elevator = PublicElevatorFeature(
+            elevator_id="public_lift",
+            current_floor=0,
+            served_floors=frozenset({0, 1}),
+        )
+        manager.building_features = SimpleNamespace(
+            elevator_features={elevator.elevator_id: elevator}
+        )
+        manager.building_client = BuildingControlClient()
+        manager.building_client.set_public_features(
+            door_ids={"ground_lift_door", "upper_lift_door"},
+            elevators={"public_lift": {0, 1}},
+            elevator_door_ids_by_floor={
+                0: ["ground_lift_door"],
+                1: ["upper_lift_door"],
+            },
+        )
+        observation = OpeningObservation(
+            distance=0.9,
+            world_xy=(2.0, 3.0),
+            yaw=0.0,
+            width=1.0,
+            evidence_count=42,
+        )
+        manager.local_detector = SimpleNamespace(
+            detect_elevator_opening_nearby=lambda **kwargs: observation
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ):
+            self.assertFalse(manager._try_register_local_elevator((1.1, 3.0, 0.0)))
+            manager._last_cloud_stamp = 1.6
+            self.assertTrue(manager._try_register_local_elevator((1.1, 3.0, 0.0)))
+
+        registered = manager.building_client.elevators["public_lift"]
+        self.assertEqual(set(registered.lobby_poses), {0, 1})
+        self.assertAlmostEqual(registered.lobby_poses[0][0], 2.0)
+        self.assertAlmostEqual(registered.lobby_poses[0][1], 3.0)
+        self.assertAlmostEqual(abs(registered.lobby_poses[0][2]), math.pi)
+        self.assertEqual(
+            set(manager.building_client.doors),
+            {"ground_lift_door", "upper_lift_door"},
+        )
+        self.assertEqual(manager.floor_params["elevator_id"], "public_lift")
+
+    def test_public_door_ids_require_building_service_connection(self):
+        self.assertTrue(
+            mission_manager_module._building_services_required(
+                max_floor=1,
+                public_door_ids={"main_entrance"},
+            )
+        )
+
+    def test_return_home_from_inside_reuses_registered_main_entrance_task(self):
+        cleared = []
+        manager = MissionManager.__new__(MissionManager)
+        manager.home_pose = (0.0, -3.2, math.pi / 2.0)
+        manager.current_floor = 0
+        manager.max_floor = 1
+        manager.home_tolerance = 0.7
+        manager.main_entrance_xy = (0.0, 0.0)
+        manager.main_entrance_pass_vector = (0.0, 1.0)
+        manager._return_home_main_entrance_crossed = False
+        manager.failed_doors = set()
+        manager.current_task = None
+        manager.active_door = None
+        manager.door_pass_offset = 0.8
+        manager.door_commit_distance = 1.8
+        manager.building_client = SimpleNamespace(
+            doors={
+                "main_entrance": mission_manager_module.DoorInfo(
+                    "main_entrance",
+                    "main_entrance",
+                    0,
+                    0.0,
+                    0.0,
+                    math.pi / 2.0,
+                    1.0,
+                )
+            }
+        )
+        manager.controller = SimpleNamespace(
+            clear_path=lambda **kwargs: cleared.append(kwargs.get("reason"))
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ):
+            manager._tick_return_home((0.0, 6.0, math.pi / 2.0))
+
+        self.assertIsInstance(manager.current_task, OpenDoorAndPass)
+        self.assertEqual(manager.current_task.door_id, "main_entrance")
+        self.assertEqual(manager.active_door, "main_entrance")
+        self.assertEqual(cleared, ["return_home_main_entrance"])
+
+    def test_opened_door_clear_covers_wait_point_and_inflation_on_both_sides(self):
+        calls = []
+        manager = MissionManager.__new__(MissionManager)
+        manager.door_clear_radius = 0.9
+        manager.door_pass_offset = 0.8
+        manager.building_client = SimpleNamespace(
+            doors={
+                "main_entrance": mission_manager_module.DoorInfo(
+                    "main_entrance",
+                    "main_entrance",
+                    0,
+                    0.0,
+                    0.0,
+                    math.pi / 2.0,
+                    1.4,
+                )
+            }
+        )
+        manager.mapper = SimpleNamespace(
+            obstacle_inflation_radius=0.35,
+            resolution=0.1,
+            clear_dynamic_door_strip=lambda *args: calls.append(args),
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ):
+            manager.clear_opened_door_area("main_entrance")
+
+        self.assertEqual(len(calls), 1)
+        # depth 为完整长度，半深度需越过 0.8 m 等待点并覆盖 0.35 m 膨胀。
+        self.assertAlmostEqual(calls[0][-1], 2.5)
+
+    def test_initial_entry_trace_is_sparse_and_excludes_active_door_task(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.state = EXPLORE_FLOOR
+        manager.current_task = None
+        manager._initial_entry_origin_pose = (0.0, -3.2, math.pi / 2.0)
+        manager._initial_entry_completed = False
+        manager._initial_entry_trace = [(0.0, -3.2)]
+
+        manager._record_initial_entry_trace_pose((0.0, -3.1, math.pi / 2.0))
+        manager._record_initial_entry_trace_pose((0.0, -2.9, math.pi / 2.0))
+        manager.current_task = OpenDoorAndPass("main_entrance")
+        manager._record_initial_entry_trace_pose((0.0, -2.5, math.pi / 2.0))
+
+        self.assertEqual(manager._initial_entry_trace, [(0.0, -3.2), (0.0, -2.9)])
+
+    def test_return_home_reverses_actual_initial_entry_trace_after_main_door(self):
+        paths = []
+        manager = MissionManager.__new__(MissionManager)
+        manager.home_pose = (0.0, -3.2, math.pi / 2.0)
+        manager.current_floor = 0
+        manager.max_floor = 1
+        manager.home_tolerance = 0.7
+        manager.main_entrance_xy = (0.0, 0.0)
+        manager.main_entrance_pass_vector = (0.0, 1.0)
+        manager._return_home_main_entrance_crossed = True
+        manager._return_home_entry_trace_attempted = False
+        manager._initial_entry_trace = [
+            (0.0, -3.2),
+            (0.02, -2.8),
+            (0.01, -2.4),
+            (0.03, -1.1),
+        ]
+        manager.building_client = SimpleNamespace(doors={})
+        manager.controller = SimpleNamespace(
+            has_path=lambda: False,
+            set_path=lambda path: paths.append(path),
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ):
+            manager._tick_return_home((0.0, -0.8, -math.pi / 2.0))
+
+        self.assertTrue(manager._return_home_entry_trace_attempted)
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(paths[0][0], (0.0, -0.8))
+        self.assertEqual(paths[0][-1], (0.0, -3.2))
+        self.assertEqual(paths[0][1:-1], [(0.03, -1.1), (0.01, -2.4), (0.02, -2.8)])
+
     def test_should_open_door_accepts_visible_dynamic_candidate(self):
         manager = MissionManager.__new__(MissionManager)
         manager.state = EXPLORE_FLOOR
@@ -1495,6 +2029,35 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertEqual(len(recorded_paths), 1)
         self.assertAlmostEqual(recorded_paths[0][-1][0], 0.0, places=6)
         self.assertAlmostEqual(recorded_paths[0][-1][1], 2.0, places=6)
+
+    def test_probe_unknown_space_uses_current_pose_heading(self):
+        """短距离探测应沿当前机身朝向，不依赖固定世界方向参数。"""
+        recorded_paths = []
+        manager = MissionManager.__new__(MissionManager)
+        manager.current_floor = 0
+        manager.probe_yaw = math.pi / 2.0
+        manager.probe_distance = 1.2
+        manager._probe_attempt = 0
+        manager.current_frontier = None
+        manager.mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=8.0,
+            length=8.0,
+            origin_x=-4.0,
+            origin_y=-4.0,
+        )
+        manager.controller = SimpleNamespace(set_path=lambda path: recorded_paths.append(path))
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ):
+            self.assertTrue(manager._try_probe_unknown_space((0.0, 0.0, 0.0)))
+
+        self.assertEqual(len(recorded_paths), 1)
+        self.assertAlmostEqual(recorded_paths[0][-1][0], 1.2, places=6)
+        self.assertAlmostEqual(recorded_paths[0][-1][1], 0.0, places=6)
 
     def test_probe_unknown_space_skips_targets_behind_known_wall(self):
         recorded_paths = []
@@ -2621,6 +3184,44 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
         # 无论哪种，都不应记录 failure
         self.assertEqual(manager._no_reachable_frontier_confirmations, 0)
 
+    def test_all_inside_tolerance_candidates_can_start_probe(self):
+        """列表非空但全部过近时，也应进入现有短距离探测流程。"""
+        from danger_search.frontier import Frontier, FrontierSelectionDebug
+
+        frontier = Frontier(
+            cells=((10, 10),), centroid=(0.30, 0.0), information_gain=10.0,
+        )
+        manager = self._make_explore_manager(
+            frontiers_list=[frontier],
+            select_result=(None, []),
+        )
+        manager.explorer.last_selection_debug = FrontierSelectionDebug(
+            candidate_count=1,
+            reachable_count=0,
+            blacklisted_count=0,
+            unreachable_count=0,
+            context_filtered_count=0,
+            used_fallback=False,
+            final_target=None,
+            final_score=0.0,
+            path_length=0.0,
+            inside_tolerance_count=1,
+        )
+        manager.no_frontier_scan_duration = 8.0
+        recorded_paths = []
+        manager.controller.set_path = lambda path: recorded_paths.append(path)
+        manager.controller.rotate_in_place = lambda value: None
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None, logwarn=lambda *args, **kwargs: None),
+        ), patch.object(mission_manager_module, "get_time", return_value=10.0):
+            manager._tick_explore((0.0, 0.0, 0.0))
+
+        self.assertEqual(len(recorded_paths), 1)
+        self.assertEqual(manager._no_reachable_frontier_confirmations, 0)
+
     def test_all_inside_tolerance_no_repeat_astar_same_pose_map(self):
         """所有候选过近且 pose/map 不变时，连续多个 tick 不重复执行完整 A*。"""
         from danger_search.frontier import Frontier, FrontierSelectionDebug
@@ -2644,6 +3245,7 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
             inside_tolerance_count=1,
         )
         manager.no_frontier_scan_duration = 8.0
+        manager._try_probe_unknown_space = lambda pose: False
         select_calls = []
         manager.explorer.select_frontier = lambda *a, **kw: select_calls.append(kw) or (None, [])
         manager.explorer.extract_frontiers = lambda g: [frontier]
@@ -2676,6 +3278,7 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
             select_result=(None, []),
         )
         manager.no_frontier_scan_duration = 1.0
+        manager._try_probe_unknown_space = lambda pose: False
 
         from danger_search.frontier import FrontierSelectionDebug
         manager.explorer.last_selection_debug = FrontierSelectionDebug(
@@ -2732,6 +3335,7 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
         )
         manager = self._make_explore_manager(frontiers_list=[near_frontier])
         manager.no_frontier_scan_duration = 8.0
+        manager._try_probe_unknown_space = lambda pose: False
         manager.explorer.last_selection_debug = FrontierSelectionDebug(
             candidate_count=1, reachable_count=0, blacklisted_count=0,
             unreachable_count=0, context_filtered_count=0, used_fallback=False,
@@ -2781,6 +3385,7 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
             final_target=None, final_score=0.0, path_length=0.0, inside_tolerance_count=1,
         )
         manager.no_frontier_scan_duration = 8.0
+        manager._try_probe_unknown_space = lambda pose: False
 
         manager.explorer.select_frontier = lambda *a, **kw: (None, [])
         manager.explorer.extract_frontiers = lambda g: [frontier]
@@ -2804,6 +3409,7 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
         )
         manager = self._make_explore_manager(frontiers_list=[frontier])
         manager.no_frontier_scan_duration = 8.0
+        manager._try_probe_unknown_space = lambda pose: False
         manager.no_reachable_frontier_confirmations = 2
         manager.explorer.last_selection_debug = FrontierSelectionDebug(
             candidate_count=1, reachable_count=0, blacklisted_count=0,

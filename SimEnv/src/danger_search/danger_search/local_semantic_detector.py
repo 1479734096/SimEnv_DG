@@ -24,6 +24,17 @@ class DoorCandidate:
     evidence_count: int = 0
 
 
+@dataclass(frozen=True)
+class OpeningObservation:
+    """由局部点云直接观测到的开放门洞几何。"""
+
+    distance: float
+    world_xy: tuple[float, float]
+    yaw: float
+    width: float
+    evidence_count: int
+
+
 class LocalSemanticDetector:
     """检测机器人局部可见范围内的可控动态门。"""
 
@@ -36,6 +47,10 @@ class LocalSemanticDetector:
         min_evidence_points: int = 6,
         min_evidence_height: float = 0.15,
         max_evidence_height: float = 1.80,
+        opening_min_width: float = 0.65,
+        opening_max_width: float = 2.50,
+        opening_plane_depth: float = 0.30,
+        opening_min_side_height_span: float = 0.50,
         use_truth_proximity_detector: bool = False,
     ):
         self.max_distance = float(max_distance)
@@ -44,7 +59,226 @@ class LocalSemanticDetector:
         self.min_evidence_points = int(min_evidence_points)
         self.min_evidence_height = float(min_evidence_height)
         self.max_evidence_height = float(max_evidence_height)
+        self.opening_min_width = float(opening_min_width)
+        self.opening_max_width = float(opening_max_width)
+        self.opening_plane_depth = float(opening_plane_depth)
+        self.opening_min_side_height_span = float(opening_min_side_height_span)
         self.use_truth_proximity_detector = bool(use_truth_proximity_detector)
+
+    def detect_opening_ahead(
+        self,
+        *,
+        robot_pose: tuple[float, float, float],
+        floor_index: int,
+        cloud_points: Iterable[tuple[float, float, float]],
+        floor_height: float = 2.6,
+    ) -> OpeningObservation | None:
+        """从前方两侧竖直结构之间确认门洞，不依赖门坐标真值。"""
+        heading = (math.cos(robot_pose[2]), math.sin(robot_pose[2]))
+        lateral_axis = (-heading[1], heading[0])
+        floor_z = floor_index * floor_height
+        samples: list[tuple[float, float, float]] = []
+        for px, py, pz in cloud_points:
+            z_rel = pz - floor_z
+            if not self.min_evidence_height <= z_rel <= self.max_evidence_height:
+                continue
+            dx = px - robot_pose[0]
+            dy = py - robot_pose[1]
+            forward = dx * heading[0] + dy * heading[1]
+            lateral = dx * lateral_axis[0] + dy * lateral_axis[1]
+            if not 0.15 <= forward <= self.max_distance:
+                continue
+            if abs(lateral) > self.opening_max_width:
+                continue
+            samples.append((forward, lateral, z_rel))
+        if not samples:
+            return None
+
+        # 门板和门框会在相近前向距离形成左右两组竖直回波。按小窗口搜索
+        # 最近一组，中心若仍有结构点则内缘间距会收缩并自然拒绝。
+        search_step = max(0.05, self.opening_plane_depth / 3.0)
+        candidate_distances = sorted(
+            {
+                round(forward / search_step) * search_step
+                for forward, _lateral, _height in samples
+            }
+        )
+        half_depth = max(0.05, self.opening_plane_depth * 0.5)
+        minimum_side_points = max(3, self.min_evidence_points)
+        observations: list[OpeningObservation] = []
+        for distance in candidate_distances:
+            plane = [sample for sample in samples if abs(sample[0] - distance) <= half_depth]
+            lateral_bin_width = 0.05
+            lateral_bins: dict[int, list[tuple[float, float, float]]] = {}
+            for sample in plane:
+                bucket = int(round(sample[1] / lateral_bin_width))
+                lateral_bins.setdefault(bucket, []).append(sample)
+            vertical_bins: list[tuple[float, list[tuple[float, float, float]]]] = []
+            for bucket, bucket_samples in lateral_bins.items():
+                if len(bucket_samples) < minimum_side_points:
+                    continue
+                height_span = max(sample[2] for sample in bucket_samples) - min(
+                    sample[2] for sample in bucket_samples
+                )
+                if height_span < self.opening_min_side_height_span:
+                    continue
+                vertical_bins.append((bucket * lateral_bin_width, bucket_samples))
+            left = [item for item in vertical_bins if item[0] > 0.05]
+            right = [item for item in vertical_bins if item[0] < -0.05]
+            if not left or not right:
+                continue
+            left_inner, left_evidence = min(left, key=lambda item: item[0])
+            right_inner, right_evidence = max(right, key=lambda item: item[0])
+            width = left_inner - right_inner
+            if not self.opening_min_width <= width <= self.opening_max_width:
+                continue
+            lateral_center = 0.5 * (left_inner + right_inner)
+            edge_evidence = left_evidence + right_evidence
+            plane_distance = sum(sample[0] for sample in edge_evidence) / len(
+                edge_evidence
+            )
+            world_xy = (
+                robot_pose[0]
+                + plane_distance * heading[0]
+                + lateral_center * lateral_axis[0],
+                robot_pose[1]
+                + plane_distance * heading[1]
+                + lateral_center * lateral_axis[1],
+            )
+            observations.append(
+                OpeningObservation(
+                    distance=plane_distance,
+                    world_xy=world_xy,
+                    yaw=float(robot_pose[2]),
+                    width=width,
+                    evidence_count=len(edge_evidence),
+                )
+            )
+        if not observations:
+            return None
+        return min(observations, key=lambda observation: observation.distance)
+
+    def detect_elevator_opening_ahead(
+        self,
+        *,
+        robot_pose: tuple[float, float, float],
+        floor_index: int,
+        cloud_points: Iterable[tuple[float, float, float]],
+        floor_height: float = 2.6,
+        minimum_cabin_depth: float = 0.8,
+        maximum_cabin_depth: float = 2.8,
+    ) -> OpeningObservation | None:
+        """确认门洞后方存在受侧壁和后壁约束的小型轿厢空间。"""
+        points = list(cloud_points)
+        opening = self.detect_opening_ahead(
+            robot_pose=robot_pose,
+            floor_index=floor_index,
+            cloud_points=points,
+            floor_height=floor_height,
+        )
+        if opening is None:
+            return None
+
+        heading = (math.cos(opening.yaw), math.sin(opening.yaw))
+        lateral_axis = (-heading[1], heading[0])
+        floor_z = floor_index * floor_height
+        behind: list[tuple[float, float, float]] = []
+        for px, py, pz in points:
+            height = pz - floor_z
+            if not self.min_evidence_height <= height <= self.max_evidence_height:
+                continue
+            dx = px - opening.world_xy[0]
+            dy = py - opening.world_xy[1]
+            forward = dx * heading[0] + dy * heading[1]
+            lateral = dx * lateral_axis[0] + dy * lateral_axis[1]
+            if 0.15 <= forward <= maximum_cabin_depth + 0.25:
+                behind.append((forward, lateral, height))
+        if not behind:
+            return None
+
+        depth_bin = 0.10
+        depth_bins: dict[int, list[tuple[float, float, float]]] = {}
+        for sample in behind:
+            depth_bins.setdefault(int(round(sample[0] / depth_bin)), []).append(sample)
+        back_candidates: list[tuple[float, list[tuple[float, float, float]]]] = []
+        minimum_back_points = max(8, 2 * self.min_evidence_points)
+        minimum_back_span = max(0.55, 0.45 * opening.width)
+        for bucket, samples in depth_bins.items():
+            depth = bucket * depth_bin
+            if not minimum_cabin_depth <= depth <= maximum_cabin_depth:
+                continue
+            if len(samples) < minimum_back_points:
+                continue
+            span = max(sample[1] for sample in samples) - min(sample[1] for sample in samples)
+            if span >= minimum_back_span:
+                back_candidates.append((depth, samples))
+        if not back_candidates:
+            return None
+        back_depth, back_evidence = min(back_candidates, key=lambda item: item[0])
+
+        expected_half_width = max(0.25, 0.5 * opening.width)
+        side_tolerance = max(0.12, min(0.25, 0.20 * opening.width))
+        left_depths = [
+            sample[0]
+            for sample in behind
+            if abs(sample[1] - expected_half_width) <= side_tolerance
+            and sample[0] <= back_depth + depth_bin
+        ]
+        right_depths = [
+            sample[0]
+            for sample in behind
+            if abs(sample[1] + expected_half_width) <= side_tolerance
+            and sample[0] <= back_depth + depth_bin
+        ]
+        minimum_side_points = max(6, self.min_evidence_points)
+        if len(left_depths) < minimum_side_points or len(right_depths) < minimum_side_points:
+            return None
+        if (
+            max(left_depths) - min(left_depths) < 0.55
+            or max(right_depths) - min(right_depths) < 0.55
+        ):
+            return None
+
+        return OpeningObservation(
+            distance=opening.distance,
+            world_xy=opening.world_xy,
+            yaw=opening.yaw,
+            width=opening.width,
+            evidence_count=(
+                opening.evidence_count
+                + len(back_evidence)
+                + len(left_depths)
+                + len(right_depths)
+            ),
+        )
+
+    def detect_elevator_opening_nearby(
+        self,
+        *,
+        robot_pose: tuple[float, float, float],
+        floor_index: int,
+        cloud_points: Iterable[tuple[float, float, float]],
+        floor_height: float = 2.6,
+        heading_count: int = 24,
+    ) -> OpeningObservation | None:
+        """利用 Livox 全向点云搜索近邻轿厢，不要求机身先朝向门洞。"""
+        points = list(cloud_points)
+        if heading_count < 4:
+            raise ValueError("全向电梯检测至少需要四个朝向假设")
+        observations: list[OpeningObservation] = []
+        for index in range(int(heading_count)):
+            yaw = -math.pi + 2.0 * math.pi * index / float(heading_count)
+            observation = self.detect_elevator_opening_ahead(
+                robot_pose=(robot_pose[0], robot_pose[1], yaw),
+                floor_index=floor_index,
+                cloud_points=points,
+                floor_height=floor_height,
+            )
+            if observation is not None:
+                observations.append(observation)
+        if not observations:
+            return None
+        return min(observations, key=lambda observation: observation.distance)
 
     def detect_controllable_door(
         self,

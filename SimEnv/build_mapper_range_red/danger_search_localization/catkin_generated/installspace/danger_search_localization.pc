@@ -1,0 +1,8 @@
+prefix=/home/xbh/tzb26/codeDG/SimEnv/install
+
+Name: danger_search_localization
+Description: Description of danger_search_localization
+Version: 0.1.0
+Cflags: -I${prefix}/include
+Libs: -L${prefix}/lib 
+Requires: geometry_msgs nav_msgs roslib roscpp sensor_msgs std_msgs

@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover - 离线环境可能没有 ROS
     OccupancyGrid = None
 
 from danger_search.detection_tracker import DetectionTracker
-from danger_search.building_control_client import BuildingControlClient, DoorInfo
+from danger_search.building_control_client import BuildingControlClient, DoorInfo, ElevatorInfo
 from danger_search.navigation_tasks import NavigationTask, TakeElevator, OpenDoorAndPass, NavigateToPose, FAILED
 from danger_search.frontier import Frontier, FrontierExplorer, FrontierSelectionContext
 from danger_search.ground_support_gate import (
@@ -50,8 +50,14 @@ from danger_search.result_writer import ResultWriter
 from danger_search.sensor_buffer import (
     SensorBuffer,
 )
-from danger_search.pose_provider import PoseProvider
-from danger_search.pose_provider import PoseSample
+from danger_search.pose_provider import (
+    POSE_EXPIRED,
+    POSE_MATCHED,
+    POSE_PENDING,
+    PoseLookup,
+    PoseProvider,
+    PoseSample,
+)
 from danger_search.interface_policy import require_allowed_topic, require_internal_topic
 from danger_search.building_feature_provider import BuildingFeatureProvider
 from danger_search.support_shadow import ShadowSupportConfig, ShadowSupportGrid
@@ -275,6 +281,15 @@ class MissionManager:
         self.current_frontier: Frontier | None = None
         self._last_image_stamp: float | None = None
         self._last_cloud_stamp: float | None = None
+        self._last_cloud_pose_pending_stamp: float | None = None
+        self._last_image_pose_pending_stamp: float | None = None
+        self._pose_lookup_stats = {
+            "cloud": {POSE_MATCHED: 0, POSE_PENDING: 0, POSE_EXPIRED: 0},
+            "rgbd": {POSE_MATCHED: 0, POSE_PENDING: 0, POSE_EXPIRED: 0},
+        }
+        self._localization_unavailable_since: float | None = None
+        self._localization_stale_reported = False
+        self._localization_failure_reported = False
         self._service_task = None
         self._change_phase: str | None = None
         self._no_frontier_scan_until = 0.0
@@ -283,12 +298,29 @@ class MissionManager:
         self._floor_timeout_logged = False
         self._last_status_publish = 0.0
         self._probe_attempt = 0
+        self._initial_entry_target: tuple[float, float] | None = None
+        self._initial_entry_origin_pose: tuple[float, float, float] | None = None
+        self._initial_entry_heading: float | None = None
+        self._initial_entry_completed = False
+        self._initial_entry_failed = False
+        self._initial_entry_retry_count = 0
+        self._initial_entry_service_task = None
+        self._initial_entry_last_opening_stamp: float | None = None
+        self._initial_entry_opening_confirmations = 0
+        self._initial_entry_opening_observation = None
+        self._initial_entry_trace: list[tuple[float, float]] = []
+        self._elevator_opening_last_stamp: float | None = None
+        self._elevator_opening_last_scan_stamp: float | None = None
+        self._elevator_opening_observation = None
+        self._elevator_opening_confirmations = 0
         self._timer = None
         self._finished = False
         self._shutdown_requested = False
         self._transition_history: list[dict[str, object]] = []
         self._return_home_started = False
         self._return_home_completed = False
+        self._return_home_main_entrance_crossed = False
+        self._return_home_entry_trace_attempted = False
         self._return_home_reason: str | None = None
         self._mission_success_eligible = True
         self._normal_completion = False
@@ -378,9 +410,16 @@ class MissionManager:
             service_timeout=self.floor_params.get("service_timeout", 5.0),
         )
         if self.building_features is not None:
+            elevator_doors_by_floor: dict[int, list[str]] = {}
+            for door in self.building_features.doors.values():
+                if door.kind == "elevator":
+                    elevator_doors_by_floor.setdefault(door.floor_index, []).append(
+                        door.door_id
+                    )
             self.building_client.set_public_features(
                 door_ids=self.building_features.door_ids,
                 elevators=self.building_features.elevators,
+                elevator_door_ids_by_floor=elevator_doors_by_floor,
             )
         self._progress_monitor = _ProgressMonitor(
             goal_tolerance=float(self.controller_params.get("goal_tolerance", 0.35)),
@@ -453,7 +492,10 @@ class MissionManager:
         self.pose_provider.start()
         self.sensor_buffer.start()
         self.controller.start()
-        if self.max_floor > 1 or self.building_client.has_controllable_doors():
+        if _building_services_required(
+            max_floor=self.max_floor,
+            public_door_ids=self.building_client.public_door_ids,
+        ):
             self.building_client.start(connect_elevator=self.max_floor > 1)
         self._status_publisher = rospy.Publisher(self.status_topic, String, queue_size=1)
         if OccupancyGrid is not None:
@@ -591,6 +633,19 @@ class MissionManager:
             float(value)
             for value in _param("localization/base_to_camera_rpy", [0.0, 0.0, 0.0])
         )
+        self.localization_stale_minimum = float(
+            _param("localization/stale_minimum", 0.4)
+        )
+        self.localization_unavailable_timeout = float(
+            _param("localization/unavailable_timeout", 3.0)
+        )
+        if (
+            not math.isfinite(self.localization_stale_minimum)
+            or self.localization_stale_minimum <= 0.0
+            or not math.isfinite(self.localization_unavailable_timeout)
+            or self.localization_unavailable_timeout <= self.localization_stale_minimum
+        ):
+            raise ValueError("定位新鲜度阈值必须为正，且不可用超时必须更长")
         self.status_topic = require_internal_topic(_param("topics/status", "/nav/status"), purpose="任务状态")
         self.goal_topic = require_internal_topic(_param("topics/goal", "/nav/goal"), purpose="诊断目标")
         self.map_topic = require_internal_topic(_param("topics/map", "/nav/map_debug"), purpose="地图调试")
@@ -607,8 +662,25 @@ class MissionManager:
         self.startup_delay = float(_param("mission/startup_delay", 2.0))
         self.max_runtime = float(_param("mission/max_runtime", 590.0))
         self.max_floor = int(_param("mission/max_floor", 1))
-        if self.runtime_profile == "formal" and self.max_floor != 1:
-            raise ValueError("当前合规基线仅支持单层；多层需要公开空间定位与合法换层方案")
+        if self.runtime_profile == "formal" and self.building_features is not None:
+            public_elevators = self.building_features.elevator_features
+            if len(public_elevators) != 1:
+                raise ValueError("正式多楼层运行要求公开 schema 恰好声明一个电梯")
+            elevator_feature = next(iter(public_elevators.values()))
+            served_floors = sorted(elevator_feature.served_floors)
+            if served_floors != list(range(len(served_floors))):
+                raise ValueError("正式多楼层运行要求 served_floors 从 0 连续编号")
+            elevator_doors_by_floor = {
+                floor: [
+                    door.door_id
+                    for door in self.building_features.doors.values()
+                    if door.kind == "elevator" and door.floor_index == floor
+                ]
+                for floor in served_floors
+            }
+            if any(len(door_ids) != 1 for door_ids in elevator_doors_by_floor.values()):
+                raise ValueError("正式多楼层运行要求每个 served floor 恰好声明一个电梯门")
+            self.max_floor = len(served_floors)
         self.floor_timeout = float(_param("mission/floor_timeout", 180.0))
         self.last_floor_uses_global_budget = bool(
             _param("mission/last_floor_uses_global_budget", True)
@@ -635,6 +707,32 @@ class MissionManager:
         self.no_frontier_scan_duration = float(_param("mission/no_frontier_scan_duration", 8.0))
         self.probe_distance = float(_param("mission/probe_distance", 1.2))
         self.probe_yaw = float(_param("mission/probe_yaw", math.pi / 2.0))
+        self.initial_entry_max_distance = float(
+            _param("mission/initial_entry_max_distance", 5.0)
+        )
+        self.initial_entry_corridor_half_width = float(
+            _param("mission/initial_entry_corridor_half_width", 0.20)
+        )
+        self.initial_entry_opening_confirmations = max(
+            1, int(_param("mission/initial_entry_opening_confirmations", 2))
+        )
+        self.initial_entry_opening_max_distance = float(
+            _param("mission/initial_entry_opening_max_distance", 1.2)
+        )
+        self.initial_entry_geometry_tolerance = float(
+            _param("mission/initial_entry_geometry_tolerance", 0.25)
+        )
+        if (
+            not math.isfinite(self.initial_entry_max_distance)
+            or self.initial_entry_max_distance <= 0.0
+            or not math.isfinite(self.initial_entry_corridor_half_width)
+            or self.initial_entry_corridor_half_width < 0.0
+            or not math.isfinite(self.initial_entry_opening_max_distance)
+            or self.initial_entry_opening_max_distance <= 0.0
+            or not math.isfinite(self.initial_entry_geometry_tolerance)
+            or self.initial_entry_geometry_tolerance <= 0.0
+        ):
+            raise ValueError("初始入口探测参数必须为有限正值")
         self.door_pass_offset = float(_param("mission/door_pass_offset", 0.8))
         self.door_commit_distance = float(_param("mission/door_commit_distance", 1.8))
         self.door_clear_radius = float(_param("mission/door_clear_radius", 0.9))
@@ -896,6 +994,12 @@ class MissionManager:
             "min_evidence_points": int(_param("local_semantic/min_door_evidence_points", 6)),
             "min_evidence_height": float(_param("local_semantic/min_door_evidence_height", 0.15)),
             "max_evidence_height": float(_param("local_semantic/max_door_evidence_height", 1.80)),
+            "opening_min_width": float(_param("local_semantic/opening_min_width", 0.65)),
+            "opening_max_width": float(_param("local_semantic/opening_max_width", 2.50)),
+            "opening_plane_depth": float(_param("local_semantic/opening_plane_depth", 0.30)),
+            "opening_min_side_height_span": float(
+                _param("local_semantic/opening_min_side_height_span", 0.50)
+            ),
             "use_truth_proximity_detector": bool(_param("local_semantic/use_truth_proximity_detector", False)),
         }
         if self.runtime_profile == "formal" and self.local_detection_params[
@@ -935,6 +1039,103 @@ class MissionManager:
                     diagnostic_context={"exception": repr(exc)},
                 )
 
+    def _localization_allows_progress(
+        self,
+        pose_sample: PoseSample | None,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """定位短暂陈旧时安全停车，持续不可用时显式结束任务。"""
+        current_time = float(get_time() if now is None else now)
+        period_reader = getattr(self.pose_provider, "observed_period", None)
+        observed_period = float(
+            period_reader(default=0.1) if callable(period_reader) else 0.1
+        )
+        stale_minimum = float(getattr(self, "localization_stale_minimum", 0.4))
+        unavailable_timeout = float(
+            getattr(self, "localization_unavailable_timeout", 3.0)
+        )
+        elapsed = max(0.0, current_time - float(getattr(self, "start_time", current_time)))
+        # 初始文档的 Livox 频率为 10 Hz；四个近期周期用于吸收正常抖动，
+        # 同时限制在最终不可用超时的一半内，避免用自适应阈值掩盖冻结。
+        stale_limit = max(
+            stale_minimum,
+            4.0 * observed_period,
+        )
+        stale_limit = min(
+            stale_limit,
+            max(
+                stale_minimum,
+                0.5 * unavailable_timeout,
+            ),
+        )
+        sample_stamp = getattr(pose_sample, "stamp", None)
+        if sample_stamp is None or not math.isfinite(float(sample_stamp)):
+            age = math.inf
+        else:
+            age = max(0.0, current_time - float(sample_stamp))
+        if pose_sample is not None and age <= stale_limit:
+            unavailable_since = getattr(self, "_localization_unavailable_since", None)
+            if unavailable_since is not None:
+                self._log_structured(
+                    {
+                        "event": "localization_recovered",
+                        "elapsed": round(elapsed, 3),
+                        "unavailable_duration": round(
+                            max(0.0, current_time - float(unavailable_since)), 3
+                        ),
+                        "pose_stamp": float(sample_stamp),
+                        "pose_age": round(age, 4),
+                        "stale_limit": round(stale_limit, 4),
+                    }
+                )
+            self._localization_unavailable_since = None
+            self._localization_stale_reported = False
+            return True
+
+        if getattr(self, "_localization_unavailable_since", None) is None:
+            self._localization_unavailable_since = current_time
+        unavailable_duration = max(
+            0.0,
+            current_time - float(self._localization_unavailable_since),
+        )
+        self.controller.stop(reason="localization_stale")
+        reset_progress = getattr(self.controller, "reset_progress_timer", None)
+        if callable(reset_progress):
+            reset_progress(pose_sample.xy_yaw if pose_sample is not None else None)
+        if not getattr(self, "_localization_stale_reported", False):
+            self._localization_stale_reported = True
+            self._log_structured(
+                {
+                    "event": "localization_stale",
+                    "elapsed": round(elapsed, 3),
+                    "pose_stamp": (
+                        float(sample_stamp) if sample_stamp is not None else None
+                    ),
+                    "pose_age": round(age, 4) if math.isfinite(age) else None,
+                    "observed_period": round(observed_period, 4),
+                    "stale_limit": round(stale_limit, 4),
+                }
+            )
+        if (
+            unavailable_duration >= unavailable_timeout
+            and not getattr(self, "_localization_failure_reported", False)
+        ):
+            self._localization_failure_reported = True
+            self._mission_success_eligible = False
+            self._record_failure("定位数据持续不可用")
+            self._transition_state(
+                WRITE_RESULT,
+                reason_code="localization_unavailable",
+                call_site="MissionManager.tick:localization_health",
+                diagnostic_context={
+                    "unavailable_duration": round(unavailable_duration, 3),
+                    "pose_age": round(age, 4) if math.isfinite(age) else None,
+                    "stale_limit": round(stale_limit, 4),
+                },
+            )
+        return False
+
     def tick(self) -> None:
         self._publish_status()
         if self.state in (FINISH, MISSION_FAILED):
@@ -970,14 +1171,14 @@ class MissionManager:
 
         snapshot = self.sensor_buffer.snapshot()
         pose_sample = self.pose_provider.latest()
-        if pose_sample is None:
-            self.controller.stop()
+        if not self._localization_allows_progress(pose_sample):
             return
         pose = pose_sample.xy_yaw
         xyz = pose_sample.xyz
 
         self._last_xyz = xyz
         self._update_pose_progress(pose)
+        self._record_initial_entry_trace_pose(pose)
         self._sync_ground_support_task_context()
         self._update_ground_support_odometry(pose_sample)
         self._update_mapping_and_detection(snapshot, pose, xyz, pose_sample)
@@ -990,6 +1191,11 @@ class MissionManager:
                 completed_task_name = getattr(self.current_task, "name", type(self.current_task).__name__)
                 completed_task_phase = getattr(self.current_task, "phase", None)
                 if isinstance(self.current_task, OpenDoorAndPass):
+                    is_initial_entry_task = (
+                        self.current_task.door_id == "main_entrance"
+                        and getattr(self, "_initial_entry_origin_pose", None) is not None
+                        and not getattr(self, "_initial_entry_completed", False)
+                    )
                     if status == DONE:
                         self.opened_doors.add(self.current_task.door_id)
                         self._remember_completed_door(self.current_task, pose)
@@ -1001,6 +1207,15 @@ class MissionManager:
                             self.main_entrance_pass_vector = self.last_door_pass_vector
                     else:
                         self.failed_doors.add(self.current_task.door_id)
+                    if is_initial_entry_task:
+                        self._initial_entry_completed = status == DONE
+                        self._initial_entry_failed = status == FAILED
+                    if (
+                        self.state == RETURN_HOME
+                        and self.current_task.door_id == "main_entrance"
+                        and status == DONE
+                    ):
+                        self._return_home_main_entrance_crossed = True
                 self.active_door = None
                 if status == FAILED:
                     rospy.logwarn("当前任务 %s 失败，放弃该门/任务", self.current_task.name)
@@ -1271,16 +1486,45 @@ class MissionManager:
                 xyz=xyz,
             )
         cloud_is_new = cloud_stamp is None or cloud_stamp != getattr(self, "_last_cloud_stamp", None)
-        estimated_floor = self.mapper.estimate_floor_from_z(xyz[2])
+        cloud_lookup = _time_matched_pose_lookup(
+            getattr(self, "pose_provider", None), cloud_stamp, allow_legacy_at=False
+        )
+        mapping_sample = cloud_lookup.sample if cloud_lookup.sample is not None else pose_sample
+        mapping_pose = mapping_sample.xy_yaw
+        mapping_xyz = mapping_sample.xyz
+        estimated_floor = self.mapper.estimate_floor_from_z(mapping_xyz[2])
         floor_scoped_updates_blocked = self._floor_scoped_updates_are_blocked(
-            snapshot,
-            estimated_floor,
-            pose_sample,
+            snapshot, estimated_floor, mapping_sample
         )
         if estimated_floor == self.current_floor:
             self._last_floor_alignment_mismatch_key = None
         if cloud_is_new:
-            if floor_scoped_updates_blocked:
+            if cloud_stamp is not None and cloud_lookup.status == POSE_PENDING:
+                if cloud_stamp != getattr(self, "_last_cloud_pose_pending_stamp", None):
+                    self._last_cloud_pose_pending_stamp = cloud_stamp
+                    self._record_pose_lookup("cloud", cloud_lookup)
+                    self._log_structured(
+                        {
+                            "event": "cloud_pose_lookup_pending",
+                            "elapsed": round(float(self._elapsed()), 3),
+                            "cloud_stamp": cloud_stamp,
+                            "pose_delta": cloud_lookup.delta,
+                        }
+                    )
+            elif cloud_stamp is not None and cloud_lookup.status == POSE_EXPIRED:
+                self._record_pose_lookup("cloud", cloud_lookup)
+                self._last_cloud_stamp = cloud_stamp
+                self._log_structured(
+                    {
+                        "event": "cloud_pose_lookup_skipped",
+                        "elapsed": round(float(self._elapsed()), 3),
+                        "cloud_stamp": cloud_stamp,
+                        "pose_delta": cloud_lookup.delta,
+                        "reason": "time_matched_localization_expired",
+                    }
+                )
+            elif floor_scoped_updates_blocked:
+                self._record_pose_lookup("cloud", cloud_lookup)
                 # 被门控的 cloud 必须标记为已消费，避免对齐后重放旧帧。
                 self._last_cloud_stamp = cloud_stamp
                 self._record_skipped_floor_scoped_update(
@@ -1288,6 +1532,7 @@ class MissionManager:
                     estimated_floor=estimated_floor,
                 )
             else:
+                self._record_pose_lookup("cloud", cloud_lookup)
                 points = self.sensor_buffer.read_cloud_xyz(
                     snapshot.cloud_msg,
                     max_points=self.cloud_max_points,
@@ -1297,7 +1542,7 @@ class MissionManager:
                 self._last_cloud_stamp = cloud_stamp
                 self.mapper.update_from_cloud(
                     floor_index=self.current_floor,
-                    robot_xyz=xyz,
+                    robot_xyz=mapping_xyz,
                     points=points,
                 )
                 if getattr(self, "_ground_support_gate", None) is not None:
@@ -1315,7 +1560,7 @@ class MissionManager:
                             {
                                 "event": "floor_alignment_mismatch",
                                 "elapsed": round(float(self._elapsed()), 3),
-                                "odom_xyz": [round(float(value), 3) for value in xyz],
+                                "odom_xyz": [round(float(value), 3) for value in mapping_xyz],
                                 "mapper_estimated_floor": int(estimated_floor),
                                 "current_floor": int(self.current_floor),
                                 "target_floor": getattr(self, "target_floor", None),
@@ -1339,7 +1584,7 @@ class MissionManager:
                     set_obstacle_distance(
                         nearest_forward_obstacle_distance(
                             points,
-                            pose,
+                            mapping_pose,
                             floor_index=self.current_floor,
                             mapper=self.mapper,
                         )
@@ -1353,15 +1598,27 @@ class MissionManager:
         stamp = bundle.rgb_msg.header.stamp.to_sec() if hasattr(bundle.rgb_msg.header.stamp, "to_sec") else None
         if stamp is not None and self._last_image_stamp == stamp:
             return
-        self._last_image_stamp = stamp
         image_stamp = _message_stamp_seconds(bundle.rgb_msg)
-        provider = getattr(self, "pose_provider", None)
-        image_pose = (
-            provider.at(image_stamp)
-            if provider is not None and image_stamp is not None
-            else None
+        image_lookup = _time_matched_pose_lookup(
+            getattr(self, "pose_provider", None), image_stamp
         )
-        if image_pose is None:
+        if image_stamp is not None and image_lookup.status == POSE_PENDING:
+            if image_stamp == getattr(self, "_last_image_pose_pending_stamp", None):
+                return
+            self._last_image_pose_pending_stamp = image_stamp
+            self._record_pose_lookup("rgbd", image_lookup)
+            self._log_structured(
+                {
+                    "event": "rgbd_pose_lookup_pending",
+                    "elapsed": round(float(self._elapsed()), 3),
+                    "image_stamp": image_stamp,
+                    "pose_delta": image_lookup.delta,
+                }
+            )
+            return
+        if image_stamp is not None and image_lookup.status == POSE_EXPIRED:
+            self._record_pose_lookup("rgbd", image_lookup)
+            self._last_image_stamp = stamp
             # 不使用最近云帧位姿、TF 或 Gazebo 真值兜底，避免 RGB-D 检测
             # 与彩色图像不同步导致伪目标。
             now = get_time()
@@ -1372,10 +1629,17 @@ class MissionManager:
                         "event": "rgbd_pose_lookup_skipped",
                         "elapsed": round(float(self._elapsed()), 3),
                         "image_stamp": image_stamp,
-                        "reason": "no_time_matched_localization_sample",
+                        "pose_delta": image_lookup.delta,
+                        "reason": "time_matched_localization_expired",
                     }
                 )
             return
+        self._record_pose_lookup("rgbd", image_lookup)
+        self._last_image_stamp = stamp
+        image_pose = image_lookup.sample
+        if image_pose is None:
+            return
+        provider = getattr(self, "pose_provider", None)
         if provider is not None:
             camera_to_world = provider.sensor_to_world_matrix(
                 image_pose,
@@ -1399,6 +1663,18 @@ class MissionManager:
         )
         if candidates:
             self.tracker.update(candidates, now=get_time())
+
+    def _record_pose_lookup(self, stream: str, lookup: PoseLookup) -> None:
+        """累计时间匹配结果；只用于运行诊断，不影响任务决策。"""
+        stats = getattr(self, "_pose_lookup_stats", None)
+        if not isinstance(stats, dict):
+            stats = {}
+            self._pose_lookup_stats = stats
+        stream_stats = stats.setdefault(
+            stream,
+            {POSE_MATCHED: 0, POSE_PENDING: 0, POSE_EXPIRED: 0},
+        )
+        stream_stats[lookup.status] = int(stream_stats.get(lookup.status, 0)) + 1
 
     def _update_ground_support_odometry(self, pose_sample) -> None:
         gate = getattr(self, "_ground_support_gate", None)
@@ -1985,6 +2261,14 @@ class MissionManager:
                 self.controller.stop()
             return
 
+        # 公开起点位于主入口外时，先沿当前合法姿态和已确认 FREE 走廊深入，
+        # 避免普通 frontier 评分优先选择入口外更近的侧向边界。目标完全由
+        # 当前传感器地图推导，不读取门坐标、布局 metadata 或固定世界坐标。
+        if self._tick_initial_entry_probe(pose, grid):
+            return
+
+        self._try_register_local_elevator(pose)
+
         frontiers = self.explorer.extract_frontiers(grid)
         self._record_progress_sample(grid)
 
@@ -2144,7 +2428,7 @@ class MissionManager:
                     and debug.unreachable_count == 0
                     and debug.reachable_count == 0
                 )
-                if not frontiers and self._try_probe_unknown_space(pose):
+                if (not frontiers or all_inside_tolerance) and self._try_probe_unknown_space(pose):
                     self._no_reachable_frontier_confirmations = 0
                     return
                 if self._tick_no_frontier_scan(
@@ -2428,7 +2712,17 @@ class MissionManager:
         door = self.building_client.doors.get(door_id)
         if door is None:
             return
-        depth = max(self.door_clear_radius, self.mapper.obstacle_inflation_radius + self.mapper.resolution)
+        # clear_dynamic_door_strip 的 depth 是完整长度。清理范围至少覆盖门两侧
+        # 等待点及占据膨胀，否则机器人从门内返航时会站在膨胀 OCC 中，A* 和
+        # 直连检查都无法离开。门宽和法向均来自传感器注册结果，不扩展到门外
+        # commit 区域，也不使用场景固定坐标。
+        half_depth = max(
+            self.door_clear_radius,
+            self.door_pass_offset
+            + self.mapper.obstacle_inflation_radius
+            + self.mapper.resolution,
+        )
+        depth = 2.0 * half_depth
         self.mapper.clear_dynamic_door_strip(door.floor_index, door.x, door.y, door.yaw, door.width, depth)
         rospy.loginfo(
             "已清理开门后的动态障碍残留：door_id=%s floor=%d center=(%.2f, %.2f) yaw=%.2f width=%.2f depth=%.2f",
@@ -2554,7 +2848,9 @@ class MissionManager:
 
     def _try_probe_unknown_space(self, pose: tuple[float, float, float]) -> bool:
         grid = self.mapper.floor(self.current_floor)
-        base_pose = (pose[0], pose[1], self.probe_yaw)
+        # 探测序列以当前合法定位姿态为基准，避免固定世界方向在不同起点或
+        # 过门后制造不必要的大角度原地转向。
+        base_pose = pose
         for _ in range(12):
             target = probe_target_for_attempt(base_pose, self.probe_distance, self._probe_attempt)
             self._probe_attempt += 1
@@ -2574,6 +2870,316 @@ class MissionManager:
             rospy.loginfo("无前沿，执行短距离探测目标：target=(%.2f, %.2f)", target[0], target[1])
             return True
         return False
+
+    def _tick_initial_entry_probe(self, pose, grid) -> bool:
+        """若公开场景声明首层主入口，先沿已确认自由走廊完成一次前向进入。"""
+        if getattr(self, "_initial_entry_completed", False) or getattr(
+            self, "_initial_entry_failed", False
+        ):
+            return False
+        features = getattr(self, "building_features", None)
+        if features is None:
+            return False
+        entrance = getattr(features, "doors", {}).get("main_entrance")
+        if entrance is None or int(getattr(entrance, "floor_index", -1)) != 0:
+            self._initial_entry_completed = True
+            return False
+        if self.current_floor != 0:
+            self._initial_entry_completed = True
+            return False
+
+        if self._initial_entry_origin_pose is None:
+            self._initial_entry_origin_pose = tuple(float(value) for value in pose)
+            self._initial_entry_heading = float(pose[2])
+            self._initial_entry_trace = [(float(pose[0]), float(pose[1]))]
+
+        heading = float(self._initial_entry_heading)
+        origin = self._initial_entry_origin_pose
+        forward = (math.cos(heading), math.sin(heading))
+        forward_progress = max(
+            0.0,
+            (pose[0] - origin[0]) * forward[0]
+            + (pose[1] - origin[1]) * forward[1],
+        )
+        remaining_distance = max(
+            0.0,
+            float(getattr(self, "initial_entry_max_distance", 5.0))
+            - forward_progress,
+        )
+        if remaining_distance <= self.controller.goal_tolerance:
+            self.controller.clear_path(reason="initial_entry_completed")
+            self._initial_entry_completed = True
+            rospy.loginfo(
+                "已沿传感器确认走廊深入主入口 %.2f m，开始常规 frontier 探索",
+                forward_progress,
+            )
+            return True
+
+        if not bool(getattr(entrance, "initial_open", False)):
+            if getattr(self, "_initial_entry_service_task", None) is None:
+                self._initial_entry_service_task = self.building_client.open_door(
+                    "main_entrance"
+                )
+                self.controller.stop(reason="initial_entry_opening")
+                return True
+            if not self._initial_entry_service_task.done():
+                self.controller.stop(reason="initial_entry_opening")
+                return True
+            if not self._initial_entry_service_task.ok():
+                self._record_failure(
+                    "主入口服务失败: " + self._initial_entry_service_task.message()
+                )
+                self._initial_entry_failed = True
+                return False
+
+        if self._try_start_initial_entry_door_task(pose, entrance):
+            return True
+
+        if getattr(self, "_initial_entry_target", None) is None:
+            target = initial_forward_free_target(
+                grid,
+                (pose[0], pose[1], heading),
+                max_distance=remaining_distance,
+                corridor_half_width=getattr(
+                    self, "initial_entry_corridor_half_width", 0.20
+                ),
+                minimum_distance=max(
+                    2.0 * float(self.controller.goal_tolerance),
+                    float(self.probe_distance),
+                ),
+            )
+            if target is None:
+                # 地图尚未确认入口方向时保持静止，等下一份合法点云；不把
+                # UNKNOWN 当 FREE，也不退回侧向 frontier 绕到建筑外侧。
+                self.controller.stop(reason="initial_entry_waiting_for_free_corridor")
+                return True
+            self._initial_entry_target = target
+            self.controller.set_path([(pose[0], pose[1]), target])
+            rospy.loginfo(
+                "按传感器确认的自由走廊进入主入口：target=(%.2f, %.2f) distance=%.2f",
+                target[0],
+                target[1],
+                math.hypot(target[0] - pose[0], target[1] - pose[1]),
+            )
+
+        target = self._initial_entry_target
+        distance = math.hypot(target[0] - pose[0], target[1] - pose[1])
+        if distance <= self.controller.goal_tolerance:
+            self.controller.clear_path(reason="initial_entry_completed")
+            # 一份点云通常只能确认近场约 1.5 m；到达后继续沿同一初始
+            # 朝向滚动确认下一段，直到累计深入上限，而不是过早交还给
+            # 可能选择建筑外侧的普通 frontier。
+            self._initial_entry_target = None
+            self._initial_entry_retry_count = 0
+            return True
+
+        if not self.controller.has_path():
+            if getattr(self, "_initial_entry_retry_count", 0) >= 1:
+                self._record_failure("主入口前向进入失败")
+                self._initial_entry_failed = True
+                return False
+            self._initial_entry_retry_count += 1
+            self.controller.set_path([(pose[0], pose[1]), target])
+
+        status = self.controller.tick(pose)
+        if status == STUCK:
+            # 保留同一入口目标且仅重试一次，不让普通 recover 改变入口方向。
+            self.controller.clear_path(reason="initial_entry_stuck")
+        elif status == DONE:
+            self._initial_entry_target = None
+            self._initial_entry_retry_count = 0
+        return True
+
+    def _try_start_initial_entry_door_task(self, pose, entrance) -> bool:
+        """连续点云确认开放门洞后，注册公开主入口并交给既有过门任务。"""
+        stamp = getattr(self, "_last_cloud_stamp", None)
+        if stamp is None or stamp == getattr(
+            self, "_initial_entry_last_opening_stamp", None
+        ):
+            return False
+        self._initial_entry_last_opening_stamp = stamp
+        observation = self.local_detector.detect_opening_ahead(
+            robot_pose=pose,
+            floor_index=self.current_floor,
+            cloud_points=self._latest_cloud_points,
+            floor_height=self.mapper.floor_height,
+        )
+        if observation is None:
+            self._initial_entry_opening_confirmations = 0
+            self._initial_entry_opening_observation = None
+            return False
+        if observation.distance > float(
+            getattr(self, "initial_entry_opening_max_distance", 1.2)
+        ):
+            # 远距离门框只占少量角分辨率，内缘估计会明显漂移；继续沿已确认
+            # FREE 走廊接近，在局部几何足够稳定后再建立过门目标。
+            self._initial_entry_opening_confirmations = 0
+            self._initial_entry_opening_observation = None
+            return False
+
+        previous = getattr(self, "_initial_entry_opening_observation", None)
+        tolerance = float(getattr(self, "initial_entry_geometry_tolerance", 0.25))
+        geometry_consistent = previous is not None and (
+            math.hypot(
+                observation.world_xy[0] - previous.world_xy[0],
+                observation.world_xy[1] - previous.world_xy[1],
+            )
+            <= tolerance
+            and abs(observation.width - previous.width) <= tolerance
+            and abs(
+                math.atan2(
+                    math.sin(observation.yaw - previous.yaw),
+                    math.cos(observation.yaw - previous.yaw),
+                )
+            )
+            <= tolerance
+        )
+        self._initial_entry_opening_confirmations = (
+            int(getattr(self, "_initial_entry_opening_confirmations", 0)) + 1
+            if geometry_consistent
+            else 1
+        )
+        self._initial_entry_opening_observation = observation
+        required = max(
+            1, int(getattr(self, "initial_entry_opening_confirmations", 2))
+        )
+        if self._initial_entry_opening_confirmations < required:
+            return False
+
+        door_id = str(entrance.door_id)
+        self.building_client.doors[door_id] = DoorInfo(
+            door_id=door_id,
+            kind=str(entrance.kind),
+            floor_index=int(entrance.floor_index),
+            x=float(observation.world_xy[0]),
+            y=float(observation.world_xy[1]),
+            yaw=float(observation.yaw),
+            width=float(observation.width),
+        )
+        self.controller.clear_path(reason="initial_entry_opening_confirmed")
+        self.current_frontier = None
+        self._last_frontier_target = None
+        self._last_frontier_score = None
+        self._last_frontier_used_fallback = False
+        self.active_door = door_id
+        self.current_task = OpenDoorAndPass(
+            door_id,
+            pass_offset=self.door_pass_offset,
+            commit_distance=self.door_commit_distance,
+        )
+        rospy.loginfo(
+            "点云连续确认主入口门洞：door_id=%s center=(%.2f, %.2f) "
+            "yaw=%.2f width=%.2f distance=%.2f evidence=%d confirmations=%d",
+            door_id,
+            observation.world_xy[0],
+            observation.world_xy[1],
+            observation.yaw,
+            observation.width,
+            observation.distance,
+            observation.evidence_count,
+            self._initial_entry_opening_confirmations,
+        )
+        return True
+
+    def _try_register_local_elevator(self, pose: tuple[float, float, float]) -> bool:
+        """用当前 Livox 点云确认轿厢，并关联公开的唯一电梯与楼层门 ID。"""
+        if int(getattr(self, "max_floor", 1)) <= 1 or getattr(self, "current_task", None) is not None:
+            return False
+        stamp = getattr(self, "_last_cloud_stamp", None)
+        if stamp is None or stamp == getattr(self, "_elevator_opening_last_stamp", None):
+            return False
+        self._elevator_opening_last_stamp = stamp
+        last_scan_stamp = getattr(self, "_elevator_opening_last_scan_stamp", None)
+        if last_scan_stamp is not None and float(stamp) - float(last_scan_stamp) < 0.5:
+            return False
+        self._elevator_opening_last_scan_stamp = float(stamp)
+
+        features = getattr(self, "building_features", None)
+        if features is None or len(features.elevator_features) != 1:
+            return False
+        elevator_feature = next(iter(features.elevator_features.values()))
+        try:
+            current_door_id = self.building_client.elevator_door_id(self.current_floor)
+        except ValueError:
+            return False
+        existing = self.building_client.elevators.get(elevator_feature.elevator_id)
+        if existing is not None and self.current_floor in existing.lobby_poses:
+            return False
+
+        observation = self.local_detector.detect_elevator_opening_nearby(
+            robot_pose=pose,
+            floor_index=self.current_floor,
+            cloud_points=self._latest_cloud_points[::2],
+            floor_height=self.mapper.floor_height,
+        )
+        if observation is None:
+            self._elevator_opening_observation = None
+            self._elevator_opening_confirmations = 0
+            return False
+        entrance_xy = getattr(self, "main_entrance_xy", None)
+        if entrance_xy is not None and math.hypot(
+            observation.world_xy[0] - entrance_xy[0],
+            observation.world_xy[1] - entrance_xy[1],
+        ) <= max(1.0, self.door_pass_offset):
+            return False
+
+        previous = getattr(self, "_elevator_opening_observation", None)
+        tolerance = float(getattr(self, "initial_entry_geometry_tolerance", 0.25))
+        consistent = previous is not None and (
+            math.hypot(
+                observation.world_xy[0] - previous.world_xy[0],
+                observation.world_xy[1] - previous.world_xy[1],
+            ) <= tolerance
+            and abs(observation.width - previous.width) <= tolerance
+        )
+        self._elevator_opening_confirmations = (
+            self._elevator_opening_confirmations + 1 if consistent else 1
+        )
+        self._elevator_opening_observation = observation
+        if self._elevator_opening_confirmations < 2:
+            return False
+
+        outward_yaw = math.atan2(
+            math.sin(observation.yaw + math.pi),
+            math.cos(observation.yaw + math.pi),
+        )
+        lobby_poses = {
+            int(floor): (
+                float(observation.world_xy[0]),
+                float(observation.world_xy[1]),
+                float(outward_yaw),
+            )
+            for floor in elevator_feature.served_floors
+        }
+        self.building_client.elevators[elevator_feature.elevator_id] = ElevatorInfo(
+            elevator_id=elevator_feature.elevator_id,
+            lobby_poses=lobby_poses,
+        )
+        for floor in elevator_feature.served_floors:
+            door_id = self.building_client.elevator_door_id(floor)
+            self.building_client.doors[door_id] = DoorInfo(
+                door_id=door_id,
+                kind="elevator",
+                floor_index=int(floor),
+                x=float(observation.world_xy[0]),
+                y=float(observation.world_xy[1]),
+                yaw=float(outward_yaw),
+                width=float(observation.width),
+            )
+        self.floor_params["elevator_id"] = elevator_feature.elevator_id
+        rospy.loginfo(
+            "Livox 连续确认电梯轿厢并注册竖井几何：elevator_id=%s door_id=%s "
+            "floor=%d center=(%.2f, %.2f) outward_yaw=%.2f width=%.2f evidence=%d",
+            elevator_feature.elevator_id,
+            current_door_id,
+            self.current_floor,
+            observation.world_xy[0],
+            observation.world_xy[1],
+            outward_yaw,
+            observation.width,
+            observation.evidence_count,
+        )
+        return True
 
     def _tick_no_frontier_scan(
         self,
@@ -2801,6 +3407,54 @@ class MissionManager:
                 call_site="MissionManager._tick_return_home",
             )
             return
+        entrance_xy = getattr(self, "main_entrance_xy", None)
+        entrance_vector = getattr(self, "main_entrance_pass_vector", None)
+        entrance = getattr(
+            getattr(self, "building_client", None), "doors", {}
+        ).get("main_entrance")
+        if (
+            not getattr(self, "_return_home_main_entrance_crossed", False)
+            and entrance_xy is not None
+            and entrance_vector is not None
+            and entrance is not None
+        ):
+            signed_progress = (
+                (pose[0] - entrance_xy[0]) * entrance_vector[0]
+                + (pose[1] - entrance_xy[1]) * entrance_vector[1]
+            )
+            if signed_progress > 0.10:
+                if "main_entrance" in self.failed_doors:
+                    self._mission_success_eligible = False
+                    self._record_failure("主入口返航通过失败")
+                    self._transition_state(
+                        WRITE_RESULT,
+                        reason_code="return_home_main_entrance_failed",
+                        call_site="MissionManager._tick_return_home",
+                    )
+                    return
+                self.controller.clear_path(reason="return_home_main_entrance")
+                self.active_door = "main_entrance"
+                self.current_task = OpenDoorAndPass(
+                    "main_entrance",
+                    pass_offset=self.door_pass_offset,
+                    commit_distance=self.door_commit_distance,
+                )
+                rospy.loginfo("返航先经已注册主入口离开建筑，再继续回到起点")
+                return
+        if (
+            getattr(self, "_return_home_main_entrance_crossed", False)
+            and not getattr(self, "_return_home_entry_trace_attempted", False)
+            and not self.controller.has_path()
+        ):
+            reverse_trace = self._initial_entry_reverse_path(pose)
+            if reverse_trace is not None:
+                self._return_home_entry_trace_attempted = True
+                self.controller.set_path(reverse_trace)
+                rospy.loginfo(
+                    "主入口外复用本轮已实际通过的入场轨迹返航：waypoints=%d",
+                    len(reverse_trace),
+                )
+                return
         if not self.controller.has_path():
             grid = self.mapper.floor(self.current_floor)
             result = astar_plan(grid, (pose[0], pose[1]), (self.home_pose[0], self.home_pose[1]))
@@ -2827,6 +3481,46 @@ class MissionManager:
         status = self.controller.tick(pose)
         if status == STUCK:
             self.controller.recover()
+
+    def _record_initial_entry_trace_pose(
+        self,
+        pose: tuple[float, float, float],
+    ) -> None:
+        """稀疏记录主入口外已实际通过的合法定位轨迹，供返航反向复用。"""
+        if (
+            getattr(self, "_initial_entry_origin_pose", None) is None
+            or getattr(self, "_initial_entry_completed", False)
+            or self.current_task is not None
+            or self.state != EXPLORE_FLOOR
+        ):
+            return
+        point = (float(pose[0]), float(pose[1]))
+        trace = getattr(self, "_initial_entry_trace", None)
+        if trace is None:
+            self._initial_entry_trace = [point]
+            return
+        if not trace or math.hypot(point[0] - trace[-1][0], point[1] - trace[-1][1]) >= 0.25:
+            trace.append(point)
+
+    def _initial_entry_reverse_path(
+        self,
+        pose: tuple[float, float, float],
+    ) -> list[tuple[float, float]] | None:
+        """构造从门外当前位姿沿已走轨迹回到实际起点的路径。"""
+        if self.home_pose is None:
+            return None
+        trace = list(getattr(self, "_initial_entry_trace", []))
+        if not trace:
+            return None
+        path = [(float(pose[0]), float(pose[1]))]
+        for point in reversed(trace):
+            waypoint = (float(point[0]), float(point[1]))
+            if math.hypot(waypoint[0] - path[-1][0], waypoint[1] - path[-1][1]) >= 0.15:
+                path.append(waypoint)
+        home_xy = (float(self.home_pose[0]), float(self.home_pose[1]))
+        if math.hypot(home_xy[0] - path[-1][0], home_xy[1] - path[-1][1]) >= 0.05:
+            path.append(home_xy)
+        return path if len(path) >= 2 else None
 
     def _begin_floor_change(
         self,
@@ -3093,6 +3787,10 @@ class MissionManager:
             "ground_support_gate": (
                 support_snapshot() if callable(support_snapshot) else None
             ),
+            "pose_lookup": {
+                stream: dict(values)
+                for stream, values in getattr(self, "_pose_lookup_stats", {}).items()
+            },
             "return_home_started": bool(getattr(self, "_return_home_started", False)),
             "return_home_completed": bool(
                 getattr(self, "_return_home_completed", False)
@@ -3178,6 +3876,10 @@ class MissionManager:
                 if getattr(self, "_ground_support_gate", None) is not None
                 else None
             ),
+            "pose_lookup": {
+                stream: dict(values)
+                for stream, values in getattr(self, "_pose_lookup_stats", {}).items()
+            },
             "result_file": str(result_path),
         }
         _atomic_write_json(summary_path, payload)
@@ -3226,6 +3928,26 @@ def _message_stamp_seconds(message) -> float | None:
         return None
     to_sec = getattr(stamp, "to_sec", None)
     return float(to_sec()) if callable(to_sec) else None
+
+
+def _time_matched_pose_lookup(
+    provider, stamp: float | None, *, allow_legacy_at: bool = True
+) -> PoseLookup:
+    """适配生产 PoseProvider 与历史轻量测试替身。"""
+    if provider is None:
+        return PoseLookup(POSE_MATCHED, None, None)
+    lookup = getattr(provider, "lookup", None)
+    if callable(lookup):
+        return lookup(stamp)
+    at = getattr(provider, "at", None)
+    if not allow_legacy_at or not callable(at):
+        return PoseLookup(POSE_MATCHED, None, None)
+    sample = at(stamp)
+    return PoseLookup(
+        POSE_MATCHED if sample is not None else POSE_EXPIRED,
+        sample,
+        None,
+    )
 
 
 def _pose_sample_from_values(*, stamp: float, pose, xyz) -> PoseSample:
@@ -3338,6 +4060,51 @@ def probe_target_for_attempt(
         base_pose[0] + forward_distance * forward[0] + lateral_offset * lateral[0],
         base_pose[1] + forward_distance * forward[1] + lateral_offset * lateral[1],
     )
+
+
+def initial_forward_free_target(
+    grid,
+    pose: tuple[float, float, float],
+    *,
+    max_distance: float,
+    corridor_half_width: float,
+    minimum_distance: float,
+) -> tuple[float, float] | None:
+    """返回当前朝向上、左右足迹带均已确认可通行的最远局部目标。"""
+    limit = max(0.0, float(max_distance))
+    required = max(0.0, float(minimum_distance))
+    half_width = max(0.0, float(corridor_half_width))
+    step = max(float(grid.resolution), 0.05)
+    forward = (math.cos(pose[2]), math.sin(pose[2]))
+    lateral = (-forward[1], forward[0])
+    offsets = (0.0,) if half_width <= 1e-6 else (-half_width, 0.0, half_width)
+    farthest = 0.0
+    for index in range(1, int(math.floor(limit / step)) + 1):
+        distance = index * step
+        traversable = True
+        for offset in offsets:
+            x = pose[0] + distance * forward[0] + offset * lateral[0]
+            y = pose[1] + distance * forward[1] + offset * lateral[1]
+            cell = grid.world_to_grid(x, y)
+            if cell is None or not grid.is_traversable(*cell):
+                traversable = False
+                break
+        if not traversable:
+            break
+        farthest = distance
+    # 与首个未知/障碍横截面保留一个栅格距离，避免量化边界成为目标点。
+    target_distance = max(0.0, farthest - step)
+    if target_distance + 1e-9 < required:
+        return None
+    return (
+        pose[0] + target_distance * forward[0],
+        pose[1] + target_distance * forward[1],
+    )
+
+
+def _building_services_required(*, max_floor: int, public_door_ids) -> bool:
+    """公开门 ID 即需要连接门服务，空间几何是否已注册与连接无关。"""
+    return int(max_floor) > 1 or bool(public_door_ids)
 
 
 def segment_crosses_blocked_cell(

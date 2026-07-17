@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="2" failures="0" disabled="0" errors="0" time="0" timestamp="2026-07-16T17:10:18" name="AllTests">
+  <testsuite name="PointRangeFilter" tests="2" failures="0" disabled="0" errors="0" time="0" timestamp="2026-07-16T17:10:18">
+    <testcase name="RetainsOnlyPointsInTheLocalizationRange" status="run" result="completed" time="0" timestamp="2026-07-16T17:10:18" classname="PointRangeFilter" />
+    <testcase name="RejectsNonFiniteAndInvalidRangeConfiguration" status="run" result="completed" time="0" timestamp="2026-07-16T17:10:18" classname="PointRangeFilter" />
+  </testsuite>
+</testsuites>

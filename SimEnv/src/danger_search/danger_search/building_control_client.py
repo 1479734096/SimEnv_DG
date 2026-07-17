@@ -91,6 +91,7 @@ class BuildingControlClient:
         self.elevators: dict[str, ElevatorInfo] = {}
         self.public_door_ids: set[str] = set()
         self.public_elevators: dict[str, set[int]] = {}
+        self.public_elevator_door_ids_by_floor: dict[int, tuple[str, ...]] = {}
 
         self._set_door = None
         self._call_elevator = None
@@ -100,6 +101,7 @@ class BuildingControlClient:
         *,
         door_ids: set[str] | frozenset[str],
         elevators: dict[str, set[int] | frozenset[int]],
+        elevator_door_ids_by_floor: dict[int, list[str] | tuple[str, ...]] | None = None,
     ) -> None:
         """登记公开 ID，不把公开信息错误扩展为坐标真值。"""
         self.public_door_ids = {str(door_id) for door_id in door_ids}
@@ -107,6 +109,19 @@ class BuildingControlClient:
             str(elevator_id): {int(floor) for floor in floors}
             for elevator_id, floors in elevators.items()
         }
+        self.public_elevator_door_ids_by_floor = {
+            int(floor): tuple(str(door_id) for door_id in door_ids)
+            for floor, door_ids in (elevator_door_ids_by_floor or {}).items()
+        }
+
+    def elevator_door_id(self, floor: int) -> str:
+        """返回公开 schema 中该楼层唯一的电梯门 ID。"""
+        door_ids = self.public_elevator_door_ids_by_floor.get(int(floor), ())
+        if len(door_ids) != 1:
+            raise ValueError(
+                f"楼层 {int(floor)} 必须恰好声明一个电梯门，实际为 {len(door_ids)}"
+            )
+        return door_ids[0]
 
     def start(self, *, connect_elevator: bool = True) -> None:
         if rospy is None:
@@ -152,7 +167,7 @@ class BuildingControlClient:
         return door is not None and door.kind == "elevator"
 
     def open_door(self, door_id: str) -> AsyncServiceCall:
-        if self.public_door_ids and door_id not in self.public_door_ids:
+        if door_id not in self.public_door_ids:
             raise ValueError(f"门 ID 未在公开场景信息中声明: {door_id}")
         def call():
             if self._set_door is None:
@@ -163,7 +178,7 @@ class BuildingControlClient:
         return task
 
     def close_door(self, door_id: str) -> AsyncServiceCall:
-        if self.public_door_ids and door_id not in self.public_door_ids:
+        if door_id not in self.public_door_ids:
             raise ValueError(f"门 ID 未在公开场景信息中声明: {door_id}")
         def call():
             if self._set_door is None:
@@ -175,7 +190,7 @@ class BuildingControlClient:
 
     def call_elevator(self, elevator_id: str, floor: int, open_doors: bool = False) -> AsyncServiceCall:
         floors = self.public_elevators.get(elevator_id)
-        if floors is not None and int(floor) not in floors:
+        if not floors or int(floor) not in floors:
             raise ValueError(f"电梯 {elevator_id} 不服务公开楼层 {floor}")
         def call():
             if self._call_elevator is None:

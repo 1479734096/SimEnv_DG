@@ -50,6 +50,21 @@ def _make_fake_env_process():
 
 
 class RunSeedCompletionTest(unittest.TestCase):
+    def test_runner_configures_workspace_ros_path_without_prior_source(self):
+        workspace = Path("/tmp/simenv-workspace")
+        with patch.dict(
+            run_seed.os.environ,
+            {"ROS_PACKAGE_PATH": "/opt/ros/noetic/share:/existing/packages"},
+        ):
+            run_seed.configure_workspace_ros_package_path(workspace)
+            run_seed.configure_workspace_ros_package_path(workspace)
+            paths = run_seed.os.environ["ROS_PACKAGE_PATH"].split(run_seed.os.pathsep)
+
+        self.assertEqual(paths[0], str(workspace / "src"))
+        self.assertEqual(paths.count(str(workspace / "src")), 1)
+        self.assertIn("/opt/ros/noetic/share", paths)
+        self.assertIn("/existing/packages", paths)
+
     def test_environment_launch_starts_paused_without_auto_unpause(self):
         overrides = run_seed.environment_launch_overrides(
             seed=42,
@@ -62,8 +77,11 @@ class RunSeedCompletionTest(unittest.TestCase):
         self.assertEqual(overrides["AUTO_UNPAUSE"], "false")
         self.assertEqual(overrides["SEED"], "42")
         self.assertEqual(overrides["FLOOR_COUNT"], "1")
+        self.assertEqual(overrides["POINTCLOUD_USE_GROUND_TRUTH_ODOM"], "false")
+        self.assertEqual(overrides["ENABLE_REFEREE_ODOM"], "false")
+        self.assertEqual(overrides["ENABLE_GROUND_TRUTH"], "true")
 
-    def test_environment_unpauses_after_model_load_before_fixed_stand(self):
+    def test_environment_unpauses_after_livox_before_fixed_stand(self):
         events = []
 
         class FakeChild:
@@ -86,8 +104,19 @@ class RunSeedCompletionTest(unittest.TestCase):
         def fake_unpause(_workspace):
             events.append(("unpause", None))
 
+        def fake_wait_for_publisher(topic, *, timeout):
+            events.append(("publisher", topic))
+
         with patch("pexpect.spawn", return_value=child) as spawn, patch.object(
+            run_seed,
+            "wait_for_ros_topic_publisher",
+            side_effect=fake_wait_for_publisher,
+        ), patch.object(
             run_seed, "unpause_environment_physics", side_effect=fake_unpause
+        ), patch.object(
+            run_seed,
+            "wait_for_fixed_stand_posture",
+            return_value={"stable": True},
         ), patch.object(run_seed, "check_startup_health"), patch.object(
             run_seed, "capture_environment_processes", return_value=[]
         ), patch.object(run_seed.time, "sleep"):
@@ -104,6 +133,7 @@ class RunSeedCompletionTest(unittest.TestCase):
         spawn_env = spawn.call_args.kwargs["env"]
         self.assertEqual(spawn_env["PAUSED"], "true")
         self.assertEqual(spawn_env["AUTO_UNPAUSE"], "false")
+        self.assertLess(events.index(("publisher", "/scan")), events.index(("unpause", None)))
         self.assertLess(events.index(("unpause", None)), events.index(("send", "2")))
         self.assertLess(events.index(("send", "2")), events.index(("send", "6")))
 
@@ -427,6 +457,21 @@ class StartupPostureGateTest(unittest.TestCase):
         self.assertIn("startup_posture_failure", detail)
         self.assertIn("max_abs_roll=3.1400", detail)
 
+    def test_crouched_tilted_startup_fails_before_algorithm_launch(self):
+        detail = run_seed._posture_breach_detail(
+            {
+                "samples": 459,
+                "max_abs_roll": 0.3476,
+                "max_abs_pitch": 0.4354,
+                "last_abs_roll": 0.31,
+                "last_abs_pitch": 0.42,
+                "min_z": None,
+            }
+        )
+
+        self.assertIsNotNone(detail)
+        self.assertIn("startup_posture_failure", detail)
+
     def test_height_truth_is_not_used_by_formal_posture_gate(self):
         stats = {
             "samples": 100,
@@ -444,7 +489,7 @@ class StartupPostureGateTest(unittest.TestCase):
         self.assertIn("samples=0", detail)
 
     def test_boundary_roll_not_breached(self):
-        # 阈值使用严格大于，恰好 0.5 不触发
+        # 阈值使用严格大于，恰好等于门限不触发。
         stats = {
             "samples": 10,
             "max_abs_roll": run_seed.POSTURE_MAX_ABS_ROLL,
@@ -452,6 +497,52 @@ class StartupPostureGateTest(unittest.TestCase):
             "min_z": 0.20,
         }
         self.assertIsNone(run_seed._posture_breach_detail(stats))
+
+    def test_fixed_stand_requires_complete_recent_stable_window(self):
+        complete_samples = [
+            (8.99 + index * 0.01, 0.05, 0.04)
+            for index in range(102)
+        ]
+        stable, count = run_seed._is_stable_posture_window(
+            complete_samples,
+            now=10.0,
+            window_seconds=1.0,
+        )
+        self.assertTrue(stable)
+        self.assertGreaterEqual(count, 100)
+
+        stable, count = run_seed._is_stable_posture_window(
+            [(9.2, 0.05, 0.04), (10.0, 0.06, 0.05)],
+            now=10.0,
+            window_seconds=1.0,
+        )
+        self.assertFalse(stable)
+        self.assertEqual(count, 2)
+
+    def test_fixed_stand_rejects_tilted_recent_sample(self):
+        stable, _ = run_seed._is_stable_posture_window(
+            [(9.0, 0.05, 0.04), (9.5, 0.08, 0.31), (10.0, 0.06, 0.05)],
+            now=10.0,
+            window_seconds=1.0,
+        )
+        self.assertFalse(stable)
+
+    def test_health_check_reuses_fixed_stand_posture_without_ros_probe(self):
+        posture = {
+            "samples": 50,
+            "max_abs_roll": 0.08,
+            "max_abs_pitch": 0.07,
+            "last_abs_roll": 0.05,
+            "last_abs_pitch": 0.04,
+            "stable": True,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            run_seed, "wait_for_ros_topic"
+        ), patch.object(run_seed, "_probe_robot_posture") as posture_probe:
+            run_seed.check_startup_health(
+                Path(temp_dir), Path(temp_dir) / "health.log", posture=posture
+            )
+        posture_probe.assert_not_called()
 
 
 if __name__ == "__main__":

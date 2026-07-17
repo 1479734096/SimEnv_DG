@@ -12,6 +12,47 @@ class BuildingControlClientTest(unittest.TestCase):
         self.assertEqual(client.elevators, {})
         self.assertFalse(client.has_controllable_doors())
 
+    def test_public_service_calls_fail_closed_before_features_are_registered(self):
+        client = BuildingControlClient()
+
+        with self.assertRaises(ValueError):
+            client.open_door("main_entrance")
+        with self.assertRaises(ValueError):
+            client.close_door("main_entrance")
+        with self.assertRaises(ValueError):
+            client.call_elevator("elevator_main", 0)
+
+    def test_public_service_calls_reject_unknown_ids_and_floors(self):
+        client = BuildingControlClient()
+        client.set_public_features(
+            door_ids={"main_entrance"},
+            elevators={"elevator_main": {0, 1}},
+        )
+
+        with self.assertRaises(ValueError):
+            client.open_door("unknown")
+        with self.assertRaises(ValueError):
+            client.call_elevator("unknown", 0)
+        with self.assertRaises(ValueError):
+            client.call_elevator("elevator_main", 2)
+
+    def test_elevator_door_id_requires_one_public_id_per_floor(self):
+        client = BuildingControlClient()
+        client.set_public_features(
+            door_ids={"lift_ground", "lift_upper_a", "lift_upper_b"},
+            elevators={"lift": {0, 1, 2}},
+            elevator_door_ids_by_floor={
+                0: ["lift_ground"],
+                1: ["lift_upper_a", "lift_upper_b"],
+            },
+        )
+
+        self.assertEqual(client.elevator_door_id(0), "lift_ground")
+        with self.assertRaises(ValueError):
+            client.elevator_door_id(1)
+        with self.assertRaises(ValueError):
+            client.elevator_door_id(2)
+
     def test_door_points_choose_current_side_as_wait_point(self):
         client = BuildingControlClient()
         client.doors["main_entrance"] = DoorInfo(

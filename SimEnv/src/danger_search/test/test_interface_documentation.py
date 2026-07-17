@@ -46,6 +46,7 @@ class InterfaceDocumentationTest(unittest.TestCase):
             arguments.get("team_scene_info_path"),
             "$(find danger_search)/../../generated_building/team_scene_info.json",
         )
+        self.assertEqual(arguments.get("localization_backend"), "rgbd_livox")
 
     def test_localization_extrinsics_are_ros_parameter_arrays(self):
         root = ElementTree.parse(LOCALIZATION_LAUNCH_PATH).getroot()
@@ -58,7 +59,22 @@ class InterfaceDocumentationTest(unittest.TestCase):
         }
         self.assertEqual(parameters.get("base_to_livox_xyz"), "[0.2, 0.0, 0.08]")
         self.assertEqual(parameters.get("base_to_livox_rpy"), "[0.0, 0.785, 0.0]")
+        self.assertEqual(parameters.get("base_to_depth_xyz"), "[0.28, 0.0, 0.043]")
+        self.assertEqual(
+            parameters.get("base_to_depth_rpy"),
+            "[-1.57079632679, 0.0, -1.57079632679]",
+        )
         string_parameters = {item.get("name") for item in node.findall("param")}
+        arguments = {item.get("name"): item.get("default") for item in root.findall("arg")}
+        self.assertEqual(arguments.get("localization_backend"), "kiss_icp")
+        self.assertEqual(
+            next(
+                item.get("value")
+                for item in node.findall("param")
+                if item.get("name") == "localization_backend"
+            ),
+            "$(arg localization_backend)",
+        )
         self.assertNotIn("base_to_livox_xyz", string_parameters)
         self.assertNotIn("base_to_livox_rpy", string_parameters)
 
@@ -68,15 +84,15 @@ class InterfaceDocumentationTest(unittest.TestCase):
                 content = path.read_text(encoding="utf-8")
                 self.assertIn(TRUTH_RESTRICTION, content)
 
-    def test_odometry_is_not_documented_as_an_algorithm_interface(self):
-        for path in DOCUMENT_PATHS:
-            with self.subTest(path=path):
-                content = path.read_text(encoding="utf-8")
-                self.assertNotIn("| `/Odometry_gazebo` |", content)
-
-    def test_reference_does_not_document_nonexistent_odom_switch(self):
+    def test_reference_marks_truth_topics_as_referee_only(self):
         content = REFERENCE_PATH.read_text(encoding="utf-8")
-        self.assertNotIn("ENABLE_REFEREE_ODOM", content)
+        self.assertIn("`/ground_truth/base_w`", content)
+        self.assertIn("仅裁判/调试使用", content)
+
+    def test_reference_marks_referee_odom_switch_as_non_algorithm_interface(self):
+        content = REFERENCE_PATH.read_text(encoding="utf-8")
+        self.assertIn("ENABLE_REFEREE_ODOM", content)
+        self.assertIn("参赛算法不得订阅", content)
 
 
 if __name__ == "__main__":
