@@ -480,7 +480,7 @@ def _format_failure_section(rows: list[Mapping[str, Any]]) -> list[str]:
     if planner_or_stuck_runs / total > 0.0:
         suggestions.append("调大黑名单 TTL 或障碍膨胀余量，并检查无效前沿是否被重复选择。")
     if elevator_fail_runs / total > 0.0:
-        suggestions.append("优先核对 `floor/elevator_lobby_xy`、`floor/elevator_inside_xy` 和门服务响应时间。")
+        suggestions.append("优先核对传感器派生的电梯几何注册结果和门服务响应时间。")
     if not suggestions:
         suggestions.append("当前汇总没有明显单一瓶颈，下一轮应增加 seed 数量并关注最差场景。")
     lines.extend(f"- {item}" for item in suggestions)

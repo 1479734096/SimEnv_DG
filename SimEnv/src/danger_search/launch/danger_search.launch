@@ -1,6 +1,5 @@
 <launch>
   <arg name="config" default="$(find danger_search)/config/danger_search.yaml"/>
-  <arg name="max_floor" default="1"/>
   <arg name="result_file" default=""/>
   <arg name="mission_summary_file" default=""/>
 
@@ -19,7 +18,6 @@
         name="danger_search"
         required="true"
         output="screen">
-    <param name="mission/max_floor" value="$(arg max_floor)"/>
     <param name="runtime/profile" value="formal"/>
     <param name="result_file" value="$(arg result_file)"/>
     <param name="mission_summary_file" value="$(arg mission_summary_file)"/>

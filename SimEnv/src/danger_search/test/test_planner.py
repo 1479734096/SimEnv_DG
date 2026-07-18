@@ -12,6 +12,7 @@ from danger_search.planner import (
     astar_path,
     astar_plan,
     path_length,
+    simplify_path_line_of_sight,
 )
 
 
@@ -41,6 +42,75 @@ class PlannerTest(unittest.TestCase):
         self.assertGreater(path_length(path), 0.0)
         self.assertAlmostEqual(path[0][0], start[0], places=5)
         self.assertAlmostEqual(path[-1][0], goal[0], places=5)
+
+    def test_line_of_sight_simplifies_grid_staircase_to_straight_segment(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        )
+        for gx in range(grid.size_x):
+            for gy in range(grid.size_y):
+                grid.mark_free(gx, gy)
+        path = [
+            grid.grid_to_world(10, 10),
+            grid.grid_to_world(11, 11),
+            grid.grid_to_world(11, 12),
+            grid.grid_to_world(12, 13),
+            grid.grid_to_world(12, 14),
+        ]
+
+        simplified = simplify_path_line_of_sight(grid, path)
+
+        self.assertEqual(simplified, [path[0], path[-1]])
+
+    def test_line_of_sight_keeps_bend_around_obstacle(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.5,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+        )
+        for gx in range(grid.size_x):
+            for gy in range(grid.size_y):
+                grid.mark_free(gx, gy)
+        obstacle = (grid.size_x // 2, grid.size_y // 2)
+        grid.mark_occupied(*obstacle)
+        start = grid.grid_to_world(obstacle[0] - 3, obstacle[1])
+        goal = grid.grid_to_world(obstacle[0] + 3, obstacle[1])
+
+        result = astar_plan(grid, start, goal, max_iterations=None)
+
+        self.assertTrue(result.reached)
+        self.assertGreater(len(result.path), 2)
+
+    def test_line_of_sight_does_not_cut_blocked_diagonal_corner(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.5,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        )
+        for gx in range(grid.size_x):
+            for gy in range(grid.size_y):
+                grid.mark_free(gx, gy)
+        grid.mark_occupied(3, 2)
+        path = [
+            grid.grid_to_world(2, 2),
+            grid.grid_to_world(2, 3),
+            grid.grid_to_world(3, 3),
+        ]
+
+        simplified = simplify_path_line_of_sight(grid, path)
+
+        self.assertEqual(simplified, path)
 
     def test_astar_returns_empty_when_budget_exhausted_without_progress(self):
         grid = self._make_long_corridor()

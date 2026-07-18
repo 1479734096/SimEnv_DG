@@ -8,8 +8,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from danger_search.building_control_client import BuildingControlClient
-from danger_search.building_feature_provider import PublicElevatorFeature
+from danger_search.building_feature_provider import (
+    PublicDoorFeature,
+    PublicElevatorFeature,
+)
 from danger_search.local_semantic_detector import DoorCandidate, OpeningObservation
+from danger_search.rgbd_door_detector import DoorOpeningChange, DoorPanelObservation
 from danger_search.ground_support_gate import (
     CLEAR as GROUND_SUPPORT_CLEAR,
     DROP_STOPPING,
@@ -20,7 +24,7 @@ from danger_search.ground_support_gate import (
     GroundSupportGateConfig,
     GroundSupportSafetyGate,
 )
-from danger_search.mapper import BLACK, MultiFloorGridMap
+from danger_search.mapper import BLACK, OCC, MultiFloorGridMap
 import danger_search.mission_manager as mission_manager_module
 from danger_search.mission_manager import (
     EXPLORE_FLOOR,
@@ -30,6 +34,7 @@ from danger_search.mission_manager import (
     WRITE_RESULT,
     _ProgressMonitor,
     nearest_forward_obstacle_distance,
+    nearest_forward_obstacle_observation,
 )
 from danger_search.mission_manager import MissionManager
 from danger_search.mission_manager import probe_target_for_attempt
@@ -40,6 +45,49 @@ from danger_search.sensor_buffer import SensorBuffer
 
 
 class MissionManagerHelperTest(unittest.TestCase):
+    def test_runtime_budget_uses_public_floor_count_table(self):
+        table = [[1, 300.0], [2, 620.0], [3, 840.0]]
+        self.assertEqual(
+            mission_manager_module._effective_max_runtime(
+                840.0,
+                max_floor=1,
+                runtime_by_floor=table,
+            ),
+            300.0,
+        )
+        self.assertEqual(
+            mission_manager_module._effective_max_runtime(
+                840.0,
+                max_floor=2,
+                runtime_by_floor=table,
+            ),
+            620.0,
+        )
+        self.assertEqual(
+            mission_manager_module._effective_max_runtime(
+                840.0,
+                max_floor=3,
+                runtime_by_floor=table,
+            ),
+            840.0,
+        )
+        self.assertEqual(
+            mission_manager_module._effective_max_runtime(
+                120.0,
+                max_floor=2,
+                runtime_by_floor=table,
+            ),
+            120.0,
+        )
+        self.assertEqual(
+            mission_manager_module._effective_max_runtime(
+                900.0,
+                max_floor=4,
+                runtime_by_floor=table,
+            ),
+            900.0,
+        )
+
     def test_summary_output_accepts_not_yet_created_run_directory(self):
         """先验证路径再创建目录，不能要求 run-id 目录已存在。"""
         with tempfile.TemporaryDirectory() as directory:
@@ -772,6 +820,91 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         self.assertAlmostEqual(distance, math.hypot(0.8, 0.1))
 
+    def test_forward_obstacle_observation_reports_exact_nearest_echo_geometry(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+            obstacle_min_z=0.15,
+            obstacle_max_z=1.4,
+        )
+
+        observation = nearest_forward_obstacle_observation(
+            [(0.8, 0.1, 0.5), (0.35, -0.05, 0.22)],
+            (0.0, 0.0, 0.0),
+            floor_index=0,
+            mapper=mapper,
+        )
+
+        self.assertIsNotNone(observation)
+        self.assertEqual(observation.world_xyz, (0.35, -0.05, 0.22))
+        self.assertAlmostEqual(observation.distance, math.hypot(0.35, 0.05))
+        self.assertAlmostEqual(observation.forward, 0.35)
+        self.assertAlmostEqual(observation.lateral, 0.05)
+        self.assertAlmostEqual(observation.relative_height, 0.22)
+
+    def test_forward_obstacle_distance_excludes_only_active_door_aperture(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+            obstacle_min_z=0.15,
+            obstacle_max_z=1.4,
+        )
+        points = [
+            # 已开门洞内的门槛回波，不应阻止已经对准的直线过门。
+            (0.20, 0.45, 0.20),
+            # 门框外缘仍位于机器人前向走廊内，必须继续作为障碍。
+            (0.25, 0.65, 0.50),
+        ]
+
+        distance = nearest_forward_obstacle_distance(
+            points,
+            (0.0, 0.45, 0.0),
+            floor_index=0,
+            mapper=mapper,
+            opened_door_exclusion=(0.30, 0.0, 0.0, 0.55, 0.80),
+        )
+
+        self.assertAlmostEqual(distance, math.hypot(0.25, 0.20))
+
+    def test_opened_door_exclusion_only_activates_after_pass_path_commit(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.mapper = SimpleNamespace(
+            resolution=0.1,
+            obstacle_inflation_radius=0.35,
+        )
+        manager.door_clear_radius = 0.9
+        manager.door_pass_offset = 0.8
+        manager.building_client = SimpleNamespace(
+            doors={
+                "main_entrance": SimpleNamespace(
+                    x=0.0,
+                    y=0.0,
+                    yaw=math.pi / 2.0,
+                    width=1.3,
+                )
+            }
+        )
+        task = OpenDoorAndPass("main_entrance")
+        task.phase = "GO_PASS_POINT"
+        manager.current_task = task
+
+        self.assertIsNone(manager._active_opened_door_obstacle_exclusion())
+
+        task._pass_path_started = True
+        exclusion = manager._active_opened_door_obstacle_exclusion()
+        self.assertIsNotNone(exclusion)
+        self.assertAlmostEqual(exclusion[3], 0.55)
+        self.assertAlmostEqual(exclusion[4], 1.25)
+
+        manager.current_task = None
+        self.assertIsNone(manager._active_opened_door_obstacle_exclusion())
+
     def test_cached_cloud_stamp_is_mapped_only_once(self):
         read_count = []
         map_count = []
@@ -915,6 +1048,218 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertEqual(
             [payload["event"] for payload in diagnostics],
             ["floor_transition_ambiguous_enter", "skipped_floor_scoped_update"],
+        )
+
+    def test_explicit_floor_transition_uses_service_and_sensor_confirmation(self):
+        from danger_search.pose_provider import PoseProvider
+
+        manager, clock, diagnostics, reads, map_updates, obstacle_updates = (
+            self._make_floor_transition_manager()
+        )
+        manager.localization_vertical_reference = "floor_local"
+        provider = PoseProvider("/danger_search/localization/odom", max_samples=8)
+
+        def append_pose(stamp):
+            provider._samples.append(
+                mission_manager_module.PoseSample(
+                    stamp=stamp,
+                    xyz=(2.4, 2.6, 0.39),
+                    quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                    linear_xyz=(0.0, 0.0, 0.0),
+                    angular_xyz=(0.0, 0.0, 0.0),
+                )
+            )
+
+        append_pose(1.0)
+        manager.pose_provider = provider
+        manager.begin_floor_transition(
+            source_floor=0,
+            target_floor=1,
+            phase="CALL_ELEVATOR_TO_TARGET_FLOOR",
+        )
+        manager.confirm_floor_transition(1)
+
+        append_pose(2.0)
+        clock[0] = 1.0
+        manager._update_mapping_and_detection(
+            self._mapping_snapshot(cloud_stamp=2.0, odom_stamp=2.0),
+            (2.4, 2.6, 0.0),
+            (2.4, 2.6, 0.39),
+        )
+        self.assertIsNotNone(manager._floor_transition_guard)
+        self.assertEqual(reads, [])
+
+        append_pose(3.0)
+        clock[0] = 1.1
+        manager._update_mapping_and_detection(
+            self._mapping_snapshot(cloud_stamp=3.0, odom_stamp=3.0),
+            (2.4, 2.6, 0.0),
+            (2.4, 2.6, 0.39),
+        )
+
+        self.assertIsNone(manager._floor_transition_guard)
+        self.assertEqual(manager.current_floor, 1)
+        self.assertEqual(reads, [True])
+        self.assertEqual(len(map_updates), 1)
+        self.assertEqual(map_updates[0]["floor_index"], 1)
+        self.assertEqual(map_updates[0]["robot_xyz"], (2.4, 2.6, 2.99))
+        self.assertEqual(map_updates[0]["points"], [(0.8, 0.0, 3.1)])
+        self.assertEqual(len(obstacle_updates), 1)
+        self.assertIn(
+            "floor_transition_sensor_confirmed",
+            [payload["event"] for payload in diagnostics],
+        )
+        self.assertIn(
+            "floor_transition_ambiguous_exit",
+            [payload["event"] for payload in diagnostics],
+        )
+
+    def test_target_elevator_opening_scan_always_faces_actual_door(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.current_floor = 1
+        manager.initial_entry_geometry_tolerance = 0.25
+        manager._last_cloud_stamp = 2.0
+        manager._floor_transition_guard = None
+        manager._latest_cloud_points = [(1.0, 0.0, 0.5)]
+        manager._elevator_door_open_confirmation = {
+            "door_id": "elevator_floor_1",
+            "baseline": None,
+            "last_image_stamp": None,
+            "visual_confirmations": 0,
+            "last_visual_change": None,
+            "last_cloud_stamp": None,
+            "livox_confirmations": 0,
+            "logged": False,
+        }
+        manager.mapper = SimpleNamespace(floor_height=2.6)
+        manager.building_client = SimpleNamespace(
+            doors={
+                "elevator_floor_1": SimpleNamespace(
+                    x=1.0,
+                    y=0.0,
+                    yaw=math.pi,
+                    width=1.4,
+                )
+            }
+        )
+        observed_poses = []
+        manager.local_detector = SimpleNamespace(
+            detect_opening_ahead=lambda **kwargs: observed_poses.append(
+                kwargs["robot_pose"]
+            )
+            or None
+        )
+
+        self.assertFalse(
+            manager.confirm_elevator_door_open(
+                "elevator_floor_1",
+                (2.4, 0.0, 0.0),
+            )
+        )
+        self.assertEqual(len(observed_poses), 1)
+        self.assertAlmostEqual(abs(observed_poses[0][2]), math.pi)
+
+    def test_target_elevator_opening_does_not_reuse_livox_during_transition(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.current_floor = 0
+        manager.initial_entry_geometry_tolerance = 0.25
+        manager._last_cloud_stamp = 2.0
+        manager._latest_cloud_points = [(1.0, 0.0, 0.5)]
+        manager._floor_transition_guard = SimpleNamespace(explicit_transition=True)
+        manager._elevator_door_open_confirmation = {
+            "door_id": "elevator_floor_1",
+            "baseline": None,
+            "last_image_stamp": None,
+            "visual_confirmations": 0,
+            "last_visual_change": None,
+            "last_cloud_stamp": None,
+            "livox_confirmations": 0,
+            "logged": False,
+        }
+        manager.mapper = SimpleNamespace(floor_height=2.6)
+        manager.building_client = SimpleNamespace(
+            doors={
+                "elevator_floor_1": SimpleNamespace(
+                    x=1.0,
+                    y=0.0,
+                    yaw=math.pi,
+                    width=1.4,
+                )
+            }
+        )
+        observations = []
+        manager.local_detector = SimpleNamespace(
+            detect_opening_ahead=lambda **kwargs: observations.append(kwargs) or None
+        )
+
+        self.assertFalse(
+            manager.confirm_elevator_door_open(
+                "elevator_floor_1",
+                (2.4, 0.0, 0.0),
+            )
+        )
+        self.assertEqual(observations, [])
+
+    def test_target_elevator_opening_uses_registered_rgbd_plane_without_baseline(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.current_floor = 0
+        manager.initial_entry_geometry_tolerance = 0.25
+        manager._last_cloud_stamp = 2.0
+        manager._latest_cloud_points = [(1.0, 0.0, 0.5)]
+        manager._floor_transition_guard = SimpleNamespace(explicit_transition=True)
+        manager._elevator_door_open_confirmation = {
+            "door_id": "elevator_floor_1",
+            "baseline": None,
+            "last_image_stamp": None,
+            "visual_confirmations": 0,
+            "last_visual_change": None,
+            "last_cloud_stamp": None,
+            "livox_confirmations": 0,
+            "logged": False,
+        }
+        manager.building_client = SimpleNamespace(
+            doors={
+                "elevator_floor_1": SimpleNamespace(
+                    x=1.0,
+                    y=0.0,
+                    yaw=math.pi,
+                    width=1.4,
+                )
+            }
+        )
+        calls = []
+        manager.rgbd_door_detector = SimpleNamespace(
+            assess_registered_opening_messages=lambda *args, **kwargs: (
+                calls.append(kwargs)
+                or DoorOpeningChange(True, 0.0, 1.0, 1.0)
+            )
+        )
+        manager.local_detector = SimpleNamespace(
+            detect_opening_ahead=lambda **kwargs: self.fail(
+                "楼层过渡期间不应读取旧 Livox 点云"
+            )
+        )
+        manager._log_structured = lambda payload: None
+        bundle = SimpleNamespace(
+            rgb_msg=object(),
+            depth_msg=object(),
+            camera_info_msg=object(),
+        )
+        camera_to_world = np.eye(4)
+
+        manager._update_elevator_door_visual_change(
+            bundle, 3.0, camera_to_world
+        )
+        manager._update_elevator_door_visual_change(
+            bundle, 4.0, camera_to_world
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(
+            manager.confirm_elevator_door_open(
+                "elevator_floor_1",
+                (2.4, 0.0, 0.0),
+            )
         )
 
     def test_floor_transition_latch_survives_task_clear_and_only_reports_timeout(self):
@@ -1301,6 +1646,47 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertFalse(transition["return_home_completed"])
         self.assertEqual(logged_payloads, [transition])
 
+    def test_entering_return_home_clears_exploration_path_and_frontier(self):
+        cleared = []
+        manager = MissionManager.__new__(MissionManager)
+        manager.state = EXPLORE_FLOOR
+        manager.current_floor = 0
+        manager.current_task = None
+        manager.current_frontier = SimpleNamespace(centroid=(4.0, 8.0))
+        manager._last_frontier_target = (4.0, 8.0)
+        manager._last_frontier_score = 1.0
+        manager._last_frontier_used_fallback = False
+        manager._return_home_started = False
+        manager._return_home_completed = False
+        manager._no_reachable_frontier_confirmations = 0
+        manager._transition_history = []
+        manager.mapper = MultiFloorGridMap(
+            resolution=0.5,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        )
+        manager.explorer = SimpleNamespace(last_selection_debug=None)
+        manager.controller = SimpleNamespace(
+            clear_path=lambda reason=None: cleared.append(reason),
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ):
+            manager._transition_state(
+                RETURN_HOME,
+                reason_code="mission_insufficient_time_for_return",
+                call_site="test.enter_return",
+            )
+
+        self.assertEqual(cleared, ["enter_return_home"])
+        self.assertIsNone(manager.current_frontier)
+        self.assertIsNone(manager._last_frontier_target)
+
     def test_external_shutdown_preserves_actual_state_in_result_diagnostics(self):
         """外部 ROS shutdown 写结果时必须保留实际状态和触发源。"""
         with tempfile.TemporaryDirectory() as tmp:
@@ -1642,6 +2028,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.initial_entry_opening_max_distance = 1.2
         manager.door_pass_offset = 0.8
         manager.door_commit_distance = 1.8
+        manager.door_transition_hold_distance = 2.5
         manager.mapper = SimpleNamespace(floor_height=2.6)
         manager.controller = SimpleNamespace(
             clear_path=lambda **kwargs: cleared_reasons.append(kwargs.get("reason"))
@@ -1728,7 +2115,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             )
         )
 
-    def test_elevator_registration_uses_sensor_geometry_and_public_ids(self):
+    def test_livox_only_elevator_registration_requires_explicit_opt_in(self):
         manager = MissionManager.__new__(MissionManager)
         manager.max_floor = 2
         manager.current_floor = 0
@@ -1778,6 +2165,9 @@ class MissionManagerHelperTest(unittest.TestCase):
             SimpleNamespace(loginfo=lambda *args, **kwargs: None),
         ):
             self.assertFalse(manager._try_register_local_elevator((1.1, 3.0, 0.0)))
+            self.assertEqual(manager.building_client.elevators, {})
+            manager.livox_elevator_registration_enabled = True
+            self.assertFalse(manager._try_register_local_elevator((1.1, 3.0, 0.0)))
             manager._last_cloud_stamp = 1.6
             self.assertTrue(manager._try_register_local_elevator((1.1, 3.0, 0.0)))
 
@@ -1791,6 +2181,190 @@ class MissionManagerHelperTest(unittest.TestCase):
             {"ground_lift_door", "upper_lift_door"},
         )
         self.assertEqual(manager.floor_params["elevator_id"], "public_lift")
+
+    def test_elevator_registration_accepts_stable_rgbd_panel_geometry(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.max_floor = 2
+        manager.current_floor = 0
+        manager.current_task = None
+        manager._last_cloud_stamp = None
+        manager._elevator_opening_last_stamp = None
+        manager._elevator_opening_last_scan_stamp = None
+        manager._elevator_opening_observation = None
+        manager._elevator_opening_confirmations = 0
+        manager._elevator_visual_last_stamp = None
+        manager._elevator_visual_candidate = None
+        manager._elevator_visual_confirmations = 0
+        manager._latest_rgbd_door_stamp = None
+        manager._latest_rgbd_door_observations = []
+        manager.initial_entry_geometry_tolerance = 0.25
+        manager.elevator_visual_confirmations = 3
+        manager.elevator_visual_min_width = 0.9
+        manager.elevator_visual_max_width = 1.8
+        manager.elevator_visual_max_distance = 4.0
+        manager.main_entrance_xy = (0.0, 0.0)
+        manager.door_pass_offset = 0.8
+        manager.mapper = SimpleNamespace(floor_height=2.6)
+        manager.floor_params = {}
+        elevator = PublicElevatorFeature(
+            elevator_id="public_lift",
+            current_floor=0,
+            served_floors=frozenset({0, 1}),
+        )
+        manager.building_features = SimpleNamespace(
+            elevator_features={elevator.elevator_id: elevator}
+        )
+        manager.building_client = BuildingControlClient()
+        manager.building_client.set_public_features(
+            door_ids={"ground_lift_door", "upper_lift_door"},
+            elevators={"public_lift": {0, 1}},
+            elevator_door_ids_by_floor={
+                0: ["ground_lift_door"],
+                1: ["upper_lift_door"],
+            },
+        )
+        manager.local_detector = SimpleNamespace(
+            detect_elevator_opening_nearby=lambda **kwargs: None
+        )
+        observation = DoorPanelObservation(
+            stamp=1.0,
+            distance=1.4,
+            world_xy=(2.0, 3.0),
+            outward_yaw=math.pi,
+            width=1.35,
+            height=1.8,
+            plane_rmse=0.01,
+            depth_inlier_count=1200,
+            bbox=(100, 80, 180, 260),
+            median_depth=1.4,
+            center_dark_fraction=0.95,
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ):
+            for stamp in (1.0, 1.1):
+                manager._latest_rgbd_door_stamp = stamp
+                manager._latest_rgbd_door_observations = [
+                    mission_manager_module.replace(observation, stamp=stamp)
+                ]
+                self.assertFalse(
+                    manager._try_register_local_elevator((0.7, 3.0, 0.0))
+                )
+            manager._latest_rgbd_door_stamp = 1.2
+            manager._latest_rgbd_door_observations = [
+                mission_manager_module.replace(observation, stamp=1.2)
+            ]
+            self.assertTrue(
+                manager._try_register_local_elevator((0.7, 3.0, 0.0))
+            )
+
+        registered = manager.building_client.elevators["public_lift"]
+        self.assertEqual(set(registered.lobby_poses), {0, 1})
+        self.assertAlmostEqual(registered.lobby_poses[0][0], 2.0)
+        self.assertAlmostEqual(registered.lobby_poses[0][1], 3.0)
+        self.assertAlmostEqual(abs(registered.lobby_poses[0][2]), math.pi)
+
+    def test_visual_preparation_closes_initially_open_elevator_only_once(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.rgbd_door_detector = object()
+        manager.max_floor = 2
+        manager.current_floor = 0
+        manager._elevator_visual_prepare_task = None
+        manager._elevator_visual_prepare_door_id = None
+        manager._elevator_visual_prepare_result_logged = False
+        manager.building_features = SimpleNamespace(
+            doors={
+                "lift_0": PublicDoorFeature(
+                    door_id="lift_0",
+                    kind="elevator",
+                    floor_index=0,
+                    initial_open=True,
+                )
+            }
+        )
+        close_calls = []
+        task = SimpleNamespace(
+            done=lambda: False,
+            ok=lambda: True,
+            message=lambda: "closing",
+        )
+        manager.building_client = SimpleNamespace(
+            door_service_ready=lambda: True,
+            close_door=lambda door_id: close_calls.append(door_id) or task,
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ):
+            manager._start_elevator_visual_preparation()
+            manager._start_elevator_visual_preparation()
+
+        self.assertEqual(close_calls, ["lift_0"])
+        self.assertTrue(manager.elevator_visual_preparation_pending("lift_0"))
+
+    def test_visual_landmark_scan_is_bounded_and_runs_only_once(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.rgbd_door_detector = object()
+        manager.current_floor = 0
+        manager.current_task = None
+        manager._elevator_visual_scan_started = False
+        manager._elevator_visual_scan_completed = False
+        manager._elevator_visual_scan_until = 0.0
+        manager.elevator_visual_scan_duration = 9.0
+        manager.elevator_visual_scan_angular_speed = 0.7
+        manager.last_door_id = "main"
+        manager.last_door_xy = (0.0, 0.0)
+        manager._post_door_context_satisfied = lambda pose: True
+        manager._elevator_visual_prepare_task = SimpleNamespace(
+            done=lambda: True,
+            ok=lambda: True,
+        )
+        elevator = PublicElevatorFeature(
+            elevator_id="lift",
+            current_floor=0,
+            served_floors=frozenset({0, 1}),
+        )
+        manager.building_features = SimpleNamespace(
+            elevator_features={"lift": elevator},
+            doors={
+                "main": PublicDoorFeature("main", "main_entrance", 0, True)
+            },
+        )
+        manager.building_client = SimpleNamespace(elevators={})
+        manager.current_frontier = (1.0, 2.0)
+        manager._last_frontier_target = (1.0, 2.0)
+        manager._last_frontier_score = 3.0
+        manager._last_frontier_used_fallback = True
+        calls = []
+        manager.controller = SimpleNamespace(
+            clear_path=lambda reason=None: calls.append(("clear", reason)),
+            rotate_in_place=lambda speed: calls.append(("rotate", speed)),
+            stop=lambda reason=None: calls.append(("stop", reason)),
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ), patch.object(mission_manager_module, "get_time", return_value=10.0):
+            self.assertTrue(manager._tick_elevator_visual_scan((0.0, 2.0, 0.0)))
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ), patch.object(mission_manager_module, "get_time", return_value=20.0):
+            self.assertFalse(manager._tick_elevator_visual_scan((0.0, 2.0, 0.0)))
+            self.assertFalse(manager._tick_elevator_visual_scan((0.0, 2.0, 0.0)))
+
+        self.assertEqual(sum(name == "clear" for name, _ in calls), 1)
+        self.assertEqual(sum(name == "rotate" for name, _ in calls), 1)
+        self.assertEqual(sum(name == "stop" for name, _ in calls), 1)
+        self.assertTrue(manager._elevator_visual_scan_completed)
 
     def test_public_door_ids_require_building_service_connection(self):
         self.assertTrue(
@@ -1826,10 +2400,16 @@ class MissionManagerHelperTest(unittest.TestCase):
                     math.pi / 2.0,
                     1.0,
                 )
-            }
+            },
+            get_door_path_points=lambda *args, **kwargs: (
+                (0.0, 0.8),
+                (0.0, -0.8),
+                (0.0, -1.8),
+            ),
         )
         manager.controller = SimpleNamespace(
-            clear_path=lambda **kwargs: cleared.append(kwargs.get("reason"))
+            goal_tolerance=0.35,
+            clear_path=lambda **kwargs: cleared.append(kwargs.get("reason")),
         )
 
         with patch.object(
@@ -1837,12 +2417,209 @@ class MissionManagerHelperTest(unittest.TestCase):
             "rospy",
             SimpleNamespace(loginfo=lambda *args, **kwargs: None),
         ):
-            manager._tick_return_home((0.0, 6.0, math.pi / 2.0))
+            manager._tick_return_home((0.0, 1.0, math.pi / 2.0))
 
         self.assertIsInstance(manager.current_task, OpenDoorAndPass)
         self.assertEqual(manager.current_task.door_id, "main_entrance")
         self.assertEqual(manager.active_door, "main_entrance")
         self.assertEqual(cleared, ["return_home_main_entrance"])
+
+    def test_return_home_lateral_to_main_entrance_first_plans_wait_point(self):
+        paths = []
+        manager = MissionManager.__new__(MissionManager)
+        manager.home_pose = (0.0, -3.2, math.pi / 2.0)
+        manager.current_floor = 0
+        manager.max_floor = 1
+        manager.home_tolerance = 0.7
+        manager.main_entrance_xy = (0.0, 0.0)
+        manager.main_entrance_pass_vector = (0.0, 1.0)
+        manager._return_home_main_entrance_crossed = False
+        manager._return_home_entry_trace_attempted = False
+        manager.failed_doors = set()
+        manager.current_task = None
+        manager.active_door = None
+        manager.door_pass_offset = 0.8
+        manager.door_commit_distance = 1.8
+        manager.door_transition_hold_distance = 2.5
+        manager.building_client = SimpleNamespace(
+            doors={"main_entrance": SimpleNamespace()},
+            get_door_path_points=lambda *args, **kwargs: (
+                (0.0, 0.8),
+                (0.0, -0.8),
+                (0.0, -1.8),
+            ),
+        )
+        manager.mapper = SimpleNamespace(floor=lambda floor: SimpleNamespace())
+        manager.controller = SimpleNamespace(
+            goal_tolerance=0.35,
+            has_path=lambda: False,
+            set_path=lambda path: paths.append(path),
+            tick=lambda pose: "RUNNING",
+            recover=lambda: None,
+        )
+        planned = PlanResult(path=[(-1.7, 1.8), (0.0, 0.8)], status="reached")
+
+        with patch.object(
+            mission_manager_module,
+            "astar_plan",
+            return_value=planned,
+        ) as astar, patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+        ):
+            manager._tick_return_home((-1.7, 1.8, -math.pi / 2.0))
+
+        self.assertIsNone(manager.current_task)
+        self.assertEqual(paths, [planned.path])
+        self.assertEqual(astar.call_args.args[2], (0.0, 0.8))
+
+    def test_return_home_far_inside_plans_home_before_creating_door_task(self):
+        paths = []
+        manager = MissionManager.__new__(MissionManager)
+        manager.home_pose = (0.0, -3.2, math.pi / 2.0)
+        manager.current_floor = 0
+        manager.max_floor = 1
+        manager.home_tolerance = 0.7
+        manager.main_entrance_xy = (0.0, 0.0)
+        manager.main_entrance_pass_vector = (0.0, 1.0)
+        manager._return_home_main_entrance_crossed = False
+        manager._return_home_entry_trace_attempted = False
+        manager.failed_doors = set()
+        manager.current_task = None
+        manager.active_door = None
+        manager.door_pass_offset = 0.8
+        manager.door_commit_distance = 1.8
+        manager.door_transition_hold_distance = 2.5
+        manager.building_client = SimpleNamespace(
+            doors={"main_entrance": SimpleNamespace()},
+            get_door_path_points=lambda *args, **kwargs: (
+                (0.0, 0.8),
+                (0.0, -0.8),
+                (0.0, -1.8),
+            ),
+        )
+        manager.mapper = SimpleNamespace(floor=lambda floor: SimpleNamespace())
+        manager.controller = SimpleNamespace(
+            has_path=lambda: False,
+            set_path=lambda path: paths.append(path),
+            tick=lambda pose: "RUNNING",
+            recover=lambda: None,
+        )
+        planned = PlanResult(path=[(0.0, 30.0), (0.0, -3.2)], status="reached")
+
+        with patch.object(
+            mission_manager_module,
+            "astar_plan",
+            return_value=planned,
+        ) as astar:
+            with patch.object(
+                mission_manager_module,
+                "rospy",
+                SimpleNamespace(loginfo=lambda *args, **kwargs: None),
+            ):
+                manager._tick_return_home((0.0, 30.0, -math.pi / 2.0))
+
+        self.assertIsNone(manager.current_task)
+        self.assertEqual(paths, [planned.path])
+        self.assertEqual(astar.call_args.args[2], (0.0, 0.8))
+        self.assertIsNone(astar.call_args.kwargs["max_iterations"])
+
+    def test_return_home_uses_actual_floor_trace_when_live_grid_is_disconnected(self):
+        paths = []
+        manager = MissionManager.__new__(MissionManager)
+        manager.home_pose = (3.0, 0.0, 0.0)
+        manager.current_floor = 0
+        manager.max_floor = 1
+        manager.home_tolerance = 0.2
+        manager._floor_navigation_traces = {
+            0: [(3.0 - 0.5 * index, 0.0) for index in range(13)]
+        }
+        manager.mapper = MultiFloorGridMap(
+            resolution=0.25,
+            width=8.0,
+            length=4.0,
+            origin_x=-4.0,
+            origin_y=-2.0,
+            visited_radius=0.45,
+        )
+        grid = manager.mapper.floor(0)
+        for point in manager._floor_navigation_traces[0]:
+            grid.mark_visited_radius(point[0], point[1], 0.30)
+        barrier_cell = grid.world_to_grid(0.0, 0.0)
+        self.assertIsNotNone(barrier_cell)
+        barrier_x = barrier_cell[0]
+        grid.data[:, barrier_x] = OCC
+        manager.controller = SimpleNamespace(
+            has_path=lambda: False,
+            set_path=lambda path: paths.append(path),
+            tick=lambda pose: "running",
+            recover=lambda: None,
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(logwarn=lambda *args, **kwargs: None),
+        ):
+            manager._tick_return_home((-3.0, 0.0, 0.0))
+
+        self.assertEqual(len(paths), 1)
+        self.assertLess(math.hypot(paths[0][0][0] + 3.0, paths[0][0][1]), 0.5)
+        self.assertLess(math.hypot(paths[0][-1][0] - 3.0, paths[0][-1][1]), 0.5)
+        self.assertTrue(np.all(grid.data[:, barrier_x] == OCC))
+
+    def test_floor_navigation_trace_is_sparse_and_pauses_only_during_floor_transition(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.state = EXPLORE_FLOOR
+        manager.current_floor = 0
+        manager._floor_transition_guard = None
+        manager._floor_navigation_traces = {}
+
+        manager._record_floor_navigation_trace_pose((0.0, 0.0, 0.0))
+        manager._record_floor_navigation_trace_pose((0.1, 0.0, 0.0))
+        manager._record_floor_navigation_trace_pose((0.3, 0.0, 0.0))
+        manager._floor_transition_guard = SimpleNamespace()
+        manager._record_floor_navigation_trace_pose((0.6, 0.0, 0.0))
+        manager._floor_transition_guard = None
+        manager.state = RETURN_HOME
+        manager._record_floor_navigation_trace_pose((0.9, 0.0, 0.0))
+
+        self.assertEqual(
+            manager._floor_navigation_traces[0],
+            [(0.0, 0.0), (0.3, 0.0), (0.9, 0.0)],
+        )
+
+    def test_return_trace_keeps_fallback_attached_after_moving_from_return_start(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager.state = RETURN_HOME
+        manager.current_floor = 0
+        manager._floor_transition_guard = None
+        manager._floor_navigation_traces = {
+            0: [(3.0 - 0.5 * index, 0.0) for index in range(13)]
+        }
+        manager._record_floor_navigation_trace_pose((-3.0, 0.3, 0.0))
+        manager._record_floor_navigation_trace_pose((-3.0, 0.6, 0.0))
+        manager._record_floor_navigation_trace_pose((-3.0, 0.9, 0.0))
+        mapper = MultiFloorGridMap(
+            resolution=0.25,
+            width=8.0,
+            length=5.0,
+            origin_x=-4.0,
+            origin_y=-2.0,
+            visited_radius=0.45,
+        )
+        manager.mapper = mapper
+        grid = mapper.floor(0)
+        path = manager._return_path_from_navigation_trace(
+            grid,
+            (-3.0, 0.9, 0.0),
+            (3.0, 0.0),
+        )
+
+        self.assertIsNotNone(path)
+        self.assertLess(math.hypot(path[0][0] + 3.0, path[0][1] - 0.9), 0.5)
+        self.assertLess(math.hypot(path[-1][0] - 3.0, path[-1][1]), 0.5)
 
     def test_opened_door_clear_covers_wait_point_and_inflation_on_both_sides(self):
         calls = []
@@ -2760,7 +3537,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             set_path=lambda path: recorded_paths.append(path),
             tick=lambda pose: "idle",
             recover=lambda: None,
-            clear_path=lambda: cleared.append(True),
+            clear_path=lambda reason=None: cleared.append(reason),
         )
 
         with patch("danger_search.mission_manager.astar_plan", return_value=PlanResult(status=BUDGET_EXHAUSTED)), \
@@ -2769,7 +3546,7 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         # 预算耗尽：不设路径，清空当前路径等待重试。
         self.assertEqual(recorded_paths, [])
-        self.assertEqual(cleared, [True])
+        self.assertEqual(cleared, ["return_home_budget_exhausted"])
 
 
 class TimeBudgetDecisionTest(unittest.TestCase):
@@ -3068,6 +3845,43 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
         # 尽管 filter_frontiers 返回空，select_frontier 仍被调用并选中 frontier
         self.assertIsNotNone(manager.current_frontier)
         self.assertEqual(manager.current_frontier.centroid, (5.0, 0.0))
+
+    def test_active_path_skips_unused_frontier_extraction_before_soft_budget(self):
+        manager = self._make_explore_manager()
+        extraction_calls = []
+        manager.explorer.extract_frontiers = lambda grid: extraction_calls.append(grid) or []
+        manager.controller.has_path = lambda: True
+        manager.controller.tick = lambda pose: "running"
+        manager.floor_timeout = 100.0
+        manager.floor_finish_time_ratio = 0.75
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None, logwarn=lambda *args, **kwargs: None),
+        ), patch.object(mission_manager_module, "get_time", return_value=10.0):
+            manager._tick_explore((0.0, 0.0, 0.0))
+
+        self.assertEqual(extraction_calls, [])
+
+    def test_active_path_refreshes_frontiers_when_soft_budget_uses_count(self):
+        manager = self._make_explore_manager()
+        extraction_calls = []
+        manager.explorer.extract_frontiers = lambda grid: extraction_calls.append(grid) or []
+        manager.controller.has_path = lambda: True
+        manager.controller.tick = lambda pose: "running"
+        manager.floor_timeout = 100.0
+        manager.floor_finish_time_ratio = 0.75
+        manager.home_pose = None
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None, logwarn=lambda *args, **kwargs: None),
+        ), patch.object(mission_manager_module, "get_time", return_value=80.0):
+            manager._tick_explore((0.0, 0.0, 0.0))
+
+        self.assertEqual(len(extraction_calls), 1)
 
     def test_progress_monitor_degenerate_does_not_clear_path_or_reselect(self):
         """退化检测不执行 cooldown、clear_path 或主动重选。"""
@@ -3399,6 +4213,60 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
                     manager._tick_explore((0.0, 0.0, 0.0))
 
         # 所有候选过近时 confirmations 不增长
+        self.assertEqual(manager._no_reachable_frontier_confirmations, 0)
+
+    def test_budget_exhausted_frontier_is_confirmed_before_no_reachable_count(self):
+        """预算耗尽不是不可达；完整扫描后确认出路径应立即继续探索。"""
+        from danger_search.frontier import Frontier, FrontierSelectionDebug
+
+        unresolved = Frontier(
+            cells=((10, 10),), centroid=(5.0, 0.0), information_gain=20.0,
+        )
+        confirmed = Frontier(
+            cells=((10, 10),), centroid=(4.5, 0.0), information_gain=20.0,
+        )
+        manager = self._make_explore_manager(
+            frontiers_list=[unresolved],
+            select_result=(None, []),
+        )
+        manager.no_frontier_scan_duration = 8.0
+        manager.explorer.last_selection_debug = FrontierSelectionDebug(
+            candidate_count=1,
+            reachable_count=0,
+            blacklisted_count=0,
+            unreachable_count=0,
+            context_filtered_count=0,
+            used_fallback=False,
+            final_target=None,
+            final_score=0.0,
+            path_length=0.0,
+            budget_exhausted_count=1,
+        )
+        confirmation_calls = []
+        manager.explorer.confirm_budget_exhausted_frontier = (
+            lambda *args, **kwargs: confirmation_calls.append((args, kwargs))
+            or (confirmed, [(0.0, 0.0), (4.5, 0.0)])
+        )
+        paths = []
+        manager.controller.set_path = paths.append
+        manager.controller.rotate_in_place = lambda value: None
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(
+                loginfo=lambda *args, **kwargs: None,
+                logwarn=lambda *args, **kwargs: None,
+            ),
+        ):
+            with patch.object(mission_manager_module, "get_time", return_value=10.0):
+                manager._tick_explore((0.0, 0.0, 0.0))
+            with patch.object(mission_manager_module, "get_time", return_value=18.0):
+                manager._tick_explore((0.0, 0.0, 0.0))
+
+        self.assertEqual(len(confirmation_calls), 1)
+        self.assertIs(manager.current_frontier, confirmed)
+        self.assertEqual(paths, [[(0.0, 0.0), (4.5, 0.0)]])
         self.assertEqual(manager._no_reachable_frontier_confirmations, 0)
 
     def test_all_inside_confirmation_increments_once_after_full_scan(self):

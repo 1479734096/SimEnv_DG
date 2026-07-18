@@ -3,10 +3,13 @@ from pathlib import Path
 import unittest
 import xml.etree.ElementTree as ElementTree
 
+import yaml
+
 
 SIMENV_ROOT = Path(__file__).resolve().parents[3]
 REFERENCE_PATH = SIMENV_ROOT / "docs" / "reference.md"
 FORMAL_LAUNCH_PATH = SIMENV_ROOT / "src" / "danger_search" / "launch" / "danger_search.launch"
+FORMAL_CONFIG_PATH = SIMENV_ROOT / "src" / "danger_search" / "config" / "danger_search.yaml"
 LOCALIZATION_LAUNCH_PATH = (
     SIMENV_ROOT
     / "src"
@@ -32,6 +35,7 @@ class InterfaceDocumentationTest(unittest.TestCase):
         self.assertFalse(
             any(arg.get("name") == "team_scene_info_path" for arg in root.findall("arg"))
         )
+        self.assertFalse(any(arg.get("name") == "max_floor" for arg in root.findall("arg")))
         localization_includes = [
             include
             for include in root.findall("include")
@@ -47,6 +51,13 @@ class InterfaceDocumentationTest(unittest.TestCase):
             "$(find danger_search)/../../generated_building/team_scene_info.json",
         )
         self.assertEqual(arguments.get("localization_backend"), "rgbd_livox")
+        formal_node = next(
+            node for node in root.findall("node") if node.get("name") == "danger_search"
+        )
+        self.assertNotIn(
+            "mission/max_floor",
+            {param.get("name") for param in formal_node.findall("param")},
+        )
 
     def test_localization_extrinsics_are_ros_parameter_arrays(self):
         root = ElementTree.parse(LOCALIZATION_LAUNCH_PATH).getroot()
@@ -93,6 +104,14 @@ class InterfaceDocumentationTest(unittest.TestCase):
         content = REFERENCE_PATH.read_text(encoding="utf-8")
         self.assertIn("ENABLE_REFEREE_ODOM", content)
         self.assertIn("参赛算法不得订阅", content)
+
+    def test_formal_config_does_not_contain_fixed_elevator_geometry(self):
+        config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertNotIn("max_floor", config.get("mission", {}))
+        floor = config.get("floor", {})
+        self.assertNotIn("elevator_lobby_xy", floor)
+        self.assertNotIn("elevator_inside_xy", floor)
+        self.assertNotIn("elevator_id", floor)
 
 
 if __name__ == "__main__":

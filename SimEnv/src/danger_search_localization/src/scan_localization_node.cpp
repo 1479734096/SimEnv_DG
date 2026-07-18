@@ -21,6 +21,7 @@
 #include <danger_search_localization/imu_constrained_odometry.hpp>
 #include <danger_search_localization/imu_motion_predictor.hpp>
 #include <danger_search_localization/planar_gicp_odometry.hpp>
+#include <danger_search_localization/ros_time_window.hpp>
 #include <danger_search_localization/velocity_transform.hpp>
 #include <geometry_msgs/TransformStamped.h>
 #include <geometry_msgs/Twist.h>
@@ -270,7 +271,7 @@ class ScanLocalizationNode {
     max_range_ = max_range;
     imu_max_delta_ = imu_max_delta;
     command_velocity_scale_ = command_velocity_scale;
-    if (use_imu_constrained_) {
+    if (use_imu_constrained_ || use_rgbd_livox_) {
       imu_odometry_ = std::make_unique<
           danger_search_localization::ImuConstrainedOdometry>();
     }
@@ -332,7 +333,8 @@ class ScanLocalizationNode {
     std::lock_guard<std::mutex> lock(command_mutex_);
     command_samples_.push_back(
         CommandSample{stamp, Eigen::Vector2d(linear_x, linear_y)});
-    const ros::Time oldest = stamp - ros::Duration(5.0);
+    const ros::Time oldest =
+        danger_search_localization::RetentionWindowStart(stamp, 5.0);
     while (!command_samples_.empty() &&
            command_samples_.front().stamp < oldest) {
       command_samples_.pop_front();
@@ -357,7 +359,7 @@ class ScanLocalizationNode {
       if (sample.stamp >= end) {
         break;
       }
-      const double dt = (sample.stamp - cursor).toSec();
+      const double dt = sample.stamp.toSec() - cursor.toSec();
       if (dt > 0.0) {
         const Eigen::Vector3d world_velocity =
             world_base_rotation *
@@ -367,7 +369,7 @@ class ScanLocalizationNode {
       cursor = sample.stamp;
       current_velocity = sample.base_velocity;
     }
-    const double final_dt = (end - cursor).toSec();
+    const double final_dt = end.toSec() - cursor.toSec();
     if (final_dt > 0.0) {
       const Eigen::Vector3d world_velocity =
           world_base_rotation *
@@ -402,7 +404,9 @@ class ScanLocalizationNode {
       imu_samples_.push_back(sample);
       // 深度配准与 Livox 配准共享 CPU；保留两秒 IMU 历史，确保短时计算
       // 抖动不会把时间戳正确的点云误判为无法匹配。
-      const ros::Time oldest = message->header.stamp - ros::Duration(2.0);
+      const ros::Time oldest =
+          danger_search_localization::RetentionWindowStart(
+              message->header.stamp, 2.0);
       while (!imu_samples_.empty() && imu_samples_.front().stamp < oldest) {
         imu_samples_.pop_front();
       }
@@ -428,7 +432,7 @@ class ScanLocalizationNode {
     const ImuSample *closest = nullptr;
     double closest_delta = std::numeric_limits<double>::infinity();
     for (const auto &sample : imu_samples_) {
-      const double delta = std::abs((sample.stamp - stamp).toSec());
+      const double delta = std::abs(sample.stamp.toSec() - stamp.toSec());
       if (delta < closest_delta) {
         closest = &sample;
         closest_delta = delta;
@@ -457,7 +461,7 @@ class ScanLocalizationNode {
       scale_window_initialized_ = true;
       return;
     }
-    if ((stamp - scale_window_stamp_).toSec() < 1.0) {
+    if (stamp.toSec() - scale_window_stamp_.toSec() < 1.0) {
       return;
     }
     const double depth_distance =
@@ -496,7 +500,7 @@ class ScanLocalizationNode {
       initial_imu_rotation = initial_imu_rotation_;
     }
     if (!last_depth_process_stamp_.isZero() &&
-        (message->header.stamp - last_depth_process_stamp_).toSec() < 0.18) {
+        message->header.stamp.toSec() - last_depth_process_stamp_.toSec() < 0.18) {
       return;
     }
     last_depth_process_stamp_ = message->header.stamp;
@@ -563,7 +567,7 @@ class ScanLocalizationNode {
       }
       const bool recovering =
           last_depth_accept_stamp_.isZero() ||
-          (message->header.stamp - last_depth_accept_stamp_).toSec() >
+          message->header.stamp.toSec() - last_depth_accept_stamp_.toSec() >
               depth_freshness_seconds_;
       if (recovering) {
         depth_fusion_offset_ = fused_planar_position_ - depth_total_;
@@ -695,7 +699,7 @@ class ScanLocalizationNode {
         }
         depth_fresh =
             !last_depth_accept_stamp_.isZero() &&
-            std::abs((message->header.stamp - last_depth_accept_stamp_).toSec()) <=
+            std::abs(message->header.stamp.toSec() - last_depth_accept_stamp_.toSec()) <=
                 depth_freshness_seconds_;
         if (!depth_fresh) {
           fused_planar_position_ =
@@ -706,6 +710,51 @@ class ScanLocalizationNode {
         depth_total = depth_total_;
         livox_total = livox_total_;
         livox_scale = livox_scale_;
+      }
+      // RGB-D 帧间配准提供连续先验，但快速转向后会累积平移误差。
+      // 使用 360° Livox 的竖向结构对局部扫描地图校正该先验；结构不足时
+      // 保留原先验，不再像纯 IMU 积分后端那样让定位发散或冻结。
+      Eigen::Vector3d base_translation_prior =
+          initial_world_base_translation_;
+      base_translation_prior.head<2>() = fused_position;
+      const Eigen::Vector3d sensor_translation_prior =
+          base_translation_prior +
+          world_base_rotation * base_to_livox_.translation();
+      std::vector<Eigen::Vector3d> structural_vectors;
+      structural_vectors.reserve(points.size());
+      for (const auto &point : points) {
+        const Eigen::Vector3d oriented = world_livox_rotation * point;
+        const double floor_relative_height =
+            sensor_translation_prior.z() + oriented.z();
+        if (floor_relative_height > 0.22 && floor_relative_height < 1.90 &&
+            point.norm() < 12.0) {
+          structural_vectors.push_back(oriented);
+        }
+      }
+      const auto map_result = imu_odometry_->RegisterFrame(
+          structural_vectors, sensor_translation_prior);
+      if (map_result.accepted) {
+        const Eigen::Vector3d corrected_base_translation =
+            map_result.translation -
+            world_base_rotation * base_to_livox_.translation();
+        const Eigen::Vector2d correction =
+            corrected_base_translation.head<2>() - fused_position;
+        {
+          std::lock_guard<std::mutex> fusion_lock(fusion_mutex_);
+          // 深度回调可在扫描匹配期间推进；把校正作为同一世界系平移量
+          // 叠加到最新状态，避免用较旧快照覆盖新到达的深度增量。
+          fused_planar_position_ += correction;
+          depth_fusion_offset_ += correction;
+          fused_at_last_depth_ += correction;
+          livox_at_last_depth_ = livox_total_;
+          fused_position = fused_planar_position_;
+          depth_total = depth_total_;
+          livox_total = livox_total_;
+        }
+        ROS_INFO_THROTTLE(
+            2.0,
+            "RGB-D/Livox 局部地图校正：correction=(%.3f, %.3f) corr=%zu",
+            correction.x(), correction.y(), map_result.correspondence_count);
       }
       Eigen::Vector3d world_base_translation =
           initial_world_base_translation_;
@@ -813,7 +862,7 @@ class ScanLocalizationNode {
     message.pose.pose.orientation.w = orientation.w();
 
     if (!previous_stamp_.isZero() && stamp > previous_stamp_) {
-      const double dt = (stamp - previous_stamp_).toSec();
+      const double dt = stamp.toSec() - previous_stamp_.toSec();
       const Eigen::Vector3d velocity_world = (translation - previous_translation_) / dt;
       // 里程计 twist 在 child_frame_id="base" 下表达，需将世界系速度转换到 base 系。
       const Eigen::Vector3d velocity_base =

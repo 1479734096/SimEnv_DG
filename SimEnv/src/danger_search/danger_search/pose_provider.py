@@ -1,8 +1,8 @@
 """参赛方统一位姿入口。
 
-生产模式仅订阅参赛方 ``scan_localization_node`` 发布的内部里程计；该节点
-只使用初始接口文档授权的 ``/scan`` 与 ``/trunk_imu``。这里不订阅 TF 或
-Gazebo 真值。
+生产模式仅订阅参赛方 ``scan_localization_node`` 发布的内部里程计；正式
+定位后端只能使用初始接口文档授权的 Livox、RealSense、IMU 和控制先验。
+这里不订阅 TF 或 Gazebo 真值。
 """
 from __future__ import annotations
 

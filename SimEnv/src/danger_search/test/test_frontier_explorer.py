@@ -4,10 +4,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 from danger_search.frontier import FrontierExplorer
 from danger_search.frontier import Frontier
 from danger_search.frontier import FrontierSelectionContext
-from danger_search.mapper import BLACK, FloorGrid, OCC, UNKNOWN
+from danger_search.frontier import _build_frontier_mask
+from danger_search.mapper import BLACK, FREE, FloorGrid, OCC, UNKNOWN, VISITED
 from danger_search.planner import PlanResult, REACHED, BUDGET_EXHAUSTED, UNREACHABLE
 
 
@@ -31,6 +34,36 @@ class FrontierExplorerTest(unittest.TestCase):
         self._mark_free_rect(grid, 4, 9, 1, 6)
         self._mark_free_rect(grid, 5, 8, 7, 11)
         return grid
+
+    def test_vectorized_frontier_mask_matches_original_eight_neighbor_semantics(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.1,
+            width=4.0,
+            length=5.0,
+            origin_x=-2.0,
+            origin_y=-2.5,
+        )
+        rng = np.random.default_rng(42)
+        grid.data[:] = rng.choice(
+            [UNKNOWN, FREE, VISITED, BLACK, OCC],
+            size=grid.data.shape,
+            p=[0.35, 0.30, 0.15, 0.05, 0.15],
+        )
+
+        expected = np.zeros_like(grid.data, dtype=bool)
+        for gy in range(1, grid.size_y - 1):
+            for gx in range(1, grid.size_x - 1):
+                if int(grid.data[gy, gx]) not in (FREE, VISITED):
+                    continue
+                expected[gy, gx] = any(
+                    int(grid.data[ny, nx]) == UNKNOWN
+                    for ny in range(gy - 1, gy + 2)
+                    for nx in range(gx - 1, gx + 2)
+                    if (nx, ny) != (gx, gy)
+                )
+
+        self.assertTrue(np.array_equal(_build_frontier_mask(grid), expected))
 
     def test_cluster_target_is_an_actual_frontier_cell(self):
         grid = FloorGrid(
@@ -567,6 +600,49 @@ class FrontierExplorerTest(unittest.TestCase):
         debug = explorer.last_selection_debug
         assert debug is not None
         self.assertGreater(debug.budget_exhausted_count, 0)
+
+    def test_budget_exhausted_frontier_can_be_confirmed_once_without_budget(self):
+        """完整扫描后应能确认预算未决候选，而不是把它计为不可达。"""
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=10.0,
+            length=10.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        self._mark_free_rect(grid, 0, 9, 0, 9)
+        explorer = FrontierExplorer(min_cluster_size=1)
+        candidate = Frontier(
+            cells=((8, 8),),
+            centroid=(8.5, 8.5),
+            information_gain=20.0,
+        )
+        iteration_limits = []
+
+        def fake_astar(_grid, start, goal, *args, **kwargs):
+            explicit_limit = kwargs.get("max_iterations", "default")
+            iteration_limits.append(explicit_limit)
+            if explicit_limit is None:
+                return PlanResult(path=[start, goal], status=REACHED)
+            return PlanResult(status=BUDGET_EXHAUSTED)
+
+        with patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+            selected, path = explorer.select_frontier(
+                grid,
+                (1.5, 1.5, 0.0),
+                frontiers=[candidate],
+            )
+            confirmed, confirmed_path = explorer.confirm_budget_exhausted_frontier(
+                grid,
+                (1.5, 1.5, 0.0),
+            )
+
+        self.assertIsNone(selected)
+        self.assertEqual(path, [])
+        self.assertIsNotNone(confirmed)
+        self.assertTrue(confirmed_path)
+        self.assertIn(None, iteration_limits)
 
     def test_unreachable_frontier_records_failure(self):
         """真正不可达的前沿应累计失败，以便后续换目标。"""

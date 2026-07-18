@@ -1,0 +1,15 @@
+# 合规多楼层闭环回归覆盖。该配置只压缩测试预算，不改变正式默认值。
+mission:
+  max_runtime: 300.0
+  floor_timeout: 35.0
+  # 闭环测试要求最后一层在楼层预算结束后立即返航；正式配置仍使用全局预算。
+  last_floor_uses_global_budget: false
+  min_floor_explore_time: 5.0
+  floor_finish_time_ratio: 0.65
+  exploration_progress_window: 8.0
+  min_exploration_progress_cells: 15
+
+# 负障碍生产门控尚未覆盖本轮实测约 1.0 m/s 的瞬时速度，必须与多楼层
+# 功能验证解耦；默认配置本来也保持关闭。
+ground_support:
+  production_gate_enabled: false

@@ -60,11 +60,24 @@ POSTURE_SAMPLE_SECONDS = 5.0
 # fixed-stand 自身有约 3.5 秒的起立/增益过渡。传感器观察使用仿真时间，
 # wall time 只承担 /clock 或进程冻结的 watchdog，避免低 RTF 下误判。
 FIXED_STAND_MIN_SECONDS = 4.0
-FIXED_STAND_MAX_WAIT_SECONDS = 30.0
+FIXED_STAND_MAX_WAIT_SECONDS = 75.0
 FIXED_STAND_STABLE_WINDOW_SECONDS = 1.0
 FIXED_STAND_STABLE_MAX_ABS_ROLL = 0.20
 FIXED_STAND_STABLE_MAX_ABS_PITCH = 0.20
 FIXED_STAND_MAX_IMU_GAP_SECONDS = 0.20
+# Livox 外参与定位节点保持一致。该距离来自允许的 /scan 楼面回波，不是真值高度。
+LIVOX_BASE_PITCH = 0.785
+LIVOX_BASE_X = 0.2
+LIVOX_BASE_Z = 0.08
+FIXED_STAND_MIN_FLOOR_CLEARANCE = 0.18
+FIXED_STAND_MIN_CLEARANCE_FRAMES = 3
+FIXED_STAND_MAX_CLEARANCE_GAP_SECONDS = 0.30
+LANDING_MAX_ABS_ROLL = 0.25
+LANDING_MAX_ABS_PITCH = 0.25
+LANDING_FREE_FALL_MAX_ACCEL = 3.0
+LANDING_SUPPORTED_MIN_ACCEL = 6.0
+LANDING_SUPPORTED_CONFIRMATIONS = 3
+LANDING_FALLBACK_SUPPORT_SECONDS = 0.10
 
 
 @dataclass(frozen=True)
@@ -101,9 +114,9 @@ def environment_launch_overrides(
 ) -> dict[str, str]:
     """构造本轮仿真环境变量。
 
-    Gazebo 必须先暂停完成 A1 和 Livox 射线装载。runner 会在 ``/scan`` 发布器
-    就绪后立即解除暂停，使 ros_control 在首个物理步之后读取正确的关节角周期
-    分支；随后仍按原接口启动 junior_ctrl 并发送起立指令。
+    只在 A1 与 Livox ray 插件初始化期间暂停物理，避免 ODE 在扫描模式
+    装载和活动碰撞查询并发时崩溃。runner 看到 ``/scan`` 发布器后立即
+    解锁，后续起立和比赛运行仍使用初始环境的正常物理语义。
     """
     return {
         "SEED": str(seed),
@@ -279,7 +292,7 @@ def resolve_gui_enabled(args: argparse.Namespace) -> bool:
 
 
 def unpause_environment_physics(workspace_dir: Path, *, timeout: int = 15) -> None:
-    """在 Livox 装载完成、关节控制器初始化前显式启动物理仿真。"""
+    """在 Livox 注册发布器后通过赛方已有 Gazebo 服务解除启动暂停。"""
     command = " ".join(
         [
             "source /opt/ros/noetic/setup.bash",
@@ -367,11 +380,8 @@ def run_environment(
         cwd=str(workspace_dir),
     )
     try:
-        # 不能等 junior_ctrl 加载完成后才解除暂停。Gazebo 在暂停状态下初始化
-        # ros_control 时，小腿关节可能以 +2*pi 的等价角度上报，fixed-stand
-        # 随后跨周期插值会让 A1 趴地漂移。/scan 发布器出现说明 Livox 已完成
-        # 装载，此时排队解除暂停既避开 Livox 并发崩溃，也让关节控制器在首个
-        # 物理步之后取得正确角度。
+        # 初始 auto.sh 已提供 paused 参数；仅把解锁时机从固定 wall sleep
+        # 改为 Livox 插件实际注册完成，避免修改任何赛方模型或传感器代码。
         print(f"[{datetime.datetime.now().time()}] 等待 Livox 发布器完成装载")
         wait_for_ros_topic_publisher("/scan", timeout=120.0)
         print(f"[{datetime.datetime.now().time()}] Livox 已就绪，解除 Gazebo 暂停")
@@ -379,16 +389,27 @@ def run_environment(
         child.expect("Use keyboard input in this terminal", timeout=120)
         print(f"[{datetime.datetime.now().time()}] 控制器进程已启动，等待 RL 模型加载完成")
         child.expect("load model to device!", timeout=120)
+        # 与初始环境的人工启动流程及早期稳定 runner 保持一致：RL 模型一旦
+        # 就绪便进入 fixed-stand，不能在 passive 状态额外等待传感器判定，
+        # 否则非暂停物理会先让机器人趴到地面。
         print(f"[{datetime.datetime.now().time()}] RL 模型已加载，发送 2 进入站立")
         child.send("2")
         child.expect("Switched from passive to fixed stand", timeout=30)
-        print(f"[{datetime.datetime.now().time()}] 已进入 fixed-stand，等待 IMU 连续稳定后发送 6 进入 RL 模式")
-        posture = wait_for_fixed_stand_posture()
-        if not posture["stable"]:
-            raise RuntimeError(_fixed_stand_failure_detail(posture))
+        # 保持赛方初始启动时序：fixed-stand 过渡 5 秒后只发送一次 6。
+        # 部分启动中 fixed-stand 净空偏低，但 RL 接管后可以正常站稳；不能
+        # 把 fixed-stand 净空作为进入 RL 的前置条件，否则会形成启动自锁。
+        print(f"[{datetime.datetime.now().time()}] 已进入 fixed-stand，等待 5 秒后发送 6 进入 RL 模式")
+        time.sleep(5.0)
         child.send("6")
         child.expect("Switched from fixed stand to RL", timeout=30)
-        print(f"[{datetime.datetime.now().time()}] 控制器已进入 RL，开始启动健康检查")
+        print(f"[{datetime.datetime.now().time()}] 控制器已进入 RL，确认机器人实际站稳")
+        posture = wait_for_fixed_stand_posture(
+            min_stand_seconds=2.0,
+            max_wait_seconds=30.0,
+        )
+        if not posture["stable"]:
+            raise RuntimeError(_fixed_stand_failure_detail(posture))
+        print(f"[{datetime.datetime.now().time()}] RL 姿态已稳定，开始启动健康检查")
         check_startup_health(workspace_dir, health_log_path, posture=posture)
         time.sleep(1.0)
         child.owned_environment_processes = capture_environment_processes(child.pid)
@@ -417,7 +438,10 @@ def wait_for_ros_topic(
     log_file=None,
     *,
     field: str | None = None,
+    message_count: int = 1,
 ) -> None:
+    if int(message_count) < 1:
+        raise ValueError("message_count 必须大于等于 1")
     echo_target = topic if field is None else f"{topic}/{field.lstrip('/')}"
     cmd = " ".join(
         [
@@ -425,7 +449,7 @@ def wait_for_ros_topic(
             "&&",
             f"source {shlex.quote(str(workspace_dir / 'devel' / 'setup.bash'))}",
             "&&",
-            f"rostopic echo -n 1 {shlex.quote(echo_target)}",
+            f"rostopic echo -n {int(message_count)} {shlex.quote(echo_target)}",
         ]
     )
     try:
@@ -524,20 +548,170 @@ def _is_stable_posture_window(
     return stable, len(window)
 
 
+def _measure_livox_floor_clearance(points) -> tuple[float | None, dict[str, object]]:
+    """从允许的 Livox 点云估计 base 到当前楼面的距离。
+
+    这里只用于 runner 起立握手。采用主平面高度众数，避免把家具底部或少量
+    离群点当成楼面；同时返回最小诊断计数，以区分未收到点云、空帧和筛选
+    失败。生产定位仍使用 C++ RANSAC 实现。
+    """
+    cosine = math.cos(LIVOX_BASE_PITCH)
+    sine = math.sin(LIVOX_BASE_PITCH)
+    candidate_z: list[float] = []
+    diagnostics: dict[str, object] = {
+        "point_count": len(points),
+        "finite_points": 0,
+        "radial_points": 0,
+        "z_band_points": 0,
+        "mode_inliers": 0,
+        "mode_z": None,
+        "rejection": "empty_frame" if not points else "unknown",
+    }
+    for point in points:
+        x = float(point.x)
+        y = float(point.y)
+        z = float(point.z)
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            continue
+        diagnostics["finite_points"] = int(diagnostics["finite_points"]) + 1
+        base_x = cosine * x + sine * z + LIVOX_BASE_X
+        base_z = -sine * x + cosine * z + LIVOX_BASE_Z
+        if not (0.25 <= math.hypot(base_x, y) <= 6.0):
+            continue
+        diagnostics["radial_points"] = int(diagnostics["radial_points"]) + 1
+        if -0.80 <= base_z <= 0.20:
+            candidate_z.append(base_z)
+    diagnostics["z_band_points"] = len(candidate_z)
+    if len(candidate_z) < 300:
+        if diagnostics["point_count"]:
+            diagnostics["rejection"] = "insufficient_z_band_points"
+        return None, diagnostics
+
+    bin_width = 0.02
+    histogram: dict[int, int] = {}
+    for value in candidate_z:
+        key = int(round(value / bin_width))
+        histogram[key] = histogram.get(key, 0) + 1
+    mode_key, _ = max(histogram.items(), key=lambda item: item[1])
+    mode_z = mode_key * bin_width
+    diagnostics["mode_z"] = mode_z
+    inliers = [value for value in candidate_z if abs(value - mode_z) <= 0.04]
+    diagnostics["mode_inliers"] = len(inliers)
+    if len(inliers) < 300 or len(inliers) < 0.15 * len(candidate_z):
+        diagnostics["rejection"] = "insufficient_mode_inliers"
+        return None, diagnostics
+    inliers.sort()
+    median_z = inliers[len(inliers) // 2]
+    clearance = -median_z
+    # passive 落地姿态的 Livox 净空实测可低至约 0.02 m；这里仅判断测量
+    # 是否有效。是否完成站立仍由 FIXED_STAND_MIN_FLOOR_CLEARANCE=0.18 m
+    # 单独判定，不能把量程下限误当成站立门槛。
+    if not math.isfinite(clearance) or not 0.01 <= clearance <= 0.80:
+        diagnostics["rejection"] = "clearance_out_of_range"
+        return None, diagnostics
+    diagnostics["rejection"] = "accepted"
+    return clearance, diagnostics
+
+
+def _estimate_livox_floor_clearance(points) -> float | None:
+    """兼容现有调用方，仅返回 Livox 楼面距离估计。"""
+    clearance, _ = _measure_livox_floor_clearance(points)
+    return clearance
+
+
+def _stable_floor_clearance(
+    samples: list[tuple[float, float]],
+    *,
+    now: float,
+) -> tuple[float | None, int]:
+    """返回连续新鲜 Livox 楼面帧的保守距离和帧数。"""
+    recent = [
+        sample
+        for sample in samples
+        if 0.0 <= now - sample[0] <= FIXED_STAND_MAX_CLEARANCE_GAP_SECONDS
+    ]
+    if len(recent) < FIXED_STAND_MIN_CLEARANCE_FRAMES:
+        return None, len(recent)
+    if any(
+        current[0] - previous[0] > FIXED_STAND_MAX_CLEARANCE_GAP_SECONDS
+        for previous, current in zip(recent, recent[1:])
+    ):
+        return None, len(recent)
+    # 使用近期最小值，避免一次偏高估计掩盖腹部贴地。
+    return min(value for _, value in recent), len(recent)
+
+
+def _aligned_floor_clearance(
+    samples: list[tuple[float, float]],
+    *,
+    imu_stamp: float | None,
+    scan_stamp: float | None,
+) -> tuple[float | None, int, float | None]:
+    """以点云自身时间判断连续帧，并独立确认其与 IMU 仍属同一时刻。"""
+    if imu_stamp is None or scan_stamp is None:
+        return None, 0, None
+    stamp_delta = abs(float(imu_stamp) - float(scan_stamp))
+    if stamp_delta > FIXED_STAND_MAX_CLEARANCE_GAP_SECONDS:
+        return None, 0, stamp_delta
+    clearance, frame_count = _stable_floor_clearance(
+        samples,
+        now=float(scan_stamp),
+    )
+    return clearance, frame_count, stamp_delta
+
+
+def _landing_contact_detected(
+    imu_samples: list[tuple[float, float, float, float]],
+) -> tuple[bool, dict[str, float | int | bool | None]]:
+    """从自由落体到承重比力的变化确认首次触地，不等待被动趴姿稳定。"""
+    diagnostics: dict[str, float | int | bool | None] = {
+        "imu_samples": len(imu_samples),
+        "free_fall_seen": False,
+        "supported_samples": 0,
+        "last_acceleration": None,
+    }
+    if len(imu_samples) < LANDING_SUPPORTED_CONFIRMATIONS:
+        return False, diagnostics
+    diagnostics["free_fall_seen"] = any(
+        acceleration <= LANDING_FREE_FALL_MAX_ACCEL
+        for _, _, _, acceleration in imu_samples
+    )
+    diagnostics["last_acceleration"] = imu_samples[-1][3]
+    supported = 0
+    for _, roll, pitch, acceleration in reversed(imu_samples):
+        if (
+            roll <= LANDING_MAX_ABS_ROLL
+            and pitch <= LANDING_MAX_ABS_PITCH
+            and acceleration >= LANDING_SUPPORTED_MIN_ACCEL
+        ):
+            supported += 1
+        else:
+            break
+    diagnostics["supported_samples"] = supported
+    if supported < LANDING_SUPPORTED_CONFIRMATIONS:
+        return False, diagnostics
+    supported_start = imu_samples[-supported][0]
+    supported_duration = imu_samples[-1][0] - supported_start
+    contact = bool(diagnostics["free_fall_seen"]) or (
+        supported_duration >= LANDING_FALLBACK_SUPPORT_SECONDS
+    )
+    return contact, diagnostics
+
+
 def wait_for_fixed_stand_posture(
     *,
     min_stand_seconds: float = FIXED_STAND_MIN_SECONDS,
     max_wait_seconds: float = FIXED_STAND_MAX_WAIT_SECONDS,
     stable_window_seconds: float = FIXED_STAND_STABLE_WINDOW_SECONDS,
+    stand_callback=None,
 ) -> dict:
-    """在 fixed-stand 阶段只读等待连续稳定的 /trunk_imu 姿态。
+    """先确认落地，再在 fixed-stand 阶段等待姿态与楼面距离正常。
 
-    这是 runner 的启动前健康握手，不向控制器发送命令，也不进入参赛算法。
-    稳定时长使用 IMU header stamp；max_wait_seconds 仅是 wall-time watchdog。
-    同一 Python 进程中 rospy 只能初始化一次，因此后续健康检查复用本统计。
+    这是 runner 的启动前健康握手，不进入参赛算法。落地和站立稳定时长均
+    使用传感器 stamp，``max_wait_seconds`` 仅是 wall-time watchdog。
     """
     import rospy
-    from sensor_msgs.msg import Imu
+    from sensor_msgs.msg import Imu, PointCloud
 
     stats = {
         "max_abs_roll": 0.0,
@@ -548,8 +722,29 @@ def wait_for_fixed_stand_posture(
         "sample_seconds": 0.0,
         "stable": False,
         "stable_window_samples": 0,
+        "floor_clearance": None,
+        "floor_clearance_frames": 0,
+        "imu_scan_stamp_delta": None,
+        "stand_retry_count": 0,
+        "landing_confirmed": stand_callback is None,
+        "landing_imu_samples": 0,
+        "landing_free_fall_seen": False,
+        "landing_supported_samples": 0,
+        "landing_last_acceleration": None,
+        "scan_messages": 0,
+        "scan_nonempty_frames": 0,
+        "scan_last_point_count": 0,
+        "scan_max_point_count": 0,
+        "scan_last_finite_points": 0,
+        "scan_last_radial_points": 0,
+        "scan_last_z_band_points": 0,
+        "scan_last_mode_inliers": 0,
+        "scan_last_mode_z": None,
+        "scan_last_rejection": "not_received",
     }
     samples: deque[tuple[float, float, float]] = deque()
+    landing_samples: deque[tuple[float, float, float, float]] = deque()
+    clearance_samples: deque[tuple[float, float]] = deque()
     finished = {"done": False}
 
     def _on_imu(msg) -> None:
@@ -566,8 +761,22 @@ def wait_for_fixed_stand_posture(
             return
         abs_roll, abs_pitch = abs(roll), abs(pitch)
         samples.append((sensor_stamp, abs_roll, abs_pitch))
+        acceleration = math.sqrt(
+            float(msg.linear_acceleration.x) ** 2
+            + float(msg.linear_acceleration.y) ** 2
+            + float(msg.linear_acceleration.z) ** 2
+        )
+        landing_samples.append(
+            (sensor_stamp, abs_roll, abs_pitch, acceleration)
+        )
         while samples and samples[0][0] < sensor_stamp - stable_window_seconds - 1.0:
             samples.popleft()
+        while (
+            landing_samples
+            and landing_samples[0][0]
+            < sensor_stamp - 2.0
+        ):
+            landing_samples.popleft()
         stats["max_abs_roll"] = max(stats["max_abs_roll"], abs_roll)
         stats["max_abs_pitch"] = max(stats["max_abs_pitch"], abs_pitch)
         stats["last_abs_roll"] = abs_roll
@@ -580,14 +789,68 @@ def wait_for_fixed_stand_posture(
             0.0, sensor_stamp - float(stats["first_sensor_stamp"])
         )
 
+    def _on_scan(msg) -> None:
+        if finished["done"]:
+            return
+        stats["scan_messages"] = int(stats["scan_messages"]) + 1
+        point_count = len(msg.points)
+        stats["scan_last_point_count"] = point_count
+        stats["scan_max_point_count"] = max(
+            int(stats["scan_max_point_count"]), point_count
+        )
+        if point_count:
+            stats["scan_nonempty_frames"] = int(stats["scan_nonempty_frames"]) + 1
+        sensor_stamp = float(msg.header.stamp.to_sec())
+        if not math.isfinite(sensor_stamp) or sensor_stamp <= 0.0:
+            stats["scan_last_rejection"] = "invalid_stamp"
+            return
+        stats["scan_last_stamp"] = sensor_stamp
+        clearance, diagnostics = _measure_livox_floor_clearance(msg.points)
+        for source, target in (
+            ("finite_points", "scan_last_finite_points"),
+            ("radial_points", "scan_last_radial_points"),
+            ("z_band_points", "scan_last_z_band_points"),
+            ("mode_inliers", "scan_last_mode_inliers"),
+            ("mode_z", "scan_last_mode_z"),
+            ("rejection", "scan_last_rejection"),
+        ):
+            stats[target] = diagnostics[source]
+        if clearance is None:
+            return
+        clearance_samples.append((sensor_stamp, clearance))
+        while (
+            clearance_samples
+            and clearance_samples[0][0]
+            < sensor_stamp - FIXED_STAND_MAX_CLEARANCE_GAP_SECONDS - 0.5
+        ):
+            clearance_samples.popleft()
+
     rospy.init_node("fixed_stand_posture_probe", anonymous=True, disable_signals=True)
-    subscriber = rospy.Subscriber("/trunk_imu", Imu, _on_imu, queue_size=200)
+    imu_subscriber = rospy.Subscriber("/trunk_imu", Imu, _on_imu, queue_size=200)
+    scan_subscriber = rospy.Subscriber("/scan", PointCloud, _on_scan, queue_size=2)
     started = time.monotonic()
     try:
         deadline = started + float(max_wait_seconds)
         while time.monotonic() < deadline and not rospy.is_shutdown():
             sensor_elapsed = float(stats.get("sensor_elapsed", 0.0))
             sensor_now = stats.get("last_sensor_stamp")
+            if sensor_now is not None and not bool(stats["landing_confirmed"]):
+                landed, landing = _landing_contact_detected(list(landing_samples))
+                stats["landing_imu_samples"] = landing["imu_samples"]
+                stats["landing_free_fall_seen"] = landing["free_fall_seen"]
+                stats["landing_supported_samples"] = landing["supported_samples"]
+                stats["landing_last_acceleration"] = landing["last_acceleration"]
+                if landed:
+                    stand_callback()
+                    stats["landing_confirmed"] = True
+                    samples.clear()
+                    landing_samples.clear()
+                    clearance_samples.clear()
+                    stats.pop("first_sensor_stamp", None)
+                    stats.pop("last_sensor_stamp", None)
+                    stats["sensor_elapsed"] = 0.0
+                time.sleep(0.05)
+                continue
             if sensor_now is not None and sensor_elapsed >= float(min_stand_seconds):
                 stable, window_samples = _is_stable_posture_window(
                     list(samples),
@@ -595,14 +858,27 @@ def wait_for_fixed_stand_posture(
                     window_seconds=stable_window_seconds,
                 )
                 stats["stable_window_samples"] = window_samples
-                if stable:
+                clearance, clearance_frames, stamp_delta = _aligned_floor_clearance(
+                    list(clearance_samples),
+                    imu_stamp=float(sensor_now),
+                    scan_stamp=stats.get("scan_last_stamp"),
+                )
+                stats["floor_clearance"] = clearance
+                stats["floor_clearance_frames"] = clearance_frames
+                stats["imu_scan_stamp_delta"] = stamp_delta
+                if (
+                    stable
+                    and clearance is not None
+                    and clearance >= FIXED_STAND_MIN_FLOOR_CLEARANCE
+                ):
                     stats["stable"] = True
                     break
             time.sleep(0.05)
     finally:
         stats["sample_seconds"] = time.monotonic() - started
         finished["done"] = True
-        subscriber.unregister()
+        imu_subscriber.unregister()
+        scan_subscriber.unregister()
         rospy.signal_shutdown("fixed_stand_posture_probe_done")
     return stats
 
@@ -642,6 +918,25 @@ def _fixed_stand_failure_detail(stats: dict) -> str:
         f" last_abs_roll={float(stats.get('last_abs_roll', 0.0)):.4f}"
         f" last_abs_pitch={float(stats.get('last_abs_pitch', 0.0)):.4f}"
         f" stable_window_samples={int(stats.get('stable_window_samples', 0))}"
+        f" floor_clearance={stats.get('floor_clearance')}"
+        f" floor_clearance_frames={int(stats.get('floor_clearance_frames', 0))}"
+        f" imu_scan_stamp_delta={stats.get('imu_scan_stamp_delta')}"
+        f" stand_retry_count={int(stats.get('stand_retry_count', 0))}"
+        f" landing_confirmed={bool(stats.get('landing_confirmed', False))}"
+        f" landing_imu_samples={int(stats.get('landing_imu_samples', 0))}"
+        f" landing_free_fall_seen={bool(stats.get('landing_free_fall_seen', False))}"
+        f" landing_supported_samples={int(stats.get('landing_supported_samples', 0))}"
+        f" landing_last_acceleration={stats.get('landing_last_acceleration')}"
+        f" scan_messages={int(stats.get('scan_messages', 0))}"
+        f" scan_nonempty_frames={int(stats.get('scan_nonempty_frames', 0))}"
+        f" scan_last_point_count={int(stats.get('scan_last_point_count', 0))}"
+        f" scan_max_point_count={int(stats.get('scan_max_point_count', 0))}"
+        f" scan_last_finite_points={int(stats.get('scan_last_finite_points', 0))}"
+        f" scan_last_radial_points={int(stats.get('scan_last_radial_points', 0))}"
+        f" scan_last_z_band_points={int(stats.get('scan_last_z_band_points', 0))}"
+        f" scan_last_mode_inliers={int(stats.get('scan_last_mode_inliers', 0))}"
+        f" scan_last_mode_z={stats.get('scan_last_mode_z')}"
+        f" scan_last_rejection={stats.get('scan_last_rejection', 'unknown')}"
     )
 
 
@@ -705,6 +1000,8 @@ def check_startup_health(
                     f"last_abs_roll={posture['last_abs_roll']:.4f} "
                     f"last_abs_pitch={posture['last_abs_pitch']:.4f} "
                     f"stable={posture.get('stable', 'n/a')} "
+                    f"livox_floor_clearance={posture.get('floor_clearance')} "
+                    f"stand_retry_count={posture.get('stand_retry_count', 0)} "
                     "高度真值不参与正式健康检查\n"
                 )
                 health_log.flush()
@@ -736,7 +1033,6 @@ def run_danger_search(
         "&&",
         "roslaunch danger_search danger_search.launch",
         f"config:={shlex.quote(str(run_config_path))}",
-        f"max_floor:={int(max_floor)}",
     ]
     if mission_summary_file is not None:
         launch_args.append(f"mission_summary_file:={shlex.quote(str(mission_summary_file))}")

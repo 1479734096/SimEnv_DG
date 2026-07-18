@@ -15,7 +15,12 @@ except ImportError:
     rospy = None
 
 from danger_search.mapper import BLACK, FREE, FloorGrid, OCC, UNKNOWN, VISITED
-from danger_search.planner import UNREACHABLE, astar_plan, path_length
+from danger_search.planner import (
+    DEFAULT_MAX_ITERATIONS,
+    UNREACHABLE,
+    astar_plan,
+    path_length,
+)
 from danger_search.time_utils import get_time
 
 
@@ -157,6 +162,7 @@ class FrontierExplorer:
     ) -> tuple[Frontier | None, list[tuple[float, float]]]:
         selection_started = time.perf_counter()
         self._expire_blacklist()
+        self._last_budget_exhausted_frontiers: list[Frontier] = []
         if frontiers is None:
             frontiers = self.extract_frontiers(grid)
         candidate_debug_records = [
@@ -237,6 +243,7 @@ class FrontierExplorer:
                 elif budget_exhausted:
                     # 预算耗尽：可能可达，不累计失败，留待下轮地图更新后重试。
                     budget_exhausted_count += 1
+                    self._last_budget_exhausted_frontiers.append(frontier)
                 elif inside_tolerance_only:
                     # 落点在 controller goal_tolerance 内：不算失败、不拉黑、不屏蔽 cluster。
                     # 跳过此 frontier，继续尝试其他 frontier。
@@ -376,24 +383,70 @@ class FrontierExplorer:
         )
         return best_frontier, best_path
 
+    def confirm_budget_exhausted_frontier(
+        self,
+        grid: FloorGrid,
+        robot_pose: tuple[float, float, float],
+        selection_context: FrontierSelectionContext | None = None,
+    ) -> tuple[Frontier | None, list[tuple[float, float]]]:
+        """对本轮预算耗尽候选做一次确定性确认，找到首个可达目标即返回。"""
+        pending = list(getattr(self, "_last_budget_exhausted_frontiers", ()))
+        self._last_budget_exhausted_frontiers = []
+        for frontier in pending:
+            (
+                target_xy,
+                path,
+                _blacklisted_only,
+                context_adjustment,
+                _context_filtered_only,
+                _budget_exhausted,
+                _inside_tolerance_only,
+                _candidate_debug,
+            ) = self._resolve_frontier_target(
+                grid,
+                frontier,
+                robot_pose,
+                selection_context=selection_context,
+                planning_max_iterations=None,
+                exhaustive_goal_candidates=True,
+            )
+            if target_xy is None or not path:
+                continue
+            score = (
+                self._score_frontier(
+                    frontier,
+                    path,
+                    robot_pose,
+                    target_xy=target_xy,
+                )
+                + context_adjustment
+            )
+            return (
+                Frontier(
+                    cells=frontier.cells,
+                    centroid=target_xy,
+                    information_gain=frontier.information_gain,
+                    score=score,
+                ),
+                path,
+            )
+        return None, []
+
     def extract_frontiers(self, grid: FloorGrid) -> list[Frontier]:
         self._last_extraction_rejections = []
-        frontier_mask = np.zeros_like(grid.data, dtype=bool)
-        for gy in range(1, grid.size_y - 1):
-            for gx in range(1, grid.size_x - 1):
-                if int(grid.data[gy, gx]) not in (FREE, VISITED):
-                    continue
-                if _has_unknown_neighbor(grid, gx, gy):
-                    frontier_mask[gy, gx] = True
+        frontier_mask = _build_frontier_mask(grid)
 
         visited = np.zeros_like(frontier_mask, dtype=bool)
         clusters: list[list[tuple[int, int]]] = []
-        for gy in range(grid.size_y):
-            for gx in range(grid.size_x):
-                if not frontier_mask[gy, gx] or visited[gy, gx]:
-                    continue
-                cluster = _flood_fill(frontier_mask, visited, gx, gy)
-                clusters.append(cluster)
+        # np.argwhere 保持行优先顺序，只遍历真实 frontier 格；原实现逐格扫描
+        # 整张 280x480 地图会在每次任务 tick 白白消耗约百毫秒。
+        for gy, gx in np.argwhere(frontier_mask):
+            cell_x = int(gx)
+            cell_y = int(gy)
+            if visited[cell_y, cell_x]:
+                continue
+            cluster = _flood_fill(frontier_mask, visited, cell_x, cell_y)
+            clusters.append(cluster)
 
         frontiers: list[Frontier] = []
         for cluster in clusters:
@@ -783,6 +836,8 @@ class FrontierExplorer:
         robot_pose: tuple[float, float, float],
         *,
         selection_context: FrontierSelectionContext | None = None,
+        planning_max_iterations: int | None = DEFAULT_MAX_ITERATIONS,
+        exhaustive_goal_candidates: bool = False,
     ) -> tuple[
         tuple[float, float] | None,
         list[tuple[float, float]],
@@ -861,7 +916,10 @@ class FrontierExplorer:
             if _world_distance(target_xy, robot_xy) <= self.goal_tolerance:
                 saw_inside_tolerance = True
                 continue
-            if path_attempt_count >= self.max_goal_candidates_per_frontier:
+            if (
+                not exhaustive_goal_candidates
+                and path_attempt_count >= self.max_goal_candidates_per_frontier
+            ):
                 # 仍可能存在可达落点，因此按预算耗尽处理，不能累计失败或拉黑。
                 saw_budget_exhausted = True
                 break
@@ -870,7 +928,12 @@ class FrontierExplorer:
             last_path_position = target_xy
             last_path_context_adjustment = context_adjustment
             last_path_context_penalty = context_penalty
-            result = astar_plan(grid, robot_xy, target_xy)
+            result = astar_plan(
+                grid,
+                robot_xy,
+                target_xy,
+                max_iterations=planning_max_iterations,
+            )
             if result.reached:
                 if self._path_crosses_permanent_gate(result.path, selection_context):
                     saw_context_skip = True
@@ -1403,14 +1466,30 @@ class FrontierExplorer:
         }
 
 
-def _has_unknown_neighbor(grid: FloorGrid, gx: int, gy: int) -> bool:
-    for ny in range(gy - 1, gy + 2):
-        for nx in range(gx - 1, gx + 2):
-            if nx == gx and ny == gy:
-                continue
-            if int(grid.data[ny, nx]) == UNKNOWN:
-                return True
-    return False
+def _build_frontier_mask(grid: FloorGrid) -> np.ndarray:
+    """按原有八邻域语义生成 frontier 掩码，边界格仍不参与提取。"""
+    data = grid.data
+    frontier_mask = np.zeros_like(data, dtype=bool)
+    if data.shape[0] < 3 or data.shape[1] < 3:
+        return frontier_mask
+
+    unknown = data == UNKNOWN
+    has_unknown_neighbor = np.zeros_like(frontier_mask)
+    interior = has_unknown_neighbor[1:-1, 1:-1]
+    interior |= unknown[:-2, :-2]
+    interior |= unknown[:-2, 1:-1]
+    interior |= unknown[:-2, 2:]
+    interior |= unknown[1:-1, :-2]
+    interior |= unknown[1:-1, 2:]
+    interior |= unknown[2:, :-2]
+    interior |= unknown[2:, 1:-1]
+    interior |= unknown[2:, 2:]
+
+    traversable = (data == FREE) | (data == VISITED)
+    frontier_mask[1:-1, 1:-1] = (
+        traversable[1:-1, 1:-1] & has_unknown_neighbor[1:-1, 1:-1]
+    )
+    return frontier_mask
 
 
 def _frontier_goal_for_robot(

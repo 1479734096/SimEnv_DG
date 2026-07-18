@@ -65,7 +65,7 @@ class RunSeedCompletionTest(unittest.TestCase):
         self.assertIn("/opt/ros/noetic/share", paths)
         self.assertIn("/existing/packages", paths)
 
-    def test_environment_launch_starts_paused_without_auto_unpause(self):
+    def test_environment_launch_pauses_only_during_livox_initialization(self):
         overrides = run_seed.environment_launch_overrides(
             seed=42,
             gui_enabled=False,
@@ -81,7 +81,7 @@ class RunSeedCompletionTest(unittest.TestCase):
         self.assertEqual(overrides["ENABLE_REFEREE_ODOM"], "false")
         self.assertEqual(overrides["ENABLE_GROUND_TRUTH"], "true")
 
-    def test_environment_unpauses_after_livox_before_fixed_stand(self):
+    def test_environment_initializes_livox_then_confirms_posture_after_rl(self):
         events = []
 
         class FakeChild:
@@ -101,25 +101,26 @@ class RunSeedCompletionTest(unittest.TestCase):
 
         child = FakeChild()
 
-        def fake_unpause(_workspace):
-            events.append(("unpause", None))
+        def fake_sleep(seconds):
+            events.append(("sleep", seconds))
 
-        def fake_wait_for_publisher(topic, *, timeout):
-            events.append(("publisher", topic))
+        posture = {"stable": True}
+
+        def fake_wait_posture(**_kwargs):
+            events.append(("wait_posture", None))
+            return posture
 
         with patch("pexpect.spawn", return_value=child) as spawn, patch.object(
-            run_seed,
-            "wait_for_ros_topic_publisher",
-            side_effect=fake_wait_for_publisher,
+            run_seed, "wait_for_ros_topic_publisher", side_effect=lambda *args, **kwargs: events.append(("wait_topic", args[0]))
         ), patch.object(
-            run_seed, "unpause_environment_physics", side_effect=fake_unpause
+            run_seed, "unpause_environment_physics", side_effect=lambda *args, **kwargs: events.append(("unpause", None))
         ), patch.object(
-            run_seed,
-            "wait_for_fixed_stand_posture",
-            return_value={"stable": True},
-        ), patch.object(run_seed, "check_startup_health"), patch.object(
+            run_seed, "wait_for_fixed_stand_posture", side_effect=fake_wait_posture
+        ) as wait_posture, patch.object(
+            run_seed, "check_startup_health"
+        ) as health, patch.object(
             run_seed, "capture_environment_processes", return_value=[]
-        ), patch.object(run_seed.time, "sleep"):
+        ), patch.object(run_seed.time, "sleep", side_effect=fake_sleep):
             returned = run_seed.run_environment(
                 42,
                 Path("/workspace"),
@@ -133,25 +134,85 @@ class RunSeedCompletionTest(unittest.TestCase):
         spawn_env = spawn.call_args.kwargs["env"]
         self.assertEqual(spawn_env["PAUSED"], "true")
         self.assertEqual(spawn_env["AUTO_UNPAUSE"], "false")
-        self.assertLess(events.index(("publisher", "/scan")), events.index(("unpause", None)))
-        self.assertLess(events.index(("unpause", None)), events.index(("send", "2")))
+        wait_topic_index = events.index(("wait_topic", "/scan"))
+        unpause_index = events.index(("unpause", None))
+        model_index = events.index(("expect", "load model to device!"))
+        stand_index = events.index(("send", "2"))
+        rl_index = events.index(("send", "6"))
+        self.assertLess(wait_topic_index, unpause_index)
+        self.assertLess(unpause_index, model_index)
+        self.assertLess(model_index, stand_index)
+        self.assertLess(stand_index, events.index(("sleep", 5.0)))
+        self.assertLess(events.index(("sleep", 5.0)), rl_index)
+        self.assertLess(rl_index, events.index(("wait_posture", None)))
+        wait_posture.assert_called_once_with(
+            min_stand_seconds=2.0,
+            max_wait_seconds=30.0,
+        )
+        health.assert_called_once_with(Path("/workspace"), Path("/workspace/health.log"), posture=posture)
         self.assertLess(events.index(("send", "2")), events.index(("send", "6")))
 
-    def test_unpause_uses_gazebo_service_with_timeout(self):
+    def test_environment_sends_only_one_fixed_stand_transition(self):
+        events = []
+
+        class FakeChild:
+            pid = 12345
+
+            def expect(self, pattern, timeout):
+                events.append(("expect", pattern))
+
+            def send(self, value):
+                events.append(("send", value))
+
+            def close(self, force):
+                pass
+
+        child = FakeChild()
+
+        with patch("pexpect.spawn", return_value=child), patch.object(
+            run_seed, "wait_for_ros_topic_publisher"
+        ), patch.object(
+            run_seed, "unpause_environment_physics"
+        ), patch.object(
+            run_seed, "wait_for_fixed_stand_posture", return_value={"stable": True}
+        ), patch.object(
+            run_seed, "check_startup_health"
+        ), patch.object(
+            run_seed, "capture_environment_processes", return_value=[]
+        ), patch.object(run_seed.time, "sleep"):
+            run_seed.run_environment(
+                42,
+                Path("/workspace"),
+                log_file=None,
+                gui_enabled=False,
+                health_log_path=Path("/workspace/health.log"),
+                max_floor=1,
+            )
+
+        self.assertEqual(
+            [value for event, value in events if event == "send"],
+            ["2", "6"],
+        )
+
+    def test_wait_for_ros_topic_can_require_multiple_fresh_messages(self):
         with patch.object(run_seed.subprocess, "run") as call:
-            run_seed.unpause_environment_physics(Path("/workspace"), timeout=7)
+            run_seed.wait_for_ros_topic(
+                Path("/workspace"),
+                "/scan",
+                timeout=9,
+                field="header/stamp",
+                message_count=3,
+            )
 
         command = call.call_args.args[0]
-        self.assertEqual(command[:2], ["bash", "-lc"])
-        self.assertIn("rosservice call /gazebo/unpause_physics", command[2])
-        self.assertEqual(call.call_args.kwargs["timeout"], 7)
-        self.assertTrue(call.call_args.kwargs["check"])
+        self.assertIn("rostopic echo -n 3 /scan/header/stamp", command[2])
+        self.assertEqual(call.call_args.kwargs["timeout"], 9)
 
     def test_algorithm_health_failure_stops_owned_launch_process(self):
         process = SimpleNamespace(poll=lambda: None)
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             run_seed.subprocess, "Popen", return_value=process
-        ), patch.object(
+        ) as popen, patch.object(
             run_seed,
             "check_startup_health",
             side_effect=RuntimeError("定位健康检查失败"),
@@ -170,6 +231,8 @@ class RunSeedCompletionTest(unittest.TestCase):
                 )
 
         stop_process.assert_called_once_with(process, label="danger_search")
+        launch_command = " ".join(popen.call_args.args[0])
+        self.assertNotIn("max_floor:=", launch_command)
 
     def test_environment_cleanup_uses_recorded_group_after_shell_exit(self):
         child = SimpleNamespace(
@@ -406,6 +469,133 @@ class RunSeedCompletionTest(unittest.TestCase):
 
 
 class StartupPostureGateTest(unittest.TestCase):
+    def test_livox_floor_clearance_distinguishes_standing_from_crouched(self):
+        class Point:
+            def __init__(self, x, y, z):
+                self.x, self.y, self.z = x, y, z
+
+        def floor_points(clearance):
+            points = []
+            cosine = run_seed.math.cos(run_seed.LIVOX_BASE_PITCH)
+            sine = run_seed.math.sin(run_seed.LIVOX_BASE_PITCH)
+            # 构造 base 系楼面点，再逆变换回 Livox 系。
+            for row in range(25):
+                for column in range(25):
+                    base_x = 0.5 + 0.08 * column
+                    base_y = -1.0 + 0.08 * row
+                    base_z = -clearance
+                    translated_x = base_x - run_seed.LIVOX_BASE_X
+                    translated_z = base_z - run_seed.LIVOX_BASE_Z
+                    sensor_x = cosine * translated_x - sine * translated_z
+                    sensor_z = sine * translated_x + cosine * translated_z
+                    points.append(Point(sensor_x, base_y, sensor_z))
+            return points
+
+        self.assertAlmostEqual(
+            run_seed._estimate_livox_floor_clearance(floor_points(0.23)),
+            0.23,
+            places=2,
+        )
+        self.assertAlmostEqual(
+            run_seed._estimate_livox_floor_clearance(floor_points(0.11)),
+            0.11,
+            places=2,
+        )
+        # passive 落地姿态只用于确认已经接触地面，不能因净空低而丢弃测量。
+        self.assertAlmostEqual(
+            run_seed._estimate_livox_floor_clearance(floor_points(0.02)),
+            0.02,
+            places=2,
+        )
+
+        clearance, diagnostics = run_seed._measure_livox_floor_clearance(
+            floor_points(0.23)
+        )
+        self.assertAlmostEqual(clearance, 0.23, places=2)
+        self.assertEqual(diagnostics["rejection"], "accepted")
+        self.assertEqual(diagnostics["point_count"], 625)
+        self.assertGreaterEqual(diagnostics["mode_inliers"], 300)
+
+    def test_livox_floor_clearance_diagnostics_distinguish_empty_and_sparse_frames(self):
+        class Point:
+            def __init__(self, x, y, z):
+                self.x, self.y, self.z = x, y, z
+
+        clearance, diagnostics = run_seed._measure_livox_floor_clearance([])
+        self.assertIsNone(clearance)
+        self.assertEqual(diagnostics["rejection"], "empty_frame")
+
+        clearance, diagnostics = run_seed._measure_livox_floor_clearance(
+            [Point(1.0, 0.0, 0.0) for _ in range(20)]
+        )
+        self.assertIsNone(clearance)
+        self.assertEqual(diagnostics["point_count"], 20)
+        self.assertEqual(diagnostics["finite_points"], 20)
+        self.assertEqual(diagnostics["rejection"], "insufficient_z_band_points")
+
+    def test_floor_clearance_requires_three_recent_frames(self):
+        clearance, count = run_seed._stable_floor_clearance(
+            [(9.8, 0.23), (9.9, 0.22)], now=10.0
+        )
+        self.assertIsNone(clearance)
+        self.assertEqual(count, 2)
+
+        clearance, count = run_seed._stable_floor_clearance(
+            [(9.8, 0.23), (9.9, 0.22), (10.0, 0.24)], now=10.0
+        )
+        self.assertAlmostEqual(clearance, 0.22)
+        self.assertEqual(count, 3)
+
+    def test_floor_clearance_window_uses_scan_stamp_not_faster_imu_stamp(self):
+        clearance, count, delta = run_seed._aligned_floor_clearance(
+            [(9.8, 0.23), (9.9, 0.22), (10.0, 0.24)],
+            imu_stamp=10.08,
+            scan_stamp=10.0,
+        )
+
+        self.assertAlmostEqual(clearance, 0.22)
+        self.assertEqual(count, 3)
+        self.assertAlmostEqual(delta, 0.08)
+
+    def test_floor_clearance_rejects_stale_scan_even_if_frames_are_continuous(self):
+        clearance, count, delta = run_seed._aligned_floor_clearance(
+            [(9.8, 0.23), (9.9, 0.22), (10.0, 0.24)],
+            imu_stamp=10.5,
+            scan_stamp=10.0,
+        )
+
+        self.assertIsNone(clearance)
+        self.assertEqual(count, 0)
+        self.assertAlmostEqual(delta, 0.5)
+
+    def test_landing_detects_free_fall_to_supported_contact(self):
+        samples = [
+            (0.00, 0.01, 0.01, 0.2),
+            (0.01, 0.01, 0.01, 0.3),
+            (0.02, 0.02, 0.01, 12.0),
+            (0.03, 0.02, 0.01, 9.5),
+            (0.04, 0.02, 0.01, 8.2),
+        ]
+
+        contact, diagnostics = run_seed._landing_contact_detected(samples)
+
+        self.assertTrue(contact)
+        self.assertTrue(diagnostics["free_fall_seen"])
+        self.assertEqual(diagnostics["supported_samples"], 3)
+
+    def test_landing_rejects_free_fall_without_supported_contact(self):
+        contact, diagnostics = run_seed._landing_contact_detected(
+            [
+                (0.00, 0.01, 0.01, 0.2),
+                (0.01, 0.01, 0.01, 0.3),
+                (0.02, 0.01, 0.01, 0.4),
+            ]
+        )
+
+        self.assertFalse(contact)
+        self.assertTrue(diagnostics["free_fall_seen"])
+        self.assertEqual(diagnostics["supported_samples"], 0)
+
     def test_algorithm_health_does_not_repeat_rospy_posture_probe(self):
         with tempfile.TemporaryDirectory() as temp_dir, patch.object(
             run_seed, "wait_for_ros_topic"

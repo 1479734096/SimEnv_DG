@@ -35,6 +35,7 @@ def _config(**overrides) -> GroundSupportGateConfig:
         "stop_linear_threshold": 0.02,
         "stop_angular_threshold": 0.05,
         "stop_confirmation_samples": 3,
+        "speed_out_of_envelope_confirmations": 2,
     }
     values.update(overrides)
     return GroundSupportGateConfig(**values)
@@ -196,7 +197,7 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
         self.assertEqual(gate.reason_code, "support_speed_out_of_envelope")
         self.assertIsNone(gate.last_stop_distance)
 
-    def test_actual_speed_above_envelope_also_stops(self):
+    def test_single_actual_speed_spike_stops_then_resumes_on_fresh_odom(self):
         gate = GroundSupportSafetyGate(_config())
         gate.update_assessment(_assessment())
         gate.observe_odometry(1.0, linear_speed=0.61, angular_speed=0.0, wall_time=99.9)
@@ -205,6 +206,41 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
 
         self.assertEqual(command, (0.0, 0.0, 0.0))
         self.assertEqual(gate.state, SPEED_OUT_OF_ENVELOPE_STOPPING)
+        self.assertFalse(gate.snapshot()["speed_out_of_envelope_confirmed"])
+
+        gate.observe_odometry(1.1, linear_speed=0.40, angular_speed=0.0, wall_time=100.1)
+
+        self.assertEqual(gate.state, CLEAR)
+        self.assertEqual(gate.automatic_resume_count, 1)
+        self.assertEqual(
+            gate.snapshot()["speed_out_of_envelope_trigger_source"],
+            "localization_odometry",
+        )
+
+    def test_two_consecutive_actual_speed_samples_confirm_terminal_stop(self):
+        gate = GroundSupportSafetyGate(_config(stop_confirmation_samples=1))
+        gate.update_assessment(_assessment())
+        gate.observe_odometry(1.0, linear_speed=0.61, angular_speed=0.0, wall_time=99.9)
+        gate.filter_command((0.30, 0.0, 0.0), pose_yaw=0.0, wall_time=100.0)
+
+        gate.observe_odometry(1.1, linear_speed=0.62, angular_speed=0.0, wall_time=100.1)
+        self.assertTrue(gate.snapshot()["speed_out_of_envelope_confirmed"])
+        gate.observe_odometry(1.2, linear_speed=0.01, angular_speed=0.0, wall_time=100.2)
+
+        self.assertEqual(gate.state, SUPPORT_PATH_UNAVAILABLE)
+        self.assertEqual(gate.reason_code, "support_speed_out_of_envelope")
+
+    def test_repeated_filter_calls_do_not_confirm_single_odom_spike(self):
+        gate = GroundSupportSafetyGate(_config())
+        gate.update_assessment(_assessment())
+        gate.observe_odometry(1.0, linear_speed=0.61, angular_speed=0.0, wall_time=99.9)
+
+        gate.filter_command((0.30, 0.0, 0.0), pose_yaw=0.0, wall_time=100.0)
+        gate.filter_command((0.30, 0.0, 0.0), pose_yaw=0.0, wall_time=100.01)
+
+        self.assertEqual(gate.state, SPEED_OUT_OF_ENVELOPE_STOPPING)
+        self.assertEqual(gate.snapshot()["speed_out_of_envelope_sample_count"], 1)
+        self.assertFalse(gate.snapshot()["speed_out_of_envelope_confirmed"])
 
     def test_temporary_hold_does_not_hide_speed_out_of_envelope(self):
         gate = GroundSupportSafetyGate(_config())

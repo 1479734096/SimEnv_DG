@@ -5,7 +5,7 @@ import heapq
 import math
 from dataclasses import dataclass, field
 
-from danger_search.mapper import FloorGrid
+from danger_search.mapper import FREE, VISITED, FloorGrid
 
 # 默认迭代预算：在当前配置尺寸（28x48m, 0.10m 分辨率）下，
 # 不可达目标的全量探索约 0.5s，会阻塞约 5 个 Timer 周期。
@@ -62,6 +62,12 @@ def astar_plan(
             return PlanResult(status=UNREACHABLE)
         goal = nearest
 
+    # 同一次同步规划期间地图不会被其他回调修改。预先生成只读掩码可避免
+    # 搜索内数十万次 Python 方法调用，同时保持 FREE/VISITED、UNKNOWN 禁行
+    # 和对角禁止切角的既有语义。
+    traversable = (grid.data == FREE) | (grid.data == VISITED)
+    size_y, size_x = traversable.shape
+
     open_heap: list[tuple[float, tuple[int, int]]] = []
     heapq.heappush(open_heap, (0.0, start))
     came_from: dict[tuple[int, int], tuple[int, int]] = {}
@@ -79,17 +85,21 @@ def astar_plan(
 
         closed_set.add(current)
         if current == goal:
-            path = [grid.grid_to_world(gx, gy) for gx, gy in _reconstruct_path(came_from, current)]
+            path = [
+                grid.grid_to_world(gx, gy)
+                for gx, gy in _reconstruct_path(came_from, current)
+            ]
+            path = simplify_path_line_of_sight(grid, path)
             return PlanResult(path=path, status=REACHED)
 
         gx, gy = current
         for dx, dy in ((-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)):
             nx, ny = gx + dx, gy + dy
-            if not grid.is_traversable(nx, ny):
+            if not (0 <= nx < size_x and 0 <= ny < size_y and traversable[ny, nx]):
                 continue
             # 对角线移动时，检查相邻两个正交格是否同时可通行，防止切角
             if dx != 0 and dy != 0:
-                if not grid.is_traversable(gx + dx, gy) or not grid.is_traversable(gx, gy + dy):
+                if not traversable[gy, gx + dx] or not traversable[gy + dy, gx]:
                     continue
             neighbor = (nx, ny)
             if neighbor in closed_set:
@@ -122,6 +132,70 @@ def path_length(path: list[tuple[float, float]]) -> float:
     if len(path) < 2:
         return 0.0
     return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(path, path[1:]))
+
+
+def simplify_path_line_of_sight(
+    grid: FloorGrid,
+    path: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    """在现有 A* 路径上删除有安全视线的中间折点。"""
+    if len(path) <= 2:
+        return list(path)
+
+    simplified = [path[0]]
+    anchor = 0
+    while anchor < len(path) - 1:
+        next_index = anchor + 1
+        for candidate in range(len(path) - 1, anchor, -1):
+            if _segment_is_traversable(grid, path[anchor], path[candidate]):
+                next_index = candidate
+                break
+        simplified.append(path[next_index])
+        anchor = next_index
+    return simplified
+
+
+def _segment_is_traversable(
+    grid: FloorGrid,
+    start_xy: tuple[float, float],
+    end_xy: tuple[float, float],
+) -> bool:
+    """检查线段覆盖的全部栅格，并保持 A* 的对角禁止切角语义。"""
+    start_cell = grid.world_to_grid(start_xy[0], start_xy[1])
+    end_cell = grid.world_to_grid(end_xy[0], end_xy[1])
+    if start_cell is None or end_cell is None:
+        return False
+    if not grid.is_traversable(*start_cell) or not grid.is_traversable(*end_cell):
+        return False
+
+    distance = math.hypot(
+        end_xy[0] - start_xy[0],
+        end_xy[1] - start_xy[1],
+    )
+    step_count = max(
+        1,
+        int(math.ceil(distance / max(float(grid.resolution) * 0.5, 1e-6))),
+    )
+    previous = start_cell
+    for index in range(1, step_count + 1):
+        ratio = index / step_count
+        cell = grid.world_to_grid(
+            start_xy[0] + (end_xy[0] - start_xy[0]) * ratio,
+            start_xy[1] + (end_xy[1] - start_xy[1]) * ratio,
+        )
+        if cell is None or not grid.is_traversable(*cell):
+            return False
+        dx = cell[0] - previous[0]
+        dy = cell[1] - previous[1]
+        if dx != 0 and dy != 0:
+            step_x = 1 if dx > 0 else -1
+            step_y = 1 if dy > 0 else -1
+            if not grid.is_traversable(previous[0] + step_x, previous[1]):
+                return False
+            if not grid.is_traversable(previous[0], previous[1] + step_y):
+                return False
+        previous = cell
+    return True
 
 
 def _nearest_traversable(grid: FloorGrid, goal: tuple[int, int], max_radius: int = 8) -> tuple[int, int] | None:

@@ -1,4 +1,4 @@
-"""多楼层和电梯服务封装。"""
+"""旧版多楼层服务封装；正式运行链使用 BuildingControlClient。"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,6 +11,8 @@ try:
 except ImportError:  # pragma: no cover - 离线环境可能没有 ROS
     rospy = None
     CallElevator = SetDoorState = None
+
+from danger_search.interface_policy import require_allowed_service
 
 
 @dataclass(frozen=True)
@@ -67,7 +69,7 @@ class AsyncServiceCall:
 
 
 class FloorManager:
-    """提供电梯目标点和异步门/电梯服务。"""
+    """提供旧配置兼容能力，不得作为正式几何信息来源。"""
 
     def __init__(
         self,
@@ -80,6 +82,14 @@ class FloorManager:
         self.elevator_id = elevator_id
         self.targets = ElevatorTargets(lobby_xy=lobby_xy, inside_xy=inside_xy)
         self.service_timeout = float(service_timeout)
+        self._set_door_service = require_allowed_service(
+            "/set_door_state",
+            purpose="旧 FloorManager 门服务",
+        )
+        self._call_elevator_service = require_allowed_service(
+            "/call_elevator",
+            purpose="旧 FloorManager 电梯服务",
+        )
         self._set_door = None
         self._call_elevator = None
 
@@ -87,10 +97,22 @@ class FloorManager:
         if rospy is None:
             raise RuntimeError("当前环境没有 rospy，无法使用门/电梯服务")
         try:
-            rospy.wait_for_service("/set_door_state", timeout=self.service_timeout)
-            rospy.wait_for_service("/call_elevator", timeout=self.service_timeout)
-            self._set_door = rospy.ServiceProxy("/set_door_state", SetDoorState)
-            self._call_elevator = rospy.ServiceProxy("/call_elevator", CallElevator)
+            rospy.wait_for_service(
+                self._set_door_service,
+                timeout=self.service_timeout,
+            )
+            rospy.wait_for_service(
+                self._call_elevator_service,
+                timeout=self.service_timeout,
+            )
+            self._set_door = rospy.ServiceProxy(
+                self._set_door_service,
+                SetDoorState,
+            )
+            self._call_elevator = rospy.ServiceProxy(
+                self._call_elevator_service,
+                CallElevator,
+            )
         except Exception as exc:
             rospy.logwarn("门/电梯服务暂不可用：%s", exc)
 

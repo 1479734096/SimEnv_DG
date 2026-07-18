@@ -10,7 +10,7 @@ except ImportError:
     rospy = None
 
 from danger_search.navigator import DONE, IDLE, RUNNING, STUCK
-from danger_search.planner import UNREACHABLE, astar_plan
+from danger_search.planner import DEFAULT_MAX_ITERATIONS, UNREACHABLE, astar_plan
 from .time_utils import get_time
 
 if TYPE_CHECKING:
@@ -87,6 +87,9 @@ class OpenDoorAndPass(NavigationTask):
         self._commit_retry_start_time: float | None = None
         self._commit_retry_limit = 30
         self._commit_retry_timeout = 12.0
+        self._wait_navigation_failure: str | None = None
+        self._wait_navigation_blocked_since: float | None = None
+        self._wait_navigation_timeout = 3.0
 
     @property
     def wait_point(self) -> tuple[float, float] | None:
@@ -116,8 +119,26 @@ class OpenDoorAndPass(NavigationTask):
                 return FAILED
 
         if self.phase == "GO_WAIT_POINT":
-            if self._navigate_to(manager, pose, self._wait_point):
+            if self._navigate_to(
+                manager,
+                pose,
+                self._wait_point,
+                allow_direct_fallback=True,
+                planning_max_iterations=None,
+            ):
                 self.phase = "CALL_OPEN"
+            elif self._last_navigation_blocked and self._can_open_from_safe_approach(pose):
+                manager.controller.stop(reason="door_wait_point_blocked_safe_open")
+                if self._wait_navigation_failure != "safe_open":
+                    self._wait_navigation_failure = "safe_open"
+                    if rospy is not None:
+                        rospy.logwarn(
+                            "[%s] 等待点不可达，但机器人已在等待侧安全接近范围内；原地开门后继续既有过门流程",
+                            self.name,
+                        )
+                self.phase = "CALL_OPEN"
+            elif self._last_navigation_blocked:
+                return self._handle_wait_navigation_blocked(manager)
             return RUNNING
 
         if self.phase == "CALL_OPEN":
@@ -271,6 +292,7 @@ class OpenDoorAndPass(NavigationTask):
         target_xy: tuple[float, float],
         *,
         allow_direct_fallback: bool = False,
+        planning_max_iterations: int | None = DEFAULT_MAX_ITERATIONS,
     ) -> bool:
         self._last_navigation_blocked = False
         self._last_navigation_stuck = False
@@ -280,7 +302,12 @@ class OpenDoorAndPass(NavigationTask):
 
         if not manager.controller.has_path():
             grid = manager.mapper.floor(manager.current_floor)
-            result = astar_plan(grid, (pose[0], pose[1]), target_xy)
+            result = astar_plan(
+                grid,
+                (pose[0], pose[1]),
+                target_xy,
+                max_iterations=planning_max_iterations,
+            )
             if result.reached:
                 manager.controller.set_path(result.path)
             elif result.unreachable:
@@ -300,6 +327,53 @@ class OpenDoorAndPass(NavigationTask):
             else:
                 manager.controller.recover()
         return status == DONE
+
+    def _can_open_from_safe_approach(
+        self,
+        pose: tuple[float, float, float],
+    ) -> bool:
+        """等待点被栅格隔离时，允许在同侧且足够近的位置原地开门。"""
+        if self._wait_point is None or self._pass_point is None:
+            return False
+        center_x = 0.5 * (self._wait_point[0] + self._pass_point[0])
+        center_y = 0.5 * (self._wait_point[1] + self._pass_point[1])
+        wait_x = self._wait_point[0] - center_x
+        wait_y = self._wait_point[1] - center_y
+        wait_norm = math.hypot(wait_x, wait_y)
+        if wait_norm <= 1e-6:
+            return False
+        signed_wait_side = (
+            (pose[0] - center_x) * wait_x
+            + (pose[1] - center_y) * wait_y
+        ) / wait_norm
+        # 仅“位于同侧且离门不远”仍可能从门侧面斜穿墙体。安全开门点还须
+        # 靠近门法向轴；该轴完全来自运行期传感器注册的 wait/pass 点。
+        lateral_offset = abs(
+            (pose[0] - center_x) * (-wait_y / wait_norm)
+            + (pose[1] - center_y) * (wait_x / wait_norm)
+        )
+        lateral_limit = max(0.25, self.pass_offset)
+        distance_to_center = math.hypot(pose[0] - center_x, pose[1] - center_y)
+        safe_approach_limit = max(
+            self.commit_distance + self.pass_offset,
+            2.0 * self.pass_offset,
+        )
+        return (
+            signed_wait_side >= self.pass_offset
+            and lateral_offset <= lateral_limit
+            and distance_to_center <= safe_approach_limit
+        )
+
+    def _handle_wait_navigation_blocked(self, manager: MissionManager) -> str:
+        """等待短暂地图更新，但不允许不可达等待点形成永久零速。"""
+        manager.controller.stop(reason="door_wait_point_blocked")
+        now = get_time()
+        if self._wait_navigation_blocked_since is None:
+            self._wait_navigation_blocked_since = now
+            return RUNNING
+        if now - self._wait_navigation_blocked_since < self._wait_navigation_timeout:
+            return RUNNING
+        return self._fail_crossing(manager, "开门等待点持续不可达")
 
     def _handle_pass_blocked(self, manager: MissionManager) -> str:
         manager.controller.stop(reason="door_pass_blocked")
@@ -404,7 +478,12 @@ def _clear_opened_door_area(manager: MissionManager, door_id: str) -> None:
 
 class TakeElevator(NavigationTask):
     _CABIN_TRANSIT_ALIGN_TOLERANCE = 0.10
+    _CABIN_TRANSIT_ALIGN_RELEASE_TOLERANCE = 0.15
     _CABIN_TRANSIT_ALIGN_CONFIRMATIONS = 2
+    # POSITION/ALIGN 翻转次数上限：栅格量化终点与精确 cabin center 的完成语义
+    # 不一致时会出现每 tick 翻转的零速死循环；acceptance 已对齐二者，这里仅作
+    # 安全网，避免今后其他语义退化再次形成永久振荡。
+    _CABIN_TRANSIT_POSITION_ALIGN_FLIP_LIMIT = 4
     _EXIT_BACKOFF_DISTANCE = 0.35
     _EXIT_BACKOFF_ALIGN_TOLERANCE = 0.12
     _EXIT_BACKOFF_ALIGN_TIMEOUT = 4.0
@@ -422,14 +501,21 @@ class TakeElevator(NavigationTask):
         self.cabin_transit_stage: str | None = None
         self._cabin_transit_mode: str | None = None
         self._cabin_transit_alignment_count = 0
+        self._cabin_transit_position_align_flips = 0
         self._cabin_transit_start_xy: tuple[float, float] | None = None
         self._cabin_transit_target_xy: tuple[float, float] | None = None
+        self._cabin_transit_door_clear_refreshed = False
         self._exit_backoff_target_xy: tuple[float, float] | None = None
         self._exit_backoff_start_xy: tuple[float, float] | None = None
         self._exit_backoff_direction: tuple[float, float] | None = None
         self._exit_backoff_exit_yaw: float | None = None
         self._exit_backoff_phase_start = 0.0
         self._exit_backoff_deadline = 0.0
+        self._door_confirmation_started: set[str] = set()
+        self._door_open_confirmed: set[str] = set()
+        self._exit_alignment_count = 0
+        self._floor_transition_started = False
+        self._floor_transition_confirmed = False
 
     def tick(self, manager: MissionManager, pose: tuple[float, float, float]) -> str:
         client = manager.building_client
@@ -449,6 +535,16 @@ class TakeElevator(NavigationTask):
 
         if self.phase == "GO_TO_ELEVATOR_DOOR":
             if self._navigate_to(manager, pose, current_wait):
+                self._exit_alignment_count = 0
+                self.phase = "ALIGN_TO_CURRENT_DOOR"
+            return RUNNING
+
+        if self.phase == "ALIGN_TO_CURRENT_DOOR":
+            # 等待点只约束位置，A* 到达时的机身朝向可能让前向 RGB-D
+            # 完全看不到门板。先朝传感器注册得到的轿厢中心对准，既为
+            # 开门前后视觉确认保留同一视角，也避免侧着开始 ENTER。
+            if self._tick_target_door_alignment(manager, pose, cabin_center):
+                self._exit_alignment_count = 0
                 self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
             return RUNNING
 
@@ -461,20 +557,46 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         if self.phase == "OPEN_CURRENT_FLOOR_DOOR":
+            preparation_pending = getattr(
+                manager, "elevator_visual_preparation_pending", None
+            )
+            if callable(preparation_pending) and preparation_pending(current_door_id):
+                manager.controller.stop()
+                return RUNNING
+            self._begin_door_open_confirmation(manager, current_door_id)
             status = self._run_service(manager, lambda: client.open_door(current_door_id))
             if status == FAILED:
+                self._finish_door_open_confirmation(manager, current_door_id)
                 return FAILED
             if status == DONE:
-                _clear_opened_door_area(manager, current_door_id)
                 self.phase = "WAIT_CURRENT_DOOR_OPEN"
                 self._wait_start_time = get_time()
             return RUNNING
 
         if self.phase == "WAIT_CURRENT_DOOR_OPEN":
             manager.controller.stop()
+            if not self._door_opening_is_confirmed(
+                manager,
+                current_door_id,
+                pose,
+            ):
+                if get_time() - self._wait_start_time > float(
+                    getattr(manager, "elevator_opening_confirmation_timeout", 8.0)
+                ):
+                    self._finish_door_open_confirmation(manager, current_door_id)
+                    if rospy is not None:
+                        rospy.logerr(
+                            "[%s] 当前层电梯门服务完成，但局部传感器未确认注册位置开口",
+                            self.name,
+                        )
+                    return FAILED
+                return RUNNING
             grid = manager.mapper.floor(manager.current_floor)
-            cabin_result = astar_plan(grid, (pose[0], pose[1]), cabin_center)
-            if cabin_result.reached and not _segment_crosses_blocked_cell(
+            # 门已由局部传感器确认打开后，轿厢内部仍可能因尚未进入而保持
+            # UNKNOWN。普通 A* 只接受 FREE/VISITED，会形成“先进入才能建图、
+            # 先建图才能进入”的循环。主动跨越阶段仍会重新检查实际起点到
+            # 目标间的 OCC/BLACK，并保留局部正障碍制动。
+            if not _segment_crosses_blocked_cell(
                 grid,
                 current_wait,
                 cabin_center,
@@ -484,7 +606,6 @@ class TakeElevator(NavigationTask):
             elif get_time() - self._wait_start_time > 10.0:
                 if rospy is not None:
                     rospy.logwarn("[%s] 等待当前楼层电梯门可通行超时，继续等待地图连通", self.name)
-                _clear_opened_door_area(manager, current_door_id)
                 self._wait_start_time = get_time()
             return RUNNING
 
@@ -495,6 +616,7 @@ class TakeElevator(NavigationTask):
                 mode="enter",
                 position_xy=current_wait,
                 target_xy=cabin_center,
+                door_id=current_door_id,
             )
             if status == DONE:
                 self._reset_cabin_transit()
@@ -518,11 +640,33 @@ class TakeElevator(NavigationTask):
             status = self._run_service(manager, lambda: client.close_door(current_door_id))
             if status == FAILED:
                 return FAILED
-            if status == DONE:
+            aligned = self._tick_target_door_alignment(manager, pose, target_wait)
+            if status == DONE and aligned:
+                self.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
+            elif status == DONE:
+                self.phase = "ALIGN_TO_TARGET_DOOR"
+            return RUNNING
+
+        if self.phase == "ALIGN_TO_TARGET_DOOR":
+            if self._tick_target_door_alignment(manager, pose, target_wait):
                 self.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
             return RUNNING
 
         if self.phase == "CALL_ELEVATOR_TO_TARGET_FLOOR":
+            if not self._floor_transition_started:
+                begin_transition = getattr(manager, "begin_floor_transition", None)
+                if callable(begin_transition):
+                    try:
+                        begin_transition(
+                            source_floor=self.current_floor,
+                            target_floor=self.target_floor,
+                            phase=self.phase,
+                        )
+                    except (RuntimeError, ValueError) as exc:
+                        if rospy is not None:
+                            rospy.logerr("[%s] 无法锁存楼层过渡：%s", self.name, exc)
+                        return FAILED
+                self._floor_transition_started = True
             status = self._run_service(manager, lambda: client.call_elevator(self.elevator_id, self.target_floor, False))
             if status == FAILED:
                 return FAILED
@@ -532,40 +676,93 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         if self.phase == "WAIT_FOR_ODOM_STABLE":
-            # 电梯到目标楼层后定位跳变：等待稳定后再继续
+            # 合规平面定位的 z 是楼层局部高度，不能用固定等待冒充换层确认。
+            # 这里只给服务动作和新传感器帧留出稳定时间，逻辑楼层在目标门
+            # 被传感器确认后才更新。
             manager.controller.stop()
             if get_time() - self._wait_start_time > 2.0:
                 self.phase = "OPEN_TARGET_FLOOR_DOOR"
-                # 更新当前楼层
-                manager.current_floor = self.target_floor
-                manager.floor_start_time = get_time()
             return RUNNING
 
         if self.phase == "OPEN_TARGET_FLOOR_DOOR":
+            self._begin_door_open_confirmation(manager, target_door_id)
             status = self._run_service(manager, lambda: client.open_door(target_door_id))
             if status == FAILED:
+                self._finish_door_open_confirmation(manager, target_door_id)
                 return FAILED
             if status == DONE:
-                _clear_opened_door_area(manager, target_door_id)
                 self.phase = "WAIT_TARGET_DOOR_OPEN"
                 self._wait_start_time = get_time()
             return RUNNING
 
         if self.phase == "WAIT_TARGET_DOOR_OPEN":
             manager.controller.stop()
+            if not self._door_opening_is_confirmed(
+                manager,
+                target_door_id,
+                pose,
+            ):
+                if get_time() - self._wait_start_time > float(
+                    getattr(manager, "elevator_opening_confirmation_timeout", 8.0)
+                ):
+                    self._finish_door_open_confirmation(manager, target_door_id)
+                    if rospy is not None:
+                        rospy.logerr(
+                            "[%s] 目标层电梯门服务完成，但局部传感器未确认注册位置开口",
+                            self.name,
+                        )
+                    return FAILED
+                return RUNNING
+            if not self._floor_transition_confirmed:
+                confirm_transition = getattr(manager, "confirm_floor_transition", None)
+                if callable(confirm_transition):
+                    try:
+                        confirm_transition(self.target_floor)
+                    except (RuntimeError, ValueError) as exc:
+                        if rospy is not None:
+                            rospy.logerr("[%s] 目标门已确认但楼层过渡无效：%s", self.name, exc)
+                        return FAILED
+                else:
+                    manager.current_floor = self.target_floor
+                    manager.floor_start_time = get_time()
+                self._floor_transition_confirmed = True
             grid = manager.mapper.floor(manager.target_floor if hasattr(manager, 'target_floor') and manager.target_floor is not None else self.target_floor)
-            wait_result = astar_plan(grid, (pose[0], pose[1]), target_wait)
-            if wait_result.reached and not _segment_crosses_blocked_cell(
+            straight_segment_blocked = _segment_crosses_blocked_cell(
                 grid,
                 cabin_center,
                 target_wait,
-            ):
+            )
+            if not straight_segment_blocked:
                 self._reset_cabin_transit()
                 self.phase = "EXIT_CABIN"
-            elif get_time() - self._wait_start_time > 10.0:
+            else:
+                start_cell = grid.world_to_grid(pose[0], pose[1])
+                goal_cell = grid.world_to_grid(target_wait[0], target_wait[1])
+                start_value = (
+                    int(grid.data[start_cell[1], start_cell[0]])
+                    if start_cell is not None
+                    else None
+                )
+                goal_value = (
+                    int(grid.data[goal_cell[1], goal_cell[0]])
+                    if goal_cell is not None
+                    else None
+                )
+                if rospy is not None:
+                    rospy.logwarn_throttle(
+                        2.0,
+                        "[%s] 目标层出厢门控未放行：straight_blocked=%s "
+                        "start_cell=%s start_value=%s goal_cell=%s goal_value=%s",
+                        self.name,
+                        straight_segment_blocked,
+                        start_cell,
+                        start_value,
+                        goal_cell,
+                        goal_value,
+                    )
+            if self.phase == "WAIT_TARGET_DOOR_OPEN" and get_time() - self._wait_start_time > 10.0:
                 if rospy is not None:
                     rospy.logwarn("[%s] 等待目标楼层电梯门可通行超时，继续等待地图连通", self.name)
-                _clear_opened_door_area(manager, target_door_id)
                 self._wait_start_time = get_time()
             return RUNNING
 
@@ -581,6 +778,7 @@ class TakeElevator(NavigationTask):
                 mode="exit",
                 position_xy=cabin_center,
                 target_xy=target_wait,
+                door_id=target_door_id,
                 max_linear=exit_linear_cap,
             )
             if status == DONE:
@@ -632,6 +830,63 @@ class TakeElevator(NavigationTask):
 
         return DONE
 
+    def _begin_door_open_confirmation(self, manager: MissionManager, door_id: str) -> None:
+        if door_id in self._door_confirmation_started:
+            return
+        self._door_confirmation_started.add(door_id)
+        begin = getattr(manager, "begin_elevator_door_open_confirmation", None)
+        if callable(begin):
+            begin(door_id)
+
+    def _door_opening_is_confirmed(
+        self,
+        manager: MissionManager,
+        door_id: str,
+        pose: tuple[float, float, float],
+    ) -> bool:
+        if door_id in self._door_open_confirmed:
+            return True
+        confirm = getattr(manager, "confirm_elevator_door_open", None)
+        if callable(confirm) and not bool(confirm(door_id, pose)):
+            return False
+        self._door_open_confirmed.add(door_id)
+        _clear_opened_door_area(manager, door_id)
+        self._finish_door_open_confirmation(manager, door_id)
+        return True
+
+    @staticmethod
+    def _finish_door_open_confirmation(manager: MissionManager, door_id: str) -> None:
+        finish = getattr(manager, "finish_elevator_door_open_confirmation", None)
+        if callable(finish):
+            finish(door_id)
+
+    def _tick_target_door_alignment(
+        self,
+        manager: MissionManager,
+        pose: tuple[float, float, float],
+        target_wait: tuple[float, float],
+    ) -> bool:
+        """机器人完整入厢后，利用关门等待时间原地朝向出口。"""
+        target_yaw = math.atan2(target_wait[1] - pose[1], target_wait[0] - pose[0])
+        yaw_error = _angle_wrap(target_yaw - pose[2])
+        if abs(yaw_error) > self._CABIN_TRANSIT_ALIGN_TOLERANCE:
+            self._exit_alignment_count = 0
+            proportional_speed = abs(1.7 * yaw_error)
+            minimum_speed = abs(
+                float(getattr(manager.controller, "recover_angular_speed", 0.0))
+            )
+            angular_limit = abs(float(getattr(manager.controller, "max_angular", 0.0)))
+            angular_speed = min(
+                angular_limit,
+                max(proportional_speed, minimum_speed),
+            )
+            manager.controller.rotate_in_place(math.copysign(angular_speed, yaw_error))
+            return False
+
+        manager.controller.stop(reason="elevator_target_door_alignment_hold")
+        self._exit_alignment_count += 1
+        return self._exit_alignment_count >= self._CABIN_TRANSIT_ALIGN_CONFIRMATIONS
+
     def _tick_cabin_transit(
         self,
         manager: MissionManager,
@@ -640,12 +895,21 @@ class TakeElevator(NavigationTask):
         mode: str,
         position_xy: tuple[float, float],
         target_xy: tuple[float, float],
+        door_id: str,
         max_linear: float | None = None,
     ) -> str:
         if self._cabin_transit_mode != mode or self.cabin_transit_stage is None:
             self._begin_cabin_transit(mode, position_xy, target_xy)
 
         position_tolerance = self._cabin_transit_position_tolerance(manager)
+        # PathFollower 以 A* 栅格量化终点判断 POSITION 到达，该终点与精确 cabin center
+        # 最多相差半格对角线 0.5*sqrt(2)*resolution。ALIGN 的漂移检查却以精确 cabin center
+        # 为准，若二者容差相同，会在临界距离上形成“POSITION 认为到达->ALIGN 认为漂移
+        # ->回 POSITION”的零速死循环。修复方式是非对称：POSITION 保持严格
+        # position_tolerance（保证 snapped 到达时精确距离 <= position_tolerance + 半格对角线），
+        # ALIGN 的漂移检查放宽到把栅格量化误差计入的 position_acceptance。CROSS 的完整
+        # 通过判定仍保留严格 position_tolerance。
+        position_acceptance = self._cabin_transit_position_acceptance(manager)
 
         if self.cabin_transit_stage == "POSITION":
             status = self._navigate_to_with_status(
@@ -668,7 +932,20 @@ class TakeElevator(NavigationTask):
 
         if self.cabin_transit_stage == "ALIGN":
             position_error = math.hypot(position_xy[0] - pose[0], position_xy[1] - pose[1])
-            if position_error > position_tolerance:
+            if position_error > position_acceptance:
+                self._cabin_transit_position_align_flips += 1
+                if self._cabin_transit_position_align_flips > self._CABIN_TRANSIT_POSITION_ALIGN_FLIP_LIMIT:
+                    manager.controller.stop(reason="elevator_transit_position_align_oscillation")
+                    if rospy is not None:
+                        rospy.logerr(
+                            "[%s] 电梯轿厢 POSITION/ALIGN 反复翻转超过上限，判定为确定性失败："
+                            "mode=%s position_error=%.3f acceptance=%.3f",
+                            self.name,
+                            self._cabin_transit_mode,
+                            position_error,
+                            position_acceptance,
+                        )
+                    return STUCK
                 manager.controller.clear_path(reason="elevator_transit_position_drift")
                 self.cabin_transit_stage = "POSITION"
                 self._cabin_transit_alignment_count = 0
@@ -688,7 +965,12 @@ class TakeElevator(NavigationTask):
 
             target_yaw = math.atan2(target_dy, target_dx)
             yaw_error = _angle_wrap(target_yaw - pose[2])
-            if abs(yaw_error) > self._CABIN_TRANSIT_ALIGN_TOLERANCE:
+            alignment_limit = self._CABIN_TRANSIT_ALIGN_TOLERANCE
+            if self._cabin_transit_alignment_count > 0:
+                # A1 停止纯转向后仍会有少量余转。首次进入必须满足严格阈值，
+                # 确认期间用窄迟滞避免在最小可执行转速两侧反复振荡。
+                alignment_limit = self._CABIN_TRANSIT_ALIGN_RELEASE_TOLERANCE
+            if abs(yaw_error) > alignment_limit:
                 self._cabin_transit_alignment_count = 0
                 proportional_speed = abs(1.7 * yaw_error)
                 minimum_speed = abs(
@@ -709,6 +991,12 @@ class TakeElevator(NavigationTask):
             if self._cabin_transit_alignment_count < self._CABIN_TRANSIT_ALIGN_CONFIRMATIONS:
                 return RUNNING
 
+            # 开门确认与完成对准之间仍会处理新点云，动态门板或门槛的膨胀
+            # OCC 可能被重新写回。提交直线路径前只刷新一次既有门区清理；
+            # clear_dynamic_door_strip 不会清除 BLACK，后面的正障碍检查仍保留。
+            if not self._cabin_transit_door_clear_refreshed:
+                _clear_opened_door_area(manager, door_id)
+                self._cabin_transit_door_clear_refreshed = True
             grid = manager.mapper.floor(manager.current_floor)
             commit_start = (pose[0], pose[1])
             if _segment_crosses_blocked_cell(grid, commit_start, target_xy):
@@ -725,6 +1013,7 @@ class TakeElevator(NavigationTask):
             self._cabin_transit_target_xy = target_xy
             manager.controller.set_path([commit_start, target_xy])
             self.cabin_transit_stage = "CROSS"
+            self._cabin_transit_position_align_flips = 0
             self._log_cabin_transit_stage(
                 "CROSS",
                 pose,
@@ -796,8 +1085,10 @@ class TakeElevator(NavigationTask):
         self._cabin_transit_mode = mode
         self.cabin_transit_stage = "POSITION"
         self._cabin_transit_alignment_count = 0
+        self._cabin_transit_position_align_flips = 0
         self._cabin_transit_start_xy = None
         self._cabin_transit_target_xy = target_xy
+        self._cabin_transit_door_clear_refreshed = False
         self._log_cabin_transit_stage(
             "POSITION",
             None,
@@ -809,8 +1100,10 @@ class TakeElevator(NavigationTask):
         self.cabin_transit_stage = None
         self._cabin_transit_mode = None
         self._cabin_transit_alignment_count = 0
+        self._cabin_transit_position_align_flips = 0
         self._cabin_transit_start_xy = None
         self._cabin_transit_target_xy = None
+        self._cabin_transit_door_clear_refreshed = False
 
     @staticmethod
     def _cabin_transit_position_tolerance(manager: MissionManager) -> float:
@@ -821,6 +1114,22 @@ class TakeElevator(NavigationTask):
         if not math.isfinite(corner_tolerance) or corner_tolerance <= 0.0:
             corner_tolerance = goal_tolerance
         return min(goal_tolerance, corner_tolerance)
+
+    @staticmethod
+    def _cabin_transit_position_acceptance(manager: MissionManager) -> float:
+        """ALIGN 漂移检查用的接受半径。
+
+        PathFollower 以 A* 栅格量化终点判断 POSITION 到达，该终点与精确 cabin center
+        最多相差半格对角线 0.5*sqrt(2)*resolution。POSITION 仍用严格 position_tolerance，
+        因此“snapped 到达”时精确距离必 <= position_tolerance + 半格对角线；ALIGN 的漂移
+        检查改用本接受半径，保证不会把已到达的机器人退回 POSITION。
+        """
+        position_tolerance = TakeElevator._cabin_transit_position_tolerance(manager)
+        grid = manager.mapper.floor(manager.current_floor)
+        resolution = max(1e-6, float(getattr(grid, "resolution", 0.1)))
+        grid_snap_radius = 0.5 * math.sqrt(2.0) * resolution
+        goal_tolerance = max(1e-3, float(manager.controller.goal_tolerance))
+        return min(goal_tolerance, position_tolerance + grid_snap_radius)
 
     @staticmethod
     def _cabin_transit_complete(

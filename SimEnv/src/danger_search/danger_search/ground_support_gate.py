@@ -82,8 +82,8 @@ class GroundSupportGateConfig:
     stop_distance_table: tuple[tuple[float, float], ...] = (
         (0.60, 0.09337727739487302),
         (0.651, 0.10195826367975175),
-        (0.80, 0.13),
     )
+    speed_out_of_envelope_confirmations: int = 2
     drop_evidence_max_age: float = 0.05
     decision_period: float = 0.10
     rl_receive_delay: float = 0.009
@@ -136,6 +136,11 @@ class GroundSupportSafetyGate:
         self._last_odom_stamp: float | None = None
         self._actual_linear_speed = 0.0
         self._actual_angular_speed = 0.0
+        self._speed_out_of_envelope_sample_count = 0
+        self._speed_out_of_envelope_confirmed = False
+        self._speed_out_of_envelope_trigger_source: str | None = None
+        self._speed_out_of_envelope_trigger_requested_speed: float | None = None
+        self._speed_out_of_envelope_trigger_actual_speed: float | None = None
         self._stopped_sample_count = 0
         self._last_requested_speed = 0.0
         self._temporary_hold_command: tuple[float, float, float] | None = None
@@ -212,10 +217,42 @@ class GroundSupportSafetyGate:
         if is_fresh:
             self._last_odom_stamp = float(stamp)
             self._note_control_progress(float(stamp), wall_time)
+            actual_out_of_envelope = (
+                self.envelope.distance_for(self._actual_linear_speed) is None
+            )
+            if actual_out_of_envelope:
+                self._speed_out_of_envelope_sample_count += 1
+                if (
+                    self.state == SPEED_OUT_OF_ENVELOPE_STOPPING
+                    and self._speed_out_of_envelope_sample_count
+                    >= max(
+                        1,
+                        int(self.config.speed_out_of_envelope_confirmations),
+                    )
+                ):
+                    self._speed_out_of_envelope_confirmed = True
+            else:
+                self._speed_out_of_envelope_sample_count = 0
+                if (
+                    self.state == SPEED_OUT_OF_ENVELOPE_STOPPING
+                    and not self._speed_out_of_envelope_confirmed
+                ):
+                    # 位姿差分速度可能因单帧定位校正产生尖峰。首帧仍立即零速，
+                    # 但只有连续新 odom 超界才升级为不可恢复的安全失败。
+                    self._leave_speed_out_of_envelope_hold(
+                        wall_time,
+                        control_time=float(stamp),
+                    )
+                    return
         if self.state not in _STOPPING_STATES:
             self._stopped_sample_count = 0
             return
         if not is_fresh:
+            return
+        if (
+            self.state == SPEED_OUT_OF_ENVELOPE_STOPPING
+            and not self._speed_out_of_envelope_confirmed
+        ):
             return
         stopped = (
             self._actual_linear_speed <= self.config.stop_linear_threshold
@@ -303,18 +340,34 @@ class GroundSupportSafetyGate:
 
         requested_speed = math.hypot(requested[0], requested[1])
         self._last_requested_speed = requested_speed
+        requested_stop_distance = self.envelope.distance_for(requested_speed)
+        actual_stop_distance = self.envelope.distance_for(self._actual_linear_speed)
+        if requested_stop_distance is None:
+            self._begin_speed_out_of_envelope_stop(
+                wall_time,
+                control_now,
+                source="requested_command",
+                confirmed=True,
+            )
+            return (0.0, 0.0, 0.0)
+        if actual_stop_distance is None:
+            self._begin_speed_out_of_envelope_stop(
+                wall_time,
+                control_now,
+                source="localization_odometry",
+                confirmed=(
+                    self._speed_out_of_envelope_sample_count
+                    >= max(
+                        1,
+                        int(self.config.speed_out_of_envelope_confirmations),
+                    )
+                ),
+            )
+            return (0.0, 0.0, 0.0)
+
         effective_speed = max(requested_speed, self._actual_linear_speed)
         stop_distance = self.envelope.distance_for(effective_speed)
         self.last_stop_distance = stop_distance
-        if stop_distance is None:
-            self.speed_out_of_envelope_count += 1
-            self._enter_state(
-                SPEED_OUT_OF_ENVELOPE_STOPPING,
-                "support_speed_out_of_envelope",
-                wall_time,
-                control_time=control_now,
-            )
-            return (0.0, 0.0, 0.0)
 
         if self.state in _TEMPORARY_HOLDS:
             hold_command = self._temporary_hold_command or requested
@@ -464,6 +517,21 @@ class GroundSupportSafetyGate:
             "observation_hold_count": self.observation_hold_count,
             "stale_data_hold_count": self.stale_data_hold_count,
             "speed_out_of_envelope_count": self.speed_out_of_envelope_count,
+            "speed_out_of_envelope_sample_count": (
+                self._speed_out_of_envelope_sample_count
+            ),
+            "speed_out_of_envelope_confirmed": (
+                self._speed_out_of_envelope_confirmed
+            ),
+            "speed_out_of_envelope_trigger_source": (
+                self._speed_out_of_envelope_trigger_source
+            ),
+            "speed_out_of_envelope_trigger_requested_speed": (
+                self._speed_out_of_envelope_trigger_requested_speed
+            ),
+            "speed_out_of_envelope_trigger_actual_speed": (
+                self._speed_out_of_envelope_trigger_actual_speed
+            ),
             "automatic_resume_count": self.automatic_resume_count,
             "total_hold_time": self.total_hold_time,
             "state_enter_control_time": self._state_enter_control_time,
@@ -628,6 +696,48 @@ class GroundSupportSafetyGate:
             wall_time,
             control_time=control_time,
         )
+
+    def _begin_speed_out_of_envelope_stop(
+        self,
+        wall_time: float,
+        control_time: float,
+        *,
+        source: str,
+        confirmed: bool,
+    ) -> None:
+        self.speed_out_of_envelope_count += 1
+        self._speed_out_of_envelope_confirmed = bool(confirmed)
+        self._speed_out_of_envelope_trigger_source = str(source)
+        self._speed_out_of_envelope_trigger_requested_speed = self._last_requested_speed
+        self._speed_out_of_envelope_trigger_actual_speed = self._actual_linear_speed
+        self.last_stop_distance = None
+        self._enter_state(
+            SPEED_OUT_OF_ENVELOPE_STOPPING,
+            "support_speed_out_of_envelope",
+            wall_time,
+            control_time=control_time,
+        )
+
+    def _leave_speed_out_of_envelope_hold(
+        self,
+        wall_time: float,
+        *,
+        control_time: float,
+    ) -> None:
+        if self._state_enter_control_time is not None:
+            self.total_hold_time += max(
+                0.0,
+                float(control_time) - self._state_enter_control_time,
+            )
+        elif self._state_enter_wall_time is not None:
+            self.total_hold_time += max(0.0, wall_time - self._state_enter_wall_time)
+        self.automatic_resume_count += 1
+        self.state = CLEAR
+        self.reason_code = None
+        self._state_enter_wall_time = None
+        self._state_enter_control_time = None
+        self._stopped_sample_count = 0
+        self._speed_out_of_envelope_confirmed = False
 
     def _enter_state(
         self,

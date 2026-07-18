@@ -11,8 +11,11 @@ find_package(catkin REQUIRED COMPONENTS
 )
 find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common filters kdtree registration)
+# Ubuntu 20.04 的 FindEigen3 模块导出 EIGEN3_INCLUDE_DIRS，而 catkin_package
+# 按依赖名检查 Eigen3_INCLUDE_DIRS；显式桥接后才能正确导出公共头文件依赖。
+set(Eigen3_INCLUDE_DIRS ${EIGEN3_INCLUDE_DIRS})
 
-# KISS-ICP v0.3.0 的核心库；不编译其 ROS wrapper，避免任何 TF 订阅。
+# KISS-ICP 固定提交 460c6f2（v0.2.9-42-g460c6f2）；不编译其 ROS wrapper。
 set(USE_SYSTEM_EIGEN3 OFF CACHE BOOL "" FORCE)
 set(USE_SYSTEM_SOPHUS OFF CACHE BOOL "" FORCE)
 set(USE_SYSTEM_TBB ON CACHE BOOL "" FORCE)
@@ -22,7 +25,7 @@ add_subdirectory(third_party/kiss_icp/cpp/kiss_icp ${CMAKE_CURRENT_BINARY_DIR}/k
 
 catkin_package(
   CATKIN_DEPENDS geometry_msgs nav_msgs roslib roscpp sensor_msgs std_msgs
-  DEPENDS PCL
+  DEPENDS Eigen3 PCL
   INCLUDE_DIRS include
 )
 
@@ -52,6 +55,14 @@ if(CATKIN_ENABLE_TESTING)
     ${EIGEN3_INCLUDE_DIRS}
   )
   target_link_libraries(test_velocity_transform ${catkin_LIBRARIES} gtest_main)
+
+  catkin_add_gtest(test_ros_time_window test/test_ros_time_window.cpp)
+  target_compile_features(test_ros_time_window PRIVATE cxx_std_17)
+  target_include_directories(test_ros_time_window PRIVATE
+    include
+    ${catkin_INCLUDE_DIRS}
+  )
+  target_link_libraries(test_ros_time_window ${catkin_LIBRARIES} gtest_main)
 
   catkin_add_gtest(test_point_range_filter test/test_point_range_filter.cpp)
   target_compile_features(test_point_range_filter PRIVATE cxx_std_17)

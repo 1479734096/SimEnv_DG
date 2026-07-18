@@ -26,13 +26,9 @@ source ./devel/setup.bash
 roslaunch danger_search danger_search.launch
 ```
 
-如果只调试单层闭环，保持默认 `max_floor=1`。需要启用多楼层电梯流程时：
-
-```bash
-roslaunch danger_search danger_search.launch max_floor:=3
-```
-
-上述命令沿用默认单层时限。三层完整闭环回归应通过 `run_seed.py` 合并专用时间预算覆盖：
+正式算法的楼层集合直接来自公开 `team_scene_info.json` 的 `served_floors`，
+不会读取 launch 参数或固定配置猜测楼层数，也不会通过无效电梯请求探测楼层。
+三层完整闭环回归可通过 `run_seed.py` 生成对应楼层环境，并合并专用时间预算覆盖：
 
 ```bash
 python3 src/danger_search/tools/run_seed.py --seed 42 \
@@ -55,7 +51,7 @@ roslaunch danger_search danger_search_smoke.launch
 - 检测结果使用多帧确认后才输出，优先降低虚警率。
 - 楼层结束需要同时满足最小探索时间、最大离家距离、最小已知面积、覆盖率和连续无可达前沿确认次数；不会再因为 `len(frontiers) <= 1` 直接结束，避免启动后小已知区域 coverage 虚高导致没搜走廊/房间就返航。
 - 楼层探索至少持续 `mission/min_floor_explore_time`，最大离家距离至少达到 `mission/min_floor_travel_distance`，已知面积至少达到 `mission/min_known_area`；`mission/no_reachable_frontier_confirmations` 控制无可达前沿需连续确认的次数，`mission/min_corridor_progress_distance` 可选限制走廊主方向已知范围。
-- `mission/floor_timeout` 作为非最后一层的探索配额，为后续换层保留时间；默认启用 `mission/last_floor_uses_global_budget`，最后一层仍有可达前沿或地图收益时继续探索，并由预计返航时间、`mission/return_safety_buffer` 与 `mission/max_runtime` 共同决定预算退出。关闭该开关可恢复所有楼层到达配额即结束的旧语义。
+- `mission/runtime_by_floor` 按公开 `served_floors` 数量选择总预算：单层 300 秒、两层 620 秒、三层 840 秒；专项测试仍可用更短的 `mission/max_runtime` 覆盖。`mission/floor_timeout` 作为非最后一层的探索配额，为后续换层保留时间；默认启用 `mission/last_floor_uses_global_budget`，最后一层仍有可达前沿或地图收益时继续探索，并由预计返航时间、`mission/return_safety_buffer` 与总预算共同决定预算退出。关闭该开关可恢复所有楼层到达配额即结束的旧语义。
 - 无前沿且无远处 FREE 目标时，会从机器人当前位置按 `mission/probe_distance` 做短距离探测前进，再重新建图；默认 `mission/probe_yaw=1.5708`，沿比赛入口到房间的全局 +Y 方向探测，避免起立后的机体 yaw 抖动把探测方向带反。探测段如果穿过已知障碍或黑名单栅格，会跳过该目标。
 - Frontier 选择带短期惯性：当前区域仍可达时，新目标分数需要高出 `frontier/switch_score_margin` 才会切换；日志会记录每次选择的分数、距离、门侧、fallback 和切换原因。
 - 过门后除了短时间抑制回头，还会在门后推进距离和门后侧已知面积达到 `mission/post_door_min_distance`、`mission/post_door_min_known_area` 前持续优先门后侧目标，减少刚进门又回头；临时和永久禁区都只在门口有限半径内完全跳过，远处仅按距离衰减降分，避免用无限半平面把整片可达区域永久屏蔽。
@@ -69,6 +65,7 @@ roslaunch danger_search danger_search_smoke.launch
 - 默认使用 `/real_sense/rgb/image_raw` 和 `/real_sense/depth/image_raw` 做红球识别。
 - Mapper 只维护 free / occupied / unknown 占据栅格，不编码门、电梯或房间入口语义；普通点云射线不会擦除已知静态障碍。
 - 动态门只能由局部传感器发现后才允许建立空间目标；`team_scene_info.json` 仅提供公开 ID，不提供门宽、朝向或坐标，运行时绝不读取 `layout_metadata.json`。
+- 多楼层模式会用 RealSense RGB 中的大面积深色区域提出门板候选，再以同步深度验证竖直平面、物理尺寸和连续性；关闭门识别完整门板，打开门识别左右滑门板及中间更深开口。公开信息若声明当前层电梯门初始打开，启动后只异步关闭该门一次以建立可见地标，机器人继续探索且不会等待或循环发服务；进入主入口并建立足够安全已知区后只做一次全向视觉扫描，发现门板即提前结束。颜色不能单独确认门，电梯门在 `/set_door_state` 完成后还必须由 RGB-D 变化或 Livox 开口确认，确认前不会清除门区地图障碍。会在长走廊产生歧义的 Livox-only 电梯注册默认关闭，Livox 只保留为开门后的交叉确认；相关开关为 `local_semantic/rgbd_door_detection_enabled` 和 `local_semantic/livox_elevator_registration_enabled`。
 - 房间入口不视为动态门，不调用 `/set_door_state`；普通探索依靠 Frontier 自然进入。
 - 电梯门不走普通开门逻辑，只在 `CHANGE_FLOOR` 状态下由 `TakeElevator` 状态机处理。
 - `local_semantic/use_truth_proximity_detector` 仅用于调试，默认关闭。

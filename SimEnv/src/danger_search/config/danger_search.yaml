@@ -21,6 +21,9 @@ localization:
   team_scene_info_path: generated_building/team_scene_info.json
   require_team_scene_info: true
   allow_relative_origin: false
+  # 当前合规 RGB-D/Livox 后端只估计平面运动；z 是当前楼层局部高度。
+  # MissionManager 仅用公开楼层 ID 将点云分层，不把该 z 冒充绝对楼层高度。
+  vertical_reference: floor_local
   base_to_camera_xyz: [0.28, 0.0, 0.043]
   base_to_camera_rpy: [0.0, 0.0, 0.0]
   # Livox 名义 10 Hz；短暂陈旧先停车，持续 3 秒无新定位则显式失败。
@@ -31,8 +34,9 @@ mission:
   startup_delay: 2.0
   # /nav/goal 不属于比赛公开接口，仅诊断工具可显式开启。
   manual_goal_enabled: false
-  max_runtime: 590.0
-  max_floor: 1
+  # 正式总预算按公开 served_floors 数量选择；专项配置可用更短 max_runtime。
+  max_runtime: 840.0
+  runtime_by_floor: [[1, 300.0], [2, 620.0], [3, 840.0]]
   floor_timeout: 180.0
   # 非最后一层仍以 floor_timeout 保护后续楼层；最后一层由全局返航预算收口。
   # 设为 false 可立即恢复“所有楼层到时即结束”的旧语义。
@@ -181,7 +185,8 @@ ground_support:
   stop_distance_table:
     - [0.60, 0.09337727739487302]
     - [0.651, 0.10195826367975175]
-    - [0.80, 0.13]
+  # 定位差分的单帧速度尖峰先立即停车；连续新 odom 超界才升级为任务失败。
+  speed_out_of_envelope_confirmations: 2
   # 正支撑只看左右足迹带；完整物理宽度仍专用于明确 DROP 检测。
   foot_band_center_offset: 0.14
   foot_band_half_width: 0.10
@@ -249,6 +254,40 @@ local_semantic:
   opening_max_width: 2.50
   opening_plane_depth: 0.30
   opening_min_side_height_span: 0.50
+  # 多楼层时用合法 RealSense RGB-D 补充发现动态门：深色只负责提出候选，
+  # 必须同时通过竖直深度平面、物理尺寸和连续帧约束。
+  rgbd_door_detection_enabled: true
+  # Livox-only 轿厢注册会把走廊凹槽误认为电梯，正式默认禁用；Livox 仍用于
+  # 开门服务后的局部开口确认。
+  livox_elevator_registration_enabled: false
+  # 实测仿真门板 V 约为 20，周围灰墙大量为 82/90；阈值过大会把整面墙
+  # 与门板合并，导致物理宽度校验反而拒绝真实门。
+  rgbd_dark_max_value: 50
+  rgbd_dark_max_saturation: 85
+  rgbd_minimum_pixel_area: 500
+  rgbd_minimum_depth: 0.40
+  rgbd_maximum_depth: 5.0
+  rgbd_minimum_depth_pixels: 250
+  rgbd_minimum_panel_width: 0.65
+  rgbd_maximum_panel_width: 2.20
+  rgbd_minimum_panel_height: 0.80
+  rgbd_maximum_plane_rmse: 0.04
+  rgbd_maximum_vertical_normal_z: 0.25
+  rgbd_minimum_opening_depth_change: 0.30
+  rgbd_maximum_opening_dark_ratio: 0.45
+  rgbd_minimum_opening_deeper_fraction: 0.20
+  # 开门后走廊可能只有稀疏远端深度；仍须同时满足门板消失与更深回波判据。
+  rgbd_minimum_opening_valid_depth_fraction: 0.20
+  # 视觉只注册候选；TakeElevator 开门后还需 RGB-D 变化或 Livox 开口确认，
+  # 确认前不得清除门区地图障碍。
+  elevator_visual_confirmations: 3
+  elevator_visual_min_width: 0.90
+  elevator_visual_max_width: 1.80
+  elevator_visual_max_distance: 4.0
+  elevator_opening_confirmation_timeout: 8.0
+  # 进入主入口并建立足够安全已知区后只执行一次，约覆盖一整圈；发现后立即结束。
+  elevator_visual_scan_duration: 9.0
+  elevator_visual_scan_angular_speed: 0.70
   # 仅用于调试：关闭时必须有局部传感器证据，不能只靠 metadata 近距判断开门。
   use_truth_proximity_detector: false
 
@@ -263,7 +302,5 @@ tracker:
   stale_after: 30.0
 
 floor:
-  elevator_id: elevator_main
-  elevator_lobby_xy: [1.0, 2.6]
-  elevator_inside_xy: [2.6, 2.6]
+  # 正式电梯 ID 来自公开 team_scene_info.json；空间几何只能由传感器注册。
   service_timeout: 5.0
