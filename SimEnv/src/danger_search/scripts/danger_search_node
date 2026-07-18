@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""ROS 可执行入口。
+
+该脚本由 ``danger_search.launch`` 启动，本身不承载业务逻辑。它只把 ROS
+进程的控制权交给 :func:`danger_search.mission_manager.main`，使状态机既能被
+catkin 安装为可执行节点，又能在单元测试中直接导入而不自动启动 ROS。
+"""
+
 from danger_search.mission_manager import main
 
 

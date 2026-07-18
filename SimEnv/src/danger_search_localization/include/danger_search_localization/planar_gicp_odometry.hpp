@@ -13,6 +13,7 @@
 
 namespace danger_search_localization {
 
+/// 相邻帧 GICP 的降采样、对应距离、运动上限和质量门槛。
 struct PlanarGicpConfig {
   double voxel_size = 0.18;
   double maximum_correspondence_distance = 0.55;
@@ -22,6 +23,7 @@ struct PlanarGicpConfig {
   int maximum_iterations = 35;
 };
 
+/// 相邻两帧的平面位移；首帧 accepted 但 ``has_delta=false``。
 struct PlanarGicpResult {
   bool accepted = false;
   bool has_delta = false;
@@ -30,8 +32,11 @@ struct PlanarGicpResult {
   std::size_t point_count = 0;
 };
 
-// 输入点已由合法 IMU 旋到统一世界方向，因此这里只消费 GICP 的平面平移；
-// 旋转与高度不会由退化点云反向污染。
+/// 对已统一旋转的相邻点云执行 GICP，并且只消费平面平移。
+///
+/// 输入点已由合法 IMU 旋到统一 world 方向，GICP 的旋转与高度结果不会反向
+/// 污染姿态。命令积分只作为初始猜测；最终位移还必须通过收敛、fitness 和
+/// 单帧位移上限。配准失败仍推进参考帧，避免恢复时长基线永久落在局部配准域外。
 class PlanarGicpOdometry {
  public:
   explicit PlanarGicpOdometry(

@@ -1,9 +1,14 @@
-"""正式比赛接口准入规则。
+"""正式比赛外部接口的第一层准入规则。
 
 规则唯一依据为 ``SimEnv初始.zip`` 中的
 ``docs/algorithm-interfaces.md``。生产代码接入外部 ROS 话题、服务或
 场景文件前必须通过本模块；未列入白名单的接口不能以“本地可用”为由进入
 正式运行链。
+
+本层维护“初始文档允许什么”的静态上限；随后
+``BuildingFeatureProvider`` 还会按照本次 ``team_scene_info.json`` 取交集。
+两层校验分别防止配置接入未授权接口，以及某个具体场景声明之外的接口被使用。
+内部派生话题则必须位于参赛方命名空间，不能伪装成新的赛方外部输入。
 """
 from __future__ import annotations
 
@@ -59,7 +64,11 @@ PUBLIC_SCENE_INFO_NAME = "team_scene_info.json"
 
 
 def _lexical_absolute(path: str | Path) -> Path:
-    """生成不解析符号链接的规范词法绝对路径。"""
+    """生成不解析符号链接的规范词法绝对路径。
+
+    这里刻意不调用 ``resolve``：先比较用户实际提供的词法路径，之后再单独检查
+    符号链接和真实路径，才能识别“同名文件经 symlink 指向禁用数据”的绕过。
+    """
     return Path(os.path.normpath(os.path.abspath(os.fspath(path))))
 
 
@@ -116,7 +125,11 @@ def require_public_scene_info(path: str | Path, *, purpose: str) -> Path:
 
 
 def require_allowed_topic(topic: str, *, purpose: str) -> str:
-    """确认生产外部话题已由初始接口文档授权。"""
+    """确认生产外部话题已由初始接口文档授权，并返回规范字符串。
+
+    ``purpose`` 会进入异常信息，使启动时能直接定位是哪个业务消费者申请了
+    非法接口。显式禁用列表先检查，以便真值话题得到比普通未知话题更明确的错误。
+    """
     normalized = str(topic).strip()
     if normalized in FORBIDDEN_TOPICS:
         raise ValueError(f"{purpose} 禁止使用 Gazebo 真值话题: {normalized}")
@@ -126,7 +139,11 @@ def require_allowed_topic(topic: str, *, purpose: str) -> str:
 
 
 def require_internal_topic(topic: str, *, purpose: str) -> str:
-    """确认参赛方内部总线不会伪装成赛方外部接口。"""
+    """确认参赛方内部总线不会伪装成赛方外部接口。
+
+    内部定位、配准点云和诊断数据可以被生产模块消费，但必须可从允许的传感器
+    追溯得到，并统一放在 ``/danger_search/`` 或 ``/nav/`` 命名空间。
+    """
     normalized = str(topic).strip()
     if not normalized.startswith(("/danger_search/", "/nav/")):
         raise ValueError(
@@ -136,7 +153,7 @@ def require_internal_topic(topic: str, *, purpose: str) -> str:
 
 
 def require_allowed_service(service: str, *, purpose: str) -> str:
-    """确认生产服务调用已由初始接口文档授权。"""
+    """确认生产服务调用已由初始接口文档授权，并返回规范字符串。"""
     normalized = str(service).strip()
     if normalized not in ALLOWED_SERVICES:
         raise ValueError(f"{purpose} 未在初始比赛服务白名单中: {normalized}")

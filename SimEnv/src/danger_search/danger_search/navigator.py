@@ -1,4 +1,11 @@
-"""局部路径跟踪控制器。"""
+"""局部路径跟踪器与全项目唯一的生产速度发送出口。
+
+上层传入 world/odom 平面折线路径，本模块压缩共线点、在当前线段内计算
+pure-pursuit 前视目标，并根据航向误差、局部曲率和前向实体净距生成机体系
+``(linear_x, linear_y, angular_z)``。命令发布前还会经过可选
+``GroundSupportSafetyGate``，所有停车、恢复、门/电梯直线跨越最终都复用
+``_publish``，避免出现绕过安全锁存的竞争 publisher。
+"""
 from __future__ import annotations
 from typing import Iterator
 
@@ -28,6 +35,12 @@ IDLE = "idle"
 
 @dataclass
 class PathFollower:
+    """维护一条活动路径并以非阻塞 tick 产生速度指令。
+
+    ``_raw_path`` 保存规划器原始输出用于诊断，``_path`` 只删除重复/共线点，
+    不做改变几何可达性的平滑。恢复流程也由内部阶段表示，调用方每次 tick 即可，
+    不需要 sleep 等待机器人动作。
+    """
     cmd_vel_topic: str
     path_raw_topic: str = "/danger_search/path_raw"
     path_followed_topic: str = "/danger_search/path_followed"
@@ -91,6 +104,7 @@ class PathFollower:
     keepalive_publish_count: int = field(default=0, init=False)
 
     def start(self) -> None:
+        """建立唯一 ``/cmd_vel`` publisher、诊断 publisher 和命令保活定时器。"""
         if rospy is None:
             raise RuntimeError("当前环境没有 rospy，无法发布 /cmd_vel")
         require_allowed_topic(self.cmd_vel_topic, purpose="PathFollower 控制输出")
@@ -121,6 +135,7 @@ class PathFollower:
             )
 
     def set_path(self, path: list[tuple[float, float]]) -> None:
+        """替换活动路径并重置 waypoint、进度监督和恢复状态。"""
         self._raw_path = [(float(point[0]), float(point[1])) for point in path]
         self._path = _compress_collinear_path(self._raw_path)
         self._recover_phase = "idle"
@@ -159,6 +174,7 @@ class PathFollower:
             self._last_progress_pose = tuple(float(value) for value in pose_xy_yaw)
 
     def clear_path(self, reason: str = "path_cleared") -> None:
+        """清除路径和恢复状态，并立即通过统一出口发送零速。"""
         self._raw_path = []
         self._path = []
         self._waypoint_index = 0
@@ -175,6 +191,11 @@ class PathFollower:
         max_linear: float | None = None,
         goal_tolerance: float | None = None,
     ) -> str:
+        """根据当前位姿推进一次路径跟踪，返回 RUNNING/DONE/STUCK/IDLE。
+
+        终点容差检查优先于进度判断；进度既看机身实际位移，也看终点距离是否
+        明显下降。超时只报告 STUCK 并清路径，是否恢复或重规划由任务层决定。
+        """
         now = get_time()
         self._debug_pose = tuple(float(value) for value in pose_xy_yaw)
         self._debug_stuck_elapsed = max(0.0, now - self._last_progress_time)
@@ -413,6 +434,11 @@ class PathFollower:
         linear_y: float = 0.0,
         zero_reason: str | None = None,
     ) -> None:
+        """过滤、记录并发布一条速度命令，是生产控制的最终出口。
+
+        先保存算法请求值，再让安全门产生实际发送值，两者都进入诊断快照。
+        publisher 尚未启动时仍更新诊断，便于离线测试验证控制计算而不触碰 ROS。
+        """
         requested = (float(linear_x), float(linear_y), float(angular_z))
         self._last_requested_command = requested
         emitted = requested
@@ -615,7 +641,12 @@ def compute_tracking_command(
     obstacle_stop_distance: float = 0.50,
     obstacle_slow_distance: float = 1.00,
 ) -> tuple[float, float, float]:
-    """按航向、曲率和前向障碍共同限制速度，不对全局速度一刀切。"""
+    """按航向、曲率和前向障碍共同限制速度，不对全局速度一刀切。
+
+    前进速度取三种缩放中的最小值；侧移帮助 A1 在有限转向时对准目标；角速度
+    独立按航向误差比例控制。大角度时保留极低爬行是为了兼容不响应纯角速度的
+    RL 控制器，最终仍受实体障碍和地面支撑安全门约束。
+    """
     angular = _clamp(1.7 * yaw_error, -float(max_angular), float(max_angular))
     min_fraction = _clamp(float(min_linear_fraction), 0.0, 1.0)
     abs_error = abs(yaw_error)

@@ -1,4 +1,9 @@
-"""A* 路径规划与碰撞检测。"""
+"""在单层占据栅格上执行 A* 路径规划与视线压缩。
+
+规划器只接受 Mapper 判定为 FREE/VISITED 的格子，不对 UNKNOWN 做乐观穿越。
+返回状态显式区分“开放集确实耗尽”和“本轮迭代预算用完”：前者允许探索器
+累计失败并拉黑目标，后者只表示计算尚未完成，不能据此破坏可达性判断。
+"""
 from __future__ import annotations
 
 import heapq
@@ -20,7 +25,10 @@ BUDGET_EXHAUSTED = "budget_exhausted"
 
 @dataclass
 class PlanResult:
-    """A* 规划结果，携带状态以区分“确实不可达”与“预算耗尽”。"""
+    """A* 规划结果，携带状态以区分“确实不可达”与“预算耗尽”。
+
+    只有 ``REACHED`` 保证 ``path`` 从起点连续到目标；另外两种状态的路径为空。
+    """
     path: list[tuple[float, float]] = field(default_factory=list)
     status: str = UNREACHABLE
 
@@ -43,12 +51,15 @@ def astar_plan(
     goal_xy: tuple[float, float],
     max_iterations: int | None = DEFAULT_MAX_ITERATIONS,
 ) -> PlanResult:
-    """A* 规划，返回 PlanResult。
+    """在八邻域栅格上规划并返回带原因的 ``PlanResult``。
 
     - REACHED：到达目标，path 为完整路径。
     - UNREACHABLE：open_heap 耗尽，确认不可达；上层可黑名单目标。
     - BUDGET_EXHAUSTED：迭代达到上限，可能可达但未搜完；上层不应黑名单，
       应等待地图更新后重试，避免把可达目标误判不可达。
+    对角移动要求两个相邻正交格都可通行，避免从障碍角点之间穿过。若请求目标
+    本身不可通行，会在有限半径内寻找最近的安全替代格；起点因量化误差落在
+    UNKNOWN 时只尝试 ``mark_free``，该操作不会覆盖 OCC/BLACK。
     """
     start = grid.world_to_grid(start_xy[0], start_xy[1])
     goal = grid.world_to_grid(goal_xy[0], goal_xy[1])
@@ -129,6 +140,7 @@ def astar_path(
 
 
 def path_length(path: list[tuple[float, float]]) -> float:
+    """计算 world 坐标折线路径的欧氏总长度。"""
     if len(path) < 2:
         return 0.0
     return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(path, path[1:]))
@@ -138,7 +150,11 @@ def simplify_path_line_of_sight(
     grid: FloorGrid,
     path: list[tuple[float, float]],
 ) -> list[tuple[float, float]]:
-    """在现有 A* 路径上删除有安全视线的中间折点。"""
+    """在现有 A* 路径上贪心删除有安全视线的中间折点。
+
+    该步骤只改变跟踪点数量，不改变可通行语义；每条跨越线段仍按半栅格间距
+    采样，并复查对角切角条件。
+    """
     if len(path) <= 2:
         return list(path)
 

@@ -18,6 +18,8 @@
 
 namespace danger_search_localization {
 
+/// 把当前 IMU 姿态锚定到初始化时的 world->base 姿态。
+/// IMU 的绝对参考系无需等于 world；初始相对旋转会在该公式中抵消。
 inline Eigen::Matrix3d AnchorImuOrientation(
     const Eigen::Matrix3d &initial_world_base_rotation,
     const Eigen::Matrix3d &initial_imu_rotation,
@@ -26,6 +28,7 @@ inline Eigen::Matrix3d AnchorImuOrientation(
          current_imu_rotation;
 }
 
+/// 局部结构地图、对应点筛选和每帧平移校正的保守参数。
 struct ImuConstrainedOdometryConfig {
   double source_voxel_size = 0.16;
   double map_voxel_size = 0.12;
@@ -40,12 +43,18 @@ struct ImuConstrainedOdometryConfig {
   int maximum_iterations = 12;
 };
 
+/// 一帧局部地图配准的验收结果；拒绝时仍返回安全的上一平移估计。
 struct ImuConstrainedOdometryResult {
   bool accepted = false;
   Eigen::Vector3d translation = Eigen::Vector3d::Zero();
   std::size_t correspondence_count = 0;
 };
 
+/// 在 IMU 已固定旋转的条件下，仅估计平面平移的局部扫描匹配器。
+///
+/// 输入点已经旋转到 world 方向，本类把先验平移后的点与稀疏体素地图做最近邻
+/// 对应，以残差分位数去除离群点，再用 XY 中位残差迭代修正。Z 始终来自楼面
+/// 先验，单帧校正也被限制在有限半径，避免走廊退化或动态物体造成定位跳变。
 class ImuConstrainedOdometry {
  public:
   explicit ImuConstrainedOdometry(
@@ -55,6 +64,8 @@ class ImuConstrainedOdometry {
   ImuConstrainedOdometryResult RegisterFrame(
       const std::vector<Eigen::Vector3d> &world_oriented_vectors,
       const Eigen::Vector3d &translation_prior) {
+    // 两级体素分别控制地图密度与当前帧计算量；首个有效帧只初始化局部地图，
+    // 没有上一地图时不虚构相对运动。
     const auto map_frame = kiss_icp::VoxelDownsample(
         world_oriented_vectors, config_.map_voxel_size);
     const auto source = kiss_icp::VoxelDownsample(
@@ -260,6 +271,8 @@ class ImuConstrainedOdometry {
 
   void UpdateMap(const std::vector<Eigen::Vector3d> &frame,
                  const Eigen::Vector3d &translation) {
+    // 地图以体素键去重，并围绕当前位置保留固定半径；随后重建 KD-tree，保证
+    // 下一帧的对应点只来自近期局部结构而不是无限增长的历史地图。
     for (const auto &point : frame) {
       const Eigen::Vector3d world_point = point + translation;
       map_points_.try_emplace(

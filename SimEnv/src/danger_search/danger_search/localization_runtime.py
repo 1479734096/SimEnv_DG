@@ -1,4 +1,10 @@
-"""定位时间匹配与健康状态的无副作用决策层。"""
+"""定位时间匹配、健康判断与诊断计数的决策层。
+
+``PoseProvider`` 负责保存事实，本模块负责解释这些事实：最新位姿是否足够新、
+一帧传感器数据应该等待还是丢弃，以及不可用状态是否已持续到任务失败阈值。
+本模块不发布停车命令、不切换任务状态；这些副作用统一由 ``MissionManager``
+执行，因此判断逻辑可以脱离 ROS 做确定性测试。
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -33,7 +39,12 @@ class LocalizationHealthAssessment:
 
 
 class LocalizationRuntime:
-    """集中管理定位健康、传感器位姿匹配和诊断统计。"""
+    """集中管理一次任务生命周期内的定位运行状态。
+
+    ``stale_minimum`` 是最小新鲜度窗口，实际窗口还会参考近期定位周期；
+    ``unavailable_timeout`` 是持续停车后升级为任务失败的时间。两个阈值分离，
+    使短暂抖动只触发安全等待，真正断流才终止任务。
+    """
 
     def __init__(
         self,
@@ -165,6 +176,7 @@ class LocalizationRuntime:
         *,
         allow_legacy_at: bool = True,
     ) -> PoseLookup:
+        """把时间匹配请求转发给统一适配函数。"""
         return time_matched_pose_lookup(
             self.pose_provider,
             stamp,
@@ -200,6 +212,7 @@ class LocalizationRuntime:
         return True
 
     def lookup_stats(self) -> dict[str, dict[str, int]]:
+        """返回诊断计数副本，防止调用方修改内部累计状态。"""
         return {
             stream: dict(values)
             for stream, values in self._lookup_stats.items()

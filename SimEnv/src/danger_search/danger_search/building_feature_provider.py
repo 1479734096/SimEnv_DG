@@ -1,7 +1,11 @@
-"""公开场景信息的唯一读取入口。
+"""公开场景信息的唯一读取与解释入口。
 
 初始接口文档只允许读取 ``team_scene_info.json``。该文件只给出 ID、起点、
 服务楼层和结果文件，不包含门、电梯的空间真值；本模块刻意不提供空间查询。
+
+调用关系为 ``MissionManager._load_params -> BuildingFeatureProvider.load``。
+加载在任何订阅、发布或服务连接之前完成；schema、ID、楼层或接口列表一旦非法，
+节点会 fail-closed，而不是退回布局元数据或根据服务响应猜测建筑结构。
 """
 from __future__ import annotations
 
@@ -19,7 +23,11 @@ from danger_search.interface_policy import (
 
 @dataclass(frozen=True)
 class PublicDoorFeature:
-    """公开门的非空间属性。"""
+    """公开门的非空间属性。
+
+    ``floor_index`` 只用于校验服务 ID 所属楼层，不能推导门的位置或朝向。
+    空间几何只能由运行期间的合法传感器在本地注册。
+    """
 
     door_id: str
     kind: str
@@ -29,7 +37,7 @@ class PublicDoorFeature:
 
 @dataclass(frozen=True)
 class PublicElevatorFeature:
-    """公开电梯的非空间属性。"""
+    """公开电梯的非空间属性，用于限制可请求的目标楼层集合。"""
 
     elevator_id: str
     current_floor: int
@@ -38,7 +46,12 @@ class PublicElevatorFeature:
 
 @dataclass(frozen=True)
 class BuildingFeatureProvider:
-    """经白名单校验后的公开场景能力描述。"""
+    """经完整校验、可安全传给业务层的公开场景能力描述。
+
+    该不可变对象是正式运行时关于建筑公开能力的唯一事实源。门/电梯客户端、
+    楼层预算和结果写入都使用这里的字段，避免不同模块重复解析 JSON 后产生
+    schema 语义差异。
+    """
 
     path: Path
     robot_start: tuple[float, float, float, float]
@@ -52,6 +65,12 @@ class BuildingFeatureProvider:
 
     @classmethod
     def load(cls, path: str | Path, *, purpose: str) -> "BuildingFeatureProvider":
+        """读取并严格验证公开 schema，成功后返回不可变能力快照。
+
+        校验顺序从文件身份、根 schema、起点数值，逐步进入门、电梯和接口集合；
+        任一步失败都会抛出 ``ValueError``，不会返回部分可用对象。输出路径也被
+        固定在工作区 ``results/detected_danger.json``，防止配置诱导任意文件写入。
+        """
         scene_path = require_public_scene_info(path, purpose=purpose)
         with scene_path.open("r", encoding="utf-8") as stream:
             raw = json.load(stream)
@@ -184,12 +203,14 @@ class BuildingFeatureProvider:
         )
 
     def require_topic(self, topic: str, *, purpose: str) -> str:
+        """要求话题同时出现在本次场景公布的接口集合中。"""
         normalized = str(topic).strip()
         if normalized not in self.allowed_topics:
             raise ValueError(f"{purpose} 未在本场景公开接口内: {normalized}")
         return normalized
 
     def require_service(self, service: str, *, purpose: str) -> str:
+        """要求服务同时出现在本次场景公布的接口集合中。"""
         normalized = str(service).strip()
         if normalized not in self.allowed_services:
             raise ValueError(f"{purpose} 未在本场景公开服务内: {normalized}")

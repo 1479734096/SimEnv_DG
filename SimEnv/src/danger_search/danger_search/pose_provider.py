@@ -1,8 +1,12 @@
-"""参赛方统一位姿入口。
+"""参赛方统一位姿入口与传感器时间对齐层。
 
 生产模式仅订阅参赛方 ``scan_localization_node`` 发布的内部里程计；正式
 定位后端只能使用初始接口文档授权的 Livox、RealSense、IMU 和控制先验。
 这里不订阅 TF 或 Gazebo 真值。
+
+``scan_localization_node`` 发布内部 ``Odometry`` 后，本模块保存一个有界历史。
+``MissionManager`` 读取最新样本推进状态机，点云与图像处理则按各自消息时间戳
+调用 ``lookup``，从而避免用“最新位姿”无条件解释较旧的传感器帧。
 """
 from __future__ import annotations
 
@@ -23,6 +27,11 @@ except ImportError:  # pragma: no cover - 离线测试环境
 
 @dataclass(frozen=True)
 class PoseSample:
+    """一次不可变的内部里程计快照。
+
+    线速度沿用 Odometry 消息语义，姿态以 ROS ``xyzw`` 四元数保存；常用的
+    平面 yaw、速度模长和旋转矩阵由只读属性按需计算。
+    """
     stamp: float
     xyz: tuple[float, float, float]
     quaternion_xyzw: tuple[float, float, float, float]
@@ -78,7 +87,11 @@ class PoseLookup:
 
 
 class PoseProvider:
-    """保存内部定位历史，并提供时间匹配的位姿快照。"""
+    """订阅内部里程计，保存线程安全历史并提供时间匹配查询。
+
+    ROS 回调线程只负责追加不可变 ``PoseSample``；任务定时器在锁内复制引用后
+    执行计算，避免长时间占用回调锁。历史长度有上限，防止长任务持续增长内存。
+    """
 
     def __init__(self, odom_topic: str, *, max_samples: int = 256):
         self.odom_topic = str(odom_topic)
@@ -87,11 +100,13 @@ class PoseProvider:
         self._subscriber = None
 
     def start(self) -> None:
+        """建立内部里程计订阅；构造对象本身不会产生 ROS 副作用。"""
         if rospy is None or Odometry is None:
             raise RuntimeError("当前环境没有 rospy，无法启动 PoseProvider")
         self._subscriber = rospy.Subscriber(self.odom_topic, Odometry, self._on_odometry, queue_size=16)
 
     def latest(self) -> PoseSample | None:
+        """返回最新定位快照；尚未收到里程计时返回 ``None``。"""
         with self._lock:
             return self._samples[-1] if self._samples else None
 
@@ -153,6 +168,12 @@ class PoseProvider:
         base_to_sensor_xyz: Iterable[float],
         base_to_sensor_rpy: Iterable[float],
     ) -> np.ndarray:
+        """组合机体位姿与固定外参，生成 sensor 到 world 的齐次变换。
+
+        ``base_to_sensor_*`` 来自公开传感器安装参数。先在 base 坐标系应用固定
+        旋转/平移，再用里程计姿态变换到 world；返回矩阵供点云和 RGB-D
+        反投影复用，保证不同感知模块采用同一变换顺序。
+        """
         translation = np.asarray(tuple(base_to_sensor_xyz), dtype=float)
         rpy = np.asarray(tuple(base_to_sensor_rpy), dtype=float)
         if translation.shape != (3,) or rpy.shape != (3,):
@@ -175,6 +196,7 @@ class PoseProvider:
         return matrix
 
     def _on_odometry(self, message) -> None:
+        """把 ROS Odometry 复制成与 ROS 消息生命周期无关的轻量快照。"""
         stamp = _stamp_seconds(message)
         if stamp is None:
             return
@@ -197,6 +219,7 @@ class PoseProvider:
 
 
 def _stamp_seconds(message) -> float | None:
+    """以秒读取 ROS header 时间戳；缺失或非法消息返回 ``None``。"""
     if message is None:
         return None
     stamp = getattr(getattr(message, "header", None), "stamp", None)

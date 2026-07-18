@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(danger_search_localization)
 
+# 构建边界：只编译参赛方 scan_localization_node 和定向单测；第三方 KISS-ICP
+# 作为固定源码子目录链接，不启用其 ROS wrapper，避免额外节点进入正式启动链。
 find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   nav_msgs
@@ -47,6 +49,7 @@ target_link_libraries(scan_localization_node
 )
 
 if(CATKIN_ENABLE_TESTING)
+  # 每个数学/时间/配准组件独立成 gtest，便于定位注释或实现改动影响的具体层次。
   catkin_add_gtest(test_velocity_transform test/test_velocity_transform.cpp)
   target_compile_features(test_velocity_transform PRIVATE cxx_std_17)
   target_include_directories(test_velocity_transform PRIVATE

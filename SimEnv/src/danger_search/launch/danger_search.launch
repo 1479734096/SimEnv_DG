@@ -1,11 +1,18 @@
 <launch>
+  <!--
+    正式生产入口。启动顺序由 ROS 自动协调：先加载统一参数，再启动合法传感器
+    定位节点，最后启动 Python 主状态机。定位节点 required=true，退出会终止
+    整个 launch；主节点同样 required=true，防止失去控制后仿真继续运行。
+  -->
   <arg name="config" default="$(find danger_search)/config/danger_search.yaml"/>
   <arg name="result_file" default=""/>
   <arg name="mission_summary_file" default=""/>
 
+  <!-- 参数加载到全局命名空间；MissionManager 只读取并分组，不允许子组件私取配置。 -->
   <rosparam command="load" file="$(arg config)"/>
 
   <include file="$(find danger_search_localization)/launch/scan_localization.launch">
+    <!-- 正式后端只使用公开 /scan、深度点云、/trunk_imu 和自身控制先验。 -->
     <arg name="localization_backend" value="rgbd_livox"/>
     <arg name="team_scene_info_path"
          value="$(find danger_search)/../../generated_building/team_scene_info.json"/>
@@ -18,6 +25,7 @@
         name="danger_search"
         required="true"
         output="screen">
+    <!-- formal 强制公开 schema/接口校验，并禁用相对原点、手动目标和真值回退。 -->
     <param name="runtime/profile" value="formal"/>
     <param name="result_file" value="$(arg result_file)"/>
     <param name="mission_summary_file" value="$(arg mission_summary_file)"/>

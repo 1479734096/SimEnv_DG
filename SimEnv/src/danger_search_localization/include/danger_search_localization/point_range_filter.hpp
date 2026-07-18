@@ -6,7 +6,10 @@
 
 namespace danger_search_localization {
 
-// 定位和注册地图输出必须使用同一有效量程，避免传感器近距离无效回波写入占据地图。
+/// 检查有限 XYZ 点是否严格位于定位有效量程内。
+///
+/// 定位输入和注册地图输出复用同一过滤规则，避免近场无效回波被定位丢弃后仍
+/// 写进 Python Mapper。参数非法时 fail-closed，不尝试交换上下界或使用默认值。
 inline bool IsPointInLocalizationRange(
     const Eigen::Vector3d &point,
     double min_range,

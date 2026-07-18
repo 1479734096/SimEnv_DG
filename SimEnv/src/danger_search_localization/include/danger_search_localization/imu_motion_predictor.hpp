@@ -8,6 +8,7 @@
 
 namespace danger_search_localization {
 
+/// IMU 零偏标定、时间连续性和静止速度归零阈值。
 struct ImuMotionPredictorConfig {
   double gravity = 9.81;
   double calibration_duration = 0.40;
@@ -17,8 +18,11 @@ struct ImuMotionPredictorConfig {
   double stationary_duration = 0.25;
 };
 
-// 利用公开机身 IMU 为点云配准提供短时平移先验。它不单独发布里程计；
-// 点云配准仍负责约束长期漂移，IMU 只补足长走廊中的平移退化方向。
+/// 利用公开机身 IMU 为点云配准提供短时平移先验。
+///
+/// 它不单独发布里程计；点云配准仍负责约束长期漂移，IMU 只补足长走廊中的
+/// 平移退化方向。初始化窗口估计水平加速度零偏，积分间隔过大时拒绝跨缺口
+/// 积分，持续静止时把速度归零以限制漂移。
 class ImuMotionPredictor {
  public:
   explicit ImuMotionPredictor(
@@ -26,6 +30,7 @@ class ImuMotionPredictor {
       : config_(Validate(config)) {}
 
   void Reset() {
+    // 换原点或重新锚定时清除所有积分历史，不能把旧参考系速度带入新世界系。
     first_stamp_ = 0.0;
     last_stamp_ = 0.0;
     acceleration_sum_.setZero();
@@ -46,6 +51,7 @@ class ImuMotionPredictor {
         !angular_velocity_base.allFinite()) {
       return;
     }
+    // 先把机体系线加速度转到 world，再扣除重力；后续只积分 XY 平面分量。
     const Eigen::Vector3d acceleration_world =
         world_base_rotation * linear_acceleration_base -
         Eigen::Vector3d(0.0, 0.0, config_.gravity);

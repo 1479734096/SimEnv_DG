@@ -1,7 +1,11 @@
-"""基于合法 RGB-D 输入的动态门板候选检测。
+"""基于合法 RGB-D 输入的动态门板候选与开门变化检测。
 
 颜色只用于提出候选；最终候选必须同时满足深度平面、竖直方向和物理尺寸
 约束。模块不读取场景文件，也不把外观候选直接解释为具体门 ID。
+
+关闭状态检测先拟合深色竖直平面；打开状态既可以比较同视角基准门板，也可以
+把运行时注册的门平面投影回当前图像，要求中央区域同时“变亮且深度变远”。
+服务调用是否成功仍不足以清地图，必须由这些视觉变化或独立 Livox 开口确认。
 """
 from __future__ import annotations
 
@@ -51,7 +55,11 @@ class DoorOpeningChange:
 
 
 class RgbdDoorDetector:
-    """以深色外观提候选、以 RGB-D 几何拒绝阴影和小型黑色物体。"""
+    """以深色外观提候选、以 RGB-D 几何拒绝阴影和小型黑色物体。
+
+    所有公开方法在输入缺失、变换非法或 OpenCV 不可用时返回空/未确认结果，
+    不抛出后再退回真值。这样感知失败只会让门保持关闭语义，不会放宽安全条件。
+    """
 
     def __init__(
         self,
@@ -98,6 +106,7 @@ class RgbdDoorDetector:
         camera_info_msg,
         camera_to_world: np.ndarray | None,
     ) -> list[DoorPanelObservation]:
+        """转换 ROS 消息并调用数组检测核心；缺少 world 变换时拒绝检测。"""
         if self._bridge is None or camera_to_world is None:
             return []
         rgb = self._bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
@@ -119,6 +128,11 @@ class RgbdDoorDetector:
         *,
         stamp: float | None = None,
     ) -> list[DoorPanelObservation]:
+        """检测一帧深色竖直门板并返回几何验证后的候选。
+
+        每个轮廓内部的有效深度像素先由相机内参反投影，随后拟合平面并检查法向、
+        物理宽高和 RMSE，最后用 ``camera_to_world`` 得到门中心和朝外法向。
+        """
         if cv2 is None or camera_to_world is None:
             return []
         if rgb_bgr is None or depth_raw is None or rgb_bgr.shape[:2] != depth_raw.shape[:2]:
@@ -609,6 +623,7 @@ class RgbdDoorDetector:
 
 
 def _fit_plane(points: np.ndarray):
+    """用 SVD 拟合点集平面，返回单位法向、中心和逐点绝对残差。"""
     if len(points) < 3:
         return None
     center = np.mean(points, axis=0)

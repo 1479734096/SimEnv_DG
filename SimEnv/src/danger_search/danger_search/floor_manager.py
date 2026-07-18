@@ -1,4 +1,9 @@
-"""旧版多楼层服务封装；正式运行链使用 BuildingControlClient。"""
+"""旧版多楼层服务兼容封装；正式运行链使用 ``BuildingControlClient``。
+
+该模块保留给历史测试和配置，不应接入正式启动链：构造参数中的 lobby/inside
+坐标不是公开 schema 字段，不能作为生产导航目标。服务名仍经过接口白名单，
+但缺少 ``BuildingFeatureProvider`` 的公开 ID/served floors 双重约束。
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -69,7 +74,7 @@ class AsyncServiceCall:
 
 
 class FloorManager:
-    """提供旧配置兼容能力，不得作为正式几何信息来源。"""
+    """提供旧配置兼容能力，不得作为正式几何信息或服务权限来源。"""
 
     def __init__(
         self,

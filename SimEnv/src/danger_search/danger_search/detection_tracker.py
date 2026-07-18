@@ -1,4 +1,10 @@
-"""危险源检测结果的多帧融合与去重。"""
+"""把单帧危险源候选融合成可输出的稳定目标。
+
+``RedSphereDetector`` 每帧产生带置信度、拟合误差和 world 坐标的候选；本模块
+按空间半径关联轨迹，并同时要求命中次数、时间窗口、位置方差、置信度和球拟合
+误差通过阈值。结果写出前再做一次按质量排序的 NMS，降低同一红球产生多轨迹
+时的重复报告概率。
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -50,6 +56,11 @@ class DetectionCandidate:
 
 @dataclass
 class Track:
+    """一个空间目标的观测历史和生命周期状态。
+
+    ``TENTATIVE`` 尚未满足确认门槛，``CONFIRMED`` 可参与最终输出，长时间未确认
+    的轨迹会成为 ``REJECTED`` 且不再参与后续关联。
+    """
     track_id: int
     mean_position: np.ndarray
     first_seen: float
@@ -61,6 +72,7 @@ class Track:
     status: str = TENTATIVE
 
     def update(self, candidate: DetectionCandidate, now: float) -> None:
+        """追加一次命中，并用全部历史观测均值更新轨迹位置。"""
         point = np.array(candidate.position, dtype=float)
         self.positions.append(point)
         self.confidences.append(float(candidate.confidence))
@@ -91,7 +103,7 @@ class Track:
 
 
 class DetectionTracker:
-    """把单帧检测融合成稳定目标，并在输出前做 NMS。"""
+    """管理全部目标轨迹、关联新候选并输出空间去重后的确认位置。"""
 
     def __init__(
         self,
@@ -121,12 +133,18 @@ class DetectionTracker:
         return list(self._tracks)
 
     def update(self, candidates: Iterable[DetectionCandidate], now: float | None = None) -> None:
+        """依次关联一帧候选，再统一刷新所有轨迹状态。"""
         timestamp = float(now if now is not None else get_time())
         for candidate in candidates:
             self._update_one(candidate, timestamp)
         self._refresh_status(timestamp)
 
     def confirmed_positions(self, now: float | None = None) -> list[list[float]]:
+        """返回质量优先、经 NMS 去重的确认目标坐标。
+
+        NMS 不删除内部轨迹，只决定本次输出集合，因此诊断仍能看到被近邻高质量
+        轨迹抑制的观测历史。
+        """
         timestamp = float(now if now is not None else get_time())
         self._refresh_status(timestamp)
         confirmed = [track for track in self._tracks if track.status == CONFIRMED]

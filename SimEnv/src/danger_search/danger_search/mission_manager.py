@@ -1,4 +1,20 @@
-"""danger_search 主任务状态机。"""
+"""自主搜索节点的编排层与主任务状态机。
+
+该模块不重新实现感知、规划或控制算法，而是把它们按 10 Hz 定时器串成一条
+可审计的数据流：
+
+``内部定位/RGB-D/点云 -> 时间匹配 -> 建图与检测 -> 任务决策 -> 路径 -> /cmd_vel``
+
+主状态按以下方向推进：
+
+``INIT -> WAIT_CONTROLLER_READY -> EXPLORE_FLOOR``
+``EXPLORE_FLOOR <-> CHANGE_FLOOR -> RETURN_HOME -> WRITE_RESULT -> FINISH``
+
+任一不可恢复异常会进入 ``WRITE_RESULT``，先保存当前已确认检测结果，再以
+``FAILED`` 结束。门、电梯和普通导航由 ``NavigationTask`` 子状态机分多次 tick
+推进，ROS 服务和电梯动作不会阻塞主定时器。所有状态转换都经过
+``_transition_state`` 记录原因、调用点和诊断快照。
+"""
 from __future__ import annotations
 
 import json
@@ -312,11 +328,19 @@ class _ProgressMonitor:
 
 
 class MissionManager:
-    """Timer 驱动的主状态机，避免在主循环里阻塞等待传感器。"""
+    """Timer 驱动的顶层编排器，拥有一次任务的全部可变运行状态。
+
+    组件所有权集中在这里：传感器和定位提供事实，Mapper/Detector 生成环境
+    表示，Frontier/Planner 选择目标，PathFollower 是唯一速度发送入口。
+    ``MissionManager`` 只在定时器回调中推进业务状态，服务等待由任务对象内部
+    的异步调用表示，从而避免卡住传感器回调和安全停车逻辑。
+    """
 
     def __init__(self):
         if rospy is None:
             raise RuntimeError("当前环境没有 rospy，无法运行 mission_manager")
+        # 顶层状态、全局/单层计时和楼层位置。这里先建立纯运行状态，参数加载与
+        # ROS 组件构造放在后面，确保配置校验失败时尚未产生订阅或发布副作用。
         self.state = INIT
         self.start_time = get_time()
         self.floor_start_time = self.start_time
@@ -335,6 +359,8 @@ class MissionManager:
         self._floor_timeout_logged = False
         self._last_status_publish = 0.0
         self._probe_attempt = 0
+        # 主入口探测是一段独立的小状态机：先由合法传感器寻找安全直行目标，
+        # 必要时注册入口门并异步开门，轨迹同时留给最终返航反向复用。
         self._initial_entry_target: tuple[float, float] | None = None
         self._initial_entry_origin_pose: tuple[float, float, float] | None = None
         self._initial_entry_heading: float | None = None
@@ -347,6 +373,8 @@ class MissionManager:
         self._initial_entry_opening_observation = None
         self._initial_entry_trace: list[tuple[float, float]] = []
         self._floor_navigation_traces: dict[int, list[tuple[float, float]]] = {}
+        # 电梯空间几何不来自公开 JSON，而由 RGB-D/Livox 局部观测在运行时注册。
+        # 这些字段保存跨帧确认与开门前后变化，避免单帧颜色或深度噪声触发服务。
         self._elevator_opening_last_stamp: float | None = None
         self._elevator_opening_last_scan_stamp: float | None = None
         self._elevator_opening_observation = None
@@ -367,6 +395,8 @@ class MissionManager:
         self._finished = False
         self._shutdown_requested = False
         self._transition_history: list[dict[str, object]] = []
+        # 任务终态信息与“是否写过结果”分开保存。这样无论正常结束、算法失败、
+        # ROS 外部关闭还是安全线程强制退出，都能且只能写出一份语义明确的结果。
         self._return_home_started = False
         self._return_home_completed = False
         self._return_home_main_entrance_crossed = False
@@ -392,6 +422,8 @@ class MissionManager:
         self._last_floor_alignment_mismatch_key = None
         self._floor_transition_guard: _FloorTransitionGuard | None = None
         self._max_home_distance = 0.0
+        # 导航任务层。正式 profile 禁用 manual_goal；门和电梯任务仍通过同一个
+        # current_task 槽位串行执行，防止多个控制行为竞争 /cmd_vel。
         self.manual_goal: tuple[float, float] | None = None
         self.manual_mode = False
         self.current_task: NavigationTask | None = None
@@ -411,6 +443,8 @@ class MissionManager:
         self.main_entrance_xy: tuple[float, float] | None = None
         self.main_entrance_pass_vector: tuple[float, float] | None = None
 
+        # 前沿惯性和进度监督状态用于抑制目标频繁切换及局部循环，不会篡改原始
+        # 地图；冷却到期后目标区域可以重新参与选择。
         self._last_frontier_target: tuple[float, float] | None = None
         self._last_frontier_score: float | None = None
         self._last_frontier_used_fallback = False
@@ -419,6 +453,8 @@ class MissionManager:
         self._progress_history: list[dict[str, object]] = []
         self._last_budget_decision: tuple[str, str] | None = None
         self._last_budget_decision_time: float = 0.0
+        # 负障碍安全链位于最终控制出口之前。ShadowSupportGrid 产生支撑评估，
+        # GroundSupportSafetyGate 过滤控制命令；墙钟线程仅处理仿真时钟冻结场景。
         self._ground_support_gate: GroundSupportSafetyGate | None = None
         self._ground_support_grid: ShadowSupportGrid | None = None
         self._ground_support_sensor_mount: np.ndarray | None = None
@@ -435,6 +471,8 @@ class MissionManager:
             tuple[int, float, float, float]
         ] = []
 
+        # 参数及公开接口先全部校验，再创建各运行组件。构造顺序体现依赖方向：
+        # 数据源 -> 环境表示/决策 -> 控制 -> 外部服务 -> 结果输出。
         self._load_params()
         self._status_publisher = None
         self.sensor_buffer = SensorBuffer(
@@ -555,6 +593,12 @@ class MissionManager:
         self.controller.set_command_gate(self._ground_support_gate)
 
     def start(self) -> None:
+        """建立 ROS I/O 并启动两个非阻塞定时循环。
+
+        10 Hz 主定时器推进任务；可选的高频支撑评估定时器只更新安全判断。
+        建筑服务仅在公开门或多楼层任务确实需要时连接，避免单层无门场景产生
+        不必要的外部依赖。
+        """
         self.pose_provider.start()
         self.sensor_buffer.start()
         self.controller.start()
@@ -612,6 +656,11 @@ class MissionManager:
             return
 
     def shutdown(self) -> None:
+        """统一处理 ROS 关闭，停止机器人并保证当前结果能够落盘。
+
+        本方法可能由正常任务、异常状态或外部 Ctrl-C 触发，因此必须幂等：若
+        主状态机已经写过结果，只停车和记录诊断；否则使用当前确认目标补写结果。
+        """
         wall_stop = getattr(self, "_ground_support_wall_stop", None)
         if wall_stop is not None:
             wall_stop.set()
@@ -641,6 +690,12 @@ class MissionManager:
             )
 
     def _load_params(self) -> None:
+        """加载、分组并验证本节点全部 ROS 参数。
+
+        正式 profile 先读取公开场景能力，再对每个外部话题和服务做“静态白名单
+        + 本场景声明”双重校验。随后构造 mission/map/controller/detection 等参数
+        字典供对应组件消费，避免组件自行从参数服务器读取而形成隐藏配置入口。
+        """
         self.runtime_profile = str(_param("runtime/profile", "formal")).strip().lower()
         if self.runtime_profile not in {"formal", "diagnostic"}:
             raise ValueError("runtime/profile 只能是 formal 或 diagnostic")
@@ -1204,6 +1259,7 @@ class MissionManager:
         }
 
     def _on_timer(self, _event) -> None:
+        """主定时器异常边界：任何未处理异常都停车并转入结果写出。"""
         try:
             self.tick()
         except Exception as exc:
@@ -1334,6 +1390,12 @@ class MissionManager:
         return False
 
     def tick(self) -> None:
+        """推进一次主状态机。
+
+        每轮严格按“终态/预算检查—读取快照—定位健康—感知更新—安全门控—
+        当前子任务—顶层状态”的顺序执行。前面的环节一旦要求等待或停车就立即
+        返回，后续规划不会基于陈旧数据继续推进。
+        """
         self._publish_status()
         if self.state in (FINISH, MISSION_FAILED):
             self.controller.stop()
@@ -4837,6 +4899,12 @@ class MissionManager:
         call_site: str,
         diagnostic_context: dict[str, object] | None = None,
     ) -> None:
+        """执行唯一的顶层状态转换并保存结构化审计记录。
+
+        ``reason_code`` 描述机器可聚合的原因，``call_site`` 标识决策位置，额外
+        上下文保存当时的规划/安全信息。进入返航时清除探索目标，进入写结果时
+        锁存写出原因，避免旧路径或后续 shutdown 覆盖真实终态。
+        """
         old_state = getattr(self, "state", None)
         entering_return_home = new_state == RETURN_HOME and old_state != RETURN_HOME
         if entering_return_home:
@@ -5316,6 +5384,7 @@ def _ros_link_from_optical_matrix() -> np.ndarray:
 
 
 def main() -> int:
+    """初始化 ROS 节点、启动管理器并把线程交给 ``rospy.spin``。"""
     if rospy is None:
         raise RuntimeError("当前环境没有 rospy，无法运行 danger_search_node")
     rospy.init_node("danger_search")

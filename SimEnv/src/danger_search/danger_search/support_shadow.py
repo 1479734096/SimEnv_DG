@@ -1,8 +1,13 @@
-"""负障碍支撑证据的稀疏计算网格。
+"""从点云维护负障碍支撑证据的稀疏计算网格。
 
 本模块只把显式楼面回波和“穿过当前楼面后命中更低表面”的射线记为
 支撑证据。没有回波、视场外、遮挡和点数不足都不会被解释为缺失地面。
 默认由 shadow 诊断使用；生产安全门只复用其局部计算结果，本模块本身不发布控制。
+
+证据语义严格分为三态：当前楼板附近的显式回波为 ``SUPPORTED``；从传感器到
+更低表面的射线穿越当前楼板且连续多帧成立为 ``NO_SUPPORT_EVIDENCE``；无回波、
+视场外、遮挡、点数不足或不连续证据一律为 ``UNKNOWN_SUPPORT``。未来路径按 A1
+足迹横向扫掠，评估只回答“停车包络内有多少连续正支撑、是否存在明确缺口”。
 """
 from __future__ import annotations
 
@@ -21,7 +26,11 @@ NO_SUPPORT_EVIDENCE = "NO_SUPPORT_EVIDENCE"
 
 @dataclass(frozen=True)
 class ShadowSupportConfig:
-    """显式地面支撑证据参数；生产门默认关闭，shadow 可独立复用。"""
+    """显式地面支撑、未来足迹扫掠和诊断敏感度参数。
+
+    ``threshold_*`` 只并行计算邻近阈值诊断，不改变默认网格状态；生产安全门
+    使用明确配置的默认宽度、命中数和连续帧数。
+    """
 
     resolution: float = 0.1
     origin_x: float = -14.0
@@ -106,6 +115,7 @@ class SweepWidthComponents:
 
 @dataclass
 class _CellEvidence:
+    """一个楼层格子的累计正/负支撑证据与最近判定原因。"""
     support_hits: int = 0
     lower_hits: int = 0
     support_frames: int = 0
@@ -561,7 +571,11 @@ def _lateral_interval_cells(
 
 
 class ShadowSupportGrid:
-    """按显式回波维护稀疏支撑证据，本类本身不控制机器人。"""
+    """按楼层维护稀疏支撑证据并评估未来路径足迹，本身不控制机器人。
+
+    仅被观测过或进入评估区的格子才分配对象，避免为整张大地图建立稠密安全层。
+    楼层转换歧义帧会消费时间戳但不更新任何证据，防止旧楼层点云污染新楼层。
+    """
 
     def __init__(self, config: ShadowSupportConfig | None = None):
         self.config = config or ShadowSupportConfig()
@@ -1186,7 +1200,13 @@ class ShadowSupportGrid:
         ambiguous: bool,
         local_only: bool = False,
     ) -> dict[str, object]:
-        """消费一帧；歧义帧的 stamp 会被消费，但不会更新网格。"""
+        """消费一帧并返回局部走廊、告警和诊断载荷。
+
+        流程为：拒绝重复/歧义帧、限量采样、构造速度相关前视折线与足迹扫掠、
+        分类楼面/更低表面/实体障碍回波、更新连续证据、判断视场与遮挡、计算
+        连续支撑前缀和明确缺口。返回字典不产生行为副作用，由调用方决定仅记录
+        shadow 诊断还是转换为 ``GroundSupportAssessment`` 交给生产安全门。
+        """
         stamp = float(stamp)
         if self._last_cloud_stamp is not None and stamp <= self._last_cloud_stamp:
             self.duplicate_cloud_count += 1

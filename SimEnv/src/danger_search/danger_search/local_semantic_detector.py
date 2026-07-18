@@ -1,7 +1,8 @@
-"""局部语义检测。
+"""从局部点云提取门洞和电梯轿厢几何。
 
-当前版本只做轻量规则检测：用局部点云确认近距离门状结构，再把候选
-匹配到可控动态门服务 ID。metadata 只用于 ID 匹配，不生成导航目标。
+正式路径只使用运行期间的局部传感器观测，不读取 metadata。门洞由同一深度
+平面上的左右竖直结构确定；电梯候选还要求门后同时存在两侧壁和后壁，减少把
+普通长走廊误认作轿厢。只有显式诊断配置才允许使用已有空间门信息做邻近回退。
 """
 from __future__ import annotations
 
@@ -14,6 +15,7 @@ from danger_search.building_control_client import BuildingControlClient, DoorInf
 
 @dataclass(frozen=True)
 class DoorCandidate:
+    """已关联到公开服务 ID 的局部门候选及其证据来源。"""
     door_id: str
     distance: float
     visible: bool
@@ -36,7 +38,11 @@ class OpeningObservation:
 
 
 class LocalSemanticDetector:
-    """检测机器人局部可见范围内的可控动态门。"""
+    """用轻量几何规则检测机器人附近的门洞与轿厢结构。
+
+    本类只做观测解释，不调用门/电梯服务。``MissionManager`` 负责跨帧确认、
+    公开 ID 绑定和任务创建，防止单帧候选直接触发环境交互。
+    """
 
     def __init__(
         self,
@@ -290,6 +296,11 @@ class LocalSemanticDetector:
         floor_height: float = 2.6,
         allow_elevator: bool = False,
     ) -> DoorCandidate | None:
+        """在已注册的可控门中选择当前局部点云证据最接近的一扇。
+
+        正式模式下空间门注册本身必须来自传感器；``use_truth_proximity_detector``
+        仅供诊断，主状态机在 formal profile 会禁止启用该回退。
+        """
         candidates: list[DoorCandidate] = []
         points = list(cloud_points)
         for door in building_client.controllable_doors(

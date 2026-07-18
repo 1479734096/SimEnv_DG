@@ -1,4 +1,14 @@
-"""多楼层 2.5D 栅格建图。"""
+"""由配准点云增量维护多楼层 2.5D 占据栅格。
+
+每个楼层使用相同 world XY 原点和分辨率，但持有独立二维数组。点云 Z 只用于
+相对当前楼板筛选障碍高度，因此地图不表达完整三维几何。栅格状态含义为：
+``UNKNOWN`` 未观测、``FREE`` 可通行、``VISITED`` 机器人已覆盖、``BLACK``
+任务层临时/永久禁区、``OCC`` 实体障碍。
+
+更新一帧时先写全部障碍命中，再执行点射线与可视扇区清空。这一顺序以及
+“遇到 OCC/BLACK 即停止”的规则可防止稀疏回波、点顺序或墙后点把静态墙擦除。
+动态门打开后的局部清理必须显式调用 ``clear_dynamic_door_strip``。
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -23,6 +33,7 @@ class _AngleBinObservation:
 
 @dataclass(frozen=True)
 class MapperDebugSnapshot:
+    """一帧建图结束后的只读诊断摘要，不参与规划决策。"""
     floor_index: int
     point_ray_count: int
     sector_ray_count: int
@@ -52,6 +63,12 @@ class _MapperFrameStats:
 
 @dataclass
 class FloorGrid:
+    """单层 world XY 与离散栅格之间的映射及基础标记操作。
+
+    数组按 ``data[gy, gx]`` 存储；world 坐标落在格子中心时通过
+    ``grid_to_world`` 返回。所有可通行判断统一只接受 FREE/VISITED，UNKNOWN、
+    BLACK 和 OCC 均 fail-closed。
+    """
     floor_index: int
     resolution: float
     width: float
@@ -83,6 +100,7 @@ class FloorGrid:
         return int(self.data[gy, gx]) in (FREE, VISITED)
 
     def mark_free(self, gx: int, gy: int) -> None:
+        """仅把 UNKNOWN 变为 FREE，绝不覆盖已知障碍或任务禁区。"""
         if 0 <= gx < self.size_x and 0 <= gy < self.size_y and self.data[gy, gx] == UNKNOWN:
             self.data[gy, gx] = FREE
 
@@ -91,6 +109,7 @@ class FloorGrid:
             self.data[gy, gx] = OCC
 
     def mark_occupied_radius(self, x: float, y: float, radius: float) -> None:
+        """把障碍命中按机器人安全余量膨胀为圆形 OCC 区域。"""
         center = self.world_to_grid(x, y)
         if center is None:
             return
@@ -108,6 +127,7 @@ class FloorGrid:
                     self.data[gy, gx] = OCC
 
     def mark_visited_radius(self, x: float, y: float, radius: float) -> None:
+        """记录机身实际覆盖区域；实体 OCC 始终拥有更高优先级。"""
         center = self.world_to_grid(x, y)
         if center is None:
             return
@@ -167,7 +187,11 @@ class FloorGrid:
 
 
 class MultiFloorGridMap:
-    """为每个楼层维护一张占据栅格。"""
+    """按需创建楼层栅格，并把已配准 world 点云融合到指定楼层。
+
+    本类不知道门 ID、房间或电梯语义。``MissionManager`` 负责在楼层转换未确认
+    时阻断更新，并只在服务成功且传感器确认开门后调用动态门清理接口。
+    """
 
     def __init__(
         self,
@@ -213,6 +237,7 @@ class MultiFloorGridMap:
         self._pending_dynamic_door_cleared_count = 0
 
     def floor(self, floor_index: int) -> FloorGrid:
+        """取得指定楼层地图；第一次访问时按统一几何参数惰性创建。"""
         if floor_index not in self._floors:
             self._floors[floor_index] = FloorGrid(
                 floor_index=floor_index,
@@ -225,6 +250,7 @@ class MultiFloorGridMap:
         return self._floors[floor_index]
 
     def estimate_floor_from_z(self, z: float) -> int:
+        """按楼层高度把绝对 Z 量化为非负楼层编号。"""
         return max(0, int(round(float(z) / self.floor_height)))
 
     def update_from_cloud(
@@ -234,6 +260,12 @@ class MultiFloorGridMap:
         robot_xyz: tuple[float, float, float],
         points: Iterable[tuple[float, float, float]],
     ) -> None:
+        """融合一帧已变换到 world 的点云。
+
+        处理阶段为：标记机器人访问区、收集有效回波和角度桶、批量写障碍、
+        对每个回波做保守自由射线、按足够观测的扇区补充自由空间，最后保存
+        诊断统计。无障碍远点的自由射线受 ``point_free_clear_max_range`` 限制。
+        """
         grid = self.floor(floor_index)
         stats = _MapperFrameStats(
             floor_index=floor_index,
@@ -332,6 +364,7 @@ class MultiFloorGridMap:
         )
 
     def mark_black(self, floor_index: int, x: float, y: float, radius: float) -> None:
+        """标记任务层禁止规划区域，但不覆盖已经确认的实体 OCC。"""
         grid = self.floor(floor_index)
         center = grid.world_to_grid(x, y)
         if center is None:
@@ -352,7 +385,11 @@ class MultiFloorGridMap:
         width: float,
         depth: float,
     ) -> None:
-        """按门洞方向清理动态障碍残留，避免圆形清理擦掉门侧静态墙。"""
+        """按门洞方向清理动态障碍残留，避免圆形清理擦掉门侧静态墙。
+
+        仅矩形门板条带中的 OCC/BLACK 会恢复为 FREE；门框两侧和门洞之外不受
+        影响。该方法是动态环境修改地图的唯一显式入口。
+        """
         grid = self.floor(floor_index)
         center = grid.world_to_grid(x, y)
         if center is None:

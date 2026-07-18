@@ -1,6 +1,8 @@
-"""红色球形危险源检测。
+"""基于合法 RGB-D 输入的红色球形危险源检测。
 
 检测链路：HSV 红色分割 -> 轮廓初筛 -> 深度反投影 -> RANSAC 球拟合。
+颜色只用于生成候选，最终必须通过物理半径和三维拟合误差约束，从而拒绝红色
+方块等干扰源。输出仍是单帧候选，必须交给 ``DetectionTracker`` 多帧确认。
 """
 from __future__ import annotations
 
@@ -26,6 +28,7 @@ except ImportError:  # pragma: no cover - 仅在缺少 ROS 的离线环境触发
 
 @dataclass(frozen=True)
 class SphereFit:
+    """一次三维球面拟合的中心、半径、误差和内点数量。"""
     center: np.ndarray
     radius: float
     rmse: float
@@ -33,7 +36,11 @@ class SphereFit:
 
 
 class RedSphereDetector:
-    """从 RGB-D 图像中检测红色球体。"""
+    """从同步 RGB-D 图像中检测红球并输出 world/camera 坐标候选。
+
+    若正式调用要求 world 变换而对应图像时间戳没有匹配位姿，则直接返回空集合，
+    不用最新位姿代替。随机采样器使用固定种子，使同一输入的 RANSAC 结果可复现。
+    """
 
     def __init__(
         self,
@@ -74,6 +81,7 @@ class RedSphereDetector:
         *,
         require_world_transform: bool = False,
     ) -> list[DetectionCandidate]:
+        """将 ROS 图像转换为数组后进入无 ROS 依赖的检测核心。"""
         if self._bridge is None:
             return []
         rgb = self._bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
@@ -98,6 +106,11 @@ class RedSphereDetector:
         stamp: float | None = None,
         require_world_transform: bool = False,
     ) -> list[DetectionCandidate]:
+        """执行一帧完整检测并返回所有通过几何校验的候选。
+
+        深度点先位于相机光学坐标；提供 ``camera_to_world`` 时才转换到 world。
+        ``require_world_transform`` 用于生产链 fail-closed，离线算法测试可省略变换。
+        """
         if require_world_transform and camera_to_world is None:
             return []
         if cv2 is None:
@@ -191,6 +204,7 @@ class RedSphereDetector:
         return np.column_stack((x, y, z))
 
     def _fit_sphere_ransac(self, points: np.ndarray) -> SphereFit | None:
+        """用最小样本提出球模型，再以残差内点做最小二乘精炼。"""
         if len(points) < self.ransac_sample_size:
             return None
         best: SphereFit | None = None

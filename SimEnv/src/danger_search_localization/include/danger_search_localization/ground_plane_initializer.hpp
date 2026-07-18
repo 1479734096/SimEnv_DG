@@ -12,6 +12,7 @@
 
 namespace danger_search_localization {
 
+/// 首帧楼面 RANSAC 的候选范围、几何阈值和最小证据量。
 struct GroundPlaneOptions {
   double minimum_candidate_z = -1.0;
   double maximum_candidate_z = 0.20;
@@ -26,6 +27,7 @@ struct GroundPlaneOptions {
   std::size_t ransac_iterations = 256;
 };
 
+/// 由当前 Livox 帧估计的 base 系楼面法向与机身离地距离。
 struct GroundPlaneEstimate {
   Eigen::Vector3d normal_base = Eigen::Vector3d::UnitZ();
   double distance_from_base = 0.0;
@@ -33,6 +35,11 @@ struct GroundPlaneEstimate {
   std::size_t candidate_count = 0;
 };
 
+/// 从 base 系点云估计当前楼面；证据不足或几何不合理时返回空值。
+///
+/// 算法先在预期高度/量程内做固定种子 RANSAC，再用最佳内点的协方差最小
+/// 特征向量精炼法向。法向必须朝上且倾角、离地距离、内点数和比例同时通过，
+/// 防止把墙面、台阶边缘或稀疏家具表面误当作出生楼面。
 inline std::optional<GroundPlaneEstimate> EstimateGroundPlane(
     const std::vector<Eigen::Vector3d> &base_points,
     const GroundPlaneOptions &options = GroundPlaneOptions()) {
@@ -154,6 +161,10 @@ inline std::optional<GroundPlaneEstimate> EstimateGroundPlane(
       normal, distance_from_base, refined_count, candidates.size()};
 }
 
+/// 用实测楼面确定 roll/pitch/z，同时保持公开起点的 world x/y/yaw。
+///
+/// 这一步把“公开场景提供的平面起点”和“传感器测得的机身离地姿态”组合为
+/// 初始 world->base，不使用 Gazebo 出生高度或真值 TF。
 inline Eigen::Isometry3d BuildWorldBaseFromGroundPlane(
     const Eigen::Vector3d &normal_base, double distance_from_base,
     double world_x, double world_y, double requested_yaw) {

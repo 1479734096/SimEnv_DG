@@ -1,4 +1,10 @@
-"""前沿探索。"""
+"""前沿提取、可达性验证、目标评分与短期失败管理。
+
+前沿是已知可通行格与 UNKNOWN 的边界。选择流程先连通域聚类，再为每个聚类
+向已知自由区内部寻找具有障碍净距和未知退让距离的安全落点；只有 A* 确认可达
+的候选才参与最终评分。评分综合信息增益、路径长度、转向、重复访问以及过门后
+上下文。规划预算耗尽与真正不可达严格区分，前者不会触发黑名单。
+"""
 from __future__ import annotations
 
 from collections import deque
@@ -26,6 +32,7 @@ from danger_search.time_utils import get_time
 
 @dataclass(frozen=True)
 class Frontier:
+    """一个前沿连通簇及其安全目标、信息增益和最终分数。"""
     cells: tuple[tuple[int, int], ...]
     centroid: tuple[float, float]
     information_gain: float
@@ -34,6 +41,11 @@ class Frontier:
 
 @dataclass(frozen=True)
 class FrontierSelectionContext:
+    """主状态机传入的一次选择上下文。
+
+    它表达过门后的有限禁回区域、优先前进方向和当前目标惯性，不修改基础地图。
+    临时约束到期后自然消失，永久约束也只在门附近硬过滤，远处采用衰减惩罚。
+    """
     forbidden_half_plane_origin: tuple[float, float] | None = None
     forbidden_half_plane_normal: tuple[float, float] | None = None
     forbidden_radius: float = 0.0
@@ -58,6 +70,7 @@ class FrontierSelectionContext:
 
 @dataclass(frozen=True)
 class FrontierSelectionDebug:
+    """一次前沿选择的汇总诊断，用于解释目标为何被接受或拒绝。"""
     candidate_count: int
     reachable_count: int
     blacklisted_count: int
@@ -81,6 +94,7 @@ class FrontierSelectionDebug:
 
 @dataclass(frozen=True)
 class FrontierCandidateDebug:
+    """单个候选从提取、规划到评分各阶段的可审计结果。"""
     position: tuple[float, float]
     cluster_size: int
     information_gain: float
@@ -105,7 +119,11 @@ class _FrontierExtractionRejection:
 
 
 class FrontierExplorer:
-    """负责提取前沿、评分、黑名单管理。"""
+    """负责提取前沿、规划候选、评分、惯性保持和失败黑名单。
+
+    本类不发布速度，也不改变顶层状态；它返回选中 ``Frontier`` 与可跟踪路径，
+    由 ``MissionManager`` 决定何时切换控制器目标或结束当前楼层。
+    """
 
     def __init__(
         self,
@@ -160,6 +178,12 @@ class FrontierExplorer:
         *,
         frontiers: list[Frontier] | None = None,
     ) -> tuple[Frontier | None, list[tuple[float, float]]]:
+        """选择本轮收益最高的可达前沿及其路径。
+
+        为限制 10 Hz 主循环阻塞，先用乐观分数截取有限候选再运行 A*；当前目标
+        所在区域仍可达时，只有新目标分数超过切换余量才会换目标。若前沿全部
+        不可用，还会在已知自由空间中尝试保守 fallback，并完整记录原因。
+        """
         selection_started = time.perf_counter()
         self._expire_blacklist()
         self._last_budget_exhausted_frontiers: list[Frontier] = []
@@ -433,6 +457,7 @@ class FrontierExplorer:
         return None, []
 
     def extract_frontiers(self, grid: FloorGrid) -> list[Frontier]:
+        """从单层栅格提取四连通前沿簇，并过滤过小或低收益簇。"""
         self._last_extraction_rejections = []
         frontier_mask = _build_frontier_mask(grid)
 
@@ -490,6 +515,7 @@ class FrontierExplorer:
         return frontiers
 
     def record_failure(self, grid: FloorGrid, world_xy: tuple[float, float]) -> None:
+        """累计目标规划/导航失败，达到阈值后临时拉黑对应格。"""
         cell = grid.world_to_grid(world_xy[0], world_xy[1])
         if cell is None:
             return
@@ -498,6 +524,7 @@ class FrontierExplorer:
             self.blacklist_cell(cell)
 
     def record_stuck_failure(self, grid: FloorGrid, world_xy: tuple[float, float]) -> None:
+        """对真实卡住位置使用更大半径黑名单，避免立即选择同一区域。"""
         """临时排除已确认卡住目标附近区域，避免前沿质心漂移绕过单格黑名单。"""
         center = grid.world_to_grid(world_xy[0], world_xy[1])
         if center is None:

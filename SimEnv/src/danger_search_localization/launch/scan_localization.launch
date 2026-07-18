@@ -1,4 +1,9 @@
 <launch>
+  <!--
+    定位子系统入口。外部输入只允许 /scan、/real_sense/depth/points、
+    /trunk_imu 和本算法自己的 /cmd_vel；输出全部位于 /danger_search/localization。
+    正式父 launch 选择 rgbd_livox，默认 kiss_icp 主要保留独立诊断兼容。
+  -->
   <arg name="raw_cloud_topic" default="/scan"/>
   <arg name="depth_cloud_topic" default="/real_sense/depth/points"/>
   <arg name="localization_backend" default="kiss_icp"/>
@@ -11,6 +16,7 @@
         name="scan_localization"
         required="true"
         output="screen">
+    <!-- C++ 构造函数还会再次检查话题固定值和公开场景 allowed_interfaces。 -->
     <param name="raw_cloud_topic" value="$(arg raw_cloud_topic)"/>
     <param name="depth_cloud_topic" value="$(arg depth_cloud_topic)"/>
     <param name="localization_backend" value="$(arg localization_backend)"/>
@@ -22,6 +28,7 @@
     <param name="voxel_size" value="0.15"/>
     <!-- 控制先验只用于点云退化方向的 GICP 初值，可由后续实测替换。 -->
     <param name="command_velocity_scale" value="1.0"/>
+    <!-- 固定外参来自公开传感器安装说明，不在运行时查询可能含真值的 TF 链。 -->
     <rosparam param="base_to_livox_xyz">[0.2, 0.0, 0.08]</rosparam>
     <rosparam param="base_to_livox_rpy">[0.0, 0.785, 0.0]</rosparam>
     <rosparam param="base_to_depth_xyz">[0.28, 0.0, 0.043]</rosparam>

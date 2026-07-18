@@ -1,4 +1,9 @@
-"""门/电梯客户端控制封装。"""
+"""公开门/电梯服务、运行时空间注册与过门几何的统一封装。
+
+公开场景文件只提供允许调用的 ID 和电梯服务楼层；门中心、朝向与轿厢等待点
+必须由合法传感器在运行时注册到 ``doors/elevators``。服务请求前再次校验公开
+集合，空间对象存在不代表 ID 自动获得调用权限。
+"""
 from __future__ import annotations
 
 import math
@@ -16,7 +21,11 @@ except ImportError:
 
 
 class AsyncServiceCall:
-    """异步服务调用，避免阻塞。"""
+    """在线程中执行一次 ROS 服务请求并暴露线程安全的轮询结果。
+
+    门动画和电梯运输可能远慢于 10 Hz 主状态机，任务对象只轮询 ``done/ok``，
+    等待期间仍可持续停车、处理传感器和执行安全检查。
+    """
 
     def __init__(self, name: str, fn):
         self.name = name
@@ -64,6 +73,7 @@ class AsyncServiceCall:
 
 @dataclass
 class DoorInfo:
+    """由传感器注册的门空间几何；``door_id`` 仍须属于公开 ID 集。"""
     door_id: str
     kind: str
     floor_index: int
@@ -74,6 +84,7 @@ class DoorInfo:
 
 @dataclass
 class ElevatorInfo:
+    """由传感器注册的各楼层电梯厅姿态，不包含服务权限。"""
     elevator_id: str
     lobby_poses: dict[int, tuple[float, float, float]]  # floor -> (x, y, yaw)
 
@@ -103,7 +114,7 @@ class BuildingControlClient:
         elevators: dict[str, set[int] | frozenset[int]],
         elevator_door_ids_by_floor: dict[int, list[str] | tuple[str, ...]] | None = None,
     ) -> None:
-        """登记公开 ID，不把公开信息错误扩展为坐标真值。"""
+        """登记公开 ID 和服务楼层，不把公开信息错误扩展为坐标真值。"""
         self.public_door_ids = {str(door_id) for door_id in door_ids}
         self.public_elevators = {
             str(elevator_id): {int(floor) for floor in floors}
@@ -124,6 +135,7 @@ class BuildingControlClient:
         return door_ids[0]
 
     def start(self, *, connect_elevator: bool = True) -> None:
+        """连接初始文档允许的服务；失败时保留未就绪状态供任务显式处理。"""
         if rospy is None:
             raise RuntimeError("没有 rospy 环境")
         try:
@@ -167,6 +179,7 @@ class BuildingControlClient:
         return door is not None and door.kind == "elevator"
 
     def open_door(self, door_id: str) -> AsyncServiceCall:
+        """校验公开门 ID 后异步请求打开；不根据响应直接修改地图。"""
         if door_id not in self.public_door_ids:
             raise ValueError(f"门 ID 未在公开场景信息中声明: {door_id}")
         def call():
@@ -178,6 +191,7 @@ class BuildingControlClient:
         return task
 
     def close_door(self, door_id: str) -> AsyncServiceCall:
+        """校验公开门 ID 后异步请求关闭。"""
         if door_id not in self.public_door_ids:
             raise ValueError(f"门 ID 未在公开场景信息中声明: {door_id}")
         def call():
@@ -189,6 +203,7 @@ class BuildingControlClient:
         return task
 
     def call_elevator(self, elevator_id: str, floor: int, open_doors: bool = False) -> AsyncServiceCall:
+        """仅对公开电梯及其 ``served_floors`` 发起异步呼叫。"""
         floors = self.public_elevators.get(elevator_id)
         if not floors or int(floor) not in floors:
             raise ValueError(f"电梯 {elevator_id} 不服务公开楼层 {floor}")
@@ -211,7 +226,11 @@ class BuildingControlClient:
         pass_offset: float = 0.8,
         commit_distance: float = 1.8,
     ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
-        """计算过门的等待点、通过点和门后深入点。"""
+        """由传感器注册门法向计算等待点、通过点和门后深入点。
+
+        法向有两个方向，离机器人更近的一侧作为等待侧，另一侧作为通过侧；
+        commit 点继续沿相同方向深入，供探索器建立“已经完整过门”的空间上下文。
+        """
         if door_id not in self.doors:
             raise ValueError(f"Unknown door_id: {door_id}")
         door = self.doors[door_id]

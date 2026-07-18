@@ -1,4 +1,7 @@
-// 参赛方定位节点：只读取初始接口文档授权的 Livox、RGB-D 与机身 IMU。
+// 参赛方定位节点：只读取初始接口文档授权的 Livox、RGB-D、机身 IMU 和
+// 自身 /cmd_vel 输出。正式 rgbd_livox 数据流为：公开起点 + 首帧楼面初始化
+// world 系；IMU 固定姿态；RGB-D/Livox 相邻帧 GICP 估计连续平移；Livox
+// 局部结构地图校正漂移；最后发布参赛方内部 odom 与 world 配准点云。
 #include <algorithm>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
@@ -67,6 +70,8 @@ Eigen::Vector3d VectorFromParam(const std::vector<double> &values, const std::st
 }
 
 struct StartPose {
+  // x/y/yaw 来自公开 team_scene_info；z 只保留用于诊断，正式世界系高度由
+  // 首帧楼面与 base 离地距离初始化。
   double x = 0.0;
   double y = 0.0;
   double z = 0.0;
@@ -112,6 +117,8 @@ StartPose ReadPublicStartPose(const std::string &path, bool require_info,
                               bool allow_relative, bool require_trunk_imu,
                               bool require_depth_points,
                               bool require_command_topic) {
+  // C++ 定位节点独立复核 Python 主节点的文件身份、schema 和所需接口，避免
+  // launch 只校验一侧后由另一侧形成未授权输入旁路。
   boost::property_tree::ptree tree;
   try {
     const auto validated_path = ValidateSceneInfoPath(path);
@@ -173,6 +180,11 @@ StartPose ReadPublicStartPose(const std::string &path, bool require_info,
 
 class ScanLocalizationNode {
  public:
+  /// 校验全部参数和公开输入后建立订阅/发布关系。
+  ///
+  /// 支持 kiss_icp、imu_constrained、rgbd_livox 三个后端；正式 launch 选择
+  /// rgbd_livox。构造期间任何接口、外参或场景信息异常都会抛出并终止节点，
+  /// 不会退回 Gazebo 真值或相对原点。
   ScanLocalizationNode() : nh_(), private_nh_("~") {
     std::string raw_cloud_topic = "/scan";
     std::string localization_backend = "kiss_icp";
@@ -321,6 +333,8 @@ class ScanLocalizationNode {
   };
 
   void OnCommand(const geometry_msgs::Twist::ConstPtr &message) {
+    // 缓存本算法已经发出的机体系平移命令，按时间积分后仅作为 GICP 初值；
+    // 点云证据仍决定是否接受位移，因此控制命令不能自证定位结果。
     const double linear_x = message->linear.x;
     const double linear_y = message->linear.y;
     if (!std::isfinite(linear_x) || !std::isfinite(linear_y)) {
@@ -344,6 +358,7 @@ class ScanLocalizationNode {
   Eigen::Vector2d CommandMotionPrior(
       const ros::Time &start, const ros::Time &end,
       const Eigen::Matrix3d &world_base_rotation) const {
+    // 对 [start,end] 内的分段常值命令积分，并用当前 IMU 姿态旋到 world XY。
     if (start.isZero() || end <= start || !world_base_rotation.allFinite()) {
       return Eigen::Vector2d::Zero();
     }
@@ -380,6 +395,8 @@ class ScanLocalizationNode {
   }
 
   void OnImu(const sensor_msgs::Imu::ConstPtr &message) {
+    // 只缓存有限、归一化且带有效时间戳的 IMU；rgbd_livox 在各点云回调中按
+    // 时间查最近样本，imu_constrained 还会在此更新短时平移积分先验。
     const auto &q = message->orientation;
     const auto &a = message->linear_acceleration;
     const auto &w = message->angular_velocity;
@@ -428,6 +445,7 @@ class ScanLocalizationNode {
 
   std::optional<ImuSample> ImuSampleAt(
       const ros::Time &stamp, double *closest_delta_out = nullptr) const {
+    // 不做跨时间插值：最近样本仍须位于 imu_max_delta_，否则整帧点云跳过。
     std::lock_guard<std::mutex> lock(imu_mutex_);
     const ImuSample *closest = nullptr;
     double closest_delta = std::numeric_limits<double>::infinity();
@@ -454,6 +472,8 @@ class ScanLocalizationNode {
   }
 
   void UpdateLivoxScale(const ros::Time &stamp) {
+    // 以约一秒窗口比较 RGB-D 与 Livox 累计里程，使用最近若干合法比值的中位数
+    // 修正 Livox 相对位移尺度；异常范围样本不进入历史。
     if (!scale_window_initialized_) {
       scale_depth_anchor_ = depth_total_;
       scale_livox_anchor_ = livox_total_;
@@ -485,6 +505,8 @@ class ScanLocalizationNode {
   }
 
   void OnDepthCloud(const sensor_msgs::PointCloud2::ConstPtr &message) {
+    // RGB-D 支路提供高频连续平移：时间匹配 IMU 固定旋转，规则采样深度点，
+    // 命令积分作初值执行平面 GICP。只有验收通过的 delta 才进入融合累计量。
     if (!use_rgbd_livox_ || message->header.stamp.isZero()) {
       return;
     }
@@ -581,6 +603,8 @@ class ScanLocalizationNode {
   }
 
   void OnCloud(const sensor_msgs::PointCloud::ConstPtr &message) {
+    // Livox 是世界系初始化和最终输出的主时钟。首个有效帧先估计楼面；之后按
+    // 后端执行纯 KISS-ICP、IMU 约束局部地图，或 RGB-D 连续里程 + Livox 校正。
     std::vector<Eigen::Vector3d> points;
     points.reserve(message->points.size());
     for (const auto &point : message->points) {
@@ -847,6 +871,8 @@ class ScanLocalizationNode {
   }
 
   void PublishOdometry(const ros::Time &stamp, const SE3d &world_base) {
+    // 位姿使用 world->base；线速度由相邻 world 平移差分后转到 base，角速度由
+    // yaw 差分得到。所有字段沿用输入点云时间戳，便于 Python 侧严格时间匹配。
     nav_msgs::Odometry message;
     message.header.stamp = stamp;
     message.header.frame_id = frame_id_;
@@ -882,6 +908,8 @@ class ScanLocalizationNode {
 
   void PublishRegisteredCloud(const ros::Time &stamp, const SE3d &world_livox,
                               const std::vector<Eigen::Vector3d> &points) {
+    // 将本帧已过滤 Livox 点逐点变换到 world，供 Mapper 使用；该内部话题不增加
+    // 新的外部信息源，坐标完全来自同一定位闭包。
     sensor_msgs::PointCloud2 message;
     message.header.stamp = stamp;
     message.header.frame_id = frame_id_;

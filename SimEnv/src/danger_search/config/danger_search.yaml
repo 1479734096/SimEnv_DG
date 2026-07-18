@@ -1,10 +1,14 @@
-# danger_search 默认参数。
+# danger_search 正式默认参数。
+# 加载链：danger_search.launch -> MissionManager._load_params -> 各组件构造函数。
 # 坐标由参赛方 /scan 定位节点锚定；正式模式只读取公开 team_scene_info.json。
+# 各组件不会自行从参数服务器读取隐藏参数，因此本文件是生产行为的统一配置面。
 
 runtime:
   profile: formal
 
 topics:
+  # 外部话题必须同时通过静态白名单与本场景 allowed_interfaces；
+  # /danger_search、/nav 下的话题均为参赛方内部派生数据或诊断输出。
   cmd_vel: /cmd_vel
   localization_odom: /danger_search/localization/odom
   cloud: /danger_search/localization/cloud_registered
@@ -31,6 +35,7 @@ localization:
   unavailable_timeout: 3.0
 
 mission:
+  # 顶层状态机、单层完成判据、返航预算、过门上下文和任务输出策略。
   startup_delay: 2.0
   # /nav/goal 不属于比赛公开接口，仅诊断工具可显式开启。
   manual_goal_enabled: false
@@ -98,6 +103,7 @@ mission:
   min_floor_change_remaining_ratio: 0.25
 
 map:
+  # 每层独立 2.5D 栅格；只表达 UNKNOWN/FREE/VISITED/BLACK/OCC，不编码房间语义。
   resolution: 0.10
   width: 28.0
   length: 48.0
@@ -121,6 +127,7 @@ map:
   cloud_max_points: 18000
 
 frontier:
+  # 前沿聚类、安全落点、A* 候选预算、收益评分、惯性和短期黑名单。
   min_cluster_size: 4
   blacklist_ttl: 60.0
   fail_limit: 3
@@ -148,6 +155,7 @@ frontier:
   max_fallback_planning_candidates: 8
 
 controller:
+  # PathFollower 的路径跟踪与唯一 /cmd_vel 输出上限；最终仍经过 ground_support 门。
   max_linear: 0.60
   # 0 保持既有全局上限；正数仅限制首次 EXIT_CABIN 通过尝试。
   exit_first_max_linear: 0.0
@@ -227,6 +235,7 @@ ground_support:
   sensor_frame: laser_livox
 
 detection:
+  # 单帧红球外观/三维球拟合门槛；多帧确认与最终去重参数位于 tracker。
   min_area: 35
   min_circularity: 0.55
   min_aspect: 0.65
@@ -243,6 +252,7 @@ detection:
   depth_frame_is_optical: true
 
 local_semantic:
+  # 仅使用局部点云/RGB-D 注册门和电梯几何；公开 JSON 只提供可调用 ID。
   max_door_distance: 3.0
   door_fov_half_angle: 0.85
   door_evidence_radius: 0.75
@@ -292,6 +302,7 @@ local_semantic:
   use_truth_proximity_detector: false
 
 tracker:
+  # DetectionCandidate -> Track -> CONFIRMED -> NMS 输出的时空质量门槛。
   association_radius: 0.45
   confirmation_window: 10.0
   min_hits: 4

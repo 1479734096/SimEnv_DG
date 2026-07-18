@@ -1,7 +1,12 @@
-"""局部地面支撑安全门的状态机与停车包络。
+"""最终速度出口前的局部地面支撑安全状态机与停车包络。
 
 该模块不修改占据地图，也不负责重规划。它只把已验证的局部支撑评估转换为
 最终速度钳制状态；关闭时必须完全透明。
+
+状态分三类：``CLEAR`` 透明放行；``OBSERVATION_HOLD/STALE_DATA_HOLD`` 是可由
+新鲜正支撑自动解除的临时零速；DROP、超包络速度和停车超时进入锁存状态，
+必须由任务层写入局部禁区、重规划或结束任务。墙钟与控制/仿真时间同时保存，
+从而在 ``/clock`` 冻结时仍能检测“已要求停车但无法确认停稳”的异常。
 """
 from __future__ import annotations
 
@@ -29,7 +34,11 @@ _LATCHED_STATES = _STOPPING_STATES | {
 
 
 class ConservativeStopEnvelope:
-    """按实测速度上界查表，不插值且绝不向有效域外外推。"""
+    """按速度上界查实测停车距离，不插值且绝不向有效域外外推。
+
+    向上取档保证同一档内使用更保守的距离；超过验证最大速度时返回 ``None``，
+    调用方立即零速并进入超包络处理，不能凭数学外推宣称安全。
+    """
 
     def __init__(
         self,
@@ -77,6 +86,7 @@ class ConservativeStopEnvelope:
 
 @dataclass(frozen=True)
 class GroundSupportGateConfig:
+    """停车包络、数据新鲜度、释放滞回和停稳确认参数。"""
     enabled: bool = False
     validated_max_speed: float | None = None
     stop_distance_table: tuple[tuple[float, float], ...] = (
@@ -99,6 +109,11 @@ class GroundSupportGateConfig:
 
 @dataclass(frozen=True)
 class GroundSupportAssessment:
+    """由支撑网格生成的一次不可变局部走廊评估。
+
+    ``drop_confirmed`` 表示有明确负支撑证据；``observation_adequate=False`` 只表示
+    当前无法判断，二者不可混用。方向和交点用于确认当前命令是否确实驶向缺口。
+    """
     stamp: float
     received_wall_time: float
     data_age: float
@@ -115,7 +130,12 @@ class GroundSupportAssessment:
 
 
 class GroundSupportSafetyGate:
-    """只对最终命令做局部安全判定的锁存状态机。"""
+    """只在最终命令出口过滤速度的锁存状态机。
+
+    它同时观察算法请求速度、定位实测速度和最新支撑评估。DROP 必须新鲜、观测
+    充分、与未来扫掠区相交且当前命令朝向缺口才锁存；UNKNOWN 只触发有限观察
+    停车。关闭配置时 ``filter_command`` 原样返回输入，保持控制链完全透明。
+    """
 
     def __init__(self, config: GroundSupportGateConfig | None = None) -> None:
         self.config = config or GroundSupportGateConfig()
@@ -172,6 +192,7 @@ class GroundSupportSafetyGate:
         return self.state != CLEAR
 
     def update_assessment(self, assessment: GroundSupportAssessment) -> None:
+        """接收时间单调的新评估并累计连续正支撑帧，用于滞回释放。"""
         if not self.enabled:
             return
         if self._assessment is not None and assessment.stamp <= self._assessment.stamp:
@@ -207,6 +228,7 @@ class GroundSupportSafetyGate:
         angular_speed: float,
         wall_time: float,
     ) -> None:
+        """用定位实测速度确认停车过程及是否超出已验证速度域。"""
         if not self.enabled:
             return
         self._actual_linear_speed = abs(float(linear_speed))
@@ -330,6 +352,12 @@ class GroundSupportSafetyGate:
         wall_time: float,
         control_time: float | None = None,
     ) -> tuple[float, float, float]:
+        """在唯一速度出口决定原样放行或输出零速。
+
+        顺序为：检查时钟/锁存状态、验证请求与实测速度包络、处理已有临时停车、
+        检查明确 DROP，最后才判断是否接近未知支撑边界。任何锁存状态都优先于
+        新命令，防止上层换目标后意外解除安全停车。
+        """
         requested = tuple(float(value) for value in command)
         if not self.enabled:
             return requested

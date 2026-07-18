@@ -1,4 +1,10 @@
-"""ROS 传感器非阻塞缓存。"""
+"""ROS 传感器的非阻塞接入与最近帧缓存。
+
+ROS 回调只保存最新消息，不在回调线程做点云遍历或图像推理；10 Hz 主状态机
+通过 ``snapshot`` 一次取得自洽引用，再根据消息时间戳到 ``PoseProvider`` 查询
+位姿。RGB、深度和相机内参先由 ``ApproximateTimeSynchronizer`` 对齐，点云则
+独立缓存，因为其频率和后续消费节奏不同。
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -21,6 +27,7 @@ except ImportError:  # pragma: no cover - 离线语法检查环境可能没有 R
 
 @dataclass
 class ImageBundle:
+    """时间近似同步的一组 RGB、深度和相机内参 ROS 消息。"""
     rgb_msg: object
     depth_msg: object
     camera_info_msg: object
@@ -28,12 +35,17 @@ class ImageBundle:
 
 @dataclass
 class SensorSnapshot:
+    """主状态机读取时刻的最近点云与最近 RGB-D 组合。"""
     cloud_msg: object | None
     image_bundle: ImageBundle | None
 
 
 class SensorBuffer:
-    """把 ROS 回调数据缓存起来，主状态机只读取快照。"""
+    """把 ROS 回调数据缓存起来，使业务计算与回调线程解耦。
+
+    锁只保护消息引用的替换与复制，不保护耗时解析过程。调用方拿到的 ROS 消息
+    在 Python 中仍持有引用，因此释放锁后读取是安全的，也不会阻塞新帧到达。
+    """
 
     def __init__(
         self,
@@ -57,6 +69,7 @@ class SensorBuffer:
         self._subscribers = []
 
     def start(self) -> None:
+        """建立点云订阅和 RGB-D 三路近似同步器。"""
         if rospy is None:
             raise RuntimeError("当前环境没有 rospy，无法启动 SensorBuffer")
 
@@ -74,6 +87,7 @@ class SensorBuffer:
         self._subscribers.extend([rgb_sub, depth_sub, info_sub, synchronizer])
 
     def snapshot(self) -> SensorSnapshot:
+        """原子复制两类最新消息引用，不消费或清空缓存。"""
         with self._lock:
             return SensorSnapshot(
                 cloud_msg=self._cloud_msg,
@@ -81,6 +95,11 @@ class SensorBuffer:
             )
 
     def read_cloud_xyz(self, cloud_msg, *, max_points: int = 25000, stride: int = 1) -> list[tuple[float, float, float]]:
+        """按固定步长解码 ``PointCloud2``，并以点数上限约束单帧开销。
+
+        返回值只保留有限的 XYZ 数值；字段选择和 ``skip_nans`` 由 ROS 官方读取器
+        处理。调用方随后负责时间匹配和坐标系语义，本函数不擅自做变换。
+        """
         if pc2 is None or cloud_msg is None:
             return []
         points: list[tuple[float, float, float]] = []
@@ -94,10 +113,12 @@ class SensorBuffer:
         return points
 
     def _on_cloud(self, msg) -> None:
+        """点云回调：以最新帧覆盖旧帧，防止处理落后时形成无界积压。"""
         with self._lock:
             self._cloud_msg = msg
 
     def _on_image_bundle(self, rgb_msg, depth_msg, camera_info_msg) -> None:
+        """同步回调：把三路同一观测窗口内的消息作为不可拆组合保存。"""
         with self._lock:
             self._image_bundle = ImageBundle(rgb_msg=rgb_msg, depth_msg=depth_msg, camera_info_msg=camera_info_msg)
 

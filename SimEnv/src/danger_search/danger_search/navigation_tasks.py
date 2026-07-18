@@ -1,4 +1,10 @@
-"""导航任务状态机封装。"""
+"""普通导航、过门和乘电梯的非阻塞子状态机。
+
+``MissionManager.current_task`` 同一时刻只持有一个任务，每次主 tick 调用一次
+任务 ``tick``。任务可以规划路径、轮询异步服务或驱动 ``PathFollower``，但不会
+自行循环等待。统一返回 ``RUNNING/DONE/FAILED``（控制器还可返回 STUCK/IDLE），
+让顶层状态机清楚地区分仍在执行、成功和失败。
+"""
 from __future__ import annotations
 
 import math
@@ -26,6 +32,7 @@ def _angle_wrap(angle: float) -> float:
 
 
 class NavigationTask:
+    """导航子任务最小接口；实现必须让每次 ``tick`` 快速返回。"""
     def __init__(self, name: str):
         self.name = name
 
@@ -34,6 +41,7 @@ class NavigationTask:
 
 
 class NavigateToPose(NavigationTask):
+    """导航到一个 world XY 目标，路径丢失时重新规划。"""
     def __init__(self, target_xy: tuple[float, float], tolerance: float | None = None):
         super().__init__(f"NavigateToPose({target_xy[0]:.2f}, {target_xy[1]:.2f})")
         self.target_xy = target_xy
@@ -63,6 +71,12 @@ class NavigateToPose(NavigationTask):
 
 
 class OpenDoorAndPass(NavigationTask):
+    """动态门交互状态机：到等待侧、开门、直线过门并深入门后。
+
+    等待/通过/commit 三点全部来自运行时传感器注册门几何。服务成功后仍由
+    ``MissionManager.clear_opened_door_area`` 采用受限门板条带更新地图；真正
+    过门阶段先原地对准，再使用两点直线和更严格端点容差，避免 A* 折线切门框。
+    """
     _PASS_ALIGN_TOLERANCE = 0.10
     _PASS_ALIGN_CONFIRMATIONS = 2
 
@@ -104,6 +118,7 @@ class OpenDoorAndPass(NavigationTask):
         return self._commit_point
 
     def tick(self, manager: MissionManager, pose: tuple[float, float, float]) -> str:
+        """按当前 ``phase`` 推进一步，所有服务等待期间保持零速。"""
         client = manager.building_client
         
         if self._wait_point is None or self._pass_point is None or self._commit_point is None:
@@ -477,6 +492,13 @@ def _clear_opened_door_area(manager: MissionManager, door_id: str) -> None:
 
 
 class TakeElevator(NavigationTask):
+    """完整乘梯交互状态机。
+
+    主流程为：到当前层厅外并对门—呼梯/开门—传感器确认开口—精确进厢—关门
+    并朝目标出口—运输—目标层开门确认—确认逻辑楼层—精确出厢—关门。
+    服务成功、固定等待时间和位姿 Z 都不能单独确认换层；只有目标层注册门开口
+    获得传感器确认后才调用 ``MissionManager.confirm_floor_transition``。
+    """
     _CABIN_TRANSIT_ALIGN_TOLERANCE = 0.10
     _CABIN_TRANSIT_ALIGN_RELEASE_TOLERANCE = 0.15
     _CABIN_TRANSIT_ALIGN_CONFIRMATIONS = 2
@@ -518,6 +540,7 @@ class TakeElevator(NavigationTask):
         self._floor_transition_confirmed = False
 
     def tick(self, manager: MissionManager, pose: tuple[float, float, float]) -> str:
+        """推进一个乘梯阶段；任一失败都显式返回 FAILED 而不猜测所在楼层。"""
         client = manager.building_client
         try:
             current_wait, cabin_center = client.get_elevator_points(self.elevator_id, self.current_floor)
@@ -898,6 +921,12 @@ class TakeElevator(NavigationTask):
         door_id: str,
         max_linear: float | None = None,
     ) -> str:
+        """以 POSITION—ALIGN—CROSS 三阶段精确进入或离开轿厢。
+
+        POSITION 到门外/轿厢中心，ALIGN 连续确认机身朝向，CROSS 只跟踪一条
+        两点直线并用实际端点距离验收。独立阶段可防止普通路径跟踪提前切段，
+        同时让卡住原因能够定位到准备、对准还是跨门槛。
+        """
         if self._cabin_transit_mode != mode or self.cabin_transit_stage is None:
             self._begin_cabin_transit(mode, position_xy, target_xy)
 
