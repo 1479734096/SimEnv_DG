@@ -20,9 +20,11 @@ BUILDING_LENGTH="${BUILDING_LENGTH:-36.0}"
 DANGER_COUNT="${DANGER_COUNT:-3:6}"
 DISTRACTOR_COUNT="${DISTRACTOR_COUNT:-4:8}"
 GUI="${GUI:-true}"
-PAUSED="${PAUSED:-false}"
+PAUSED="$(as_ros_bool "${PAUSED:-true}")"
 AUTO_UNPAUSE="$(as_ros_bool "${AUTO_UNPAUSE:-1}")"
-AUTO_UNPAUSE_DELAY="${AUTO_UNPAUSE_DELAY:-6}"
+SPAWN_CONFIG_SETTLE_TIMEOUT="${SPAWN_CONFIG_SETTLE_TIMEOUT:-15}"
+CONTROLLER_READY_TIMEOUT="${CONTROLLER_READY_TIMEOUT:-30}"
+STARTUP_CALF_POSITION="${STARTUP_CALF_POSITION:--2.0}"
 START_CONTROLLER="${START_CONTROLLER:-1}"
 START_VIRTUAL_JOY="${START_VIRTUAL_JOY:-0}"
 CONTROLLER_FOREGROUND="${CONTROLLER_FOREGROUND:-1}"
@@ -51,26 +53,9 @@ GAZEBO_PHYSICS_REAL_TIME_UPDATE_RATE="${GAZEBO_PHYSICS_REAL_TIME_UPDATE_RATE:-50
 GAZEBO_PHYSICS_ODE_ITERS="${GAZEBO_PHYSICS_ODE_ITERS:-40}"
 GAZEBO_PHYSICS_CONTACT_MAX_CORRECTING_VEL="${GAZEBO_PHYSICS_CONTACT_MAX_CORRECTING_VEL:-5.0}"
 ROBOT_X="${ROBOT_X:-0.0}"
-ROBOT_Y="${ROBOT_Y:--3.2}"
+ROBOT_Y="${ROBOT_Y:--2.2}"
 ROBOT_Z="${ROBOT_Z:-0.6}"
 ROBOT_YAW="${ROBOT_YAW:-1.5708}"
-
-schedule_unpause_physics() {
-  if [ "$AUTO_UNPAUSE" != "true" ]; then
-    return
-  fi
-
-  (
-    sleep "$AUTO_UNPAUSE_DELAY"
-    for _ in $(seq 1 40); do
-      if rosservice list 2>/dev/null | grep -q '^/gazebo/unpause_physics$'; then
-        rosservice call /gazebo/unpause_physics >/dev/null 2>&1 || true
-        exit 0
-      fi
-      sleep 0.25
-    done
-  ) &
-}
 
 wait_for_robot_spawn() {
   local timeout="$ROBOT_SPAWN_TIMEOUT"
@@ -98,6 +83,145 @@ wait_for_robot_spawn() {
   echo "Timed out waiting for robot spawn. Last log lines:" >&2
   tail -n 80 "$WORKSPACE_DIR/logs/competition_gazebo.log" >&2
   exit 1
+}
+
+wait_for_spawn_configuration_settle() {
+  local deadline=$((SECONDS + SPAWN_CONFIG_SETTLE_TIMEOUT))
+  echo "等待 spawn_model 完成延迟关节配置……"
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if ! kill -0 "$LAUNCH_PID" 2>/dev/null; then
+      echo "等待延迟关节配置时 roslaunch 已退出。" >&2
+      tail -n 80 "$WORKSPACE_DIR/logs/competition_gazebo.log" >&2
+      return 1
+    fi
+    if grep -a -q "Set model configuration status: SetModelConfiguration: success" \
+        "$WORKSPACE_DIR/logs/competition_gazebo.log" 2>/dev/null; then
+      echo "spawn_model 延迟关节配置已完成。"
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  echo "等待 spawn_model 延迟关节配置超时。" >&2
+  tail -n 80 "$WORKSPACE_DIR/logs/competition_gazebo.log" >&2
+  return 1
+}
+
+prepare_ros_control_joint_angles() {
+  local request
+  local response
+  request="model_name: 'a1_gazebo'
+urdf_param_name: 'robot_description'
+joint_names: ['FR_calf_joint', 'FL_calf_joint', 'RR_calf_joint', 'RL_calf_joint']
+joint_positions: [$STARTUP_CALF_POSITION, $STARTUP_CALF_POSITION, $STARTUP_CALF_POSITION, $STARTUP_CALF_POSITION]"
+
+  echo "写入恢复物理前的最终 calf 配置：${STARTUP_CALF_POSITION} rad。"
+  response="$(timeout 5s rosservice call /gazebo/set_model_configuration "$request" 2>/dev/null || true)"
+  if ! grep -q 'success: True' <<<"$response"; then
+    echo "恢复物理前的最终 calf 配置写入失败。" >&2
+    [ -n "$response" ] && echo "$response" >&2
+    return 1
+  fi
+}
+
+unpause_physics() {
+  if ! timeout 5s rosservice call /gazebo/unpause_physics >/dev/null 2>&1; then
+    echo "Gazebo 物理恢复失败。" >&2
+    return 1
+  fi
+  echo "Gazebo 物理已恢复，现在可以等待实时关节反馈。"
+}
+
+wait_for_live_joint_feedback() {
+  local deadline=$((SECONDS + CONTROLLER_READY_TIMEOUT))
+  local topics=(
+    /a1_gazebo/FR_hip_controller/state
+    /a1_gazebo/FR_thigh_controller/state
+    /a1_gazebo/FR_calf_controller/state
+    /a1_gazebo/FL_hip_controller/state
+    /a1_gazebo/FL_thigh_controller/state
+    /a1_gazebo/FL_calf_controller/state
+    /a1_gazebo/RR_hip_controller/state
+    /a1_gazebo/RR_thigh_controller/state
+    /a1_gazebo/RR_calf_controller/state
+    /a1_gazebo/RL_hip_controller/state
+    /a1_gazebo/RL_thigh_controller/state
+    /a1_gazebo/RL_calf_controller/state
+    /trunk_imu
+  )
+  local topic
+  local received
+
+  for topic in "${topics[@]}"; do
+    received="false"
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      if timeout 2s rostopic echo -n 1 "$topic" >/dev/null 2>&1; then
+        received="true"
+        break
+      fi
+      if ! kill -0 "$LAUNCH_PID" 2>/dev/null; then
+        echo "等待 $topic 实时反馈时 roslaunch 已退出。" >&2
+        return 1
+      fi
+    done
+    if [ "$received" != "true" ]; then
+      echo "等待 $topic 实时反馈超时。" >&2
+      return 1
+    fi
+  done
+
+  echo "12 路 Gazebo 关节状态和机身 IMU 均已有实时反馈。"
+}
+
+wait_for_junior_ctrl_main_loop() {
+  local deadline=$((SECONDS + CONTROLLER_READY_TIMEOUT))
+  local ctrl_bin="$WORKSPACE_DIR/devel/lib/unitree_guide/junior_ctrl"
+  # IOROS::sendCmd() 在 FSM::run() 每次迭代无条件发布命令，且 absoluteWait 用墙钟，
+  # 物理暂停时主循环也照常空转发布；命令首帧能证明主循环已启动，且不依赖物理更新。
+  echo "等待 junior_ctrl 主循环首帧命令（证明模型加载与 FSM 主循环已启动）……"
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if ! pgrep -f "^${ctrl_bin}\$" >/dev/null 2>&1; then
+      echo "junior_ctrl 进程已退出，安全启动失败。" >&2
+      tail -n 40 "$WORKSPACE_DIR/logs/junior_ctrl.log" >&2 2>/dev/null || true
+      return 1
+    fi
+    if rostopic info /a1_gazebo/FR_calf_controller/command 2>/dev/null | \
+         grep -q '^[[:space:]]*\* /unitree_gazebo_servo ' && \
+       timeout 2s rostopic echo -n 1 /a1_gazebo/FR_calf_controller/command >/dev/null 2>&1; then
+      echo "junior_ctrl 主循环已启动（命令话题有首帧）。"
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  echo "等待 junior_ctrl 主循环首帧超时；保持物理暂停。" >&2
+  return 1
+}
+
+prepare_paused_startup() {
+  if [ "$AUTO_UNPAUSE" != "true" ] || [ "$PAUSED" != "true" ]; then
+    return
+  fi
+  wait_for_spawn_configuration_settle
+  prepare_ros_control_joint_angles
+}
+
+unpause_when_controller_is_ready() {
+  # 该函数在 if 条件上下文中被调用时 set -e 不生效，必须用 && 串联，
+  # 否则前置检查失败后仍会恢复物理（fail-open）。
+  wait_for_junior_ctrl_main_loop &&
+  unpause_physics &&
+  wait_for_live_joint_feedback
+}
+
+schedule_controller_ready_unpause() {
+  (
+    if ! unpause_when_controller_is_ready; then
+      echo "安全启动失败；停止 Gazebo，不允许控制链不完整时继续运行。" >&2
+      kill "$LAUNCH_PID" 2>/dev/null || true
+      pkill -f "$WORKSPACE_DIR/devel/lib/unitree_guide/junior_ctrl" 2>/dev/null || true
+    fi
+  ) &
 }
 
 echo "Terminating previous Gazebo, launch, controller, and optional joystick processes..."
@@ -158,6 +282,8 @@ export COMPETITION_ROBOT_X="$ROBOT_X"
 export COMPETITION_ROBOT_Y="$ROBOT_Y"
 export COMPETITION_ROBOT_Z="$ROBOT_Z"
 export COMPETITION_ROBOT_YAW="$ROBOT_YAW"
+# 按键 8 reset 的 unpause 前关节配置与启动 calf 角同源，避免 -2.65 立即恢复物理（ENV-004）
+export COMPETITION_RESET_CALF_POSITION="$STARTUP_CALF_POSITION"
 export UNITREE_CTRL_DT
 export UNITREE_LOG_WAIT_WARNINGS
 export CONTROLLER_SPAWNER_TIMEOUT
@@ -183,7 +309,10 @@ echo "  Referee odom: $ENABLE_REFEREE_ODOM"
 echo "  Foot contact sensors: $ENABLE_FOOT_CONTACT_SENSOR"
 echo "  Foot force visual: $ENABLE_FOOT_FORCE_VISUAL"
 echo "  Gazebo starts paused: $PAUSED"
-echo "  Auto unpause: $AUTO_UNPAUSE after ${AUTO_UNPAUSE_DELAY}s"
+echo "  自动恢复物理：$AUTO_UNPAUSE"
+echo "  spawn 配置等待超时：${SPAWN_CONFIG_SETTLE_TIMEOUT}s"
+echo "  控制链就绪超时：${CONTROLLER_READY_TIMEOUT}s"
+echo "  启动 calf 角：${STARTUP_CALF_POSITION} rad"
 echo "  Unitree wait warnings: $UNITREE_LOG_WAIT_WARNINGS"
 echo "  Robot spawn timeout: ${ROBOT_SPAWN_TIMEOUT}s"
 echo "  Controller spawner timeout: ${CONTROLLER_SPAWNER_TIMEOUT}s"
@@ -224,6 +353,7 @@ roslaunch unitree_guide multi_floor_gazeboSim.launch \
 LAUNCH_PID=$!
 echo "$LAUNCH_PID" > "$WORKSPACE_DIR/logs/competition_gazebo.pid"
 wait_for_robot_spawn
+prepare_paused_startup
 
 if [ "$START_BUILDING_CONTROL" = "1" ]; then
   echo "Starting building door/elevator control service..."
@@ -240,7 +370,9 @@ if [ "$START_CONTROLLER" = "1" ]; then
     echo "UNITREE_CTRL_DT=$UNITREE_CTRL_DT seconds."
     echo "Use keyboard input in this terminal: 2 = stand, 4 = RL keyboard walk, 6 = RL /cmd_vel mode, 8 = reset."
     echo "In RL keyboard walk mode: W/S = forward/back, A/D = left/right, J/L = turn, Space = stop."
-    schedule_unpause_physics
+    if [ "$AUTO_UNPAUSE" = "true" ] && [ "$PAUSED" = "true" ]; then
+      schedule_controller_ready_unpause
+    fi
     "$WORKSPACE_DIR/devel/lib/unitree_guide/junior_ctrl" || true
     echo "junior_ctrl exited; keeping Gazebo running for inspection. Press Ctrl-C to stop this script."
     wait "$LAUNCH_PID"
@@ -250,11 +382,21 @@ if [ "$START_CONTROLLER" = "1" ]; then
     echo "UNITREE_CTRL_DT=$UNITREE_CTRL_DT seconds."
     "$WORKSPACE_DIR/devel/lib/unitree_guide/junior_ctrl" \
       > "$WORKSPACE_DIR/logs/junior_ctrl.log" 2>&1 &
-    echo $! > "$WORKSPACE_DIR/logs/junior_ctrl.pid"
-    schedule_unpause_physics
+    CONTROLLER_PID=$!
+    echo "$CONTROLLER_PID" > "$WORKSPACE_DIR/logs/junior_ctrl.pid"
+    if [ "$AUTO_UNPAUSE" = "true" ] && [ "$PAUSED" = "true" ]; then
+      if ! unpause_when_controller_is_ready; then
+        kill "$CONTROLLER_PID" 2>/dev/null || true
+        kill "$LAUNCH_PID" 2>/dev/null || true
+        exit 1
+      fi
+    fi
   fi
 else
-  schedule_unpause_physics
+  if [ "$AUTO_UNPAUSE" = "true" ] && [ "$PAUSED" = "true" ]; then
+    echo "START_CONTROLLER=0 时不会自动恢复物理：缺少 junior_ctrl 首帧命令，无法证明控制链安全。" >&2
+    echo "如需运行传感器，请保留 START_CONTROLLER=1；可用 CONTROLLER_FOREGROUND=0 后台运行。" >&2
+  fi
 fi
 
 echo "Simulation startup command completed."

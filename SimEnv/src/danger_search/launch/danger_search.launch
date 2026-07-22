@@ -14,6 +14,7 @@
   <include file="$(find danger_search_localization)/launch/scan_localization.launch">
     <!-- 正式后端只使用公开 /scan、深度点云、/trunk_imu 和自身控制先验。 -->
     <arg name="localization_backend" value="rgbd_livox"/>
+    <arg name="stance_health_enabled" value="true"/>
     <arg name="team_scene_info_path"
          value="$(find danger_search)/../../generated_building/team_scene_info.json"/>
     <arg name="require_team_scene_info" value="true"/>
@@ -27,6 +28,7 @@
         output="screen">
     <!-- formal 强制公开 schema/接口校验，并禁用相对原点、手动目标和真值回退。 -->
     <param name="runtime/profile" value="formal"/>
+    <param name="wait_for_localization_ready" value="true"/>
     <param name="result_file" value="$(arg result_file)"/>
     <param name="mission_summary_file" value="$(arg mission_summary_file)"/>
     <param name="localization/team_scene_info_path"

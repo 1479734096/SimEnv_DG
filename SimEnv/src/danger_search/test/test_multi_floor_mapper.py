@@ -3,7 +3,15 @@ import unittest
 from typing import Tuple
 
 from danger_search.planner import astar_path
-from danger_search.mapper import BLACK, FREE, MultiFloorGridMap, OCC, UNKNOWN, VISITED
+from danger_search.mapper import (
+    BLACK,
+    FREE,
+    NEGATIVE,
+    MultiFloorGridMap,
+    OCC,
+    UNKNOWN,
+    VISITED,
+)
 
 
 class MultiFloorMapperTest(unittest.TestCase):
@@ -35,6 +43,52 @@ class MultiFloorMapperTest(unittest.TestCase):
         self.assertEqual(grid.data[neighbor[1], neighbor[0]], OCC)
         self.assertFalse(grid.is_traversable(*center))
         self.assertFalse(grid.is_traversable(*neighbor))
+
+    def test_visited_mark_does_not_erase_black_safety_cell(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=2.0,
+            length=2.0,
+            origin_x=-1.0,
+            origin_y=-1.0,
+        )
+        grid = mapper.floor(0)
+        cell = grid.world_to_grid(0.0, 0.0)
+        self.assertIsNotNone(cell)
+        center = grid.grid_to_world(*cell)
+        grid.data[cell[1], cell[0]] = BLACK
+
+        grid.mark_visited_radius(center[0], center[1], 0.05)
+
+        self.assertEqual(grid.data[cell[1], cell[0]], BLACK)
+
+    def test_invalid_geometry_is_rejected_explicitly(self):
+        with self.assertRaises(ValueError):
+            MultiFloorGridMap(resolution=0.0)
+        with self.assertRaises(ValueError):
+            MultiFloorGridMap(floor_height=math.nan)
+        with self.assertRaises(ValueError):
+            MultiFloorGridMap(point_free_clear_max_range=math.nan)
+
+    def test_non_finite_cloud_point_is_ignored(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=3.0,
+            length=3.0,
+            origin_x=-1.5,
+            origin_y=-1.5,
+            obstacle_inflation_radius=0.0,
+        )
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.3),
+            points=[(math.nan, 0.0, 0.6), (0.5, 0.0, 0.6)],
+        )
+
+        cell = mapper.floor(0).world_to_grid(0.5, 0.0)
+        self.assertIsNotNone(cell)
+        self.assertEqual(mapper.floor(0).data[cell[1], cell[0]], OCC)
 
     def test_astar_does_not_cross_inflated_obstacle(self):
         mapper = MultiFloorGridMap(
@@ -385,6 +439,94 @@ class MultiFloorMapperTest(unittest.TestCase):
 
         self.assertIsNotNone(skipped_cell)
         self.assertEqual(grid.data[skipped_cell[1], skipped_cell[0]], UNKNOWN)
+
+    def test_lower_return_does_not_create_free_ray_or_visible_sector(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+            visited_radius=0.0,
+            free_clear_enabled=True,
+            free_clear_min_points_per_bin=1,
+        )
+
+        mapper.update_from_cloud(
+            floor_index=1,
+            robot_xyz=(0.0, 0.0, 2.9),
+            points=[(1.0, 0.0, 0.0)],
+        )
+
+        grid = mapper.floor(1)
+        middle = grid.world_to_grid(0.5, 0.0)
+        target = grid.world_to_grid(1.0, 0.0)
+        self.assertEqual(grid.data[middle[1], middle[0]], UNKNOWN)
+        self.assertEqual(grid.data[target[1], target[0]], UNKNOWN)
+        self.assertEqual(mapper.latest_debug_snapshot().point_ray_count, 0)
+
+    def test_dynamic_negative_is_blocked_and_only_direct_support_clears_it(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+            visited_radius=0.0,
+        )
+        grid = mapper.floor(0)
+        cell = grid.world_to_grid(0.5, 0.0)
+
+        self.assertEqual(mapper.mark_negative_cells(0, [cell]), 1)
+        self.assertEqual(grid.data[cell[1], cell[0]], NEGATIVE)
+        self.assertFalse(grid.is_traversable(*cell))
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.3),
+            points=[(1.0, 0.0, 0.0)],
+        )
+        self.assertEqual(grid.data[cell[1], cell[0]], NEGATIVE)
+        self.assertEqual(mapper.clear_negative_cells_with_support(0, [cell]), 1)
+        self.assertEqual(grid.data[cell[1], cell[0]], FREE)
+
+    def test_direct_support_never_clears_black_or_occupied_priority(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        )
+        grid = mapper.floor(0)
+        black = grid.world_to_grid(0.2, 0.0)
+        occupied = grid.world_to_grid(0.4, 0.0)
+        mapper.mark_negative_cells(0, [black, occupied])
+        grid.data[black[1], black[0]] = BLACK
+        grid.data[occupied[1], occupied[0]] = OCC
+
+        mapper.clear_negative_cells_with_support(0, [black, occupied])
+
+        self.assertEqual(grid.data[black[1], black[0]], BLACK)
+        self.assertEqual(grid.data[occupied[1], occupied[0]], OCC)
+
+    def test_open_door_restores_negative_source_hidden_by_door_obstacle(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        )
+        grid = mapper.floor(0)
+        cell = grid.world_to_grid(0.2, 0.0)
+        mapper.mark_negative_cells(0, [cell])
+        grid.mark_occupied(*cell)
+
+        mapper.clear_dynamic_door_strip(
+            0, 0.0, 0.0, 0.0, width=1.0, depth=0.8
+        )
+
+        self.assertEqual(grid.data[cell[1], cell[0]], NEGATIVE)
 
 
 if __name__ == "__main__":

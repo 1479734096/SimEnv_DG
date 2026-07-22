@@ -70,6 +70,28 @@ class LocalSemanticDetector:
         self.opening_plane_depth = float(opening_plane_depth)
         self.opening_min_side_height_span = float(opening_min_side_height_span)
         self.use_truth_proximity_detector = bool(use_truth_proximity_detector)
+        if (
+            not all(
+                math.isfinite(value) and value > 0.0
+                for value in (
+                    self.max_distance,
+                    self.evidence_radius,
+                    self.max_evidence_height,
+                    self.opening_min_width,
+                    self.opening_max_width,
+                    self.opening_plane_depth,
+                    self.opening_min_side_height_span,
+                )
+            )
+            or not math.isfinite(self.fov_half_angle)
+            or not 0.0 < self.fov_half_angle <= math.pi
+            or self.min_evidence_points <= 0
+            or not math.isfinite(self.min_evidence_height)
+            or self.min_evidence_height < 0.0
+            or self.min_evidence_height >= self.max_evidence_height
+            or self.opening_min_width >= self.opening_max_width
+        ):
+            raise ValueError("本地语义距离、视场、证据高度或门洞参数无效")
 
     def detect_opening_ahead(
         self,

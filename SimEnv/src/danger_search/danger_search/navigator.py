@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Iterator
 
 from .time_utils import get_time
-from .interface_policy import require_allowed_topic
+from .interface_policy import require_allowed_output_topic, require_internal_topic
 
 from dataclasses import dataclass, field
 import math
@@ -103,11 +103,58 @@ class PathFollower:
     _last_command_wall_time: float | None = field(default=None, init=False)
     keepalive_publish_count: int = field(default=0, init=False)
 
+    def __post_init__(self) -> None:
+        self.cmd_vel_topic = require_allowed_output_topic(
+            self.cmd_vel_topic,
+            purpose="PathFollower 控制输出",
+        )
+        self.path_raw_topic = require_internal_topic(
+            self.path_raw_topic,
+            purpose="原始路径诊断输出",
+        )
+        self.path_followed_topic = require_internal_topic(
+            self.path_followed_topic,
+            purpose="跟踪路径诊断输出",
+        )
+        self.local_target_topic = require_internal_topic(
+            self.local_target_topic,
+            purpose="局部目标诊断输出",
+        )
+        nonnegative = (
+            self.max_linear,
+            self.max_lateral,
+            self.max_angular,
+            self.goal_tolerance,
+            self.waypoint_tolerance,
+            self.corner_tolerance,
+            self.pure_pursuit_lookahead,
+            self.recover_duration,
+            self.recover_turn_duration,
+            self.recover_angular_speed,
+            self.command_keepalive_period,
+            self.obstacle_stop_distance,
+            self.obstacle_slow_distance,
+            self.no_progress_timeout,
+            self.progress_distance,
+        )
+        if (
+            not all(math.isfinite(float(value)) and float(value) >= 0.0 for value in nonnegative)
+            or not math.isfinite(float(self.min_linear_fraction))
+            or not 0.0 <= float(self.min_linear_fraction) <= 1.0
+            or not math.isfinite(float(self.reverse_speed))
+            or float(self.reverse_speed) > 0.0
+            or self.goal_tolerance <= 0.0
+            or self.pure_pursuit_lookahead <= 0.0
+            or self.obstacle_slow_distance <= self.obstacle_stop_distance
+            or self.no_progress_timeout <= 0.0
+            or self.progress_distance <= 0.0
+        ):
+            raise ValueError("路径跟踪速度、容差、恢复或进度参数无效")
+
     def start(self) -> None:
         """建立唯一 ``/cmd_vel`` publisher、诊断 publisher 和命令保活定时器。"""
         if rospy is None:
             raise RuntimeError("当前环境没有 rospy，无法发布 /cmd_vel")
-        require_allowed_topic(self.cmd_vel_topic, purpose="PathFollower 控制输出")
         self._publisher = rospy.Publisher(self.cmd_vel_topic, Twist, queue_size=1)
         if PathMessage is not None:
             self._raw_path_publisher = rospy.Publisher(
@@ -136,7 +183,19 @@ class PathFollower:
 
     def set_path(self, path: list[tuple[float, float]]) -> None:
         """替换活动路径并重置 waypoint、进度监督和恢复状态。"""
-        self._raw_path = [(float(point[0]), float(point[1])) for point in path]
+        try:
+            parsed = [(float(point[0]), float(point[1])) for point in path]
+        except (TypeError, ValueError, IndexError, KeyError):
+            self.stop(reason="invalid_path")
+            raise ValueError("路径必须由二维数值点组成") from None
+        self._raw_path = parsed
+        if not all(
+            math.isfinite(value)
+            for point in self._raw_path
+            for value in point
+        ):
+            self.stop(reason="invalid_path")
+            raise ValueError("路径点必须为有限 world XY")
         self._path = _compress_collinear_path(self._raw_path)
         self._recover_phase = "idle"
         self._recover_until = 0.0
@@ -152,6 +211,15 @@ class PathFollower:
     def has_path(self) -> bool:
         # 恢复阶段由控制器自行完成，避免上层在转向尚未结束时同步重规划。
         return bool(self._path) or self._recover_phase != "idle"
+
+    def current_segment(
+        self,
+    ) -> tuple[tuple[float, float], tuple[float, float]] | None:
+        """返回当前跟踪段的只读副本，供任务层记录失败反馈。"""
+        if not self._path or len(self._path) < 2:
+            return None
+        index = min(self._waypoint_index, len(self._path) - 2)
+        return tuple(self._path[index]), tuple(self._path[index + 1])
 
     def set_nearest_obstacle_distance(self, distance: float | None) -> None:
         if distance is None or not math.isfinite(distance):
@@ -197,7 +265,17 @@ class PathFollower:
         明显下降。超时只报告 STUCK 并清路径，是否恢复或重规划由任务层决定。
         """
         now = get_time()
-        self._debug_pose = tuple(float(value) for value in pose_xy_yaw)
+        try:
+            self._debug_pose = tuple(float(value) for value in pose_xy_yaw)
+        except (TypeError, ValueError):
+            self._debug_pose = None
+            self.clear_path(reason="invalid_pose")
+            return STUCK
+        if len(self._debug_pose) != 3 or not all(
+            math.isfinite(value) for value in self._debug_pose
+        ):
+            self.clear_path(reason="invalid_pose")
+            return STUCK
         self._debug_stuck_elapsed = max(0.0, now - self._last_progress_time)
         if self._recover_phase == "settle":
             if now < self._recover_until:
@@ -314,6 +392,8 @@ class PathFollower:
                 time.sleep(max(0.0, float(interval)))
 
     def _lookahead_target(self, x: float, y: float) -> tuple[float, float]:
+        if len(self._path) == 1:
+            return self._path[0]
         # 推进 waypoint：直线段使用 waypoint_tolerance；遇到转角前缩小容忍，
         # 确保机器人先贴近拐角再切换到下一段，防止提前切角或跳到未来折返段。
         while self._waypoint_index < len(self._path) - 2:
@@ -439,7 +519,14 @@ class PathFollower:
         先保存算法请求值，再让安全门产生实际发送值，两者都进入诊断快照。
         publisher 尚未启动时仍更新诊断，便于离线测试验证控制计算而不触碰 ROS。
         """
-        requested = (float(linear_x), float(linear_y), float(angular_z))
+        try:
+            requested = (float(linear_x), float(linear_y), float(angular_z))
+        except (TypeError, ValueError):
+            requested = (0.0, 0.0, 0.0)
+            zero_reason = "invalid_requested_command"
+        if not all(math.isfinite(value) for value in requested):
+            requested = (0.0, 0.0, 0.0)
+            zero_reason = "invalid_requested_command"
         self._last_requested_command = requested
         emitted = requested
         gate = self._command_gate
@@ -448,15 +535,22 @@ class PathFollower:
             filter_command = getattr(gate, "filter_command", None)
             if callable(filter_command):
                 pose_yaw = self._debug_pose[2] if self._debug_pose is not None else 0.0
-                emitted = tuple(
-                    float(value)
-                    for value in filter_command(
+                try:
+                    filtered = filter_command(
                         requested,
                         pose_yaw=pose_yaw,
                         wall_time=wall_now,
                         control_time=get_time(),
                     )
-                )
+                    emitted = tuple(float(value) for value in filtered)
+                except Exception:
+                    # 最终安全门异常时仍必须覆盖上一条保活命令并发送零速。
+                    emitted = ()
+                if len(emitted) != 3 or not all(
+                    math.isfinite(value) for value in emitted
+                ):
+                    emitted = (0.0, 0.0, 0.0)
+                    zero_reason = "invalid_command_gate_output"
         self._last_emitted_command = emitted
         if all(abs(value) <= 1e-4 for value in emitted):
             if emitted != requested and gate is not None:

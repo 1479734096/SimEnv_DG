@@ -20,7 +20,7 @@ try:
 except ImportError:
     rospy = None
 
-from danger_search.mapper import BLACK, FREE, FloorGrid, OCC, UNKNOWN, VISITED
+from danger_search.mapper import BLACK, FREE, NEGATIVE, FloorGrid, OCC, UNKNOWN, VISITED
 from danger_search.planner import (
     DEFAULT_MAX_ITERATIONS,
     UNREACHABLE,
@@ -150,7 +150,7 @@ class FrontierExplorer:
         self.min_cluster_size = int(min_cluster_size)
         self.blacklist_ttl = float(blacklist_ttl)
         self.fail_limit = int(fail_limit)
-        self.stuck_blacklist_radius = max(0.0, float(stuck_blacklist_radius))
+        self.stuck_blacklist_radius = float(stuck_blacklist_radius)
         self.information_gain_weight = float(information_gain_weight)
         self.path_cost_weight = float(path_cost_weight)
         self.yaw_cost_weight = float(yaw_cost_weight)
@@ -161,10 +161,39 @@ class FrontierExplorer:
         self.door_front_half_plane_penalty = float(door_front_half_plane_penalty)
         self.door_front_half_plane_radius = float(door_front_half_plane_radius)
         self.door_preferred_direction_bonus = float(door_preferred_direction_bonus)
-        self.max_planning_candidates = max(1, int(max_planning_candidates))
-        self.max_goal_candidates_per_frontier = max(1, int(max_goal_candidates_per_frontier))
-        self.max_fallback_planning_candidates = max(1, int(max_fallback_planning_candidates))
+        self.max_planning_candidates = int(max_planning_candidates)
+        self.max_goal_candidates_per_frontier = int(max_goal_candidates_per_frontier)
+        self.max_fallback_planning_candidates = int(max_fallback_planning_candidates)
         self.goal_tolerance = float(goal_tolerance)
+        finite_nonnegative = (
+            self.stuck_blacklist_radius,
+            self.information_gain_weight,
+            self.path_cost_weight,
+            self.yaw_cost_weight,
+            self.revisit_penalty_weight,
+            self.frontier_obstacle_clearance,
+            self.frontier_unknown_standoff,
+            self.frontier_min_information_gain,
+            self.door_front_half_plane_penalty,
+            self.door_front_half_plane_radius,
+            self.door_preferred_direction_bonus,
+        )
+        if (
+            not math.isfinite(self.blacklist_ttl)
+            or self.blacklist_ttl <= 0.0
+            or self.min_cluster_size <= 0
+            or self.fail_limit <= 0
+            or self.max_planning_candidates <= 0
+            or self.max_goal_candidates_per_frontier <= 0
+            or self.max_fallback_planning_candidates <= 0
+            or not math.isfinite(self.goal_tolerance)
+            or self.goal_tolerance <= 0.0
+            or not all(
+                math.isfinite(value) and value >= 0.0
+                for value in finite_nonnegative
+            )
+        ):
+            raise ValueError("前沿提取、评分、黑名单或规划预算参数无效")
         self._blacklist: dict[tuple[int, int], float] = {}
         self._fail_counts: dict[tuple[int, int], int] = {}
         self.last_selection_debug: FrontierSelectionDebug | None = None
@@ -1163,7 +1192,7 @@ class FrontierExplorer:
         max_x = min(grid.size_x, gx + clearance_steps + 1)
         for ny in range(min_y, max_y):
             for nx in range(min_x, max_x):
-                if int(grid.data[ny, nx]) not in (OCC, BLACK):
+                if int(grid.data[ny, nx]) not in (OCC, BLACK, NEGATIVE):
                     continue
                 if math.hypot(nx - gx, ny - gy) < float(clearance_steps):
                     return False
@@ -1185,7 +1214,7 @@ class FrontierExplorer:
         max_x = min(grid.size_x, gx + search_steps + 1)
         for ny in range(min_y, max_y):
             for nx in range(min_x, max_x):
-                if int(grid.data[ny, nx]) not in (OCC, BLACK):
+                if int(grid.data[ny, nx]) not in (OCC, BLACK, NEGATIVE):
                     continue
                 distance = math.hypot(nx - gx, ny - gy)
                 if distance < best:

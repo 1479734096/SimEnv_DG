@@ -13,14 +13,15 @@ from dataclasses import dataclass, field
 from danger_search.mapper import FREE, VISITED, FloorGrid
 
 # 默认迭代预算：在当前配置尺寸（28x48m, 0.10m 分辨率）下，
-# 不可达目标的全量探索约 0.5s，会阻塞约 5 个 Timer 周期。
-# 20000 次迭代约 0.1s（一个周期量级），既限制阻塞时长，
+# 复杂绕行的全量探索可超过一个 10 Hz Timer 周期。
+# 20000 次迭代实测约 0.05~0.08s，既限制单次阻塞时长，
 # 又给正常可达目标留足搜索空间。
 DEFAULT_MAX_ITERATIONS = 20000
 
 REACHED = "reached"
 UNREACHABLE = "unreachable"
 BUDGET_EXHAUSTED = "budget_exhausted"
+DIAGONAL_COST = math.sqrt(2.0)
 
 
 @dataclass
@@ -61,12 +62,22 @@ def astar_plan(
     本身不可通行，会在有限半径内寻找最近的安全替代格；起点因量化误差落在
     UNKNOWN 时只尝试 ``mark_free``，该操作不会覆盖 OCC/BLACK。
     """
+    if max_iterations is not None and (
+        isinstance(max_iterations, bool)
+        or not isinstance(max_iterations, int)
+        or max_iterations <= 0
+    ):
+        raise ValueError("A* 最大迭代次数必须为正整数或 None")
     start = grid.world_to_grid(start_xy[0], start_xy[1])
     goal = grid.world_to_grid(goal_xy[0], goal_xy[1])
     if start is None or goal is None:
         return PlanResult(status=UNREACHABLE)
     if not grid.is_traversable(*start):
         grid.mark_free(*start)
+    if not grid.is_traversable(*start):
+        # UNKNOWN 可由 mark_free 修正为当前机器人所在自由格；OCC/BLACK 不可
+        # 覆盖，也不能作为搜索起点直接穿出阻塞区域。
+        return PlanResult(status=UNREACHABLE)
     if not grid.is_traversable(*goal):
         nearest = _nearest_traversable(grid, goal)
         if nearest is None:
@@ -79,8 +90,11 @@ def astar_plan(
     traversable = (grid.data == FREE) | (grid.data == VISITED)
     size_y, size_x = traversable.shape
 
-    open_heap: list[tuple[float, tuple[int, int]]] = []
-    heapq.heappush(open_heap, (0.0, start))
+    # f 相同的节点优先选择 h 更小者，保持 A* 的最优 f 顺序，同时避免开放区
+    # 由坐标字典序扩展大量等价节点。
+    start_heuristic = _heuristic(start, goal)
+    open_heap: list[tuple[float, float, tuple[int, int]]] = []
+    heapq.heappush(open_heap, (start_heuristic, start_heuristic, start))
     came_from: dict[tuple[int, int], tuple[int, int]] = {}
     cost_so_far: dict[tuple[int, int], float] = {start: 0.0}
     closed_set: set[tuple[int, int]] = set()
@@ -90,7 +104,7 @@ def astar_plan(
         if max_iterations is not None and iterations >= max_iterations:
             return PlanResult(status=BUDGET_EXHAUSTED)
         iterations += 1
-        _, current = heapq.heappop(open_heap)
+        _, _, current = heapq.heappop(open_heap)
         if current in closed_set:
             continue
 
@@ -115,12 +129,13 @@ def astar_plan(
             neighbor = (nx, ny)
             if neighbor in closed_set:
                 continue
-            step_cost = 1.414 if dx != 0 and dy != 0 else 1.0
+            step_cost = DIAGONAL_COST if dx != 0 and dy != 0 else 1.0
             new_cost = cost_so_far[current] + step_cost
             if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
                 cost_so_far[neighbor] = new_cost
-                priority = new_cost + _heuristic(neighbor, goal)
-                heapq.heappush(open_heap, (priority, neighbor))
+                heuristic = _heuristic(neighbor, goal)
+                priority = new_cost + heuristic
+                heapq.heappush(open_heap, (priority, heuristic, neighbor))
                 came_from[neighbor] = current
 
     return PlanResult(status=UNREACHABLE)
@@ -216,12 +231,22 @@ def _segment_is_traversable(
 
 def _nearest_traversable(grid: FloorGrid, goal: tuple[int, int], max_radius: int = 8) -> tuple[int, int] | None:
     gx, gy = goal
-    for radius in range(1, max_radius + 1):
-        for ny in range(gy - radius, gy + radius + 1):
-            for nx in range(gx - radius, gx + radius + 1):
-                if grid.is_traversable(nx, ny):
-                    return (nx, ny)
-    return None
+    candidates = [
+        (nx, ny)
+        for ny in range(gy - max_radius, gy + max_radius + 1)
+        for nx in range(gx - max_radius, gx + max_radius + 1)
+        if grid.is_traversable(nx, ny)
+    ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda cell: (
+            (cell[0] - gx) ** 2 + (cell[1] - gy) ** 2,
+            cell[1],
+            cell[0],
+        ),
+    )
 
 
 def _heuristic(a: tuple[int, int], b: tuple[int, int]) -> float:

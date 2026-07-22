@@ -14,6 +14,18 @@ from danger_search.navigator import PathFollower, compute_tracking_command, RUNN
 
 
 class LocalControllerTest(unittest.TestCase):
+    def test_control_and_diagnostic_topics_are_direction_checked(self):
+        with self.assertRaises(ValueError):
+            PathFollower(cmd_vel_topic="/scan")
+        with self.assertRaises(ValueError):
+            PathFollower(cmd_vel_topic="/cmd_vel", path_raw_topic="/scan")
+
+    def test_invalid_configuration_is_rejected(self):
+        with self.assertRaises(ValueError):
+            PathFollower(cmd_vel_topic="/cmd_vel", max_linear=math.nan)
+        with self.assertRaises(ValueError):
+            PathFollower(cmd_vel_topic="/cmd_vel", obstacle_slow_distance=0.4)
+
     def test_large_yaw_error_keeps_forward_component(self):
         linear_x, linear_y, angular = compute_tracking_command(
             1.5,
@@ -115,6 +127,22 @@ class LocalControllerTest(unittest.TestCase):
             "done",
         )
         self.assertAlmostEqual(follower.goal_tolerance, 0.35)
+
+    def test_current_segment_returns_copy_of_active_tracking_segment(self):
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path([(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)])
+
+        self.assertEqual(
+            follower.current_segment(),
+            ((0.0, 0.0), (0.0, 1.0)),
+        )
+        follower._waypoint_index = 1
+        self.assertEqual(
+            follower.current_segment(),
+            ((0.0, 1.0), (1.0, 1.0)),
+        )
+        follower.clear_path(reason="test")
+        self.assertIsNone(follower.current_segment())
 
         follower.set_path([(0.0, 0.0), (1.0, 0.0)])
         self.assertEqual(follower.tick((0.75, 0.0, 0.0)), "done")
@@ -273,6 +301,78 @@ class LocalControllerTest(unittest.TestCase):
         self.assertEqual(
             follower.tracking_debug_snapshot()["recover_reason"],
             "exit_cabin_backoff",
+        )
+
+    def test_final_output_replaces_non_finite_command_with_zero(self):
+        class FakeTwist:
+            def __init__(self):
+                self.linear = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+                self.angular = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+        class FakePublisher:
+            def __init__(self):
+                self.messages = []
+
+            def publish(self, message):
+                self.messages.append(message)
+
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower._publisher = FakePublisher()
+        with patch("danger_search.navigator.Twist", FakeTwist):
+            follower._publish(math.nan, 0.2)
+
+        message = follower._publisher.messages[-1]
+        self.assertEqual((message.linear.x, message.linear.y, message.angular.z), (0.0, 0.0, 0.0))
+        self.assertEqual(
+            follower.tracking_debug_snapshot()["zero_command_reason"],
+            "invalid_requested_command",
+        )
+
+    def test_single_point_path_outside_tolerance_remains_trackable(self):
+        follower = PathFollower(cmd_vel_topic="/cmd_vel", goal_tolerance=0.1)
+        follower.set_path([(1.0, 0.0)])
+
+        self.assertEqual(follower.tick((0.0, 0.0, 0.0)), RUNNING)
+        self.assertEqual(follower.tracking_debug_snapshot()["local_target"], [1.0, 0.0])
+
+    def test_invalid_pose_stops_and_reports_stuck(self):
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+
+        self.assertEqual(follower.tick((math.nan, 0.0, 0.0)), STUCK)
+        self.assertFalse(follower.has_path())
+        self.assertEqual(
+            follower.tracking_debug_snapshot()["zero_command_reason"],
+            "invalid_pose",
+        )
+
+    def test_malformed_path_stops_before_raising(self):
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+        follower._last_emitted_command = (0.3, 0.0, 0.0)
+
+        with self.assertRaises(ValueError):
+            follower.set_path([()])
+
+        self.assertEqual(follower._last_emitted_command, (0.0, 0.0, 0.0))
+
+    def test_command_gate_exception_is_replaced_with_zero(self):
+        class BrokenGate:
+            reason_code = "broken"
+
+            @staticmethod
+            def filter_command(*_args, **_kwargs):
+                raise RuntimeError("测试异常")
+
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_command_gate(BrokenGate())
+
+        follower._publish(0.3, 0.0)
+
+        self.assertEqual(follower._last_emitted_command, (0.0, 0.0, 0.0))
+        self.assertEqual(
+            follower._debug_zero_command_reason,
+            "ground_support_gate:broken",
         )
 
     def test_tracking_debug_snapshot_records_tracking_context(self):

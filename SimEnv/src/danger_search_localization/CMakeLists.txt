@@ -2,7 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 project(danger_search_localization)
 
 # 构建边界：只编译参赛方 scan_localization_node 和定向单测；第三方 KISS-ICP
-# 作为固定源码子目录链接，不启用其 ROS wrapper，避免额外节点进入正式启动链。
+# 作为固定源码子目录链接，不启用其 ROS wrapper、Python 包或评测工具，避免额外
+# 节点与离线代码进入正式启动链。
 find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   nav_msgs
@@ -23,7 +24,11 @@ set(USE_SYSTEM_SOPHUS OFF CACHE BOOL "" FORCE)
 set(USE_SYSTEM_TBB ON CACHE BOOL "" FORCE)
 set(USE_SYSTEM_TSL-ROBIN-MAP OFF CACHE BOOL "" FORCE)
 set(USE_CCACHE OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/kiss_icp/cpp/kiss_icp ${CMAKE_CURRENT_BINARY_DIR}/kiss_icp)
+add_subdirectory(
+  third_party/kiss_icp/cpp/kiss_icp
+  ${CMAKE_CURRENT_BINARY_DIR}/kiss_icp
+  EXCLUDE_FROM_ALL
+)
 
 catkin_package(
   CATKIN_DEPENDS geometry_msgs nav_msgs roslib roscpp sensor_msgs std_msgs
@@ -49,6 +54,7 @@ target_link_libraries(scan_localization_node
 )
 
 if(CATKIN_ENABLE_TESTING)
+  find_package(rostest REQUIRED)
   # 每个数学/时间/配准组件独立成 gtest，便于定位注释或实现改动影响的具体层次。
   catkin_add_gtest(test_velocity_transform test/test_velocity_transform.cpp)
   target_compile_features(test_velocity_transform PRIVATE cxx_std_17)
@@ -115,6 +121,29 @@ if(CATKIN_ENABLE_TESTING)
     ${PCL_LIBRARIES}
     gtest_main
   )
+
+  catkin_add_gtest(test_stance_initialization_gate
+    test/test_stance_initialization_gate.cpp)
+  target_compile_features(test_stance_initialization_gate PRIVATE cxx_std_17)
+  target_include_directories(test_stance_initialization_gate PRIVATE include)
+  target_link_libraries(test_stance_initialization_gate gtest_main)
+
+  catkin_add_gtest(test_stance_health_monitor
+    test/test_stance_health_monitor.cpp)
+  target_compile_features(test_stance_health_monitor PRIVATE cxx_std_17)
+  target_include_directories(test_stance_health_monitor PRIVATE include)
+  target_link_libraries(test_stance_health_monitor gtest_main)
+
+  catkin_add_gtest(test_pose_velocity_estimator
+    test/test_pose_velocity_estimator.cpp)
+  target_compile_features(test_pose_velocity_estimator PRIVATE cxx_std_17)
+  target_include_directories(test_pose_velocity_estimator PRIVATE
+    include
+    ${EIGEN3_INCLUDE_DIRS}
+  )
+  target_link_libraries(test_pose_velocity_estimator gtest_main)
+
+  add_rostest(test/stance_health_ros.test)
 
 endif()
 

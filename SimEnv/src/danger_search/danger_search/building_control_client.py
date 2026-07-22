@@ -82,11 +82,44 @@ class DoorInfo:
     yaw: float
     width: float = 1.0
 
+    def __post_init__(self) -> None:
+        self.door_id = str(self.door_id).strip()
+        self.kind = str(self.kind).strip()
+        self.floor_index = int(self.floor_index)
+        self.x = float(self.x)
+        self.y = float(self.y)
+        self.yaw = float(self.yaw)
+        self.width = float(self.width)
+        if (
+            not self.door_id
+            or not self.kind
+            or not all(
+                math.isfinite(value)
+                for value in (self.x, self.y, self.yaw, self.width)
+            )
+            or self.width <= 0.0
+        ):
+            raise ValueError("运行时门 ID、类型、位置、朝向或宽度无效")
+
 @dataclass
 class ElevatorInfo:
     """由传感器注册的各楼层电梯厅姿态，不包含服务权限。"""
     elevator_id: str
     lobby_poses: dict[int, tuple[float, float, float]]  # floor -> (x, y, yaw)
+
+    def __post_init__(self) -> None:
+        self.elevator_id = str(self.elevator_id).strip()
+        resolved: dict[int, tuple[float, float, float]] = {}
+        for floor, pose in self.lobby_poses.items():
+            if len(pose) != 3:
+                raise ValueError("电梯厅姿态必须是三维 XY-yaw")
+            values = tuple(float(value) for value in pose)
+            if not all(math.isfinite(value) for value in values):
+                raise ValueError("电梯厅姿态必须是有限数")
+            resolved[int(floor)] = values
+        if not self.elevator_id or not resolved:
+            raise ValueError("运行时电梯 ID 和厅姿态不能为空")
+        self.lobby_poses = resolved
 
 
 class BuildingControlClient:
@@ -98,6 +131,8 @@ class BuildingControlClient:
 
     def __init__(self, service_timeout: float = 5.0):
         self.service_timeout = float(service_timeout)
+        if not math.isfinite(self.service_timeout) or self.service_timeout <= 0.0:
+            raise ValueError("服务连接超时必须是正有限数")
         self.doors: dict[str, DoorInfo] = {}
         self.elevators: dict[str, ElevatorInfo] = {}
         self.public_door_ids: set[str] = set()
@@ -234,16 +269,26 @@ class BuildingControlClient:
         if door_id not in self.doors:
             raise ValueError(f"Unknown door_id: {door_id}")
         door = self.doors[door_id]
-        offset = max(float(pass_offset), 0.05)
-        commit = max(float(commit_distance), offset)
+        try:
+            robot_x, robot_y = float(robot_pose[0]), float(robot_pose[1])
+            offset = float(pass_offset)
+            commit = float(commit_distance)
+        except (IndexError, TypeError, ValueError):
+            raise ValueError("机器人位置和过门距离必须是二维有限数") from None
+        if not all(
+            math.isfinite(value) for value in (robot_x, robot_y, offset, commit)
+        ):
+            raise ValueError("机器人位置和过门距离必须是二维有限数")
+        offset = max(offset, 0.05)
+        commit = max(commit, offset)
         dx = math.cos(door.yaw) * offset
         dy = math.sin(door.yaw) * offset
 
         p1 = (door.x + dx, door.y + dy)
         p2 = (door.x - dx, door.y - dy)
 
-        d1 = math.hypot(robot_pose[0] - p1[0], robot_pose[1] - p1[1])
-        d2 = math.hypot(robot_pose[0] - p2[0], robot_pose[1] - p2[1])
+        d1 = math.hypot(robot_x - p1[0], robot_y - p1[1])
+        d2 = math.hypot(robot_x - p2[0], robot_y - p2[1])
 
         if d1 < d2:
             wait_point, pass_point = p1, p2
@@ -276,8 +321,18 @@ class BuildingControlClient:
         elevator = self.elevators[elevator_id]
         if floor not in elevator.lobby_poses:
             raise ValueError(f"Elevator {elevator_id} does not serve floor {floor}")
-        
+
         ex, ey, eyaw = elevator.lobby_poses[floor]
+        try:
+            offset_out = float(offset_out)
+            offset_in = float(offset_in)
+        except (TypeError, ValueError):
+            raise ValueError("电梯内外偏移必须是有限数") from None
+        if not all(
+            math.isfinite(value) and value >= 0.0
+            for value in (offset_out, offset_in)
+        ):
+            raise ValueError("电梯内外偏移必须是非负有限数")
         # 电梯门法向量朝外（朝向大厅）
         dx_out = math.cos(eyaw) * offset_out
         dy_out = math.sin(eyaw) * offset_out

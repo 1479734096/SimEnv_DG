@@ -28,14 +28,10 @@ catkin_package(
   std_msgs
 )
 
+# 只安装正式节点入口；离线审计与评测工具固定放在工作区根目录 tools/offline，
+# 不属于 catkin 包，也不得进入安装清单。
 catkin_install_python(PROGRAMS
-  # danger_search_node 是正式入口，其余脚本只用于离线评测和参数工具。
-  scripts/batch_evaluate.py
   scripts/danger_search_node
-  tools/generate_optimization_report.py
-  tools/run_seed.py
-  tools/summarize_results.py
-  tools/tune_params.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

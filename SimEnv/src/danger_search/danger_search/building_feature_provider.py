@@ -17,6 +17,8 @@ from pathlib import Path
 from danger_search.interface_policy import (
     ALLOWED_SERVICES,
     ALLOWED_TOPICS,
+    require_allowed_input_topic,
+    require_allowed_output_topic,
     require_public_scene_info,
 )
 
@@ -203,11 +205,21 @@ class BuildingFeatureProvider:
         )
 
     def require_topic(self, topic: str, *, purpose: str) -> str:
-        """要求话题同时出现在本次场景公布的接口集合中。"""
+        """兼容旧调用方：只校验场景集合，不判断话题方向。"""
         normalized = str(topic).strip()
         if normalized not in self.allowed_topics:
             raise ValueError(f"{purpose} 未在本场景公开接口内: {normalized}")
         return normalized
+
+    def require_input_topic(self, topic: str, *, purpose: str) -> str:
+        """要求输入话题同时通过静态权限和本场景声明。"""
+        normalized = require_allowed_input_topic(topic, purpose=purpose)
+        return self.require_topic(normalized, purpose=purpose)
+
+    def require_output_topic(self, topic: str, *, purpose: str) -> str:
+        """要求输出话题同时通过静态权限和本场景声明。"""
+        normalized = require_allowed_output_topic(topic, purpose=purpose)
+        return self.require_topic(normalized, purpose=purpose)
 
     def require_service(self, service: str, *, purpose: str) -> str:
         """要求服务同时出现在本次场景公布的接口集合中。"""

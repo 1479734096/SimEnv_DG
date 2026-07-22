@@ -1,0 +1,22 @@
+{
+  "schema": "official_baseline_v1",
+  "source_archive": "SimEnv初始.zip",
+  "archive_root": "SimEnv-master/",
+  "archive_sha256": "168c61d25848bf4efe43f9d14083169cfa9b97e433a5f3699e880b499ac4c308",
+  "official_files_manifest": "OFFICIAL_FILES.sha256",
+  "official_file_count": 1109,
+  "exclusions": [
+    "build/",
+    "devel/",
+    "logs/",
+    "results/",
+    "generated_building/",
+    "src/generated_building/",
+    "任意 __pycache__/、*.pyc 和 *.pyo"
+  ],
+  "notes": [
+    "本仓库只保存赛方源码基线，不保存构建产物、运行产物和生成场景。",
+    "接口权限和赛方文件仍以指定 SHA-256 的原始 ZIP 为唯一权威。",
+    "OFFICIAL_FILES.sha256 只列出从 ZIP 提取的官方文件，不包含本基线说明和团队新增文件。"
+  ]
+}

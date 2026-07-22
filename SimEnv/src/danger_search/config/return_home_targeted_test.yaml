@@ -1,8 +1,0 @@
-mission:
-  max_runtime: 135.0
-  min_floor_explore_time: 20.0
-  return_safety_buffer: 20.0
-  return_speed_estimate: 0.45
-
-ground_support:
-  production_gate_enabled: false

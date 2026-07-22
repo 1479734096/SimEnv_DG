@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Sequence
+from typing import MutableMapping, Sequence
 
 import numpy as np
 
@@ -97,7 +97,44 @@ class RgbdDoorDetector:
         self.minimum_opening_valid_depth_fraction = float(
             minimum_opening_valid_depth_fraction
         )
+        if (
+            not 0 <= self.maximum_value <= 255
+            or not 0 <= self.maximum_saturation <= 255
+            or self.minimum_pixel_area <= 0
+            or self.minimum_depth_pixels <= 0
+            or not all(
+                math.isfinite(value) and value >= 0.0
+                for value in (
+                    self.minimum_depth,
+                    self.maximum_depth,
+                    self.minimum_panel_width,
+                    self.maximum_panel_width,
+                    self.minimum_panel_height,
+                    self.maximum_plane_rmse,
+                    self.maximum_vertical_normal_z,
+                    self.minimum_opening_depth_change,
+                    self.maximum_opening_dark_ratio,
+                    self.minimum_opening_deeper_fraction,
+                    self.minimum_opening_valid_depth_fraction,
+                )
+            )
+            or self.minimum_depth <= 0.0
+            or self.minimum_depth >= self.maximum_depth
+            or self.minimum_panel_width <= 0.0
+            or self.minimum_panel_width >= self.maximum_panel_width
+            or self.minimum_panel_height <= 0.0
+            or self.maximum_plane_rmse <= 0.0
+            or self.maximum_vertical_normal_z > 1.0
+            or self.maximum_opening_dark_ratio > 1.0
+            or self.minimum_opening_deeper_fraction > 1.0
+            or self.minimum_opening_valid_depth_fraction > 1.0
+        ):
+            raise ValueError("门板检测的颜色、尺度、深度、平面或开门参数无效")
         self._bridge = CvBridge() if CvBridge is not None else None
+        self._diagnostic_frames = 0
+        self._last_diagnostics: dict[str, int] = {}
+        self._cumulative_diagnostics: dict[str, int] = {}
+        self._last_observation_count = 0
 
     def detect_messages(
         self,
@@ -107,17 +144,69 @@ class RgbdDoorDetector:
         camera_to_world: np.ndarray | None,
     ) -> list[DoorPanelObservation]:
         """转换 ROS 消息并调用数组检测核心；缺少 world 变换时拒绝检测。"""
-        if self._bridge is None or camera_to_world is None:
+        frame_diagnostics: dict[str, int] = {}
+        if self._bridge is None:
+            frame_diagnostics["missing_cv_bridge"] = 1
+            self._store_diagnostics(frame_diagnostics, 0)
             return []
-        rgb = self._bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
-        depth = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
-        return self.detect_arrays(
+        if camera_to_world is None:
+            frame_diagnostics["missing_world_transform"] = 1
+            self._store_diagnostics(frame_diagnostics, 0)
+            return []
+        try:
+            rgb = self._bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
+            depth = self._bridge.imgmsg_to_cv2(
+                depth_msg,
+                desired_encoding="passthrough",
+            )
+            camera_k = camera_info_msg.K
+            stamp = _stamp_to_float(getattr(rgb_msg, "header", None))
+        except Exception:
+            frame_diagnostics["message_conversion_failed"] = 1
+            self._store_diagnostics(frame_diagnostics, 0)
+            return []
+        observations = self.detect_arrays(
             rgb,
             depth,
-            camera_info_msg.K,
+            camera_k,
             camera_to_world,
-            stamp=_stamp_to_float(getattr(rgb_msg, "header", None)),
+            stamp=stamp,
+            diagnostics=frame_diagnostics,
         )
+        self._store_diagnostics(frame_diagnostics, len(observations))
+        return observations
+
+    def diagnostics(self) -> dict[str, object]:
+        """返回只读检测统计；这些计数不参与任何检测或任务决策。"""
+        return {
+            "frames": int(self._diagnostic_frames),
+            "last": dict(self._last_diagnostics),
+            "cumulative": dict(self._cumulative_diagnostics),
+            "last_observation_count": int(self._last_observation_count),
+        }
+
+    def reset_diagnostics(self) -> None:
+        """开始新的审计窗口；只清计数，不改变任何检测参数或缓存。"""
+        self._diagnostic_frames = 0
+        self._last_diagnostics = {}
+        self._cumulative_diagnostics = {}
+        self._last_observation_count = 0
+
+    def _store_diagnostics(
+        self,
+        frame_diagnostics: MutableMapping[str, int],
+        observation_count: int,
+    ) -> None:
+        self._diagnostic_frames += 1
+        self._last_diagnostics = {
+            str(name): int(count)
+            for name, count in frame_diagnostics.items()
+        }
+        self._last_observation_count = int(observation_count)
+        for name, count in self._last_diagnostics.items():
+            self._cumulative_diagnostics[name] = (
+                int(self._cumulative_diagnostics.get(name, 0)) + int(count)
+            )
 
     def detect_arrays(
         self,
@@ -127,25 +216,49 @@ class RgbdDoorDetector:
         camera_to_world: np.ndarray | None,
         *,
         stamp: float | None = None,
+        diagnostics: MutableMapping[str, int] | None = None,
     ) -> list[DoorPanelObservation]:
         """检测一帧深色竖直门板并返回几何验证后的候选。
 
         每个轮廓内部的有效深度像素先由相机内参反投影，随后拟合平面并检查法向、
         物理宽高和 RMSE，最后用 ``camera_to_world`` 得到门中心和朝外法向。
         """
+        def record(name: str) -> None:
+            if diagnostics is not None:
+                diagnostics[name] = int(diagnostics.get(name, 0)) + 1
+
         if cv2 is None or camera_to_world is None:
+            record("invalid_runtime_or_transform")
             return []
-        if rgb_bgr is None or depth_raw is None or rgb_bgr.shape[:2] != depth_raw.shape[:2]:
+        if not _valid_rgbd_arrays(rgb_bgr, depth_raw):
+            record("invalid_rgbd_arrays")
             return []
-        matrix = np.asarray(camera_to_world, dtype=float)
-        if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+        try:
+            matrix = np.asarray(camera_to_world, dtype=float)
+            resolved_stamp = None if stamp is None else float(stamp)
+        except (TypeError, ValueError):
+            record("invalid_transform_value")
+            return []
+        if (
+            matrix.shape != (4, 4)
+            or not np.all(np.isfinite(matrix))
+            or not _is_rigid_transform(matrix)
+        ):
+            record("invalid_rigid_transform")
+            return []
+        if resolved_stamp is not None and (
+            not math.isfinite(resolved_stamp) or resolved_stamp < 0.0
+        ):
+            record("invalid_stamp")
             return []
         try:
             fx, fy = float(camera_k[0]), float(camera_k[4])
             cx, cy = float(camera_k[2]), float(camera_k[5])
         except (IndexError, TypeError, ValueError):
+            record("invalid_camera_intrinsics")
             return []
         if not all(math.isfinite(value) for value in (fx, fy, cx, cy)) or fx <= 0.0 or fy <= 0.0:
+            record("invalid_camera_intrinsics")
             return []
 
         depth = _depth_to_meters(depth_raw)
@@ -155,15 +268,20 @@ class RgbdDoorDetector:
         )
         observations: list[DoorPanelObservation] = []
         for contour in contours:
+            record("contours_total")
             if cv2.contourArea(contour) < self.minimum_pixel_area:
+                record("rejected_pixel_area")
                 continue
+            record("passed_pixel_area")
             x, y, width_px, height_px = cv2.boundingRect(contour)
             if width_px < 8 or height_px < 16:
+                record("rejected_pixel_extent")
                 continue
             contour_mask = np.zeros(dark_mask.shape, dtype=np.uint8)
             cv2.drawContours(contour_mask, [contour], -1, 255, thickness=-1)
             ys, xs = np.where(contour_mask > 0)
             if len(xs) < self.minimum_depth_pixels:
+                record("rejected_mask_pixels")
                 continue
             z = depth[ys, xs].astype(float)
             valid = (
@@ -175,7 +293,9 @@ class RgbdDoorDetector:
             ys = ys[valid]
             z = z[valid]
             if len(z) < self.minimum_depth_pixels:
+                record("rejected_valid_depth_pixels")
                 continue
+            record("passed_valid_depth_pixels")
 
             median_depth = float(np.median(z))
             plane_band = max(0.12, 0.08 * median_depth)
@@ -184,7 +304,9 @@ class RgbdDoorDetector:
             ys = ys[near_plane]
             z = z[near_plane]
             if len(z) < self.minimum_depth_pixels:
+                record("rejected_near_plane_pixels")
                 continue
+            record("passed_near_plane_pixels")
 
             # 高分辨率门板像素无需全部进入 SVD；均匀抽样保持控制周期稳定。
             if len(z) > 5000:
@@ -199,18 +321,23 @@ class RgbdDoorDetector:
             )
             fit = _fit_plane(optical_points)
             if fit is None:
+                record("rejected_initial_plane_fit")
                 continue
             normal_optical, center_optical, residuals = fit
             inliers = residuals <= max(0.02, 2.5 * self.maximum_plane_rmse)
             if int(np.count_nonzero(inliers)) < self.minimum_depth_pixels:
+                record("rejected_plane_inliers")
                 continue
             refined = _fit_plane(optical_points[inliers])
             if refined is None:
+                record("rejected_refined_plane_fit")
                 continue
             normal_optical, center_optical, residuals = refined
             plane_rmse = float(np.sqrt(np.mean(np.square(residuals))))
             if not math.isfinite(plane_rmse) or plane_rmse > self.maximum_plane_rmse:
+                record("rejected_plane_rmse")
                 continue
+            record("passed_plane_rmse")
 
             homogeneous = np.column_stack(
                 (optical_points[inliers], np.ones(int(np.count_nonzero(inliers))))
@@ -219,16 +346,20 @@ class RgbdDoorDetector:
             normal_world = matrix[:3, :3] @ normal_optical
             normal_norm = float(np.linalg.norm(normal_world))
             if normal_norm <= 1e-9:
+                record("rejected_world_normal")
                 continue
             normal_world = normal_world / normal_norm
             if abs(float(normal_world[2])) > self.maximum_vertical_normal_z:
+                record("rejected_vertical_normal")
                 continue
+            record("passed_vertical_normal")
 
             horizontal_normal = np.asarray(
                 [normal_world[0], normal_world[1], 0.0], dtype=float
             )
             horizontal_norm = float(np.linalg.norm(horizontal_normal))
             if horizontal_norm <= 1e-9:
+                record("rejected_horizontal_normal")
                 continue
             horizontal_normal /= horizontal_norm
             tangent = np.asarray(
@@ -244,9 +375,13 @@ class RgbdDoorDetector:
                 - np.percentile(world_points[:, 2], 2.5)
             )
             if not self.minimum_panel_width <= width <= self.maximum_panel_width:
+                record("rejected_panel_width")
                 continue
+            record("passed_panel_width")
             if height < self.minimum_panel_height:
+                record("rejected_panel_height")
                 continue
+            record("passed_panel_height")
 
             center_world = matrix @ np.asarray(
                 [center_optical[0], center_optical[1], center_optical[2], 1.0],
@@ -264,7 +399,7 @@ class RgbdDoorDetector:
             center_dark_fraction = _mask_fraction(dark_mask, center_roi)
             observations.append(
                 DoorPanelObservation(
-                    stamp=stamp,
+                    stamp=resolved_stamp,
                     distance=distance,
                     world_xy=(float(center_world[0]), float(center_world[1])),
                     outward_yaw=float(outward_yaw),
@@ -277,6 +412,7 @@ class RgbdDoorDetector:
                     center_dark_fraction=center_dark_fraction,
                 )
             )
+            record("accepted_panel")
         observations.extend(
             self._pair_open_panels(observations, dark_mask, depth)
         )
@@ -410,12 +546,19 @@ class RgbdDoorDetector:
         """以已注册门平面为基准，确认门洞后方出现更深回波。"""
         if self._bridge is None:
             return DoorOpeningChange(False, 1.0, 0.0, 0.0)
-        rgb = self._bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
-        depth = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
+        try:
+            rgb = self._bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
+            depth = self._bridge.imgmsg_to_cv2(
+                depth_msg,
+                desired_encoding="passthrough",
+            )
+            camera_k = camera_info_msg.K
+        except Exception:
+            return DoorOpeningChange(False, 1.0, 0.0, 0.0)
         return self.assess_registered_opening_arrays(
             rgb,
             depth,
-            camera_info_msg.K,
+            camera_k,
             camera_to_world,
             door_xy=door_xy,
             door_yaw=door_yaw,
@@ -441,14 +584,17 @@ class RgbdDoorDetector:
         """
         if cv2 is None or camera_to_world is None:
             return DoorOpeningChange(False, 1.0, 0.0, 0.0)
-        if (
-            rgb_bgr is None
-            or depth_raw is None
-            or rgb_bgr.shape[:2] != depth_raw.shape[:2]
-        ):
+        if not _valid_rgbd_arrays(rgb_bgr, depth_raw):
             return DoorOpeningChange(False, 1.0, 0.0, 0.0)
-        matrix = np.asarray(camera_to_world, dtype=float)
-        if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+        try:
+            matrix = np.asarray(camera_to_world, dtype=float)
+        except (TypeError, ValueError):
+            return DoorOpeningChange(False, 1.0, 0.0, 0.0)
+        if (
+            matrix.shape != (4, 4)
+            or not np.all(np.isfinite(matrix))
+            or not _is_rigid_transform(matrix)
+        ):
             return DoorOpeningChange(False, 1.0, 0.0, 0.0)
         try:
             fx, fy = float(camera_k[0]), float(camera_k[4])
@@ -552,8 +698,14 @@ class RgbdDoorDetector:
     ) -> DoorOpeningChange:
         if self._bridge is None:
             return DoorOpeningChange(False, 1.0, 0.0, 0.0)
-        rgb = self._bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
-        depth = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
+        try:
+            rgb = self._bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
+            depth = self._bridge.imgmsg_to_cv2(
+                depth_msg,
+                desired_encoding="passthrough",
+            )
+        except Exception:
+            return DoorOpeningChange(False, 1.0, 0.0, 0.0)
         return self.assess_opening_change_arrays(baseline, rgb, depth)
 
     def assess_opening_change_arrays(
@@ -562,11 +714,21 @@ class RgbdDoorDetector:
         rgb_bgr: np.ndarray,
         depth_raw: np.ndarray,
     ) -> DoorOpeningChange:
-        if cv2 is None or rgb_bgr is None or depth_raw is None:
+        if cv2 is None or not _valid_rgbd_arrays(rgb_bgr, depth_raw):
             return DoorOpeningChange(False, 1.0, 0.0, 0.0)
-        if rgb_bgr.shape[:2] != depth_raw.shape[:2]:
+        try:
+            median_depth = float(baseline.median_depth)
+            baseline_dark_fraction = float(baseline.center_dark_fraction)
+            roi = _center_roi(baseline.bbox, rgb_bgr.shape[:2])
+        except (AttributeError, TypeError, ValueError, OverflowError):
             return DoorOpeningChange(False, 1.0, 0.0, 0.0)
-        roi = _center_roi(baseline.bbox, rgb_bgr.shape[:2])
+        if (
+            not math.isfinite(median_depth)
+            or median_depth <= 0.0
+            or not math.isfinite(baseline_dark_fraction)
+            or not 0.0 <= baseline_dark_fraction <= 1.0
+        ):
+            return DoorOpeningChange(False, 1.0, 0.0, 0.0)
         x, y, width, height = roi
         if width <= 0 or height <= 0:
             return DoorOpeningChange(False, 1.0, 0.0, 0.0)
@@ -583,12 +745,12 @@ class RgbdDoorDetector:
         valid_fraction = float(valid_count / area)
         if valid_count:
             deeper = depth[valid] >= (
-                baseline.median_depth + self.minimum_opening_depth_change
+                median_depth + self.minimum_opening_depth_change
             )
             deeper_fraction = float(np.count_nonzero(deeper) / valid_count)
         else:
             deeper_fraction = 0.0
-        baseline_dark = max(float(baseline.center_dark_fraction), 1e-6)
+        baseline_dark = max(baseline_dark_fraction, 1e-6)
         confirmed = bool(
             dark_fraction <= baseline_dark * self.maximum_opening_dark_ratio
             and valid_fraction >= self.minimum_opening_valid_depth_fraction
@@ -646,6 +808,28 @@ def _depth_to_meters(depth_raw: np.ndarray) -> np.ndarray:
     return depth_raw.astype(float)
 
 
+def _valid_rgbd_arrays(rgb_bgr, depth_raw) -> bool:
+    return bool(
+        isinstance(rgb_bgr, np.ndarray)
+        and isinstance(depth_raw, np.ndarray)
+        and rgb_bgr.ndim == 3
+        and rgb_bgr.shape[2] == 3
+        and rgb_bgr.dtype == np.uint8
+        and depth_raw.ndim == 2
+        and rgb_bgr.shape[:2] == depth_raw.shape[:2]
+        and np.issubdtype(depth_raw.dtype, np.number)
+    )
+
+
+def _is_rigid_transform(matrix: np.ndarray) -> bool:
+    rotation = matrix[:3, :3]
+    return bool(
+        np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-6)
+        and np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5)
+        and np.linalg.det(rotation) > 0.0
+    )
+
+
 def _center_roi(
     bbox: tuple[int, int, int, int],
     shape: tuple[int, ...],
@@ -671,4 +855,10 @@ def _mask_fraction(mask: np.ndarray, roi: tuple[int, int, int, int]) -> float:
 def _stamp_to_float(header) -> float | None:
     stamp = getattr(header, "stamp", None) if header is not None else None
     to_sec = getattr(stamp, "to_sec", None)
-    return float(to_sec()) if callable(to_sec) else None
+    if not callable(to_sec):
+        return None
+    try:
+        value = float(to_sec())
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0.0 else None

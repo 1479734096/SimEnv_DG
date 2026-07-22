@@ -3,7 +3,7 @@
 每个楼层使用相同 world XY 原点和分辨率，但持有独立二维数组。点云 Z 只用于
 相对当前楼板筛选障碍高度，因此地图不表达完整三维几何。栅格状态含义为：
 ``UNKNOWN`` 未观测、``FREE`` 可通行、``VISITED`` 机器人已覆盖、``BLACK``
-任务层临时/永久禁区、``OCC`` 实体障碍。
+任务层临时/永久禁区、``NEGATIVE`` 动态负障、``OCC`` 实体障碍。
 
 更新一帧时先写全部障碍命中，再执行点射线与可视扇区清空。这一顺序以及
 “遇到 OCC/BLACK 即停止”的规则可防止稀疏回波、点顺序或墙后点把静态墙擦除。
@@ -22,6 +22,7 @@ UNKNOWN = -1
 FREE = 0
 VISITED = 30
 BLACK = 80
+NEGATIVE = 90
 OCC = 100
 
 
@@ -77,11 +78,37 @@ class FloorGrid:
     origin_y: float
 
     def __post_init__(self) -> None:
+        self.resolution = float(self.resolution)
+        self.width = float(self.width)
+        self.length = float(self.length)
+        self.origin_x = float(self.origin_x)
+        self.origin_y = float(self.origin_y)
+        if (
+            not all(
+                math.isfinite(value)
+                for value in (
+                    self.resolution,
+                    self.width,
+                    self.length,
+                    self.origin_x,
+                    self.origin_y,
+                )
+            )
+            or self.resolution <= 0.0
+            or self.width <= 0.0
+            or self.length <= 0.0
+        ):
+            raise ValueError("栅格分辨率和尺寸必须为正有限数，原点必须为有限数")
         self.size_x = int(math.ceil(self.width / self.resolution))
         self.size_y = int(math.ceil(self.length / self.resolution))
         self.data = np.full((self.size_y, self.size_x), UNKNOWN, dtype=np.int16)
+        # NEGATIVE 可能暂时被 OCC/BLACK 覆盖；单独保存来源，动态门清除 OCC 时
+        # 才能恢复负障，而直接楼面证据也只能移除这一来源。
+        self.negative_cells: set[tuple[int, int]] = set()
 
     def world_to_grid(self, x: float, y: float) -> tuple[int, int] | None:
+        if not math.isfinite(float(x)) or not math.isfinite(float(y)):
+            return None
         gx = int(math.floor((x - self.origin_x) / self.resolution))
         gy = int(math.floor((y - self.origin_y) / self.resolution))
         if 0 <= gx < self.size_x and 0 <= gy < self.size_y:
@@ -108,6 +135,28 @@ class FloorGrid:
         if 0 <= gx < self.size_x and 0 <= gy < self.size_y:
             self.data[gy, gx] = OCC
 
+    def mark_negative(self, gx: int, gy: int) -> bool:
+        """登记动态负障；OCC/BLACK 保持更高显示优先级。"""
+        if not (0 <= gx < self.size_x and 0 <= gy < self.size_y):
+            return False
+        cell = (int(gx), int(gy))
+        was_new = cell not in self.negative_cells
+        self.negative_cells.add(cell)
+        if int(self.data[gy, gx]) not in (OCC, BLACK):
+            self.data[gy, gx] = NEGATIVE
+        return was_new
+
+    def clear_negative_with_support(self, gx: int, gy: int) -> bool:
+        """直接楼面证据只移除动态负障，不清 OCC 或任务 BLACK。"""
+        cell = (int(gx), int(gy))
+        if cell not in self.negative_cells:
+            return False
+        self.negative_cells.remove(cell)
+        if 0 <= gx < self.size_x and 0 <= gy < self.size_y:
+            if int(self.data[gy, gx]) == NEGATIVE:
+                self.data[gy, gx] = FREE
+        return True
+
     def mark_occupied_radius(self, x: float, y: float, radius: float) -> None:
         """把障碍命中按机器人安全余量膨胀为圆形 OCC 区域。"""
         center = self.world_to_grid(x, y)
@@ -127,7 +176,7 @@ class FloorGrid:
                     self.data[gy, gx] = OCC
 
     def mark_visited_radius(self, x: float, y: float, radius: float) -> None:
-        """记录机身实际覆盖区域；实体 OCC 始终拥有更高优先级。"""
+        """记录机身实际覆盖区域；实体 OCC 与安全 BLACK 始终拥有更高优先级。"""
         center = self.world_to_grid(x, y)
         if center is None:
             return
@@ -138,7 +187,10 @@ class FloorGrid:
                 if not (0 <= gx < self.size_x and 0 <= gy < self.size_y):
                     continue
                 wx, wy = self.grid_to_world(gx, gy)
-                if math.hypot(wx - x, wy - y) <= radius and self.data[gy, gx] != OCC:
+                if (
+                    math.hypot(wx - x, wy - y) <= radius
+                    and self.data[gy, gx] not in (OCC, BLACK, NEGATIVE)
+                ):
                     self.data[gy, gx] = VISITED
 
     def coverage_ratio(self) -> float:
@@ -213,6 +265,7 @@ class MultiFloorGridMap:
         free_clear_angle_step: float = 0.1745,
         free_clear_obstacle_margin: float = 0.25,
         free_clear_min_points_per_bin: int = 2,
+        negative_minimum_drop: float = 0.30,
     ):
         self.resolution = float(resolution)
         self.width = float(width)
@@ -224,13 +277,49 @@ class MultiFloorGridMap:
         self.obstacle_max_z = float(obstacle_max_z)
         self.obstacle_inflation_radius = float(obstacle_inflation_radius)
         self.raycast_max_range = float(raycast_max_range)
-        self.point_free_clear_max_range = max(0.0, float(point_free_clear_max_range))
+        self.point_free_clear_max_range = float(point_free_clear_max_range)
         self.visited_radius = float(visited_radius)
         self.free_clear_enabled = bool(free_clear_enabled)
         self.free_clear_max_range = float(free_clear_max_range)
         self.free_clear_angle_step = float(free_clear_angle_step)
         self.free_clear_obstacle_margin = float(free_clear_obstacle_margin)
         self.free_clear_min_points_per_bin = max(1, int(free_clear_min_points_per_bin))
+        self.negative_minimum_drop = float(negative_minimum_drop)
+        finite_parameters = (
+            self.resolution,
+            self.width,
+            self.length,
+            self.origin_x,
+            self.origin_y,
+            self.floor_height,
+            self.obstacle_min_z,
+            self.obstacle_max_z,
+            self.obstacle_inflation_radius,
+            self.raycast_max_range,
+            self.point_free_clear_max_range,
+            self.visited_radius,
+            self.free_clear_max_range,
+            self.free_clear_angle_step,
+            self.free_clear_obstacle_margin,
+            self.negative_minimum_drop,
+        )
+        if not all(math.isfinite(value) for value in finite_parameters):
+            raise ValueError("建图参数必须为有限数")
+        if (
+            self.resolution <= 0.0
+            or self.width <= 0.0
+            or self.length <= 0.0
+            or self.floor_height <= 0.0
+            or self.obstacle_max_z < self.obstacle_min_z
+            or self.obstacle_inflation_radius < 0.0
+            or self.raycast_max_range < 0.0
+            or self.visited_radius < 0.0
+            or self.free_clear_max_range < 0.0
+            or self.free_clear_obstacle_margin < 0.0
+            or self.negative_minimum_drop <= 0.0
+        ):
+            raise ValueError("建图尺寸、楼高、障碍范围或距离参数无效")
+        self.point_free_clear_max_range = max(0.0, self.point_free_clear_max_range)
         self._floors: dict[int, FloorGrid] = {}
         self.last_debug_snapshot: MapperDebugSnapshot | None = None
         self._pending_occupied_to_free_count = 0
@@ -251,7 +340,10 @@ class MultiFloorGridMap:
 
     def estimate_floor_from_z(self, z: float) -> int:
         """按楼层高度把绝对 Z 量化为非负楼层编号。"""
-        return max(0, int(round(float(z) / self.floor_height)))
+        height = float(z)
+        if not math.isfinite(height):
+            raise ValueError("楼层估计高度必须为有限数")
+        return max(0, int(round(height / self.floor_height)))
 
     def update_from_cloud(
         self,
@@ -285,16 +377,27 @@ class MultiFloorGridMap:
             tuple[float, float, float, float, bool, tuple[int, int]]
         ] = []
         for point in points:
-            px, py, pz = point
+            try:
+                px, py, pz = (float(value) for value in point)
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(value) for value in (px, py, pz)):
+                continue
             distance = math.hypot(px - robot_xyz[0], py - robot_xyz[1])
             if distance > self.raycast_max_range:
                 continue
             z_rel = pz - floor_base_z
             is_obstacle_point = self.obstacle_min_z <= z_rel <= self.obstacle_max_z
+            is_lower_return = z_rel < -self.negative_minimum_drop
             if is_obstacle_point and distance < stats.nearest_obstacle_distance:
                 stats.nearest_obstacle_distance = distance
             target_cell = grid.world_to_grid(px, py)
             if target_cell is None:
+                continue
+            # 明确落到本层楼板以下的回波由支撑层投影为负障。它既不能产生
+            # 普通自由射线，也不能让该方向被视为“无障碍扇区”。
+            if is_lower_return:
+                stats.suspicious_clearing_prevented_count += 1
                 continue
             self._record_angle_bin(
                 angle_bins,
@@ -376,6 +479,27 @@ class MultiFloorGridMap:
                 if 0 <= gx < grid.size_x and 0 <= gy < grid.size_y and grid.data[gy, gx] != OCC:
                     grid.data[gy, gx] = BLACK
 
+    def mark_negative_cells(
+        self,
+        floor_index: int,
+        cells: Iterable[tuple[int, int]],
+    ) -> int:
+        """把已完成抗噪确认的支撑交点写入动态负障层。"""
+        grid = self.floor(floor_index)
+        return sum(grid.mark_negative(int(gx), int(gy)) for gx, gy in cells)
+
+    def clear_negative_cells_with_support(
+        self,
+        floor_index: int,
+        cells: Iterable[tuple[int, int]],
+    ) -> int:
+        """用连续直接楼面证据移除对应动态负障来源。"""
+        grid = self.floor(floor_index)
+        return sum(
+            grid.clear_negative_with_support(int(gx), int(gy))
+            for gx, gy in cells
+        )
+
     def clear_dynamic_door_strip(
         self,
         floor_index: int,
@@ -387,8 +511,8 @@ class MultiFloorGridMap:
     ) -> None:
         """按门洞方向清理动态障碍残留，避免圆形清理擦掉门侧静态墙。
 
-        仅矩形门板条带中的 OCC/BLACK 会恢复为 FREE；门框两侧和门洞之外不受
-        影响。该方法是动态环境修改地图的唯一显式入口。
+        仅矩形门板条带中的 OCC 会恢复；BLACK 是任务/安全禁区，不能由开门
+        动作清除。若格子仍有动态负障来源则恢复为 NEGATIVE，而不是 FREE。
         """
         grid = self.floor(floor_index)
         center = grid.world_to_grid(x, y)
@@ -418,7 +542,9 @@ class MultiFloorGridMap:
                 along_normal = dx * normal_x + dy * normal_y
                 along_tangent = dx * tangent_x + dy * tangent_y
                 if abs(along_normal) <= half_depth and abs(along_tangent) <= half_width:
-                    grid.data[gy, gx] = FREE
+                    grid.data[gy, gx] = (
+                        NEGATIVE if (gx, gy) in grid.negative_cells else FREE
+                    )
                     cleared_count += 1
         self._pending_occupied_to_free_count += cleared_count
         self._pending_dynamic_door_cleared_count += cleared_count
@@ -433,7 +559,7 @@ class MultiFloorGridMap:
     ) -> tuple[float, bool]:
         last_cleared = start
         for gx, gy in _bresenham(start[0], start[1], end[0], end[1])[:-1]:
-            if stop_at_blocked and int(grid.data[gy, gx]) in (OCC, BLACK):
+            if stop_at_blocked and int(grid.data[gy, gx]) in (OCC, BLACK, NEGATIVE):
                 return _grid_distance(grid, start, last_cleared), True
             grid.mark_free(gx, gy)
             last_cleared = (gx, gy)
@@ -507,7 +633,7 @@ class MultiFloorGridMap:
         last_cleared = start
         for gx, gy in _bresenham(start[0], start[1], end[0], end[1])[1:]:
             cell_value = int(grid.data[gy, gx])
-            if cell_value in (OCC, BLACK):
+            if cell_value in (OCC, BLACK, NEGATIVE):
                 return _grid_distance(grid, start, last_cleared), True
             grid.mark_free(gx, gy)
             last_cleared = (gx, gy)

@@ -121,5 +121,3 @@ python3 ./src/building_obstacles/scripts/evaluate_danger.py \
 ## 参赛注意事项
 
 正式算法应只使用公开接口、传感器话题和 `generated_building/team_scene_info.json`。不要读取真值文件、完整 world 文件或布局元数据作为算法输入。
-
-`/Odometry_gazebo`、`/ground_truth/base_w`、`/ground_truth/base_trunk` 和 `/ground_truth/*_foot` 是 Gazebo 真值通道，不作为正式比赛算法输入。即使本地调试时能够看到这些话题，参赛算法也不得订阅或读取。

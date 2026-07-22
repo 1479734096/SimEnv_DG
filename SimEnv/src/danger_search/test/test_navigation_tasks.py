@@ -3,10 +3,77 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from danger_search.navigation_tasks import DONE, FAILED, OpenDoorAndPass, RUNNING, TakeElevator
+from danger_search.navigation_tasks import (
+    DONE,
+    FAILED,
+    IDLE,
+    NavigateToPose,
+    OpenDoorAndPass,
+    RUNNING,
+    TakeElevator,
+)
 from danger_search.mapper import BLACK, FREE, MultiFloorGridMap
 from danger_search.navigator import STUCK
 from danger_search.planner import BUDGET_EXHAUSTED, PlanResult, UNREACHABLE
+
+
+class NavigateToPoseTest(unittest.TestCase):
+    def test_invalid_task_inputs_are_rejected(self):
+        with self.assertRaises(ValueError):
+            NavigateToPose((math.nan, 0.0))
+        with self.assertRaises(ValueError):
+            OpenDoorAndPass("")
+        with self.assertRaises(ValueError):
+            TakeElevator(0, 0)
+
+    @staticmethod
+    def _manager():
+        stopped = []
+        paths = []
+        controller = SimpleNamespace(
+            goal_tolerance=0.1,
+            has_path=lambda: False,
+            set_path=lambda path: paths.append(path),
+            stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
+            tick=lambda pose: RUNNING,
+        )
+        return (
+            SimpleNamespace(
+                controller=controller,
+                mapper=SimpleNamespace(floor=lambda _floor: object()),
+                current_floor=0,
+            ),
+            stopped,
+            paths,
+        )
+
+    def test_unreachable_target_fails_without_direct_path(self):
+        manager, stopped, paths = self._manager()
+        task = NavigateToPose((1.0, 0.0))
+
+        with patch(
+            "danger_search.navigation_tasks.astar_plan",
+            return_value=PlanResult(status=UNREACHABLE),
+        ):
+            status = task.tick(manager, (0.0, 0.0, 0.0))
+
+        self.assertEqual(status, FAILED)
+        self.assertEqual(paths, [])
+        self.assertEqual(stopped, ["navigation_target_unreachable"])
+
+    def test_budget_exhaustion_waits_without_direct_path(self):
+        manager, stopped, paths = self._manager()
+        task = NavigateToPose((1.0, 0.0))
+
+        with patch(
+            "danger_search.navigation_tasks.astar_plan",
+            return_value=PlanResult(status=BUDGET_EXHAUSTED),
+        ):
+            status = task.tick(manager, (0.0, 0.0, 0.0))
+
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(paths, [])
+        self.assertEqual(stopped, ["navigation_budget_exhausted"])
 
 
 class _DoneService:
@@ -54,6 +121,49 @@ class OpenDoorAndPassTest(unittest.TestCase):
         self.assertEqual(task.phase, "GO_PASS_POINT")
         self.assertEqual(cleared, ["main_entrance"])
 
+    def test_open_door_refreshes_near_field_geometry_before_crossing(self):
+        stopped = []
+        cleared = []
+        path_queries = []
+        refresh_results = iter((RUNNING, DONE))
+
+        def path_points(*args, **kwargs):
+            path_queries.append(True)
+            if len(path_queries) == 1:
+                return ((0.0, -0.8), (0.0, 0.8), (0.0, 1.8))
+            return ((0.3, -0.8), (0.3, 0.8), (0.3, 1.8))
+
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "CALL_OPEN"
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(
+                get_door_path_points=path_points,
+                open_door=lambda door_id: _DoneService(),
+            ),
+            refresh_open_door_geometry=lambda door_id, pose: next(refresh_results),
+            clear_opened_door_area=lambda door_id: cleared.append(door_id),
+            controller=SimpleNamespace(
+                goal_tolerance=0.25,
+                stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
+                clear_path=lambda **kwargs: cleared.append(kwargs.get("reason")),
+            ),
+        )
+        pose = (0.0, -0.8, math.pi / 2.0)
+
+        self.assertEqual(task.tick(manager, pose), RUNNING)
+        self.assertEqual(task.tick(manager, pose), RUNNING)
+        self.assertEqual(task.phase, "GO_OPEN_WAIT_POINT")
+        self.assertEqual(task.tick(manager, pose), RUNNING)
+        self.assertEqual(task.phase, "REFRESH_OPENING")
+        self.assertEqual(task.tick(manager, pose), RUNNING)
+        self.assertEqual(task.tick(manager, pose), RUNNING)
+
+        self.assertEqual(task.phase, "GO_REFRESHED_WAIT_POINT")
+        self.assertEqual(task.wait_point, (0.3, -0.8))
+        self.assertEqual(task.pass_point, (0.3, 0.8))
+        self.assertEqual(stopped, ["door_opening_refresh"])
+        self.assertIn("door_opening_geometry_refreshed", cleared)
+
     def test_open_door_service_failure_returns_failed(self):
         failures = []
         task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
@@ -73,6 +183,31 @@ class OpenDoorAndPassTest(unittest.TestCase):
 
         self.assertEqual(status, FAILED)
         self.assertEqual(failures, ["开门服务失败: denied"])
+
+    def test_regular_door_keeps_original_pass_flow_when_refresh_hook_exists(self):
+        task = OpenDoorAndPass("room_door_1", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "CALL_OPEN"
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(
+                get_door_path_points=lambda *args, **kwargs: (
+                    (0.0, -0.8),
+                    (0.0, 0.8),
+                    (0.0, 1.8),
+                ),
+                open_door=lambda door_id: _DoneService(),
+            ),
+            refresh_open_door_geometry=lambda door_id, pose: self.fail(
+                "普通门不应进入主入口近场重观测"
+            ),
+            clear_opened_door_area=lambda door_id: None,
+            controller=SimpleNamespace(stop=lambda **kwargs: None),
+        )
+
+        pose = (0.0, -0.8, math.pi / 2.0)
+        self.assertEqual(task.tick(manager, pose), RUNNING)
+        self.assertEqual(task.tick(manager, pose), RUNNING)
+
+        self.assertEqual(task.phase, "GO_PASS_POINT")
 
     def test_wait_point_blocked_opens_from_same_side_safe_approach(self):
         """门区膨胀隔离精确等待点时，安全同侧接近不得永久零速。"""
@@ -314,6 +449,42 @@ class OpenDoorAndPassTest(unittest.TestCase):
             ["door_pass_alignment_hold", "door_pass_alignment_hold"],
         )
         astar.assert_not_called()
+
+    def test_active_pass_applies_dedicated_linear_cap(self):
+        observed_kwargs = []
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "GO_PASS_POINT"
+        task._wait_point = (0.0, -0.8)
+        task._pass_point = (0.0, 0.8)
+        task._commit_point = (0.0, 1.8)
+        task._pass_path_started = True
+        manager = SimpleNamespace(
+            door_pass_max_linear=0.25,
+            building_client=SimpleNamespace(),
+            controller=SimpleNamespace(
+                goal_tolerance=0.35,
+                corner_tolerance=0.15,
+                has_path=lambda: True,
+                tick=lambda pose, **kwargs: observed_kwargs.append(kwargs) or RUNNING,
+            ),
+        )
+
+        self.assertEqual(
+            task.tick(manager, (0.0, -0.6, math.pi / 2.0)),
+            RUNNING,
+        )
+
+        self.assertEqual(observed_kwargs[0]["max_linear"], 0.25)
+        self.assertEqual(observed_kwargs[0]["goal_tolerance"], 0.15)
+
+    def test_opening_sensor_confirmation_is_explicit_and_latched(self):
+        task = OpenDoorAndPass("main_entrance")
+
+        self.assertFalse(task.opening_sensor_confirmed)
+
+        task.mark_opening_sensor_confirmed()
+
+        self.assertTrue(task.opening_sensor_confirmed)
 
     def test_pass_point_blocked_and_line_blocked_fails_bounded_without_recover(self):
         """GO_PASS_POINT 持续阻塞应明确失败，不能由通用 recover 改变过门方向。"""
@@ -583,6 +754,214 @@ class TakeElevatorTest(unittest.TestCase):
         self.assertEqual(task.phase, "ALIGN_TO_CURRENT_DOOR")
         self.assertEqual(task.tick(manager, (0.85, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
+
+    def test_elevator_unreachable_planning_fails_after_bounded_retries(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        manager.elevator_planning_retry_limit = 3
+        task = TakeElevator(0, 1)
+
+        with patch(
+            "danger_search.navigation_tasks.astar_plan",
+            return_value=PlanResult(status=UNREACHABLE),
+        ) as planner, patch(
+            "danger_search.navigation_tasks.get_time",
+            side_effect=(0.0, 0.6, 1.2),
+        ):
+            statuses = [task.tick(manager, (4.0, 4.0, 0.0)) for _ in range(3)]
+
+        self.assertEqual(statuses, [RUNNING, RUNNING, FAILED])
+        self.assertEqual(planner.call_count, 3)
+        self.assertEqual(task.failure_reason, "elevator_navigation_unreachable")
+        self.assertIn("elevator_navigation_unreachable", manager.controller.stop_reasons)
+
+    def test_elevator_budget_exhaustion_expands_budget_then_fails(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        manager.elevator_planning_retry_limit = 3
+        task = TakeElevator(0, 1)
+
+        with patch(
+            "danger_search.navigation_tasks.astar_plan",
+            return_value=PlanResult(status=BUDGET_EXHAUSTED),
+        ) as planner, patch(
+            "danger_search.navigation_tasks.get_time",
+            side_effect=(0.0, 0.6, 1.2),
+        ):
+            statuses = [task.tick(manager, (4.0, 4.0, 0.0)) for _ in range(3)]
+
+        self.assertEqual(statuses, [RUNNING, RUNNING, FAILED])
+        self.assertEqual(
+            [call.kwargs["max_iterations"] for call in planner.call_args_list],
+            [20000, 40000, 80000],
+        )
+        self.assertEqual(
+            task.failure_reason, "elevator_navigation_budget_exhausted"
+        )
+
+    def test_elevator_uses_safe_trace_approach_after_precise_goal_unreachable(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        manager.elevator_planning_retry_limit = 3
+        manager.elevator_approach_trace_candidates = (
+            lambda elevator_id, floor, max_candidates: [(1.2, 2.6)]
+        )
+        manager.controller.next_tick_status = DONE
+        task = TakeElevator(0, 1)
+
+        with patch(
+            "danger_search.navigation_tasks.astar_plan",
+            side_effect=(
+                PlanResult(status=UNREACHABLE),
+                PlanResult(status=UNREACHABLE),
+                PlanResult(status=UNREACHABLE),
+                PlanResult(path=[(4.0, 4.0), (1.2, 2.6)], status="reached"),
+            ),
+        ), patch(
+            "danger_search.navigation_tasks.get_time",
+            side_effect=(0.0, 0.6, 1.2, 1.3),
+        ):
+            self.assertEqual(task.tick(manager, (4.0, 4.0, 0.0)), RUNNING)
+            self.assertEqual(task.tick(manager, (4.0, 4.0, 0.0)), RUNNING)
+            self.assertEqual(task.tick(manager, (4.0, 4.0, 0.0)), RUNNING)
+            self.assertEqual(task.phase, "GO_TO_ELEVATOR_TRACE_APPROACH")
+            self.assertEqual(task.tick(manager, (4.0, 4.0, 0.0)), RUNNING)
+
+        self.assertEqual(task.phase, "ALIGN_TO_CURRENT_DOOR")
+        self.assertIsNone(task.failure_reason)
+
+    def test_elevator_stuck_recovery_is_bounded(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        manager.elevator_stuck_retry_limit = 4
+        manager.controller.next_tick_status = STUCK
+        task = TakeElevator(0, 1)
+
+        with patch(
+            "danger_search.navigation_tasks.astar_plan",
+            return_value=PlanResult(
+                path=[(4.0, 4.0), (0.85, 2.60)], status="reached"
+            ),
+        ), patch(
+            "danger_search.navigation_tasks.get_time",
+            side_effect=(0.0, 0.1, 0.2, 0.3, 0.4),
+        ):
+            statuses = [task.tick(manager, (4.0, 4.0, 0.0)) for _ in range(5)]
+
+        self.assertEqual(statuses[-1], FAILED)
+        self.assertEqual(len(manager.controller.recover_reasons), 4)
+        self.assertEqual(
+            task.failure_reason, "elevator_navigation_stuck_exhausted"
+        )
+
+    def test_elevator_stuck_recovery_uses_rotation_clearance_gate(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        manager.controller.next_tick_status = STUCK
+        gate_sources = []
+        manager._recover_with_rotation_clearance = gate_sources.append
+        task = TakeElevator(0, 1)
+
+        with patch(
+            "danger_search.navigation_tasks.astar_plan",
+            return_value=PlanResult(
+                path=[(4.0, 4.0), (0.85, 2.60)], status="reached"
+            ),
+        ), patch("danger_search.navigation_tasks.get_time", return_value=0.0):
+            status = task.tick(manager, (4.0, 4.0, 0.0))
+
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(gate_sources, ["elevator_navigation_stuck"])
+        self.assertEqual(manager.controller.recover_reasons, [])
+
+    def test_elevator_refresh_phase_replans_to_updated_wait_point(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        refresh_calls = []
+        manager.refresh_elevator_geometry = lambda *args: refresh_calls.append(args) or DONE
+        task = TakeElevator(0, 1)
+        task.phase = "REFRESH_CURRENT_ELEVATOR_GEOMETRY"
+
+        self.assertEqual(task.tick(manager, (0.85, 2.6, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "GO_TO_REFRESHED_ELEVATOR_DOOR")
+        self.assertEqual(len(refresh_calls), 1)
+        self.assertIn("elevator_geometry_refreshed", manager.controller.clear_reasons)
+
+        with patch.object(task, "_navigate_to", return_value=True):
+            self.assertEqual(task.tick(manager, (0.85, 2.6, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "ALIGN_TO_REFRESHED_ELEVATOR_DOOR")
+
+    def test_elevator_refresh_timeout_preserves_registered_geometry(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        manager.refresh_elevator_geometry = lambda *args: IDLE
+        task = TakeElevator(0, 1)
+        task.phase = "REFRESH_CURRENT_ELEVATOR_GEOMETRY"
+
+        self.assertEqual(task.tick(manager, (0.85, 2.6, 0.0)), RUNNING)
+
+        self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
+        self.assertIsNone(task.failure_reason)
+        self.assertIn(
+            "elevator_geometry_refresh_unavailable",
+            manager.controller.clear_reasons,
+        )
+
+    def test_elevator_refresh_viewpoint_keeps_camera_farther_from_door(self):
+        viewpoint = TakeElevator._refresh_viewpoint(
+            (0.85, 2.6), (2.6, 2.6), 1.2
+        )
+        self.assertAlmostEqual(viewpoint[0], 0.45)
+        self.assertAlmostEqual(viewpoint[1], 2.6)
 
     def test_first_exit_attempt_passes_local_linear_cap_without_shared_override(self):
         grid = MultiFloorGridMap(

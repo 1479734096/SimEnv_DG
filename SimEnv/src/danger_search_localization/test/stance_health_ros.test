@@ -1,0 +1,16 @@
+<launch>
+  <!-- 只发布合成的公开 /scan 与 /trunk_imu，不启动 Gazebo 或真值适配器。 -->
+  <include file="$(find danger_search_localization)/launch/scan_localization.launch">
+    <arg name="localization_backend" value="kiss_icp"/>
+    <arg name="require_team_scene_info" value="false"/>
+    <arg name="allow_relative_origin" value="true"/>
+    <arg name="stance_health_enabled" value="true"/>
+    <arg name="health_required_healthy_frames" value="2"/>
+    <arg name="health_required_unhealthy_frames" value="2"/>
+  </include>
+
+  <test test-name="stance_health_ros"
+        pkg="danger_search_localization"
+        type="test_stance_health_ros.py"
+        time-limit="40"/>
+</launch>

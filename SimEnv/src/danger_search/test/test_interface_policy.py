@@ -7,9 +7,13 @@ import unittest
 from unittest.mock import patch
 
 from danger_search.interface_policy import (
+    ALLOWED_INPUT_TOPICS,
+    ALLOWED_OUTPUT_TOPICS,
     ALLOWED_SERVICES,
     ALLOWED_TOPICS,
     official_scene_info_path,
+    require_allowed_input_topic,
+    require_allowed_output_topic,
     require_allowed_service,
     require_allowed_topic,
     require_public_scene_info,
@@ -96,6 +100,23 @@ class InterfacePolicyTest(unittest.TestCase):
         for topic in ("/scan", "/trunk_imu", "/real_sense/depth/points", "/cmd_vel"):
             with self.subTest(topic=topic):
                 self.assertEqual(topic, require_allowed_topic(topic, purpose="测试"))
+
+    def test_topic_direction_is_enforced(self):
+        self.assertIn("/scan", ALLOWED_INPUT_TOPICS)
+        self.assertNotIn("/cmd_vel", ALLOWED_INPUT_TOPICS)
+        self.assertEqual(ALLOWED_OUTPUT_TOPICS, frozenset({"/cmd_vel"}))
+        self.assertEqual(
+            "/scan",
+            require_allowed_input_topic("/scan", purpose="测试输入"),
+        )
+        self.assertEqual(
+            "/cmd_vel",
+            require_allowed_output_topic("/cmd_vel", purpose="测试输出"),
+        )
+        with self.assertRaises(ValueError):
+            require_allowed_input_topic("/cmd_vel", purpose="错误输入")
+        with self.assertRaises(ValueError):
+            require_allowed_output_topic("/scan", purpose="错误输出")
 
     def test_truth_and_undocumented_topics_are_rejected(self):
         for topic in ("/Odometry_gazebo", "/ground_truth/base_w", "/tf", "/nav/goal"):
@@ -216,6 +237,16 @@ class InterfacePolicyTest(unittest.TestCase):
             self.assertTrue(provider.doors["main_entrance"].initial_open)
             self.assertEqual(provider.elevator_features["elevator_main"].current_floor, 0)
             self.assertFalse(hasattr(provider, "door_positions"))
+            self.assertEqual(
+                provider.require_input_topic("/scan", purpose="测试"),
+                "/scan",
+            )
+            self.assertEqual(
+                provider.require_output_topic("/cmd_vel", purpose="测试"),
+                "/cmd_vel",
+            )
+            with self.assertRaises(ValueError):
+                provider.require_input_topic("/cmd_vel", purpose="错误输入")
 
     def test_public_scene_provider_rejects_result_file_outside_workspace(self):
         with tempfile.TemporaryDirectory() as directory:

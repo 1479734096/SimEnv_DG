@@ -17,4 +17,6 @@
   <depend>roscpp</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
+  <test_depend>rospy</test_depend>
+  <test_depend>rostest</test_depend>
 </package>

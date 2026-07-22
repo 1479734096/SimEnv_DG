@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import json
+import math
+from numbers import Real
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -27,27 +29,49 @@ class ResultWriter:
         ``positions`` 可以是生成器，因此先一次性构造 JSON 数组。三维坐标保留
         毫米级小数，探索时间保留百分之一秒，以获得稳定且易比较的归档结果。
         """
+        if isinstance(exploration_time, bool) or not isinstance(exploration_time, Real):
+            raise ValueError("探索时间必须是 JSON 数值")
+        resolved_time = float(exploration_time)
+        if not math.isfinite(resolved_time) or resolved_time < 0.0:
+            raise ValueError("探索时间必须是非负有限数")
+
         detected = []
         for position in positions:
             if len(position) != 3:
                 raise ValueError(f"危险源位置必须是三维坐标: {position}")
+            coordinates = []
+            for value in position:
+                if isinstance(value, bool) or not isinstance(value, Real):
+                    raise ValueError(f"危险源坐标必须是 JSON 数值: {position}")
+                coordinate = float(value)
+                if not math.isfinite(coordinate):
+                    raise ValueError(f"危险源坐标必须是有限数: {position}")
+                coordinates.append(round(coordinate, 3))
             detected.append(
                 {
-                    "position": [
-                        round(float(position[0]), 3),
-                        round(float(position[1]), 3),
-                        round(float(position[2]), 3),
-                    ]
+                    "position": coordinates
                 }
             )
 
         payload = {
-            "exploration_time": round(float(exploration_time), 2),
+            "exploration_time": round(resolved_time, 2),
             "detected_danger_sources": detected,
         }
         self.result_file.parent.mkdir(parents=True, exist_ok=True)
-        self.result_file.write_text(
-            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
+        temporary_file = self.result_file.with_name(f".{self.result_file.name}.tmp")
+        try:
+            temporary_file.write_text(
+                json.dumps(
+                    payload,
+                    indent=2,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            temporary_file.replace(self.result_file)
+        except Exception:
+            temporary_file.unlink(missing_ok=True)
+            raise
         return self.result_file

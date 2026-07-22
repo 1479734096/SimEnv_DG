@@ -16,11 +16,10 @@ import os
 from pathlib import Path
 
 
-# 初始文档“允许状态与传感器接口”与“最小控制接口”。
-ALLOWED_TOPICS = frozenset(
+# 初始文档“允许状态与传感器接口”。这些话题只能被参赛算法读取。
+ALLOWED_INPUT_TOPICS = frozenset(
     {
         "/clock",
-        "/cmd_vel",
         "/scan",
         "/livox/Pointcloud2",
         "/livox/lidar2",
@@ -33,6 +32,12 @@ ALLOWED_TOPICS = frozenset(
         "/real_sense/depth/points",
     }
 )
+
+# 初始文档“最小控制接口”。生产代码只能向该集合发布。
+ALLOWED_OUTPUT_TOPICS = frozenset({"/cmd_vel"})
+
+# 兼容旧调用方的静态上限；新增代码必须使用带方向的校验函数。
+ALLOWED_TOPICS = ALLOWED_INPUT_TOPICS | ALLOWED_OUTPUT_TOPICS
 
 # 初始文档“门与电梯交互”。
 ALLOWED_SERVICES = frozenset({"/set_door_state", "/call_elevator"})
@@ -135,6 +140,22 @@ def require_allowed_topic(topic: str, *, purpose: str) -> str:
         raise ValueError(f"{purpose} 禁止使用 Gazebo 真值话题: {normalized}")
     if normalized not in ALLOWED_TOPICS:
         raise ValueError(f"{purpose} 未在初始比赛接口白名单中: {normalized}")
+    return normalized
+
+
+def require_allowed_input_topic(topic: str, *, purpose: str) -> str:
+    """确认生产代码只读取初始文档允许的输入话题。"""
+    normalized = require_allowed_topic(topic, purpose=purpose)
+    if normalized not in ALLOWED_INPUT_TOPICS:
+        raise ValueError(f"{purpose} 不是允许的生产输入话题: {normalized}")
+    return normalized
+
+
+def require_allowed_output_topic(topic: str, *, purpose: str) -> str:
+    """确认生产代码只向初始文档允许的控制话题发布。"""
+    normalized = require_allowed_topic(topic, purpose=purpose)
+    if normalized not in ALLOWED_OUTPUT_TOPICS:
+        raise ValueError(f"{purpose} 不是允许的生产输出话题: {normalized}")
     return normalized
 
 

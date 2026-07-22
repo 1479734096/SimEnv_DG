@@ -69,6 +69,29 @@ class RedSphereDetector:
         self.max_depth = float(max_depth)
         self.ransac_iterations = int(ransac_iterations)
         self.ransac_sample_size = int(ransac_sample_size)
+        if (
+            self.min_area <= 0
+            or not math.isfinite(self.min_circularity)
+            or not 0.0 <= self.min_circularity <= 1.0
+            or not all(
+                math.isfinite(value) and value > 0.0
+                for value in (
+                    self.min_aspect,
+                    self.max_aspect,
+                    self.min_radius,
+                    self.max_radius,
+                    self.max_rmse,
+                    self.min_depth,
+                    self.max_depth,
+                )
+            )
+            or self.min_aspect > self.max_aspect
+            or self.min_radius >= self.max_radius
+            or self.min_depth >= self.max_depth
+            or self.ransac_iterations <= 0
+            or self.ransac_sample_size < 4
+        ):
+            raise ValueError("红球检测的形状、尺度、深度或 RANSAC 参数无效")
         self._rng = random.Random(random_seed)
         self._bridge = CvBridge() if CvBridge is not None else None
 
@@ -84,13 +107,20 @@ class RedSphereDetector:
         """将 ROS 图像转换为数组后进入无 ROS 依赖的检测核心。"""
         if self._bridge is None:
             return []
-        rgb = self._bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
-        depth = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
-        stamp = _stamp_to_float(getattr(rgb_msg, "header", None))
+        try:
+            rgb = self._bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
+            depth = self._bridge.imgmsg_to_cv2(
+                depth_msg,
+                desired_encoding="passthrough",
+            )
+            camera_k = camera_info_msg.K
+            stamp = _stamp_to_float(getattr(rgb_msg, "header", None))
+        except Exception:
+            return []
         return self.detect_arrays(
             rgb,
             depth,
-            camera_info_msg.K,
+            camera_k,
             camera_to_world,
             stamp=stamp,
             require_world_transform=require_world_transform,
@@ -117,6 +147,48 @@ class RedSphereDetector:
             return []
         if rgb_bgr is None or depth_raw is None:
             return []
+        if (
+            not isinstance(rgb_bgr, np.ndarray)
+            or not isinstance(depth_raw, np.ndarray)
+            or rgb_bgr.ndim != 3
+            or rgb_bgr.shape[2] != 3
+            or rgb_bgr.dtype != np.uint8
+            or depth_raw.ndim != 2
+            or rgb_bgr.shape[:2] != depth_raw.shape[:2]
+            or not np.issubdtype(depth_raw.dtype, np.number)
+        ):
+            return []
+        try:
+            fx, fy = float(camera_k[0]), float(camera_k[4])
+            cx, cy = float(camera_k[2]), float(camera_k[5])
+        except (IndexError, TypeError, ValueError):
+            return []
+        if (
+            not all(math.isfinite(value) for value in (fx, fy, cx, cy))
+            or fx <= 0.0
+            or fy <= 0.0
+        ):
+            return []
+        try:
+            resolved_stamp = None if stamp is None else float(stamp)
+        except (TypeError, ValueError):
+            return []
+        if resolved_stamp is not None and (
+            not math.isfinite(resolved_stamp) or resolved_stamp < 0.0
+        ):
+            return []
+        matrix = None
+        if camera_to_world is not None:
+            try:
+                matrix = np.asarray(camera_to_world, dtype=float)
+            except (TypeError, ValueError):
+                return []
+            if (
+                matrix.shape != (4, 4)
+                or not np.all(np.isfinite(matrix))
+                or not _is_rigid_transform(matrix)
+            ):
+                return []
 
         depth = _depth_to_meters(depth_raw)
         mask = self._red_mask(rgb_bgr)
@@ -130,7 +202,12 @@ class RedSphereDetector:
                 continue
             if not self._passes_2d_shape_filter(contour):
                 continue
-            points = self._contour_points_3d(contour, mask, depth, camera_k)
+            points = self._contour_points_3d(
+                contour,
+                mask,
+                depth,
+                (fx, 0.0, cx, 0.0, fy, cy),
+            )
             if len(points) < 12:
                 continue
             sphere = self._fit_sphere_ransac(points)
@@ -140,8 +217,10 @@ class RedSphereDetector:
                 continue
 
             center = sphere.center
-            if camera_to_world is not None:
-                center = _transform_point(camera_to_world, center)
+            if matrix is not None:
+                center = _transform_point(matrix, center)
+            if not np.all(np.isfinite(center)):
+                continue
             confidence = self._score_detection(contour, sphere)
             candidates.append(
                 DetectionCandidate.from_sequence(
@@ -149,7 +228,7 @@ class RedSphereDetector:
                     confidence=confidence,
                     rmse=sphere.rmse,
                     radius=sphere.radius,
-                    stamp=stamp,
+                    stamp=resolved_stamp,
                 )
             )
         return candidates
@@ -275,6 +354,15 @@ def _transform_point(matrix: np.ndarray, point: np.ndarray) -> np.ndarray:
     return transformed[:3]
 
 
+def _is_rigid_transform(matrix: np.ndarray) -> bool:
+    rotation = matrix[:3, :3]
+    return bool(
+        np.allclose(matrix[3], (0.0, 0.0, 0.0, 1.0), atol=1e-6)
+        and np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5)
+        and np.linalg.det(rotation) > 0.0
+    )
+
+
 def _stamp_to_float(header) -> float | None:
     if header is None:
         return None
@@ -282,5 +370,9 @@ def _stamp_to_float(header) -> float | None:
     if stamp is None:
         return None
     if hasattr(stamp, "to_sec"):
-        return float(stamp.to_sec())
+        try:
+            value = float(stamp.to_sec())
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value >= 0.0 else None
     return None

@@ -17,11 +17,8 @@ LOCALIZATION_LAUNCH_PATH = (
     / "launch"
     / "scan_localization.launch"
 )
-DOCUMENT_PATHS = (
-    SIMENV_ROOT / "README.md",
-    SIMENV_ROOT / "docs" / "algorithm-interfaces.md",
-    REFERENCE_PATH,
-)
+README_PATH = SIMENV_ROOT / "README.md"
+ALGORITHM_INTERFACES_PATH = SIMENV_ROOT / "docs" / "algorithm-interfaces.md"
 TRUTH_RESTRICTION = (
     "`/Odometry_gazebo`、`/ground_truth/base_w`、`/ground_truth/base_trunk` 和 "
     "`/ground_truth/*_foot` 是 Gazebo 真值通道，不作为正式比赛算法输入。"
@@ -58,6 +55,22 @@ class InterfaceDocumentationTest(unittest.TestCase):
             "mission/max_floor",
             {param.get("name") for param in formal_node.findall("param")},
         )
+        node_parameters = {
+            param.get("name"): param.get("value")
+            for param in formal_node.findall("param")
+        }
+        self.assertEqual(
+            node_parameters.get("wait_for_localization_ready"),
+            "true",
+        )
+        localization_arguments = {
+            arg.get("name"): arg.get("value")
+            for arg in localization_includes[0].findall("arg")
+        }
+        self.assertEqual(
+            localization_arguments.get("stance_health_enabled"),
+            "true",
+        )
 
     def test_localization_extrinsics_are_ros_parameter_arrays(self):
         root = ElementTree.parse(LOCALIZATION_LAUNCH_PATH).getroot()
@@ -90,20 +103,37 @@ class InterfaceDocumentationTest(unittest.TestCase):
         self.assertNotIn("base_to_livox_rpy", string_parameters)
 
     def test_truth_restriction_is_listed_in_all_interface_documents(self):
-        for path in DOCUMENT_PATHS:
+        for path in (ALGORITHM_INTERFACES_PATH, REFERENCE_PATH):
             with self.subTest(path=path):
                 content = path.read_text(encoding="utf-8")
                 self.assertIn(TRUTH_RESTRICTION, content)
+        readme = README_PATH.read_text(encoding="utf-8")
+        self.assertIn("真值文件仅供裁判评估使用", readme)
+        self.assertIn("不作为参赛算法输入", readme)
+
+    def test_stance_health_allows_the_normal_angular_command_envelope(self):
+        launch_root = ElementTree.parse(LOCALIZATION_LAUNCH_PATH).getroot()
+        launch_arguments = {
+            arg.get("name"): arg.get("default")
+            for arg in launch_root.findall("arg")
+        }
+        config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
+
+        self.assertGreaterEqual(
+            float(launch_arguments["health_max_angular_speed"]),
+            float(config["controller"]["max_angular"]),
+        )
 
     def test_reference_marks_truth_topics_as_referee_only(self):
         content = REFERENCE_PATH.read_text(encoding="utf-8")
         self.assertIn("`/ground_truth/base_w`", content)
-        self.assertIn("仅裁判/调试使用", content)
+        self.assertIn("不作为正式比赛算法输入", content)
 
     def test_reference_marks_referee_odom_switch_as_non_algorithm_interface(self):
         content = REFERENCE_PATH.read_text(encoding="utf-8")
         self.assertIn("ENABLE_REFEREE_ODOM", content)
-        self.assertIn("参赛算法不得订阅", content)
+        self.assertIn("`/Odometry_gazebo`", content)
+        self.assertIn("参赛算法也不得订阅或读取", content)
 
     def test_formal_config_does_not_contain_fixed_elevator_geometry(self):
         config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
@@ -112,6 +142,24 @@ class InterfaceDocumentationTest(unittest.TestCase):
         self.assertNotIn("elevator_lobby_xy", floor)
         self.assertNotIn("elevator_inside_xy", floor)
         self.assertNotIn("elevator_id", floor)
+
+    def test_formal_config_enables_verified_ground_support_envelope(self):
+        config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
+        controller = config["controller"]
+        support = config["ground_support"]
+        validated_max_speed = float(support["stop_distance_table"][-1][0])
+
+        self.assertTrue(support["production_gate_enabled"])
+        self.assertTrue(config["localization"]["stance_health_required"])
+        self.assertLessEqual(float(controller["max_linear"]), validated_max_speed)
+        self.assertGreaterEqual(
+            float(support["stop_linear_threshold"]),
+            float(support["odometry_linear_deadband"]),
+        )
+        self.assertGreaterEqual(
+            float(support["stop_angular_threshold"]),
+            float(support["odometry_angular_deadband"]),
+        )
 
 
 if __name__ == "__main__":

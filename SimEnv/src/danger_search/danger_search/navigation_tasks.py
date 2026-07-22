@@ -16,6 +16,7 @@ except ImportError:
     rospy = None
 
 from danger_search.navigator import DONE, IDLE, RUNNING, STUCK
+from danger_search.mapper import BLACK, NEGATIVE, OCC
 from danger_search.planner import DEFAULT_MAX_ITERATIONS, UNREACHABLE, astar_plan
 from .time_utils import get_time
 
@@ -43,9 +44,20 @@ class NavigationTask:
 class NavigateToPose(NavigationTask):
     """导航到一个 world XY 目标，路径丢失时重新规划。"""
     def __init__(self, target_xy: tuple[float, float], tolerance: float | None = None):
-        super().__init__(f"NavigateToPose({target_xy[0]:.2f}, {target_xy[1]:.2f})")
-        self.target_xy = target_xy
-        self.tolerance = tolerance
+        try:
+            target = (float(target_xy[0]), float(target_xy[1]))
+            resolved_tolerance = None if tolerance is None else float(tolerance)
+        except (IndexError, TypeError, ValueError):
+            raise ValueError("导航目标和容差必须是有限数") from None
+        if (
+            not all(math.isfinite(value) for value in target)
+            or resolved_tolerance is not None
+            and (not math.isfinite(resolved_tolerance) or resolved_tolerance <= 0.0)
+        ):
+            raise ValueError("导航目标和容差必须是有限正值")
+        super().__init__(f"NavigateToPose({target[0]:.2f}, {target[1]:.2f})")
+        self.target_xy = target
+        self.tolerance = resolved_tolerance
 
     def tick(self, manager: MissionManager, pose: tuple[float, float, float]) -> str:
         tol = self.tolerance if self.tolerance is not None else manager.controller.goal_tolerance
@@ -58,10 +70,13 @@ class NavigateToPose(NavigationTask):
             result = astar_plan(grid, (pose[0], pose[1]), self.target_xy)
             if result.reached:
                 manager.controller.set_path(result.path)
+            elif result.unreachable:
+                manager.controller.stop(reason="navigation_target_unreachable")
+                return FAILED
             else:
-                # 不可达或预算耗尽都退化为直连，由后续 STUCK/障碍检测兜底。
-                path = [(pose[0], pose[1]), self.target_xy]
-                manager.controller.set_path(path)
+                # 预算耗尽只表示本轮未完成搜索，不能穿过 OCC/BLACK 直连。
+                manager.controller.stop(reason="navigation_budget_exhausted")
+                return RUNNING
 
         status = manager.controller.tick(pose)
         if status == STUCK:
@@ -81,6 +96,14 @@ class OpenDoorAndPass(NavigationTask):
     _PASS_ALIGN_CONFIRMATIONS = 2
 
     def __init__(self, door_id: str, *, pass_offset: float = 0.8, commit_distance: float = 1.8):
+        door_id = str(door_id).strip()
+        if not door_id:
+            raise ValueError("过门任务必须提供公开门 ID")
+        if not all(
+            math.isfinite(float(value)) and float(value) > 0.0
+            for value in (pass_offset, commit_distance)
+        ):
+            raise ValueError("过门偏移和深入距离必须是正有限数")
         super().__init__(f"OpenDoorAndPass({door_id})")
         self.door_id = door_id
         self.pass_offset = float(pass_offset)
@@ -97,6 +120,7 @@ class OpenDoorAndPass(NavigationTask):
         self._pass_retry_timeout = 3.0
         self._pass_alignment_count = 0
         self._pass_path_started = False
+        self._opening_sensor_confirmed = False
         self._commit_retry_count = 0
         self._commit_retry_start_time: float | None = None
         self._commit_retry_limit = 30
@@ -117,10 +141,18 @@ class OpenDoorAndPass(NavigationTask):
     def commit_point(self) -> tuple[float, float] | None:
         return self._commit_point
 
+    @property
+    def opening_sensor_confirmed(self) -> bool:
+        return self._opening_sensor_confirmed
+
+    def mark_opening_sensor_confirmed(self) -> None:
+        """记录开放门洞已由近场传感器连续确认。"""
+        self._opening_sensor_confirmed = True
+
     def tick(self, manager: MissionManager, pose: tuple[float, float, float]) -> str:
         """按当前 ``phase`` 推进一步，所有服务等待期间保持零速。"""
         client = manager.building_client
-        
+
         if self._wait_point is None or self._pass_point is None or self._commit_point is None:
             try:
                 self._wait_point, self._pass_point, self._commit_point = client.get_door_path_points(
@@ -130,7 +162,8 @@ class OpenDoorAndPass(NavigationTask):
                     commit_distance=self.commit_distance,
                 )
             except ValueError as e:
-                rospy.logerr(f"OpenDoorAndPass 失败: {e}")
+                if rospy is not None:
+                    rospy.logerr(f"OpenDoorAndPass 失败: {e}")
                 return FAILED
 
         if self.phase == "GO_WAIT_POINT":
@@ -162,7 +195,73 @@ class OpenDoorAndPass(NavigationTask):
                 return FAILED
             if status == DONE:
                 _clear_opened_door_area(manager, self.door_id)
+                # 主入口等开放门洞可能在接近过程中积累横向定位误差。生产编排器
+                # 若提供近场重观测，就必须先用新鲜门洞几何重新回到等待轴线；普通
+                # 门或精简测试没有该接口时保持原有流程。
+                self.phase = (
+                    "GO_OPEN_WAIT_POINT"
+                    if self.door_id == "main_entrance"
+                    and callable(getattr(manager, "refresh_open_door_geometry", None))
+                    else "GO_PASS_POINT"
+                )
+            return RUNNING
+
+        if self.phase == "GO_OPEN_WAIT_POINT":
+            if self._navigate_to(
+                manager,
+                pose,
+                self._wait_point,
+                allow_direct_fallback=True,
+                planning_max_iterations=None,
+                max_linear=getattr(manager, "door_pass_max_linear", None),
+            ):
+                manager.controller.clear_path(reason="door_open_wait_reached")
+                self.phase = "REFRESH_OPENING"
+            elif self._last_navigation_blocked:
+                return self._fail_crossing(manager, "开门后的门洞等待点不可达")
+            return RUNNING
+
+        if self.phase == "REFRESH_OPENING":
+            refresh = getattr(manager, "refresh_open_door_geometry", None)
+            if not callable(refresh):
                 self.phase = "GO_PASS_POINT"
+                return RUNNING
+            status = refresh(self.door_id, pose)
+            if status == RUNNING:
+                manager.controller.stop(reason="door_opening_refresh")
+                return RUNNING
+            if status != DONE:
+                return self._fail_crossing(manager, "开放门洞近场重观测失败")
+            try:
+                self._wait_point, self._pass_point, self._commit_point = (
+                    client.get_door_path_points(
+                        self.door_id,
+                        (pose[0], pose[1]),
+                        pass_offset=self.pass_offset,
+                        commit_distance=self.commit_distance,
+                    )
+                )
+            except ValueError as exc:
+                return self._fail_crossing(manager, f"开放门洞几何更新失败: {exc}")
+            manager.controller.clear_path(reason="door_opening_geometry_refreshed")
+            self._pass_alignment_count = 0
+            self._pass_path_started = False
+            self.phase = "GO_REFRESHED_WAIT_POINT"
+            return RUNNING
+
+        if self.phase == "GO_REFRESHED_WAIT_POINT":
+            if self._navigate_to(
+                manager,
+                pose,
+                self._wait_point,
+                allow_direct_fallback=True,
+                planning_max_iterations=None,
+                max_linear=getattr(manager, "door_pass_max_linear", None),
+            ):
+                manager.controller.clear_path(reason="door_refreshed_wait_reached")
+                self.phase = "GO_PASS_POINT"
+            elif self._last_navigation_blocked:
+                return self._fail_crossing(manager, "更新后的门洞等待点不可达")
             return RUNNING
 
         if self.phase == "GO_PASS_POINT":
@@ -268,7 +367,11 @@ class OpenDoorAndPass(NavigationTask):
         if not manager.controller.has_path():
             return self._fail_crossing(manager, "过门直线路径意外丢失")
 
-        status = manager.controller.tick(pose, goal_tolerance=crossing_tolerance)
+        tick_kwargs = {"goal_tolerance": crossing_tolerance}
+        pass_linear_cap = getattr(manager, "door_pass_max_linear", None)
+        if pass_linear_cap is not None:
+            tick_kwargs["max_linear"] = pass_linear_cap
+        status = manager.controller.tick(pose, **tick_kwargs)
         if status == DONE:
             endpoint_distance = math.hypot(
                 self._pass_point[0] - pose[0],
@@ -308,6 +411,7 @@ class OpenDoorAndPass(NavigationTask):
         *,
         allow_direct_fallback: bool = False,
         planning_max_iterations: int | None = DEFAULT_MAX_ITERATIONS,
+        max_linear: float | None = None,
     ) -> bool:
         self._last_navigation_blocked = False
         self._last_navigation_stuck = False
@@ -335,7 +439,8 @@ class OpenDoorAndPass(NavigationTask):
                 # 预算耗尽：可能可达，不退化为直连也不标记阻塞，等下轮重新规划。
                 return False
 
-        status = manager.controller.tick(pose)
+        tick_kwargs = {} if max_linear is None else {"max_linear": max_linear}
+        status = manager.controller.tick(pose, **tick_kwargs)
         if status == STUCK:
             if self.phase in ("GO_PASS_POINT", "GO_COMMIT_POINT"):
                 self._last_navigation_stuck = True
@@ -480,7 +585,7 @@ def _segment_crosses_blocked_cell(
         if cell is None:
             return True
         gx, gy = cell
-        if int(grid.data[gy, gx]) in (80, 100):
+        if int(grid.data[gy, gx]) in (BLACK, NEGATIVE, OCC):
             return True
     return False
 
@@ -510,8 +615,19 @@ class TakeElevator(NavigationTask):
     _EXIT_BACKOFF_ALIGN_TOLERANCE = 0.12
     _EXIT_BACKOFF_ALIGN_TIMEOUT = 4.0
     _EXIT_BACKOFF_TIMEOUT_MARGIN = 1.5
+    _PLAN_RETRY_INTERVAL = 0.5
+    _DEFAULT_PLAN_FAILURE_LIMIT = 3
+    _DEFAULT_NAVIGATION_TIMEOUT = 120.0
+    _DEFAULT_STUCK_RETRY_LIMIT = 4
+    _DEFAULT_WAIT_STANDOFF = 0.8
+    _DEFAULT_REFRESH_STANDOFF = 1.2
 
     def __init__(self, current_floor: int, target_floor: int, elevator_id: str = "elevator_main"):
+        current_floor = int(current_floor)
+        target_floor = int(target_floor)
+        elevator_id = str(elevator_id).strip()
+        if current_floor == target_floor or not elevator_id:
+            raise ValueError("乘梯任务必须提供不同楼层和公开电梯 ID")
         super().__init__(f"TakeElevator({current_floor}->{target_floor})")
         self.current_floor = current_floor
         self.target_floor = target_floor
@@ -538,6 +654,16 @@ class TakeElevator(NavigationTask):
         self._exit_alignment_count = 0
         self._floor_transition_started = False
         self._floor_transition_confirmed = False
+        self.failure_reason: str | None = None
+        self._navigation_phase_key: str | None = None
+        self._navigation_started_at: float | None = None
+        self._navigation_next_plan_time = 0.0
+        self._navigation_unreachable_count = 0
+        self._navigation_budget_count = 0
+        self._navigation_stuck_count = 0
+        self._approach_trace_candidates: list[tuple[float, float]] = []
+        self._approach_trace_index = 0
+        self._approach_trace_attempted = False
 
     def tick(self, manager: MissionManager, pose: tuple[float, float, float]) -> str:
         """推进一个乘梯阶段；任一失败都显式返回 FAILED 而不猜测所在楼层。"""
@@ -546,26 +672,122 @@ class TakeElevator(NavigationTask):
             current_wait, cabin_center = client.get_elevator_points(self.elevator_id, self.current_floor)
             target_wait, _ = client.get_elevator_points(self.elevator_id, self.target_floor)
         except ValueError as e:
-            rospy.logerr(f"TakeElevator 失败: {e}")
+            if rospy is not None:
+                rospy.logerr(f"TakeElevator 失败: {e}")
             return FAILED
-            
+        refresh_wait = self._refresh_viewpoint(
+            current_wait,
+            cabin_center,
+            float(
+                getattr(
+                    manager,
+                    "elevator_geometry_refresh_standoff",
+                    self._DEFAULT_REFRESH_STANDOFF,
+                )
+            ),
+        )
+
         try:
             current_door_id = client.elevator_door_id(self.current_floor)
             target_door_id = client.elevator_door_id(self.target_floor)
         except ValueError as e:
-            rospy.logerr(f"TakeElevator 失败: {e}")
+            if rospy is not None:
+                rospy.logerr(f"TakeElevator 失败: {e}")
             return FAILED
 
         if self.phase == "GO_TO_ELEVATOR_DOOR":
-            if self._navigate_to(manager, pose, current_wait):
+            if self._navigate_to(manager, pose, refresh_wait):
                 self._exit_alignment_count = 0
                 self.phase = "ALIGN_TO_CURRENT_DOOR"
+            elif self.failure_reason is not None:
+                if (
+                    self.failure_reason == "elevator_navigation_unreachable"
+                    and self._begin_trace_approach(manager)
+                ):
+                    return RUNNING
+                return FAILED
+            return RUNNING
+
+        if self.phase == "GO_TO_ELEVATOR_TRACE_APPROACH":
+            if not self._approach_trace_candidates:
+                return self._fail_navigation(
+                    manager,
+                    "elevator_trace_approach_unavailable",
+                    "没有可供电梯粗接近的安全历史点",
+                )
+            target = self._approach_trace_candidates[self._approach_trace_index]
+            if self._navigate_to(manager, pose, target):
+                self._exit_alignment_count = 0
+                self.phase = "ALIGN_TO_CURRENT_DOOR"
+            elif self.failure_reason is not None:
+                self._approach_trace_index += 1
+                if self._approach_trace_index >= len(self._approach_trace_candidates):
+                    return self._fail_navigation(
+                        manager,
+                        "elevator_trace_approach_exhausted",
+                        "所有电梯粗接近历史点均不可达",
+                    )
+                manager.controller.clear_path(reason="elevator_trace_candidate_retry")
+                self._reset_navigation_watchdog(clear_failure=True)
             return RUNNING
 
         if self.phase == "ALIGN_TO_CURRENT_DOOR":
             # 等待点只约束位置，A* 到达时的机身朝向可能让前向 RGB-D
             # 完全看不到门板。先朝传感器注册得到的轿厢中心对准，既为
             # 开门前后视觉确认保留同一视角，也避免侧着开始 ENTER。
+            if self._tick_target_door_alignment(manager, pose, cabin_center):
+                self._exit_alignment_count = 0
+                self.phase = (
+                    "REFRESH_CURRENT_ELEVATOR_GEOMETRY"
+                    if callable(getattr(manager, "refresh_elevator_geometry", None))
+                    else "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+                )
+            return RUNNING
+
+        if self.phase == "REFRESH_CURRENT_ELEVATOR_GEOMETRY":
+            manager.controller.stop(reason="elevator_geometry_refresh")
+            refresh = getattr(manager, "refresh_elevator_geometry", None)
+            if not callable(refresh):
+                self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+                return RUNNING
+            status = refresh(
+                self.elevator_id,
+                self.current_floor,
+                current_door_id,
+                pose,
+            )
+            if status == RUNNING:
+                return RUNNING
+            if status == IDLE:
+                if rospy is not None:
+                    rospy.logwarn(
+                        "[%s] 电梯近场几何未刷新，保留此前连续确认几何并继续；"
+                        "开门和跨越仍需局部传感器确认",
+                        self.name,
+                    )
+                manager.controller.clear_path(
+                    reason="elevator_geometry_refresh_unavailable"
+                )
+                self._reset_navigation_watchdog(clear_failure=True)
+                self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+                return RUNNING
+            if status != DONE:
+                self.failure_reason = "elevator_geometry_refresh_failed"
+                return FAILED
+            manager.controller.clear_path(reason="elevator_geometry_refreshed")
+            self._reset_navigation_watchdog(clear_failure=True)
+            self.phase = "GO_TO_REFRESHED_ELEVATOR_DOOR"
+            return RUNNING
+
+        if self.phase == "GO_TO_REFRESHED_ELEVATOR_DOOR":
+            if self._navigate_to(manager, pose, current_wait):
+                self._exit_alignment_count = 0
+                self.phase = "ALIGN_TO_REFRESHED_ELEVATOR_DOOR"
+            elif self.failure_reason is not None:
+                return FAILED
+            return RUNNING
+
+        if self.phase == "ALIGN_TO_REFRESHED_ELEVATOR_DOOR":
             if self._tick_target_door_alignment(manager, pose, cabin_center):
                 self._exit_alignment_count = 0
                 self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
@@ -1362,6 +1584,28 @@ class TakeElevator(NavigationTask):
         max_linear: float | None = None,
         goal_tolerance: float | None = None,
     ) -> str:
+        now = get_time()
+        if self._navigation_phase_key != self.phase:
+            self._reset_navigation_watchdog(clear_failure=True)
+            self._navigation_phase_key = self.phase
+            self._navigation_started_at = now
+        elif self._navigation_started_at is None:
+            self._navigation_started_at = now
+
+        navigation_timeout = float(
+            getattr(
+                manager,
+                "elevator_navigation_timeout",
+                self._DEFAULT_NAVIGATION_TIMEOUT,
+            )
+        )
+        if now - self._navigation_started_at > navigation_timeout:
+            return self._fail_navigation(
+                manager,
+                "elevator_navigation_timeout",
+                f"导航阶段 {self.phase} 超过 {navigation_timeout:.1f}s",
+            )
+
         effective_goal_tolerance = float(manager.controller.goal_tolerance)
         if goal_tolerance is not None:
             effective_goal_tolerance = min(
@@ -1370,32 +1614,241 @@ class TakeElevator(NavigationTask):
             )
         if math.hypot(target_xy[0] - pose[0], target_xy[1] - pose[1]) <= effective_goal_tolerance:
             manager.controller.clear_path()
+            self._reset_navigation_watchdog(clear_failure=True)
             return DONE
 
         if not manager.controller.has_path():
+            if now < self._navigation_next_plan_time:
+                manager.controller.stop(reason="elevator_navigation_plan_wait")
+                return RUNNING
             grid = manager.mapper.floor(manager.current_floor)
-            result = astar_plan(grid, (pose[0], pose[1]), target_xy)
+            multiplier = 1 << min(self._navigation_budget_count, 2)
+            max_iterations = DEFAULT_MAX_ITERATIONS * multiplier
+            result = astar_plan(
+                grid,
+                (pose[0], pose[1]),
+                target_xy,
+                max_iterations=max_iterations,
+            )
             if result.reached:
                 manager.controller.set_path(result.path)
+                self._navigation_unreachable_count = 0
+                self._navigation_budget_count = 0
+                self._navigation_next_plan_time = 0.0
+                self._log_navigation_plan(
+                    manager,
+                    pose,
+                    target_xy,
+                    result.status,
+                    max_iterations,
+                    0,
+                )
+            elif result.budget_exhausted:
+                self._navigation_budget_count += 1
+                self._log_navigation_plan(
+                    manager,
+                    pose,
+                    target_xy,
+                    result.status,
+                    max_iterations,
+                    self._navigation_budget_count,
+                )
+                manager.controller.stop(reason="elevator_navigation_budget_exhausted")
+                if self._navigation_budget_count >= int(
+                    getattr(
+                        manager,
+                        "elevator_planning_retry_limit",
+                        self._DEFAULT_PLAN_FAILURE_LIMIT,
+                    )
+                ):
+                    return self._fail_navigation(
+                        manager,
+                        "elevator_navigation_budget_exhausted",
+                        "A* 逐级扩大预算后仍未完成",
+                    )
+                self._navigation_next_plan_time = now + self._PLAN_RETRY_INTERVAL
+                return RUNNING
             else:
-                # 不可达或预算耗尽：停止并等待下轮重新规划。
-                manager.controller.stop()
+                self._navigation_unreachable_count += 1
+                self._log_navigation_plan(
+                    manager,
+                    pose,
+                    target_xy,
+                    result.status,
+                    max_iterations,
+                    self._navigation_unreachable_count,
+                )
+                manager.controller.stop(reason="elevator_navigation_unreachable")
+                if self._navigation_unreachable_count >= int(
+                    getattr(
+                        manager,
+                        "elevator_planning_retry_limit",
+                        self._DEFAULT_PLAN_FAILURE_LIMIT,
+                    )
+                ):
+                    return self._fail_navigation(
+                        manager,
+                        "elevator_navigation_unreachable",
+                        "A* 连续确认目标不可达",
+                    )
+                self._navigation_next_plan_time = now + self._PLAN_RETRY_INTERVAL
                 return RUNNING
 
         if max_linear is None and goal_tolerance is None:
-            return manager.controller.tick(pose)
-        tick_kwargs = {}
-        if max_linear is not None:
-            tick_kwargs["max_linear"] = max_linear
-        if goal_tolerance is not None:
-            tick_kwargs["goal_tolerance"] = effective_goal_tolerance
-        return manager.controller.tick(pose, **tick_kwargs)
+            status = manager.controller.tick(pose)
+        else:
+            tick_kwargs = {}
+            if max_linear is not None:
+                tick_kwargs["max_linear"] = max_linear
+            if goal_tolerance is not None:
+                tick_kwargs["goal_tolerance"] = effective_goal_tolerance
+            status = manager.controller.tick(pose, **tick_kwargs)
+        if status == STUCK:
+            self._navigation_stuck_count += 1
+            stuck_limit = int(
+                getattr(
+                    manager,
+                    "elevator_stuck_retry_limit",
+                    self._DEFAULT_STUCK_RETRY_LIMIT,
+                )
+            )
+            if self._navigation_stuck_count > stuck_limit:
+                return self._fail_navigation(
+                    manager,
+                    "elevator_navigation_stuck_exhausted",
+                    f"局部控制卡住恢复超过 {stuck_limit} 次",
+                )
+            recover_with_clearance = getattr(
+                manager, "_recover_with_rotation_clearance", None
+            )
+            if callable(recover_with_clearance):
+                recover_with_clearance("elevator_navigation_stuck")
+            else:
+                # 独立任务夹具可能没有 MissionManager 的净空辅助方法；生产实例
+                # 始终通过上面的统一门控，兼容分支只保留任务的既有独立可测性。
+                manager.controller.recover()
+            return RUNNING
+        if status == DONE:
+            self._reset_navigation_watchdog(clear_failure=True)
+        return status
 
     def _navigate_to(self, manager: MissionManager, pose: tuple[float, float, float], target_xy: tuple[float, float]) -> bool:
         status = self._navigate_to_with_status(manager, pose, target_xy)
-        if status == STUCK:
-            manager.controller.recover()
         return status == DONE
+
+    @classmethod
+    def _refresh_viewpoint(
+        cls,
+        wait_xy: tuple[float, float],
+        cabin_xy: tuple[float, float],
+        standoff: float,
+    ) -> tuple[float, float]:
+        """从既有候梯点沿大厅方向后退，给前置 RGB-D 留出完整门板视场。"""
+        dx = float(wait_xy[0]) - float(cabin_xy[0])
+        dy = float(wait_xy[1]) - float(cabin_xy[1])
+        norm = math.hypot(dx, dy)
+        if norm <= 1e-9 or not math.isfinite(float(standoff)):
+            return wait_xy
+        extra = max(0.0, float(standoff) - cls._DEFAULT_WAIT_STANDOFF)
+        return (
+            float(wait_xy[0]) + extra * dx / norm,
+            float(wait_xy[1]) + extra * dy / norm,
+        )
+
+    def _begin_trace_approach(self, manager: MissionManager) -> bool:
+        if self._approach_trace_attempted:
+            return False
+        self._approach_trace_attempted = True
+        candidate_provider = getattr(manager, "elevator_approach_trace_candidates", None)
+        if not callable(candidate_provider):
+            return False
+        candidates = list(
+            candidate_provider(
+                self.elevator_id,
+                self.current_floor,
+                max_candidates=4,
+            )
+        )
+        if not candidates:
+            return False
+        self._approach_trace_candidates = [
+            (float(candidate[0]), float(candidate[1])) for candidate in candidates
+        ]
+        self._approach_trace_index = 0
+        manager.controller.clear_path(reason="elevator_trace_approach_start")
+        self._reset_navigation_watchdog(clear_failure=True)
+        self.phase = "GO_TO_ELEVATOR_TRACE_APPROACH"
+        if rospy is not None:
+            rospy.logwarn(
+                "[%s] 精确电梯等待点不可达，改用 %d 个已走轨迹上的安全粗接近点",
+                self.name,
+                len(self._approach_trace_candidates),
+            )
+        return True
+
+    def _reset_navigation_watchdog(self, *, clear_failure: bool) -> None:
+        self._navigation_phase_key = None
+        self._navigation_started_at = None
+        self._navigation_next_plan_time = 0.0
+        self._navigation_unreachable_count = 0
+        self._navigation_budget_count = 0
+        self._navigation_stuck_count = 0
+        if clear_failure:
+            self.failure_reason = None
+
+    def _fail_navigation(
+        self,
+        manager: MissionManager,
+        reason_code: str,
+        detail: str,
+    ) -> str:
+        self.failure_reason = str(reason_code)
+        manager.controller.clear_path(reason=reason_code)
+        manager.controller.stop(reason=reason_code)
+        if rospy is not None:
+            rospy.logerr("[%s] %s：%s", self.name, reason_code, detail)
+        self._log_navigation_plan(
+            manager,
+            None,
+            None,
+            reason_code,
+            0,
+            max(
+                self._navigation_unreachable_count,
+                self._navigation_budget_count,
+                self._navigation_stuck_count,
+            ),
+        )
+        return FAILED
+
+    def _log_navigation_plan(
+        self,
+        manager: MissionManager,
+        pose: tuple[float, float, float] | None,
+        target_xy: tuple[float, float] | None,
+        result: str,
+        max_iterations: int,
+        attempt: int,
+    ) -> None:
+        log_structured = getattr(manager, "_log_structured", None)
+        if not callable(log_structured):
+            return
+        log_structured(
+            {
+                "event": "elevator_navigation_plan",
+                "task": self.name,
+                "phase": self.phase,
+                "result": str(result),
+                "attempt": int(attempt),
+                "max_iterations": int(max_iterations),
+                "pose": None
+                if pose is None
+                else [round(float(pose[0]), 3), round(float(pose[1]), 3)],
+                "target": None
+                if target_xy is None
+                else [round(float(target_xy[0]), 3), round(float(target_xy[1]), 3)],
+            }
+        )
 
     def _run_service(self, manager: MissionManager, task_factory) -> str:
         if self._service_task is None:

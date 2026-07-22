@@ -1,2 +1,0 @@
-danger_search_localization
--DCATKIN_DEVEL_PREFIX=/home/xbh/tzb26/codeDG/SimEnv/devel_mapper_range_red -DCMAKE_INSTALL_PREFIX=/home/xbh/tzb26/codeDG/SimEnv/install -DCATKIN_WHITELIST_PACKAGES=danger_search_localization -G Unix Makefiles

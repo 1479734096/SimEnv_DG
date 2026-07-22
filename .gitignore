@@ -9,6 +9,7 @@ SimEnv/.catkin_tools/
 # 运行日志和结果
 SimEnv/logs/
 SimEnv/results/
+codeDG/results/
 SimEnv/src/unitree_guide/logs/
 log/
 logs/
@@ -65,5 +66,6 @@ opencode.json
 AGENTS.md
 config.toml
 SimEnv初始
+SimEnv老备份
 presentation.md
 presentation.pdf

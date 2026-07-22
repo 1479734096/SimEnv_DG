@@ -10,6 +10,21 @@
   <arg name="team_scene_info_path" default="$(find danger_search)/../../generated_building/team_scene_info.json"/>
   <arg name="require_team_scene_info" default="true"/>
   <arg name="allow_relative_origin" default="false"/>
+  <arg name="initialization_min_base_height" default="0.20"/>
+  <arg name="initialization_max_base_height" default="0.55"/>
+  <arg name="initialization_stable_frames" default="8"/>
+  <arg name="stance_health_enabled" default="true"/>
+  <!-- 允许经过约 7.5 cm 门槛时楼面距离短暂降低；趴地约 0.058 m 仍会被拒绝。 -->
+  <arg name="health_min_base_height" default="0.14"/>
+  <arg name="health_max_base_height" default="0.60"/>
+  <arg name="health_min_ground_normal_z" default="0.85"/>
+  <arg name="health_min_base_up_z" default="0.71"/>
+  <!-- 不得低于正式控制器正常角速度包络，避免正常转弯被判成跌倒。 -->
+  <arg name="health_max_angular_speed" default="1.50"/>
+  <arg name="health_required_healthy_frames" default="8"/>
+  <arg name="health_required_unhealthy_frames" default="3"/>
+  <arg name="health_required_unknown_frames" default="30"/>
+  <arg name="health_latch_unhealthy" default="true"/>
 
   <node pkg="danger_search_localization"
         type="scan_localization_node"
@@ -23,6 +38,36 @@
     <param name="team_scene_info_path" value="$(arg team_scene_info_path)"/>
     <param name="require_team_scene_info" value="$(arg require_team_scene_info)"/>
     <param name="allow_relative_origin" value="$(arg allow_relative_origin)"/>
+    <!-- 腹部着地时楼面法向仍可能合法；以连续站立高度窗口阻止错误世界系。 -->
+    <param name="initialization_min_base_height"
+           value="$(arg initialization_min_base_height)"/>
+    <param name="initialization_max_base_height"
+           value="$(arg initialization_max_base_height)"/>
+    <param name="initialization_stable_frames"
+           value="$(arg initialization_stable_frames)"/>
+    <param name="initialization_max_height_span" value="0.04"/>
+    <param name="initialization_max_angular_speed" value="0.30"/>
+    <!-- 速度按一秒位姿窗口估计，避免静止配准抖动被 10 Hz 差分放大。 -->
+    <param name="velocity_estimation_window" value="1.00"/>
+    <param name="velocity_minimum_interval" value="0.80"/>
+    <param name="velocity_linear_deadband" value="0.05"/>
+    <param name="velocity_angular_deadband" value="0.03"/>
+    <!-- 世界系建立后的持续姿态健康监控；只用 /scan 与 /trunk_imu。 -->
+    <param name="stance_health_enabled" value="$(arg stance_health_enabled)"/>
+    <param name="health_min_base_height" value="$(arg health_min_base_height)"/>
+    <param name="health_max_base_height" value="$(arg health_max_base_height)"/>
+    <param name="health_min_ground_normal_z"
+           value="$(arg health_min_ground_normal_z)"/>
+    <param name="health_min_base_up_z" value="$(arg health_min_base_up_z)"/>
+    <param name="health_max_angular_speed"
+           value="$(arg health_max_angular_speed)"/>
+    <param name="health_required_healthy_frames"
+           value="$(arg health_required_healthy_frames)"/>
+    <param name="health_required_unhealthy_frames"
+           value="$(arg health_required_unhealthy_frames)"/>
+    <param name="health_required_unknown_frames"
+           value="$(arg health_required_unknown_frames)"/>
+    <param name="health_latch_unhealthy" value="$(arg health_latch_unhealthy)"/>
     <param name="min_range" value="0.5"/>
     <param name="max_range" value="15.0"/>
     <param name="voxel_size" value="0.15"/>

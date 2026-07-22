@@ -13,6 +13,11 @@ from typing import Iterable
 
 import numpy as np
 
+from danger_search.interface_policy import (
+    require_allowed_input_topic,
+    require_internal_topic,
+)
+
 try:
     import message_filters
     import rospy
@@ -57,12 +62,32 @@ class SensorBuffer:
         sync_slop: float = 0.08,
         sync_queue_size: int = 10,
     ):
-        self.cloud_topic = cloud_topic
-        self.rgb_topic = rgb_topic
-        self.depth_topic = depth_topic
-        self.camera_info_topic = camera_info_topic
+        normalized_cloud_topic = str(cloud_topic).strip()
+        if normalized_cloud_topic.startswith(("/danger_search/", "/nav/")):
+            self.cloud_topic = require_internal_topic(
+                normalized_cloud_topic,
+                purpose="参赛方配准建图点云输入",
+            )
+        else:
+            self.cloud_topic = require_allowed_input_topic(
+                normalized_cloud_topic,
+                purpose="公开建图点云输入",
+            )
+        self.rgb_topic = require_allowed_input_topic(
+            rgb_topic, purpose="RGB-D 彩色图输入"
+        )
+        self.depth_topic = require_allowed_input_topic(
+            depth_topic, purpose="RGB-D 深度图输入"
+        )
+        self.camera_info_topic = require_allowed_input_topic(
+            camera_info_topic, purpose="RGB-D 标定输入"
+        )
         self.sync_slop = float(sync_slop)
         self.sync_queue_size = int(sync_queue_size)
+        if not np.isfinite(self.sync_slop) or self.sync_slop < 0.0:
+            raise ValueError("RGB-D 同步容差必须为非负有限数")
+        if self.sync_queue_size <= 0:
+            raise ValueError("RGB-D 同步队列长度必须为正数")
         self._lock = Lock()
         self._cloud_msg = None
         self._image_bundle: ImageBundle | None = None
@@ -100,6 +125,9 @@ class SensorBuffer:
         返回值只保留有限的 XYZ 数值；字段选择和 ``skip_nans`` 由 ROS 官方读取器
         处理。调用方随后负责时间匹配和坐标系语义，本函数不擅自做变换。
         """
+        point_limit = int(max_points)
+        if point_limit <= 0:
+            raise ValueError("点云读取上限必须为正数")
         if pc2 is None or cloud_msg is None:
             return []
         points: list[tuple[float, float, float]] = []
@@ -107,8 +135,11 @@ class SensorBuffer:
         for index, point in enumerate(pc2.read_points(cloud_msg, field_names=("x", "y", "z"), skip_nans=True)):
             if index % step != 0:
                 continue
-            points.append((float(point[0]), float(point[1]), float(point[2])))
-            if len(points) >= max_points:
+            xyz = (float(point[0]), float(point[1]), float(point[2]))
+            if not np.all(np.isfinite(np.asarray(xyz, dtype=float))):
+                continue
+            points.append(xyz)
+            if len(points) >= point_limit:
                 break
         return points
 

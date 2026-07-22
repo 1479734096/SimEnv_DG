@@ -20,9 +20,12 @@
   <node pkg="danger_search"
         type="danger_search_node"
         name="danger_search_smoke"
+        required="true"
         output="screen">
     <param name="mission/max_runtime" value="$(arg max_runtime)"/>
     <param name="runtime/profile" value="diagnostic"/>
+    <param name="wait_for_localization_ready" value="false"/>
+    <param name="localization/stance_health_required" value="false"/>
     <param name="mission/max_floor" value="1"/>
     <param name="result_file" value="$(arg result_file)"/>
     <param name="mission_summary_file" value="$(arg mission_summary_file)"/>

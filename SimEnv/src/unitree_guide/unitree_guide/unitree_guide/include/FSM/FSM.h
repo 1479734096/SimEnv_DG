@@ -63,6 +63,9 @@ private:
     bool resetGazeboRobot();
     void forcePassiveState();
     void setResetDownCommand();
+    void setResetTransitionInitialCommand(double calfConfig);
+    void startResetTransition(double calfStart);
+    void applyResetTransition();
     CtrlComponents *_ctrlComp;
     FSMState *_currentState;
     FSMState *_nextState;
@@ -74,6 +77,12 @@ private:
     bool _waitingForStateFeedback = false;
     bool _resetCommandLatched = false;
     bool _fallSafetyLatched = false;
+    bool _resetTransitionActive = false;
+    long long _resetTransitionStartUs = 0;
+    double _resetTransitionCalfStart = -2.0;
+    int _resetSettleFrames = 0;
+    int _resetReleaseFrames = 0;
+    bool _resetFlopSeen = false;
 };
 
 

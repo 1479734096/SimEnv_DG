@@ -17,6 +17,8 @@ from typing import Iterable
 
 import numpy as np
 
+from danger_search.interface_policy import require_internal_topic
+
 try:
     import rospy
     from nav_msgs.msg import Odometry
@@ -94,7 +96,10 @@ class PoseProvider:
     """
 
     def __init__(self, odom_topic: str, *, max_samples: int = 256):
-        self.odom_topic = str(odom_topic)
+        self.odom_topic = require_internal_topic(
+            odom_topic,
+            purpose="统一位姿入口",
+        )
         self._lock = Lock()
         self._samples: deque[PoseSample] = deque(maxlen=max(2, int(max_samples)))
         self._subscriber = None
@@ -147,8 +152,10 @@ class PoseProvider:
             )
         target = float(stamp)
         tolerance = float(max_delta)
-        if tolerance < 0.0:
-            raise ValueError("max_delta 必须非负")
+        if not np.isfinite(target):
+            raise ValueError("定位查询时间戳必须为有限数")
+        if not np.isfinite(tolerance) or tolerance < 0.0:
+            raise ValueError("max_delta 必须为非负有限数")
         with self._lock:
             if not self._samples:
                 return PoseLookup(POSE_PENDING, None, None)
@@ -215,6 +222,11 @@ class PoseProvider:
             angular_xyz=(float(twist.angular.x), float(twist.angular.y), float(twist.angular.z)),
         )
         with self._lock:
+            if not _is_valid_sample(sample):
+                return
+            # 查询逻辑依赖历史按时间递增；异常乱序帧不能破坏这一不变量。
+            if self._samples and sample.stamp <= self._samples[-1].stamp:
+                return
             self._samples.append(sample)
 
 
@@ -226,8 +238,24 @@ def _stamp_seconds(message) -> float | None:
     if stamp is None:
         return None
     if hasattr(stamp, "to_sec"):
-        return float(stamp.to_sec())
+        value = float(stamp.to_sec())
+        return value if np.isfinite(value) and value > 0.0 else None
     try:
-        return float(stamp)
+        value = float(stamp)
+        return value if np.isfinite(value) and value > 0.0 else None
     except (TypeError, ValueError):
         return None
+
+
+def _is_valid_sample(sample: PoseSample) -> bool:
+    """拒绝会把非有限数或无效姿态带入规划链的内部里程计。"""
+    values = (
+        sample.stamp,
+        *sample.xyz,
+        *sample.quaternion_xyzw,
+        *sample.linear_xyz,
+        *sample.angular_xyz,
+    )
+    if not np.all(np.isfinite(np.asarray(values, dtype=float))):
+        return False
+    return float(np.linalg.norm(sample.quaternion_xyzw)) > 1e-12

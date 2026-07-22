@@ -1,25 +1,29 @@
 """危险源自主搜索算法包。
 
-包内代码按“数据接入—环境理解—任务决策—运动执行”分层：
-
-* ``pose_provider`` 与 ``sensor_buffer`` 接收定位、点云和 RGB-D 数据；
-* ``mapper``、各类 detector 与 ``detection_tracker`` 生成地图和稳定目标；
-* ``frontier``、``planner`` 与 ``mission_manager`` 选择探索/返航行为；
-* ``navigator`` 和 ``navigation_tasks`` 把行为转换为唯一的 ``/cmd_vel`` 输出；
-* ``interface_policy`` 与 ``building_feature_provider`` 在最外层限制正式运行
-  能访问的话题、服务和文件，防止业务模块绕过比赛接口边界。
-
-主入口是 ``scripts/danger_search_node``。除入口脚本外，导入本包不会主动创建
-ROS 节点、订阅话题或写结果文件。
+当前迁移层提供接口权限、公开场景解析、统一计时、结果写入、传感器缓存、统一
+位姿入口、建图、A*、前沿、路径执行、地面支撑安全门、RGB-D 感知及任务编排。
+正式启动入口仍按后续阶段验证后加入；导入本包不会创建 ROS 节点、订阅话题或写文件。
 """
 
 __all__ = [
+    "building_feature_provider",
+    "building_control_client",
     "detection_tracker",
-    "frontier_explorer",
-    "local_controller",
+    "frontier",
+    "interface_policy",
+    "localization_runtime",
+    "local_semantic_detector",
+    "mapper",
     "mission_manager",
-    "multi_floor_mapper",
+    "ground_support_gate",
+    "navigator",
+    "navigation_tasks",
+    "planner",
+    "pose_provider",
     "red_sphere_detector",
     "result_writer",
+    "rgbd_door_detector",
     "sensor_buffer",
+    "support_shadow",
+    "time_utils",
 ]

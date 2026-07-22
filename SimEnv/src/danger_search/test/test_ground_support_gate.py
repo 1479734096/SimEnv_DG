@@ -1,6 +1,7 @@
 """生产负障碍安全门的纯逻辑测试。"""
 from __future__ import annotations
 
+import math
 import unittest
 
 from danger_search.ground_support_gate import (
@@ -32,7 +33,9 @@ def _config(**overrides) -> GroundSupportGateConfig:
         "release_supported_frames": 2,
         "observation_hold_timeout": 2.0,
         "safety_stop_timeout": 3.0,
-        "stop_linear_threshold": 0.02,
+        "odometry_linear_deadband": 0.05,
+        "odometry_angular_deadband": 0.03,
+        "stop_linear_threshold": 0.05,
         "stop_angular_threshold": 0.05,
         "stop_confirmation_samples": 3,
         "speed_out_of_envelope_confirmations": 2,
@@ -116,6 +119,83 @@ class ConservativeStopEnvelopeTest(unittest.TestCase):
 
 
 class GroundSupportSafetyGateTest(unittest.TestCase):
+    def test_invalid_configuration_is_rejected(self):
+        with self.assertRaises(ValueError):
+            GroundSupportSafetyGate(_config(decision_period=math.nan))
+        with self.assertRaises(ValueError):
+            GroundSupportSafetyGate(_config(stop_confirmation_samples=0))
+        with self.assertRaises(ValueError):
+            GroundSupportSafetyGate(_config(stop_linear_threshold=0.02))
+
+    def test_non_finite_command_is_fail_closed_even_when_disabled(self):
+        gate = GroundSupportSafetyGate(_config(enabled=False))
+
+        self.assertEqual(
+            gate.filter_command(
+                (0.2, 0.0, math.nan),
+                pose_yaw=0.0,
+                wall_time=100.0,
+            ),
+            (0.0, 0.0, 0.0),
+        )
+
+    def test_invalid_control_context_is_fail_closed(self):
+        gate = GroundSupportSafetyGate(_config())
+
+        self.assertEqual(
+            gate.filter_command(
+                (0.2, 0.0, 0.0),
+                pose_yaw=math.nan,
+                wall_time=100.0,
+            ),
+            (0.0, 0.0, 0.0),
+        )
+
+    def test_non_finite_odom_stamp_does_not_poison_freshness(self):
+        gate = GroundSupportSafetyGate(_config())
+
+        gate.observe_odometry(
+            math.nan,
+            linear_speed=0.1,
+            angular_speed=0.0,
+            wall_time=100.0,
+        )
+        gate.observe_odometry(
+            1.0,
+            linear_speed=0.1,
+            angular_speed=0.0,
+            wall_time=100.1,
+        )
+
+        self.assertEqual(gate._last_odom_stamp, 1.0)
+
+    def test_missing_assessment_is_fail_closed(self):
+        gate = GroundSupportSafetyGate(_config())
+
+        command = gate.filter_command(
+            (0.2, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.0,
+        )
+
+        self.assertEqual(command, (0.0, 0.0, 0.0))
+        self.assertEqual(gate.state, STALE_DATA_HOLD)
+        self.assertEqual(gate.reason_code, "ground_support_missing")
+
+    def test_non_finite_assessment_invalidates_previous_evidence(self):
+        gate = GroundSupportSafetyGate(_config())
+        gate.update_assessment(_assessment())
+        gate.update_assessment(_assessment(stamp=math.nan))
+
+        command = gate.filter_command(
+            (0.2, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.0,
+        )
+
+        self.assertEqual(command, (0.0, 0.0, 0.0))
+        self.assertEqual(gate.state, STALE_DATA_HOLD)
+
     def test_disabled_gate_is_transparent(self):
         gate = GroundSupportSafetyGate(_config(enabled=False))
         gate.update_assessment(_assessment(drop_confirmed=True, drop_intersects_sweep=True))
@@ -636,6 +716,55 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
 
         self.assertEqual(gate.state, SAFETY_STOP_TIMEOUT)
         self.assertEqual(gate.reason_code, "ground_support_clock_or_odom_stalled")
+
+    def test_boundary_margin_stops_before_verified_support_edge(self):
+        gate = GroundSupportSafetyGate(_config(boundary_hold_margin=0.30))
+        gate.update_assessment(_assessment(supported_distance=0.35))
+
+        command = gate.filter_command(
+            (0.30, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.0,
+            control_time=10.0,
+        )
+
+        self.assertEqual(command, (0.0, 0.0, 0.0))
+        self.assertEqual(gate.state, OBSERVATION_HOLD)
+
+    def test_stable_boundary_cells_are_latched_after_three_frames(self):
+        gate = GroundSupportSafetyGate(
+            _config(boundary_persistence_confirmations=3)
+        )
+        cells = ((1.0, 2.0), (1.0, 2.1), (1.0, 2.2))
+        for index in range(3):
+            gate.update_assessment(
+                _assessment(
+                    stamp=10.0 + 0.1 * index,
+                    support_boundary_cells_world=cells,
+                )
+            )
+
+        self.assertEqual(gate.latched_boundary_cells_world, cells)
+
+    def test_boundary_geometry_jump_resets_confirmation(self):
+        gate = GroundSupportSafetyGate(
+            _config(
+                boundary_persistence_confirmations=2,
+                boundary_consistency_radius=0.20,
+            )
+        )
+        gate.update_assessment(
+            _assessment(support_boundary_cells_world=((1.0, 2.0),))
+        )
+        gate.update_assessment(
+            _assessment(
+                stamp=10.1,
+                support_boundary_cells_world=((1.5, 2.0),),
+            )
+        )
+
+        self.assertEqual(gate.latched_boundary_cells_world, ())
+        self.assertEqual(gate.snapshot()["boundary_confirmation_count"], 1)
 
 
 if __name__ == "__main__":

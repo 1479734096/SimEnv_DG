@@ -208,6 +208,66 @@ class PlannerTest(unittest.TestCase):
         self.assertTrue(result.unreachable)
         self.assertFalse(result.budget_exhausted)
 
+    def test_astar_rejects_occupied_start_cell(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.5,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        )
+        for gx in range(grid.size_x):
+            for gy in range(grid.size_y):
+                grid.mark_free(gx, gy)
+        start_cell = (2, 2)
+        grid.mark_occupied(*start_cell)
+
+        result = astar_plan(
+            grid,
+            grid.grid_to_world(*start_cell),
+            grid.grid_to_world(6, 6),
+            max_iterations=None,
+        )
+
+        self.assertEqual(result.status, UNREACHABLE)
+        self.assertEqual(result.path, [])
+
+    def test_blocked_goal_uses_geometrically_nearest_free_cell(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        for gx in range(grid.size_x):
+            for gy in range(grid.size_y):
+                grid.mark_free(gx, gy)
+        goal_cell = (2, 2)
+        grid.mark_occupied(*goal_cell)
+
+        result = astar_plan(
+            grid,
+            grid.grid_to_world(2, 0),
+            grid.grid_to_world(*goal_cell),
+            max_iterations=None,
+        )
+
+        self.assertTrue(result.reached)
+        self.assertEqual(result.path[-1], grid.grid_to_world(2, 1))
+
+    def test_astar_rejects_invalid_iteration_budget(self):
+        grid = self._make_long_corridor()
+        start = grid.grid_to_world(2, 2)
+        goal = grid.grid_to_world(grid.size_x - 3, 2)
+
+        with self.assertRaises(ValueError):
+            astar_plan(grid, start, goal, max_iterations=0)
+        with self.assertRaises(ValueError):
+            astar_plan(grid, start, goal, max_iterations=math.nan)
+
 
 if __name__ == "__main__":
     unittest.main()

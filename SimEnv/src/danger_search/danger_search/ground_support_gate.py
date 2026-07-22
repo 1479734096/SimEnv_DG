@@ -98,11 +98,16 @@ class GroundSupportGateConfig:
     decision_period: float = 0.10
     rl_receive_delay: float = 0.009
     required_margin: float = 0.02
+    boundary_hold_margin: float = 0.0
+    boundary_persistence_confirmations: int = 3
+    boundary_consistency_radius: float = 0.20
     release_hysteresis: float = 0.10
     release_supported_frames: int = 2
     observation_hold_timeout: float = 2.0
     safety_stop_timeout: float = 3.0
-    stop_linear_threshold: float = 0.02
+    odometry_linear_deadband: float = 0.05
+    odometry_angular_deadband: float = 0.03
+    stop_linear_threshold: float = 0.05
     stop_angular_threshold: float = 0.05
     stop_confirmation_samples: int = 3
 
@@ -127,6 +132,7 @@ class GroundSupportAssessment:
     received_control_time: float | None = None
     support_boundary_detected: bool = False
     drop_point_world: tuple[float, float] | None = None
+    support_boundary_cells_world: tuple[tuple[float, float], ...] = ()
 
 
 class GroundSupportSafetyGate:
@@ -139,6 +145,41 @@ class GroundSupportSafetyGate:
 
     def __init__(self, config: GroundSupportGateConfig | None = None) -> None:
         self.config = config or GroundSupportGateConfig()
+        finite_nonnegative = (
+            self.config.drop_evidence_max_age,
+            self.config.decision_period,
+            self.config.rl_receive_delay,
+            self.config.required_margin,
+            self.config.boundary_hold_margin,
+            self.config.boundary_consistency_radius,
+            self.config.release_hysteresis,
+            self.config.observation_hold_timeout,
+            self.config.safety_stop_timeout,
+            self.config.odometry_linear_deadband,
+            self.config.odometry_angular_deadband,
+            self.config.stop_linear_threshold,
+            self.config.stop_angular_threshold,
+        )
+        if (
+            not all(
+                math.isfinite(float(value)) and float(value) >= 0.0
+                for value in finite_nonnegative
+            )
+            or self.config.decision_period <= 0.0
+            or self.config.observation_hold_timeout <= 0.0
+            or self.config.safety_stop_timeout <= 0.0
+            or int(self.config.release_supported_frames) <= 0
+            or int(self.config.stop_confirmation_samples) <= 0
+            or int(self.config.speed_out_of_envelope_confirmations) <= 0
+            or int(self.config.boundary_persistence_confirmations) <= 0
+            or self.config.stop_linear_threshold
+            < self.config.odometry_linear_deadband
+            or self.config.stop_angular_threshold
+            < self.config.odometry_angular_deadband
+        ):
+            raise ValueError(
+                "地面支撑安全门时序、阈值、确认次数或里程计死区契约无效"
+            )
         self.envelope = ConservativeStopEnvelope(
             self.config.stop_distance_table,
             validated_max_speed=self.config.validated_max_speed,
@@ -167,6 +208,9 @@ class GroundSupportSafetyGate:
         self._temporary_hold_pose_yaw: float | None = None
         self._unknown_support_hold_enabled = True
         self._latched_drop_point_world: tuple[float, float] | None = None
+        self._boundary_candidate_centroid: tuple[float, float] | None = None
+        self._boundary_confirmation_count = 0
+        self._latched_boundary_cells_world: tuple[tuple[float, float], ...] = ()
         self.last_stop_distance: float | None = 0.0
         self.true_drop_stop_count = 0
         self.observation_hold_count = 0
@@ -195,10 +239,18 @@ class GroundSupportSafetyGate:
         """接收时间单调的新评估并累计连续正支撑帧，用于滞回释放。"""
         if not self.enabled:
             return
+        if not self._assessment_has_valid_numbers(assessment):
+            # 畸形证据不能继续保留上一帧“安全”结论；清空后由唯一出口进入
+            # UNKNOWN 临时停车，等待新的有限数据恢复。
+            self._assessment = None
+            self._fresh_supported_sequence_count = 0
+            self._reset_boundary_candidate()
+            return
         if self._assessment is not None and assessment.stamp <= self._assessment.stamp:
             return
         self._assessment = assessment
         self._assessment_sequence += 1
+        self._update_boundary_candidate(assessment)
         control_time = (
             assessment.received_control_time
             if assessment.received_control_time is not None
@@ -231,14 +283,25 @@ class GroundSupportSafetyGate:
         """用定位实测速度确认停车过程及是否超出已验证速度域。"""
         if not self.enabled:
             return
-        self._actual_linear_speed = abs(float(linear_speed))
-        self._actual_angular_speed = abs(float(angular_speed))
-        is_fresh = stamp is not None and (
-            self._last_odom_stamp is None or float(stamp) > self._last_odom_stamp
+        try:
+            resolved_linear = abs(float(linear_speed))
+            resolved_angular = abs(float(angular_speed))
+        except (TypeError, ValueError):
+            resolved_linear = math.inf
+            resolved_angular = math.inf
+        self._actual_linear_speed = (
+            resolved_linear if math.isfinite(resolved_linear) else math.inf
+        )
+        self._actual_angular_speed = (
+            resolved_angular if math.isfinite(resolved_angular) else math.inf
+        )
+        stamp_value = float(stamp) if stamp is not None else math.nan
+        is_fresh = math.isfinite(stamp_value) and (
+            self._last_odom_stamp is None or stamp_value > self._last_odom_stamp
         )
         if is_fresh:
-            self._last_odom_stamp = float(stamp)
-            self._note_control_progress(float(stamp), wall_time)
+            self._last_odom_stamp = stamp_value
+            self._note_control_progress(stamp_value, wall_time)
             actual_out_of_envelope = (
                 self.envelope.distance_for(self._actual_linear_speed) is None
             )
@@ -263,7 +326,7 @@ class GroundSupportSafetyGate:
                     # 但只有连续新 odom 超界才升级为不可恢复的安全失败。
                     self._leave_speed_out_of_envelope_hold(
                         wall_time,
-                        control_time=float(stamp),
+                        control_time=stamp_value,
                     )
                     return
         if self.state not in _STOPPING_STATES:
@@ -358,10 +421,29 @@ class GroundSupportSafetyGate:
         检查明确 DROP，最后才判断是否接近未知支撑边界。任何锁存状态都优先于
         新命令，防止上层换目标后意外解除安全停车。
         """
-        requested = tuple(float(value) for value in command)
+        try:
+            requested = tuple(float(value) for value in command)
+        except (TypeError, ValueError):
+            return (0.0, 0.0, 0.0)
+        if len(requested) != 3 or not all(math.isfinite(value) for value in requested):
+            return (0.0, 0.0, 0.0)
         if not self.enabled:
             return requested
-        control_now = float(wall_time if control_time is None else control_time)
+        try:
+            resolved_wall_time = float(wall_time)
+            control_now = float(
+                resolved_wall_time if control_time is None else control_time
+            )
+            resolved_pose_yaw = float(pose_yaw)
+        except (TypeError, ValueError):
+            return (0.0, 0.0, 0.0)
+        if not all(
+            math.isfinite(value)
+            for value in (resolved_wall_time, control_now, resolved_pose_yaw)
+        ):
+            return (0.0, 0.0, 0.0)
+        wall_time = resolved_wall_time
+        pose_yaw = resolved_pose_yaw
         self.check_control_timeout(control_now, wall_time=wall_time)
         if self.state in _LATCHED_STATES:
             return (0.0, 0.0, 0.0)
@@ -441,7 +523,18 @@ class GroundSupportSafetyGate:
 
         assessment = self._assessment
         if assessment is None:
-            return requested
+            if not self._unknown_support_hold_enabled:
+                return requested
+            self._temporary_hold_command = requested
+            self._temporary_hold_pose_yaw = float(pose_yaw)
+            self.stale_data_hold_count += 1
+            self._enter_state(
+                STALE_DATA_HOLD,
+                "ground_support_missing",
+                wall_time,
+                control_time=control_now,
+            )
+            return (0.0, 0.0, 0.0)
         fresh = self._assessment_is_usable(assessment, control_now)
         if self._fresh_drop_blocks(
             assessment,
@@ -461,7 +554,7 @@ class GroundSupportSafetyGate:
             effective_speed,
             stop_distance,
             data_age=self._latency_data_age(assessment, control_now),
-        )
+        ) + self.config.boundary_hold_margin
         supported_distance = assessment.supported_distance
         near_supported_boundary = (
             assessment.current_footprint_supported
@@ -568,12 +661,25 @@ class GroundSupportSafetyGate:
                 if self._latched_drop_point_world is not None
                 else None
             ),
+            "boundary_candidate_centroid": (
+                list(self._boundary_candidate_centroid)
+                if self._boundary_candidate_centroid is not None
+                else None
+            ),
+            "boundary_confirmation_count": self._boundary_confirmation_count,
+            "latched_boundary_cells_world": [
+                list(point) for point in self._latched_boundary_cells_world
+            ],
             "assessment": assessment,
         }
 
     @property
     def latched_drop_point_world(self) -> tuple[float, float] | None:
         return self._latched_drop_point_world
+
+    @property
+    def latched_boundary_cells_world(self) -> tuple[tuple[float, float], ...]:
+        return self._latched_boundary_cells_world
 
     def reset_negative_obstacle_after_replan(self) -> bool:
         """停稳且外部已写入局部禁行区后，解除 DROP 锁存。"""
@@ -589,6 +695,7 @@ class GroundSupportSafetyGate:
         self._temporary_hold_command = None
         self._temporary_hold_pose_yaw = None
         self._latched_drop_point_world = None
+        self._reset_boundary_candidate()
         return True
 
     def reset_path_unavailable(self) -> bool:
@@ -605,6 +712,7 @@ class GroundSupportSafetyGate:
         self._stopped_sample_count = 0
         self._temporary_hold_command = None
         self._temporary_hold_pose_yaw = None
+        self._reset_boundary_candidate()
         return True
 
     def invalidate_assessment(self) -> None:
@@ -613,6 +721,7 @@ class GroundSupportSafetyGate:
             return
         self._assessment = None
         self._fresh_supported_sequence_count = 0
+        self._reset_boundary_candidate()
 
     def _guard_distance(
         self,
@@ -653,7 +762,7 @@ class GroundSupportSafetyGate:
             speed,
             stop_distance,
             data_age=self._latency_data_age(assessment, control_time),
-        ) + self.config.release_hysteresis
+        ) + self.config.boundary_hold_margin + self.config.release_hysteresis
         boundary_is_clear = not assessment.support_boundary_detected
         distance_is_clear = (
             assessment.supported_distance is not None
@@ -685,6 +794,45 @@ class GroundSupportSafetyGate:
         self._last_release_sequence = self._assessment_sequence
         self._temporary_hold_command = None
         self._temporary_hold_pose_yaw = None
+        self._reset_boundary_candidate()
+
+    def _update_boundary_candidate(self, assessment: GroundSupportAssessment) -> None:
+        cells = tuple(assessment.support_boundary_cells_world or ())
+        qualifies = (
+            assessment.support_boundary_detected
+            and assessment.observation_adequate
+            and assessment.current_footprint_supported
+            and assessment.data_age <= self.config.drop_evidence_max_age
+            and bool(cells)
+        )
+        if not qualifies:
+            self._reset_boundary_candidate()
+            return
+        centroid = (
+            sum(float(point[0]) for point in cells) / len(cells),
+            sum(float(point[1]) for point in cells) / len(cells),
+        )
+        previous = self._boundary_candidate_centroid
+        if previous is None or math.hypot(
+            centroid[0] - previous[0], centroid[1] - previous[1]
+        ) > self.config.boundary_consistency_radius:
+            self._boundary_candidate_centroid = centroid
+            self._boundary_confirmation_count = 1
+            self._latched_boundary_cells_world = ()
+            return
+        self._boundary_candidate_centroid = centroid
+        self._boundary_confirmation_count += 1
+        if self._boundary_confirmation_count >= max(
+            1, int(self.config.boundary_persistence_confirmations)
+        ):
+            self._latched_boundary_cells_world = tuple(
+                (float(point[0]), float(point[1])) for point in cells
+            )
+
+    def _reset_boundary_candidate(self) -> None:
+        self._boundary_candidate_centroid = None
+        self._boundary_confirmation_count = 0
+        self._latched_boundary_cells_world = ()
 
     def _fresh_drop_blocks(
         self,
@@ -814,6 +962,43 @@ class GroundSupportSafetyGate:
         if self._last_control_time is None or value > self._last_control_time + 1e-9:
             self._last_control_time = value
             self._last_progress_wall_time = float(wall_time)
+
+    @staticmethod
+    def _assessment_has_valid_numbers(assessment: GroundSupportAssessment) -> bool:
+        try:
+            required = (
+                assessment.stamp,
+                assessment.received_wall_time,
+                assessment.data_age,
+            )
+            if not all(math.isfinite(float(value)) for value in required):
+                return False
+            if float(assessment.data_age) < 0.0:
+                return False
+            if assessment.received_control_time is not None and not math.isfinite(
+                float(assessment.received_control_time)
+            ):
+                return False
+            for value in (assessment.supported_distance, assessment.drop_distance):
+                if value is not None and (
+                    not math.isfinite(float(value)) or float(value) < 0.0
+                ):
+                    return False
+            for point in (assessment.drop_direction_world, assessment.drop_point_world):
+                if point is not None and (
+                    len(point) != 2
+                    or not all(math.isfinite(float(value)) for value in point)
+                ):
+                    return False
+            for point in assessment.support_boundary_cells_world:
+                if (
+                    len(point) != 2
+                    or not all(math.isfinite(float(value)) for value in point)
+                ):
+                    return False
+            return True
+        except (AttributeError, TypeError, ValueError):
+            return False
 
     @staticmethod
     def _assessment_elapsed(

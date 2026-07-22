@@ -1,5 +1,6 @@
 import math
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -16,15 +17,53 @@ class RgbdDoorDetectorTest(unittest.TestCase):
             maximum_plane_rmse=0.04,
         )
         self.camera_k = [100.0, 0.0, 80.0, 0.0, 100.0, 60.0, 0.0, 0.0, 1.0]
-        # 光学坐标 x 向右、y 向下、z 向前；相机朝 world +X。
+        # 光学坐标 x 向右、y 向下、z 向前；相机朝 world +X，world +Y 向左。
         self.camera_to_world = np.asarray(
             [
                 [0.0, 0.0, 1.0, 0.0],
-                [1.0, 0.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0, 0.0],
                 [0.0, -1.0, 0.0, 1.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
             dtype=float,
+        )
+
+    def test_invalid_configuration_is_rejected(self):
+        with self.assertRaises(ValueError):
+            RgbdDoorDetector(minimum_depth=2.0, maximum_depth=1.0)
+        with self.assertRaises(ValueError):
+            RgbdDoorDetector(maximum_plane_rmse=math.nan)
+
+    def test_invalid_array_intrinsics_and_transform_fail_closed(self):
+        rgb, depth = self._door_frame()
+        self.assertEqual(
+            self.detector.detect_arrays(
+                rgb,
+                depth[:10],
+                self.camera_k,
+                self.camera_to_world,
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.detector.detect_arrays(
+                rgb,
+                depth,
+                [0.0, 0.0, 80.0, 0.0, 100.0, 60.0],
+                self.camera_to_world,
+            ),
+            [],
+        )
+        invalid_transform = self.camera_to_world.copy()
+        invalid_transform[0, 0] = math.nan
+        self.assertEqual(
+            self.detector.detect_arrays(
+                rgb,
+                depth,
+                self.camera_k,
+                invalid_transform,
+            ),
+            [],
         )
 
     @staticmethod
@@ -54,6 +93,56 @@ class RgbdDoorDetectorTest(unittest.TestCase):
         self.assertGreater(observation.width, 1.0)
         self.assertGreater(observation.height, 1.5)
         self.assertGreater(observation.depth_inlier_count, 1000)
+
+    def test_message_path_exposes_read_only_rejection_diagnostics(self):
+        rgb, depth = self._door_frame()
+        self.detector._bridge = SimpleNamespace(
+            imgmsg_to_cv2=lambda message, desired_encoding: (
+                rgb if desired_encoding == "bgr8" else depth
+            )
+        )
+        stamp = SimpleNamespace(to_sec=lambda: 12.5)
+        message = SimpleNamespace(header=SimpleNamespace(stamp=stamp))
+        camera_info = SimpleNamespace(K=self.camera_k)
+
+        observations = self.detector.detect_messages(
+            message,
+            message,
+            camera_info,
+            self.camera_to_world,
+        )
+        snapshot = self.detector.diagnostics()
+
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(snapshot["frames"], 1)
+        self.assertEqual(snapshot["last_observation_count"], 1)
+        self.assertEqual(snapshot["last"]["accepted_panel"], 1)
+        self.assertEqual(snapshot["cumulative"]["accepted_panel"], 1)
+        snapshot["last"]["accepted_panel"] = 99
+        self.assertEqual(self.detector.diagnostics()["last"]["accepted_panel"], 1)
+
+    def test_message_path_records_missing_transform_without_fallback(self):
+        self.detector._bridge = SimpleNamespace()
+
+        self.assertEqual(
+            self.detector.detect_messages(None, None, None, None),
+            [],
+        )
+
+        snapshot = self.detector.diagnostics()
+        self.assertEqual(snapshot["frames"], 1)
+        self.assertEqual(snapshot["last"], {"missing_world_transform": 1})
+
+        self.detector.reset_diagnostics()
+        self.assertEqual(
+            self.detector.diagnostics(),
+            {
+                "frames": 0,
+                "last": {},
+                "cumulative": {},
+                "last_observation_count": 0,
+            },
+        )
 
     def test_gray_wall_does_not_merge_with_black_door_panel(self):
         """灰墙不能与黑门合成整幅超宽轮廓。"""

@@ -1,10 +1,23 @@
 import math
+from types import SimpleNamespace
 import unittest
 
-from danger_search.building_control_client import BuildingControlClient, DoorInfo
+from danger_search.building_control_client import (
+    BuildingControlClient,
+    DoorInfo,
+    ElevatorInfo,
+)
 
 
 class BuildingControlClientTest(unittest.TestCase):
+    def test_invalid_runtime_geometry_and_timeout_are_rejected(self):
+        with self.assertRaises(ValueError):
+            BuildingControlClient(service_timeout=math.nan)
+        with self.assertRaises(ValueError):
+            DoorInfo("door", "dynamic", 0, math.nan, 0.0, 0.0)
+        with self.assertRaises(ValueError):
+            ElevatorInfo("lift", {0: (0.0, math.nan, 0.0)})
+
     def test_constructor_does_not_create_spatial_targets_from_scene_files(self):
         client = BuildingControlClient()
 
@@ -35,6 +48,46 @@ class BuildingControlClientTest(unittest.TestCase):
             client.call_elevator("unknown", 0)
         with self.assertRaises(ValueError):
             client.call_elevator("elevator_main", 2)
+
+    def test_authorized_service_calls_preserve_public_request_fields(self):
+        calls = []
+        client = BuildingControlClient()
+        client.set_public_features(
+            door_ids={"main_entrance"},
+            elevators={"elevator_main": {0, 1}},
+        )
+        client._set_door = lambda **kwargs: (
+            calls.append(("door", kwargs))
+            or SimpleNamespace(accepted=True, message="ok")
+        )
+        client._call_elevator = lambda **kwargs: (
+            calls.append(("elevator", kwargs))
+            or SimpleNamespace(accepted=True, message="ok")
+        )
+
+        door_task = client.open_door("main_entrance")
+        elevator_task = client.call_elevator("elevator_main", 1, open_doors=True)
+        door_task._thread.join(timeout=1.0)
+        elevator_task._thread.join(timeout=1.0)
+
+        self.assertTrue(door_task.done())
+        self.assertTrue(door_task.ok())
+        self.assertTrue(elevator_task.done())
+        self.assertTrue(elevator_task.ok())
+        self.assertCountEqual(
+            calls,
+            [
+                ("door", {"door_id": "main_entrance", "open": True}),
+                (
+                    "elevator",
+                    {
+                        "elevator_id": "elevator_main",
+                        "target_floor": 1,
+                        "open_doors": True,
+                    },
+                ),
+            ],
+        )
 
     def test_elevator_door_id_requires_one_public_id_per_floor(self):
         client = BuildingControlClient()

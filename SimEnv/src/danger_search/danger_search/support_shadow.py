@@ -119,6 +119,7 @@ class _CellEvidence:
     support_hits: int = 0
     lower_hits: int = 0
     support_frames: int = 0
+    support_streak: int = 0
     lower_frames: int = 0
     lower_streak: int = 0
     state: str = UNKNOWN_SUPPORT
@@ -132,6 +133,7 @@ class _CellEvidence:
             "support_hits": self.support_hits,
             "lower_hits": self.lower_hits,
             "support_frames": self.support_frames,
+            "support_streak": self.support_streak,
             "lower_frames": self.lower_frames,
             "lower_streak": self.lower_streak,
             "last_stamp": self.last_stamp,
@@ -239,6 +241,30 @@ def _largest_cluster(cells: Iterable[tuple[int, int]]) -> int:
                     queue.append(neighbor)
         largest = max(largest, count)
     return largest
+
+
+def _cells_in_clusters_at_least(
+    cells: Iterable[tuple[int, int]],
+    minimum_size: int,
+) -> set[tuple[int, int]]:
+    """返回所有达到最小四连通规模的格子，孤立噪点不进入行为层。"""
+    remaining = set(cells)
+    accepted: set[tuple[int, int]] = set()
+    threshold = max(1, int(minimum_size))
+    while remaining:
+        seed = remaining.pop()
+        queue = deque([seed])
+        cluster = {seed}
+        while queue:
+            x, y = queue.popleft()
+            for neighbor in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if neighbor in remaining:
+                    remaining.remove(neighbor)
+                    cluster.add(neighbor)
+                    queue.append(neighbor)
+        if len(cluster) >= threshold:
+            accepted.update(cluster)
+    return accepted
 
 
 def _distance_to_polyline_progress(
@@ -673,6 +699,9 @@ class ShadowSupportGrid:
         for cell, evidence in floor_cells.items():
             if active_cells is not None and cell not in active_cells:
                 continue
+            if evidence.support_streak and cell not in support_counts:
+                evidence.support_streak = 0
+                self._changed[int(floor)].add(cell)
             if evidence.lower_streak and cell not in active_default:
                 before = (evidence.lower_streak, evidence.state, evidence.last_reason)
                 evidence.lower_streak = 0
@@ -689,6 +718,7 @@ class ShadowSupportGrid:
             before = (
                 evidence.support_hits,
                 evidence.support_frames,
+                evidence.support_streak,
                 evidence.lower_streak,
                 evidence.state,
                 evidence.last_reason,
@@ -701,6 +731,10 @@ class ShadowSupportGrid:
                 max(self.config.threshold_consecutive_frames),
                 evidence.support_frames + 1,
             )
+            evidence.support_streak = min(
+                max(self.config.threshold_consecutive_frames),
+                evidence.support_streak + 1,
+            )
             evidence.lower_streak = 0
             if evidence.support_hits >= self.config.minimum_cell_hits:
                 evidence.state = SUPPORTED
@@ -711,6 +745,7 @@ class ShadowSupportGrid:
             after = (
                 evidence.support_hits,
                 evidence.support_frames,
+                evidence.support_streak,
                 evidence.lower_streak,
                 evidence.state,
                 evidence.last_reason,
@@ -744,10 +779,7 @@ class ShadowSupportGrid:
                         max(self.config.threshold_consecutive_frames),
                         evidence.lower_streak + 1,
                     )
-            if evidence.state == SUPPORTED:
-                evidence.state = SUPPORTED
-                evidence.last_reason = "historical_explicit_support_overrides_conflict"
-            elif evidence.lower_streak >= self.config.required_consecutive_frames:
+            if evidence.lower_streak >= self.config.required_consecutive_frames:
                 evidence.state = NO_SUPPORT_EVIDENCE
                 evidence.last_reason = "consecutive_lower_surface_crossings"
             else:
@@ -1001,6 +1033,7 @@ class ShadowSupportGrid:
             section_records.append(
                 {
                     "progress": float(progress),
+                    "point": np.asarray(point, dtype=float).copy(),
                     "cells": set(left_cells) | set(right_cells),
                     "left_supported": float(left_supported),
                     "right_supported": float(right_supported),
@@ -1078,6 +1111,20 @@ class ShadowSupportGrid:
         for record in boundary_records:
             boundary_cells.update(record["cells"])
 
+        first_boundary_cells = (
+            set(boundary_records[0]["cells"]) if boundary_records else set()
+        )
+        boundary_cells_world = [
+            _cell_center(
+                cell,
+                resolution=self.config.resolution,
+                origin_x=self.config.origin_x,
+                origin_y=self.config.origin_y,
+                z=int(floor) * self.config.floor_height,
+            )[:2].tolist()
+            for cell in sorted(first_boundary_cells)
+        ]
+
         longitudinal_support_ratio = (
             accepted_supported_sections / accepted_sections
             if accepted_sections
@@ -1148,6 +1195,7 @@ class ShadowSupportGrid:
             ),
             "fresh_drop_cell_count": len(fresh_drop_cells),
             "boundary_cell_count": len(boundary_cells),
+            "support_boundary_cells_world": boundary_cells_world,
             "minimum_left_foot_band_coverage": minimum_left_coverage,
             "minimum_right_foot_band_coverage": minimum_right_coverage,
             "longitudinal_support_ratio": longitudinal_support_ratio,
@@ -1375,6 +1423,31 @@ class ShadowSupportGrid:
             sweep_payload["largest_no_support_cluster"]
             >= self.config.minimum_alert_cells
         )
+        floor_cells = self._cells.get(floor_index, {})
+        current_negative_candidates = {
+            cell
+            for cell, count in lower_counts.items()
+            if count >= self.config.minimum_cell_hits
+            and floor_cells.get(cell) is not None
+            and floor_cells[cell].state == NO_SUPPORT_EVIDENCE
+            and floor_cells[cell].last_stamp is not None
+            and abs(float(floor_cells[cell].last_stamp) - stamp) <= 1e-6
+        }
+        confirmed_negative_cells = _cells_in_clusters_at_least(
+            current_negative_candidates,
+            self.config.minimum_alert_cells,
+        )
+        confirmed_supported_cells = {
+            cell
+            for cell, count in support_counts.items()
+            if count >= self.config.minimum_cell_hits
+            and floor_cells.get(cell) is not None
+            and floor_cells[cell].state == SUPPORTED
+            and floor_cells[cell].support_streak
+            >= self.config.required_consecutive_frames
+            and floor_cells[cell].last_stamp is not None
+            and abs(float(floor_cells[cell].last_stamp) - stamp) <= 1e-6
+        }
         threshold_payload = self._threshold_sensitivity(floor_index, sweep_by_width)
         should_emit = (
             self._last_emit_stamp is None
@@ -1405,6 +1478,14 @@ class ShadowSupportGrid:
             ),
             "path_footprint_sweep": sweep_payload,
             "local_corridor_assessment": local_assessment,
+            "confirmed_negative_cells": [
+                [int(cell[0]), int(cell[1])]
+                for cell in sorted(confirmed_negative_cells)
+            ],
+            "confirmed_supported_cells": [
+                [int(cell[0]), int(cell[1])]
+                for cell in sorted(confirmed_supported_cells)
+            ],
             "hypothetical_alert": {
                 "active": alert_active,
                 "transition": alert_transition,

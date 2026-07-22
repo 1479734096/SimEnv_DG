@@ -7,6 +7,11 @@ from danger_search.local_semantic_detector import LocalSemanticDetector
 
 
 class LocalSemanticDetectorTest(unittest.TestCase):
+    def test_invalid_configuration_is_rejected(self):
+        with self.assertRaises(ValueError):
+            LocalSemanticDetector(max_distance=math.nan)
+        with self.assertRaises(ValueError):
+            LocalSemanticDetector(opening_min_width=2.0, opening_max_width=1.0)
     @staticmethod
     def _opening_points(
         robot_pose=(1.0, 2.0, math.pi / 2.0),

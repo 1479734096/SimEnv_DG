@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-import time
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -25,7 +24,7 @@ REJECTED = "Rejected"
 class DetectionCandidate:
     """单帧检测候选。
 
-    position 使用 Gazebo world/odom 数值坐标，confidence 为 0 到 1。
+    position 使用第 2 层定位建立的逻辑 world 数值坐标，confidence 为 0 到 1。
     """
 
     position: tuple[float, float, float]
@@ -33,6 +32,32 @@ class DetectionCandidate:
     rmse: float = 0.0
     radius: float | None = None
     stamp: float | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.position) != 3:
+            raise ValueError("检测候选位置必须是三维坐标")
+        position = tuple(float(value) for value in self.position)
+        confidence = float(self.confidence)
+        rmse = float(self.rmse)
+        radius = None if self.radius is None else float(self.radius)
+        stamp = None if self.stamp is None else float(self.stamp)
+        if (
+            not all(math.isfinite(value) for value in position)
+            or not math.isfinite(confidence)
+            or not 0.0 <= confidence <= 1.0
+            or not math.isfinite(rmse)
+            or rmse < 0.0
+            or radius is not None
+            and (not math.isfinite(radius) or radius <= 0.0)
+            or stamp is not None
+            and (not math.isfinite(stamp) or stamp < 0.0)
+        ):
+            raise ValueError("检测候选的坐标、质量、半径或时间戳无效")
+        object.__setattr__(self, "position", position)
+        object.__setattr__(self, "confidence", confidence)
+        object.__setattr__(self, "rmse", rmse)
+        object.__setattr__(self, "radius", radius)
+        object.__setattr__(self, "stamp", stamp)
 
     @classmethod
     def from_sequence(
@@ -49,8 +74,8 @@ class DetectionCandidate:
             position=(float(position[0]), float(position[1]), float(position[2])),
             confidence=float(confidence),
             rmse=float(rmse),
-            radius=radius,
-            stamp=stamp,
+            radius=None if radius is None else float(radius),
+            stamp=None if stamp is None else float(stamp),
         )
 
 
@@ -125,8 +150,30 @@ class DetectionTracker:
         self.max_average_rmse = float(max_average_rmse)
         self.nms_radius = float(nms_radius)
         self.stale_after = float(stale_after)
+        finite_nonnegative = (
+            self.max_position_std,
+            self.max_average_rmse,
+            self.nms_radius,
+        )
+        if (
+            not math.isfinite(self.association_radius)
+            or self.association_radius <= 0.0
+            or not math.isfinite(self.confirmation_window)
+            or self.confirmation_window <= 0.0
+            or self.min_hits <= 0
+            or not all(
+                math.isfinite(value) and value >= 0.0
+                for value in finite_nonnegative
+            )
+            or not math.isfinite(self.min_confidence)
+            or not 0.0 <= self.min_confidence <= 1.0
+            or not math.isfinite(self.stale_after)
+            or self.stale_after <= 0.0
+        ):
+            raise ValueError("检测跟踪关联、确认、质量或过期参数无效")
         self._tracks: list[Track] = []
         self._next_track_id = 1
+        self._last_update_time: float | None = None
 
     @property
     def tracks(self) -> list[Track]:
@@ -135,8 +182,18 @@ class DetectionTracker:
     def update(self, candidates: Iterable[DetectionCandidate], now: float | None = None) -> None:
         """依次关联一帧候选，再统一刷新所有轨迹状态。"""
         timestamp = float(now if now is not None else get_time())
+        if not math.isfinite(timestamp):
+            raise ValueError("检测跟踪时间必须是有限数")
+        if self._last_update_time is not None and timestamp < self._last_update_time:
+            raise ValueError("检测跟踪时间不能倒退")
+        self._last_update_time = timestamp
+        updated_track_ids: set[int] = set()
         for candidate in candidates:
-            self._update_one(candidate, timestamp)
+            if not isinstance(candidate, DetectionCandidate):
+                raise TypeError("检测跟踪只接受 DetectionCandidate")
+            updated_track_ids.add(
+                self._update_one(candidate, timestamp, updated_track_ids)
+            )
         self._refresh_status(timestamp)
 
     def confirmed_positions(self, now: float | None = None) -> list[list[float]]:
@@ -146,6 +203,10 @@ class DetectionTracker:
         轨迹抑制的观测历史。
         """
         timestamp = float(now if now is not None else get_time())
+        if not math.isfinite(timestamp):
+            raise ValueError("确认目标查询时间必须是有限数")
+        if self._last_update_time is not None and timestamp < self._last_update_time:
+            raise ValueError("确认目标查询时间不能早于最后观测")
         self._refresh_status(timestamp)
         confirmed = [track for track in self._tracks if track.status == CONFIRMED]
         confirmed.sort(
@@ -159,8 +220,13 @@ class DetectionTracker:
                 selected.append(track)
         return [track.mean_position.astype(float).tolist() for track in selected]
 
-    def _update_one(self, candidate: DetectionCandidate, now: float) -> None:
-        matched = self._nearest_track(candidate.position)
+    def _update_one(
+        self,
+        candidate: DetectionCandidate,
+        now: float,
+        excluded_track_ids: set[int],
+    ) -> int:
+        matched = self._nearest_track(candidate.position, excluded_track_ids)
         if matched is None:
             point = np.array(candidate.position, dtype=float)
             track = Track(
@@ -172,15 +238,20 @@ class DetectionTracker:
             self._next_track_id += 1
             track.update(candidate, now)
             self._tracks.append(track)
-            return
+            return track.track_id
         matched.update(candidate, now)
+        return matched.track_id
 
-    def _nearest_track(self, position: Sequence[float]) -> Track | None:
+    def _nearest_track(
+        self,
+        position: Sequence[float],
+        excluded_track_ids: set[int],
+    ) -> Track | None:
         point = np.array(position, dtype=float)
         nearest: Track | None = None
         nearest_distance = math.inf
         for track in self._tracks:
-            if track.status == REJECTED:
+            if track.status == REJECTED or track.track_id in excluded_track_ids:
                 continue
             distance = _distance(point, track.mean_position)
             if distance < nearest_distance:

@@ -1,4 +1,0 @@
-# 负障碍首版生产停车门的工程回归覆盖。
-# 其余参数继承 danger_search.yaml；不修改全局速度、规划或地图语义。
-ground_support:
-  production_gate_enabled: true

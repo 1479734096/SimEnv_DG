@@ -111,7 +111,7 @@ SEED=77 FLOOR_COUNT=3 ROOMS_PER_FLOOR=4 ./auto.sh
 | `ENABLE_FRONT_CAMERA` | `0` | 是否启用可选前视 RGB 相机 |
 | `ENABLE_POINTCLOUD_CONVERTER` | 跟随 `ENABLE_LIVOX` | 是否将 `/scan` 转换为 `/livox/Pointcloud2` 和 `/livox/lidar2` |
 | `ENABLE_GROUND_TRUTH` | `1` | 是否发布 Gazebo 真值调试话题 |
-| `ENABLE_REFEREE_ODOM` | `1` | 是否发布 `/Odometry_gazebo` 和 `odom -> base` TF（仅裁判/调试使用；参赛算法不得订阅） |
+| `ENABLE_REFEREE_ODOM` | `1` | 是否发布 `/Odometry_gazebo` 和 `odom -> base` TF |
 | `ENABLE_FOOT_CONTACT_SENSOR` | `0` | 是否启用四个足端 ContactSensor 及接触力话题 |
 | `UNITREE_STAND_DURATION` | `3.0` | 按 `2` 后从当前姿态平滑站立的时长，单位 s |
 | `START_VIRTUAL_JOY` | `0` | 是否启动虚拟手柄。该功能通常需要 `uinput` 权限 |
@@ -211,7 +211,7 @@ GUI=false ./auto.sh
 | 接口 | 类型 | 说明 |
 |------|------|------|
 | `/cmd_vel` | `geometry_msgs/Twist` | 机器人速度指令输入 |
-| `/scan` | `sensor_msgs/PointCloud` | Livox Mid-360 原始点云数据 |
+| `/scan` | `sensor_msgs/PointCloud2` | Livox Mid-360 点云数据 |
 | `/livox/Pointcloud2` | `sensor_msgs/PointCloud2` | 点云转换节点输出，开启时可用 |
 | `/livox/lidar2` | `unitree_guide/CustomMsg` | Livox 风格点云消息，开启时可用 |
 | `/livox/imu` | `sensor_msgs/Imu` | Livox 内置 IMU |
@@ -229,19 +229,6 @@ GUI=false ./auto.sh
 参赛算法不应读取 `results/danger_truth.json`、`generated_building/danger_truth.json`、`generated_building/layout_metadata.json`、`generated_building/building_config.json` 或 `generated_building/scene_manifest.json`。这些文件用于裁判评估、环境启动或本地自检。
 
 `/Odometry_gazebo`、`/ground_truth/base_w`、`/ground_truth/base_trunk` 和 `/ground_truth/*_foot` 是 Gazebo 真值通道，不作为正式比赛算法输入。即使本地调试时能够看到这些话题，参赛算法也不得订阅或读取。
-
-### 裁判与调试专用真值接口
-
-以下接口与上方允许算法接入的接口表分离列出，仅用于裁判和本地调试；参赛算法不得订阅或读取。
-
-| 话题名称 | 消息类型 | 发布频率 | 说明 |
-|---------|---------|---------|------|
-| `/ground_truth/base_trunk` | `nav_msgs/Odometry` | 100 Hz | base 相对于 trunk 的真值位姿 |
-| `/ground_truth/base_w` | `nav_msgs/Odometry` | 100 Hz | base 相对于 world 的真值位姿 |
-| `/ground_truth/FL_foot` | `nav_msgs/Odometry` | 100 Hz | 左前足位姿与速度 |
-| `/ground_truth/FR_foot` | `nav_msgs/Odometry` | 100 Hz | 右前足位姿与速度 |
-| `/ground_truth/RL_foot` | `nav_msgs/Odometry` | 100 Hz | 左后足位姿与速度 |
-| `/ground_truth/RR_foot` | `nav_msgs/Odometry` | 100 Hz | 右后足位姿与速度 |
 
 ## 门与电梯控制
 
@@ -433,10 +420,17 @@ python3 ./src/building_obstacles/scripts/evaulate_danger.py
 |---------|---------|---------|------|
 | `/trunk_imu` | `sensor_msgs/Imu` | 1000 Hz | 躯干IMU数据（加速度、角速度、姿态） |
 | `/livox/imu` | `sensor_msgs/Imu` | 1000 Hz | Livox雷达内置IMU数据 |
+| `/ground_truth/base_trunk` | `nav_msgs/Odometry` | 100 Hz | base相对于trunk的真值位姿（用于调试） |
+| `/ground_truth/base_w` | `nav_msgs/Odometry` | 100 Hz | base相对于world的真值位姿 |
 
 ### 2. 足端状态真值
 
-足端位姿真值属于裁判与调试专用接口，已在上文“裁判与调试专用真值接口”集中列出；参赛算法不得订阅或读取。
+| 话题名称 | 消息类型 | 发布频率 | 说明 |
+|---------|---------|---------|------|
+| `/ground_truth/FL_foot` | `nav_msgs/Odometry` | 100 Hz | 左前足(FL)相对于base的位姿与速度 |
+| `/ground_truth/FR_foot` | `nav_msgs/Odometry` | 100 Hz | 右前足(FR)相对于base的位姿与速度 |
+| `/ground_truth/RL_foot` | `nav_msgs/Odometry` | 100 Hz | 左后足(RL)相对于base的位姿与速度 |
+| `/ground_truth/RR_foot` | `nav_msgs/Odometry` | 100 Hz | 右后足(RR)相对于base的位姿与速度 |
 
 ### 3. 足端接触力
 

@@ -1,6 +1,6 @@
 // 参赛方定位节点：只读取初始接口文档授权的 Livox、RGB-D、机身 IMU 和
-// 自身 /cmd_vel 输出。正式 rgbd_livox 数据流为：公开起点 + 首帧楼面初始化
-// world 系；IMU 固定姿态；RGB-D/Livox 相邻帧 GICP 估计连续平移；Livox
+// 自身 /cmd_vel 输出。正式 rgbd_livox 数据流为：公开起点 + 连续站立楼面证据
+// 初始化 world 系；IMU 固定姿态；RGB-D/Livox 相邻帧 GICP 估计连续平移；Livox
 // 局部结构地图校正漂移；最后发布参赛方内部 odom 与 world 配准点云。
 #include <algorithm>
 #include <boost/property_tree/json_parser.hpp>
@@ -25,6 +25,9 @@
 #include <danger_search_localization/imu_motion_predictor.hpp>
 #include <danger_search_localization/planar_gicp_odometry.hpp>
 #include <danger_search_localization/ros_time_window.hpp>
+#include <danger_search_localization/pose_velocity_estimator.hpp>
+#include <danger_search_localization/stance_health_monitor.hpp>
+#include <danger_search_localization/stance_initialization_gate.hpp>
 #include <danger_search_localization/velocity_transform.hpp>
 #include <geometry_msgs/TransformStamped.h>
 #include <geometry_msgs/Twist.h>
@@ -48,13 +51,13 @@ double YawFromRotation(const Eigen::Matrix3d &rotation) {
   return std::atan2(rotation(1, 0), rotation(0, 0));
 }
 
-double WrapAngle(double angle) {
-  return std::atan2(std::sin(angle), std::cos(angle));
-}
-
 SO3d RotationFromRpy(const std::vector<double> &rpy) {
   if (rpy.size() != 3) {
     throw std::runtime_error("base_to_livox_rpy 必须包含 3 个值");
+  }
+  if (!std::all_of(rpy.begin(), rpy.end(),
+                   [](double value) { return std::isfinite(value); })) {
+    throw std::runtime_error("传感器固定外参 rpy 包含非有限数值");
   }
   const Eigen::AngleAxisd roll(rpy[0], Eigen::Vector3d::UnitX());
   const Eigen::AngleAxisd pitch(rpy[1], Eigen::Vector3d::UnitY());
@@ -65,6 +68,10 @@ SO3d RotationFromRpy(const std::vector<double> &rpy) {
 Eigen::Vector3d VectorFromParam(const std::vector<double> &values, const std::string &name) {
   if (values.size() != 3) {
     throw std::runtime_error(name + " 必须包含 3 个值");
+  }
+  if (!std::all_of(values.begin(), values.end(),
+                   [](double value) { return std::isfinite(value); })) {
+    throw std::runtime_error(name + " 包含非有限数值");
   }
   return {values[0], values[1], values[2]};
 }
@@ -196,6 +203,25 @@ class ScanLocalizationNode {
     double voxel_size = 0.15;
     double imu_max_delta = 0.01;
     double command_velocity_scale = 1.0;
+    double initialization_min_base_height = 0.20;
+    double initialization_max_base_height = 0.55;
+    double initialization_max_height_span = 0.04;
+    double initialization_max_angular_speed = 0.30;
+    int initialization_stable_frames = 8;
+    double health_min_base_height = 0.14;
+    double health_max_base_height = 0.60;
+    double health_min_ground_normal_z = 0.85;
+    double health_min_base_up_z = 0.71;
+    double health_max_angular_speed = 1.50;
+    int health_required_healthy_frames = 8;
+    int health_required_unhealthy_frames = 3;
+    int health_required_unknown_frames = 30;
+    bool health_latch_unhealthy = true;
+    bool stance_health_enabled = true;
+    double velocity_estimation_window = 1.00;
+    double velocity_minimum_interval = 0.80;
+    double velocity_linear_deadband = 0.05;
+    double velocity_angular_deadband = 0.03;
     std::string depth_cloud_topic = "/real_sense/depth/points";
     std::vector<double> base_to_livox_xyz;
     std::vector<double> base_to_livox_rpy;
@@ -214,6 +240,52 @@ class ScanLocalizationNode {
     private_nh_.param("imu_max_delta", imu_max_delta, imu_max_delta);
     private_nh_.param("command_velocity_scale", command_velocity_scale,
                       command_velocity_scale);
+    private_nh_.param("initialization_min_base_height",
+                      initialization_min_base_height,
+                      initialization_min_base_height);
+    private_nh_.param("initialization_max_base_height",
+                      initialization_max_base_height,
+                      initialization_max_base_height);
+    private_nh_.param("initialization_max_height_span",
+                      initialization_max_height_span,
+                      initialization_max_height_span);
+    private_nh_.param("initialization_max_angular_speed",
+                      initialization_max_angular_speed,
+                      initialization_max_angular_speed);
+    private_nh_.param("initialization_stable_frames",
+                      initialization_stable_frames,
+                      initialization_stable_frames);
+    private_nh_.param("health_min_base_height", health_min_base_height,
+                      health_min_base_height);
+    private_nh_.param("health_max_base_height", health_max_base_height,
+                      health_max_base_height);
+    private_nh_.param("health_min_ground_normal_z", health_min_ground_normal_z,
+                      health_min_ground_normal_z);
+    private_nh_.param("health_min_base_up_z", health_min_base_up_z,
+                      health_min_base_up_z);
+    private_nh_.param("health_max_angular_speed", health_max_angular_speed,
+                      health_max_angular_speed);
+    private_nh_.param("health_required_healthy_frames",
+                      health_required_healthy_frames,
+                      health_required_healthy_frames);
+    private_nh_.param("health_required_unhealthy_frames",
+                      health_required_unhealthy_frames,
+                      health_required_unhealthy_frames);
+    private_nh_.param("health_required_unknown_frames",
+                      health_required_unknown_frames,
+                      health_required_unknown_frames);
+    private_nh_.param("health_latch_unhealthy", health_latch_unhealthy,
+                      health_latch_unhealthy);
+    private_nh_.param("stance_health_enabled", stance_health_enabled,
+                      stance_health_enabled);
+    private_nh_.param("velocity_estimation_window", velocity_estimation_window,
+                      velocity_estimation_window);
+    private_nh_.param("velocity_minimum_interval", velocity_minimum_interval,
+                      velocity_minimum_interval);
+    private_nh_.param("velocity_linear_deadband", velocity_linear_deadband,
+                      velocity_linear_deadband);
+    private_nh_.param("velocity_angular_deadband", velocity_angular_deadband,
+                      velocity_angular_deadband);
     private_nh_.param("depth_cloud_topic", depth_cloud_topic,
                       depth_cloud_topic);
     if (!std::isfinite(min_range) || !std::isfinite(max_range) || min_range < 0.0 ||
@@ -241,7 +313,8 @@ class ScanLocalizationNode {
     }
     use_imu_constrained_ = localization_backend == "imu_constrained";
     use_rgbd_livox_ = localization_backend == "rgbd_livox";
-    const bool requires_imu = use_imu_constrained_ || use_rgbd_livox_;
+    const bool requires_imu =
+        use_imu_constrained_ || use_rgbd_livox_ || stance_health_enabled;
     if (use_rgbd_livox_ && depth_cloud_topic != "/real_sense/depth/points") {
       throw std::runtime_error(
           "RGB-D/Livox 定位仅允许使用 /real_sense/depth/points");
@@ -249,7 +322,7 @@ class ScanLocalizationNode {
     const StartPose start = ReadPublicStartPose(
         scene_info_path, require_scene_info, allow_relative_origin,
         requires_imu, use_rgbd_livox_, use_rgbd_livox_);
-    if (requires_imu && start.relative) {
+    if ((use_imu_constrained_ || use_rgbd_livox_) && start.relative) {
       throw std::runtime_error("IMU 融合定位必须使用公开世界系起点");
     }
     start_pose_ = start;
@@ -283,6 +356,38 @@ class ScanLocalizationNode {
     max_range_ = max_range;
     imu_max_delta_ = imu_max_delta;
     command_velocity_scale_ = command_velocity_scale;
+    stance_health_enabled_ = stance_health_enabled;
+    danger_search_localization::StanceInitializationConfig stance_config;
+    stance_config.minimum_base_height = initialization_min_base_height;
+    stance_config.maximum_base_height = initialization_max_base_height;
+    stance_config.maximum_height_span = initialization_max_height_span;
+    stance_config.maximum_angular_speed = initialization_max_angular_speed;
+    stance_config.required_consecutive_frames =
+        static_cast<std::size_t>(std::max(0, initialization_stable_frames));
+    stance_initialization_gate_ =
+        danger_search_localization::StanceInitializationGate(stance_config);
+    danger_search_localization::StanceHealthMonitorConfig health_config;
+    health_config.minimum_base_height = health_min_base_height;
+    health_config.maximum_base_height = health_max_base_height;
+    health_config.minimum_ground_normal_z = health_min_ground_normal_z;
+    health_config.minimum_base_up_z = health_min_base_up_z;
+    health_config.maximum_angular_speed = health_max_angular_speed;
+    health_config.required_healthy_frames =
+        static_cast<std::size_t>(std::max(0, health_required_healthy_frames));
+    health_config.required_unhealthy_frames =
+        static_cast<std::size_t>(std::max(0, health_required_unhealthy_frames));
+    health_config.required_unknown_frames =
+        static_cast<std::size_t>(std::max(0, health_required_unknown_frames));
+    health_config.latch_unhealthy = health_latch_unhealthy;
+    stance_health_monitor_ =
+        danger_search_localization::StanceHealthMonitor(health_config);
+    danger_search_localization::PoseVelocityConfig velocity_config;
+    velocity_config.window_seconds = velocity_estimation_window;
+    velocity_config.minimum_interval = velocity_minimum_interval;
+    velocity_config.linear_deadband = velocity_linear_deadband;
+    velocity_config.angular_deadband = velocity_angular_deadband;
+    velocity_estimator_ =
+        danger_search_localization::PoseVelocityEstimator(velocity_config);
     if (use_imu_constrained_ || use_rgbd_livox_) {
       imu_odometry_ = std::make_unique<
           danger_search_localization::ImuConstrainedOdometry>();
@@ -302,6 +407,14 @@ class ScanLocalizationNode {
         "/danger_search/localization/cloud_registered", 2);
     ready_publisher_ = nh_.advertise<std_msgs::Bool>(
         "/danger_search/localization/ready", 1, true);
+    health_publisher_ = nh_.advertise<std_msgs::Bool>(
+        "/danger_search/localization/health", 1, true);
+    std_msgs::Bool not_ready;
+    not_ready.data = false;
+    ready_publisher_.publish(not_ready);
+    std_msgs::Bool not_healthy;
+    not_healthy.data = false;
+    health_publisher_.publish(not_healthy);
     subscriber_ = nh_.subscribe(raw_cloud_topic, 2,
                                 &ScanLocalizationNode::OnCloud, this);
     if (requires_imu) {
@@ -623,7 +736,7 @@ class ScanLocalizationNode {
         use_rgbd_livox_ ? rgbd_scan_mutex_ : processing_mutex_);
 
     std::optional<ImuSample> current_imu_sample;
-    if (use_imu_constrained_ || use_rgbd_livox_) {
+    if (use_imu_constrained_ || use_rgbd_livox_ || stance_health_enabled_) {
       double imu_delta = std::numeric_limits<double>::infinity();
       current_imu_sample = ImuSampleAt(message->header.stamp, &imu_delta);
       if (!current_imu_sample.has_value()) {
@@ -635,47 +748,76 @@ class ScanLocalizationNode {
       }
     }
 
-    {
-      std::lock_guard<std::mutex> initialization_lock(initialization_mutex_);
-      if (!world_frame_initialized_) {
+    std::optional<danger_search_localization::GroundPlaneEstimate>
+        current_ground;
+    if (!world_frame_initialized_ || stance_health_enabled_) {
       std::vector<Eigen::Vector3d> base_points;
       base_points.reserve(points.size());
       for (const auto &point : points) {
         base_points.push_back(base_to_livox_ * point);
       }
-      const auto ground = danger_search_localization::EstimateGroundPlane(base_points);
-      if (!ground.has_value()) {
-        ROS_WARN_THROTTLE(
-            2.0,
-            "首帧楼面证据不足，等待下一份 /scan；不会使用出生高度发布错误世界坐标");
-        return;
-      }
-      const Eigen::Isometry3d world_base_matrix =
-          danger_search_localization::BuildWorldBaseFromGroundPlane(
-              ground->normal_base, ground->distance_from_base,
-              start_pose_.x, start_pose_.y, start_pose_.yaw);
-      const SE3d world_base0(
-          SO3d(world_base_matrix.linear()), world_base_matrix.translation());
-      world_livox0_ = world_base0 * base_to_livox_;
-      initial_world_base_rotation_ = world_base0.rotationMatrix();
-      initial_world_base_translation_ = world_base0.translation();
-      if (use_imu_constrained_ || use_rgbd_livox_) {
-        initial_imu_rotation_ = current_imu_sample->rotation;
-        imu_anchor_initialized_ = true;
-      }
-      if (use_imu_constrained_) {
-        imu_motion_predictor_.Reset();
-        imu_motion_predictor_.AddSample(
-            current_imu_sample->stamp.toSec(), initial_world_base_rotation_,
-            current_imu_sample->linear_acceleration,
-            current_imu_sample->angular_velocity);
-      }
-      if (use_rgbd_livox_) {
-        fused_planar_position_ = world_base0.translation().head<2>();
-        fused_at_last_depth_ = fused_planar_position_;
-        depth_fusion_offset_ = fused_planar_position_;
-        fusion_initialized_ = true;
-      }
+      current_ground =
+          danger_search_localization::EstimateGroundPlane(base_points);
+    }
+
+    {
+      std::lock_guard<std::mutex> initialization_lock(initialization_mutex_);
+      if (!world_frame_initialized_) {
+        if (!current_ground.has_value()) {
+          ROS_WARN_THROTTLE(
+              2.0,
+              "楼面证据不足，等待下一份 /scan；不会使用出生高度发布错误世界坐标");
+          return;
+        }
+        const auto &ground = current_ground;
+        const double base_up_z = current_imu_sample.has_value()
+                                     ? (current_imu_sample->rotation *
+                                        Eigen::Vector3d::UnitZ())
+                                           .z()
+                                     : 1.0;
+        const double angular_speed =
+            current_imu_sample.has_value()
+                ? current_imu_sample->angular_velocity.norm()
+                : 0.0;
+        const bool stance_ready = stance_initialization_gate_.Update(
+            danger_search_localization::StanceObservation{
+                ground->distance_from_base, ground->normal_base.z(), base_up_z,
+                angular_speed});
+        if (!stance_ready) {
+          ROS_WARN_THROTTLE(
+              2.0,
+              "等待站立稳定后初始化定位：base_z=%.3f ground_nz=%.3f "
+              "base_up_z=%.3f angular=%.3f stable_frames=%zu",
+              ground->distance_from_base, ground->normal_base.z(), base_up_z,
+              angular_speed, stance_initialization_gate_.consecutive_frames());
+          return;
+        }
+        const Eigen::Isometry3d world_base_matrix =
+            danger_search_localization::BuildWorldBaseFromGroundPlane(
+                ground->normal_base, ground->distance_from_base,
+                start_pose_.x, start_pose_.y, start_pose_.yaw);
+        const SE3d world_base0(
+            SO3d(world_base_matrix.linear()), world_base_matrix.translation());
+        world_livox0_ = world_base0 * base_to_livox_;
+        initial_world_base_rotation_ = world_base0.rotationMatrix();
+        initial_world_base_translation_ = world_base0.translation();
+        if (use_imu_constrained_ || use_rgbd_livox_) {
+          initial_imu_rotation_ = current_imu_sample->rotation;
+          imu_anchor_initialized_ = true;
+        }
+        if (use_imu_constrained_) {
+          imu_motion_predictor_.Reset();
+          imu_motion_predictor_.AddSample(
+              current_imu_sample->stamp.toSec(), initial_world_base_rotation_,
+              current_imu_sample->linear_acceleration,
+              current_imu_sample->angular_velocity);
+        }
+        if (use_rgbd_livox_) {
+          fused_planar_position_ = world_base0.translation().head<2>();
+          fused_at_last_depth_ = fused_planar_position_;
+          depth_fusion_offset_ = fused_planar_position_;
+          fusion_initialized_ = true;
+        }
         world_frame_initialized_ = true;
         ROS_INFO(
             "定位世界系已由 Livox 楼面初始化：base_z=%.3f normal=(%.3f, %.3f, %.3f) "
@@ -862,17 +1004,17 @@ class ScanLocalizationNode {
       world_livox = world_livox0_ * local_livox;
     }
     const SE3d world_base = world_livox * base_to_livox_.inverse();
+    if (!UpdateAndPublishStanceHealth(
+            message->header.stamp, current_imu_sample, current_ground)) {
+      return;
+    }
     PublishOdometry(message->header.stamp, world_base);
     PublishRegisteredCloud(message->header.stamp, world_livox, points);
-
-    std_msgs::Bool ready;
-    ready.data = true;
-    ready_publisher_.publish(ready);
   }
 
   void PublishOdometry(const ros::Time &stamp, const SE3d &world_base) {
-    // 位姿使用 world->base；线速度由相邻 world 平移差分后转到 base，角速度由
-    // yaw 差分得到。所有字段沿用输入点云时间戳，便于 Python 侧严格时间匹配。
+    // 位姿使用 world->base；速度由固定窗口的 world 位姿差分后转到 base，避免
+    // 单帧配准抖动被 10 Hz 差分放大。所有字段沿用输入点云时间戳。
     nav_msgs::Odometry message;
     message.header.stamp = stamp;
     message.header.frame_id = frame_id_;
@@ -887,22 +1029,18 @@ class ScanLocalizationNode {
     message.pose.pose.orientation.z = orientation.z();
     message.pose.pose.orientation.w = orientation.w();
 
-    if (!previous_stamp_.isZero() && stamp > previous_stamp_) {
-      const double dt = stamp.toSec() - previous_stamp_.toSec();
-      const Eigen::Vector3d velocity_world = (translation - previous_translation_) / dt;
+    const auto velocity = velocity_estimator_.Update(
+        stamp.toSec(), translation, YawFromRotation(world_base.rotationMatrix()));
+    if (velocity.valid) {
       // 里程计 twist 在 child_frame_id="base" 下表达，需将世界系速度转换到 base 系。
       const Eigen::Vector3d velocity_base =
           danger_search_localization::WorldVelocityToBase(
-              velocity_world, world_base.rotationMatrix());
+              velocity.linear_world, world_base.rotationMatrix());
       message.twist.twist.linear.x = velocity_base.x();
       message.twist.twist.linear.y = velocity_base.y();
       message.twist.twist.linear.z = velocity_base.z();
-      message.twist.twist.angular.z = WrapAngle(
-          YawFromRotation(world_base.rotationMatrix()) - previous_yaw_) / dt;
+      message.twist.twist.angular.z = velocity.yaw_rate;
     }
-    previous_stamp_ = stamp;
-    previous_translation_ = translation;
-    previous_yaw_ = YawFromRotation(world_base.rotationMatrix());
     odom_publisher_.publish(message);
   }
 
@@ -931,6 +1069,66 @@ class ScanLocalizationNode {
     cloud_publisher_.publish(message);
   }
 
+  bool UpdateAndPublishStanceHealth(
+      const ros::Time &stamp,
+      const std::optional<ImuSample> &current_imu_sample,
+      const std::optional<danger_search_localization::GroundPlaneEstimate>
+          &ground) {
+    if (!stance_health_enabled_) {
+      std_msgs::Bool ready_msg;
+      ready_msg.data = true;
+      ready_publisher_.publish(ready_msg);
+      return true;
+    }
+    // 姿态健康只依赖公开 /scan 楼面证据和 /trunk_imu。建立世界系前保持
+    // false；初始化后每帧更新。明确越界是异常，短时缺失是有界 UNKNOWN，
+    // 避免稀疏楼面回波把直立机器人误判为跌倒。
+    if (!world_frame_initialized_) {
+      return false;
+    }
+    const double base_up_z =
+        current_imu_sample.has_value()
+            ? (current_imu_sample->rotation * Eigen::Vector3d::UnitZ()).z()
+            : 1.0;
+    const double angular_speed =
+        current_imu_sample.has_value()
+            ? current_imu_sample->angular_velocity.norm()
+            : std::numeric_limits<double>::quiet_NaN();
+    const double base_height =
+        ground.has_value()
+            ? ground->distance_from_base
+            : std::numeric_limits<double>::quiet_NaN();
+    const double ground_normal_z =
+        ground.has_value()
+            ? ground->normal_base.z()
+            : std::numeric_limits<double>::quiet_NaN();
+    const bool healthy = stance_health_monitor_.Update(
+        danger_search_localization::StanceObservation{
+            base_height, ground_normal_z, base_up_z, angular_speed});
+    std_msgs::Bool health_msg;
+    health_msg.data = healthy;
+    health_publisher_.publish(health_msg);
+    if (!healthy) {
+      std_msgs::Bool not_ready;
+      not_ready.data = false;
+      ready_publisher_.publish(not_ready);
+      ROS_WARN_THROTTLE(
+          2.0,
+          "定位姿态健康异常：base_up_z=%.3f angular=%.3f "
+          "base_z=%.3f ground_nz=%.3f good_frames=%zu bad_frames=%zu "
+          "unknown_frames=%zu；已撤销 ready",
+          base_up_z, angular_speed, base_height, ground_normal_z,
+          stance_health_monitor_.consecutive_good_frames(),
+          stance_health_monitor_.consecutive_bad_frames(),
+          stance_health_monitor_.consecutive_unknown_frames());
+    } else {
+      std_msgs::Bool ready_msg;
+      ready_msg.data = true;
+      ready_publisher_.publish(ready_msg);
+    }
+    return healthy;
+  }
+
   ros::NodeHandle nh_;
   ros::NodeHandle private_nh_;
   ros::Subscriber subscriber_;
@@ -940,6 +1138,7 @@ class ScanLocalizationNode {
   ros::Publisher odom_publisher_;
   ros::Publisher cloud_publisher_;
   ros::Publisher ready_publisher_;
+  ros::Publisher health_publisher_;
   kiss_icp::pipeline::KissICP odometry_;
   std::unique_ptr<danger_search_localization::ImuConstrainedOdometry>
       imu_odometry_;
@@ -953,8 +1152,13 @@ class ScanLocalizationNode {
   Eigen::Vector3d initial_world_base_translation_ = Eigen::Vector3d::Zero();
   Eigen::Matrix3d initial_imu_rotation_ = Eigen::Matrix3d::Identity();
   danger_search_localization::ImuMotionPredictor imu_motion_predictor_;
+  danger_search_localization::StanceInitializationGate
+      stance_initialization_gate_;
+  danger_search_localization::StanceHealthMonitor stance_health_monitor_;
+  danger_search_localization::PoseVelocityEstimator velocity_estimator_;
   Eigen::Vector3d scan_translation_correction_ = Eigen::Vector3d::Zero();
   bool world_frame_initialized_ = false;
+  bool stance_health_enabled_ = true;
   bool use_imu_constrained_ = false;
   bool use_rgbd_livox_ = false;
   bool imu_anchor_initialized_ = false;
@@ -990,9 +1194,6 @@ class ScanLocalizationNode {
   std::deque<double> livox_scale_samples_;
   double livox_scale_ = 1.0;
   std::string frame_id_;
-  ros::Time previous_stamp_;
-  Eigen::Vector3d previous_translation_ = Eigen::Vector3d::Zero();
-  double previous_yaw_ = 0.0;
 };
 
 }  // namespace

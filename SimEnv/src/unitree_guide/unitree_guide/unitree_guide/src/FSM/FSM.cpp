@@ -28,9 +28,19 @@ const std::array<std::string, 12> kResetJointNames = {{
 const std::array<double, 12> kResetJointPositions = {{
     -0.35, 1.36, -2.65,
      0.35, 1.36, -2.65,
-    -0.50, 1.36, -2.65,
-     0.50, 1.36, -2.65
+     -0.50, 1.36, -2.65,
+      0.50, 1.36, -2.65
 }};
+
+// a1.urdf calf 关节限位
+const double kCalfUrdfLower = -2.69653369433;
+const double kCalfUrdfUpper = -0.916297857297;
+// 经启动链与 reset 实测验证的安全配置区间（-2.0 附近）
+const double kCalfSafeLower = -2.4;
+const double kCalfSafeUpper = -1.8;
+// reset 输入重新武装所需的去抖帧数：250Hz 下约 0.5s，
+// 必须覆盖 joy/键盘输入帧间隔，否则按住的输入会反复触发 reset
+const int kResetRearmFrames = 125;
 
 double getEnvDouble(const char *name, double fallback)
 {
@@ -46,6 +56,39 @@ double getEnvDouble(const char *name, double fallback)
         return fallback;
     }
     return parsed;
+}
+
+// 恢复物理前写入模型的 calf 配置。calf 与启动链 STARTUP_CALF_POSITION 同源：
+// 直接写成 -2.65 再 unpause 有重新触发关节角展开的风险（ENV-004），
+// 启动链已验证“配置 -2.0 + 下趴命令 -2.65”的过渡可稳定收敛。
+// 外部配置必须同时通过 URDF 限位和上述安全区间校验，否则回退 -2.0。
+double getResetConfigCalfPosition()
+{
+    const double fallback = -2.0;
+    const double calf = getEnvDouble("COMPETITION_RESET_CALF_POSITION", fallback);
+    if(calf < kCalfUrdfLower || calf > kCalfUrdfUpper){
+        std::cout << "[WARNING] COMPETITION_RESET_CALF_POSITION=" << calf
+                  << " exceeds the URDF calf limit [" << kCalfUrdfLower << ", "
+                  << kCalfUrdfUpper << "]. Falling back to " << fallback << " rad." << std::endl;
+        return fallback;
+    }
+    if(calf < kCalfSafeLower || calf > kCalfSafeUpper){
+        std::cout << "[WARNING] COMPETITION_RESET_CALF_POSITION=" << calf
+                  << " is outside the validated safe range [" << kCalfSafeLower << ", "
+                  << kCalfSafeUpper << "]. Falling back to " << fallback << " rad." << std::endl;
+        return fallback;
+    }
+    return calf;
+}
+
+std::array<double, 12> getResetConfigJointPositions()
+{
+    std::array<double, 12> positions = kResetJointPositions;
+    const double calf = getResetConfigCalfPosition();
+    for(size_t i = 2; i < positions.size(); i += 3){
+        positions[i] = calf;
+    }
+    return positions;
 }
 
 #ifdef COMPILE_WITH_ROS
@@ -152,6 +195,8 @@ void FSM::run(){
         _currentState->run();
     }
 
+    applyResetTransition();
+
     absoluteWait(_startTime, (long long)(_ctrlComp->dt * 1000000));
 }
 
@@ -207,9 +252,19 @@ bool FSM::checkSafty(){
 
 bool FSM::handleResetCommand(){
     if(_ctrlComp->lowState->userCmd != UserCommand::RESET){
-        _resetCommandLatched = false;
+        if(_resetCommandLatched){
+            // 释放去抖：forcePassiveState 会把面板命令改成 L2_B，而持续按住的
+            // joy/键盘输入随后又会写回 RESET；必须连续足够帧观察到非 RESET
+            // 才重新武装，保证“按住只触发一次，释放再按才触发第二次”。
+            _resetReleaseFrames += 1;
+            if(_resetReleaseFrames >= kResetRearmFrames){
+                _resetCommandLatched = false;
+                _resetReleaseFrames = 0;
+            }
+        }
         return false;
     }
+    _resetReleaseFrames = 0;
     if(_resetCommandLatched){
         return true;
     }
@@ -222,7 +277,9 @@ bool FSM::handleResetCommand(){
         if(resetGazeboRobot()){
             std::cout << "[INFO] Gazebo robot reset complete. Press 2 to stand again." << std::endl;
         }else{
-            std::cout << "[WARNING] Gazebo robot reset request failed. Check Gazebo service availability." << std::endl;
+            std::cout << "[WARNING] Gazebo robot reset request failed. Physics stays paused; "
+                      << "check Gazebo services, then unpause manually or restart the round."
+                      << std::endl;
         }
     }else{
         std::cout << "[WARNING] Reset command is only supported in Gazebo simulation." << std::endl;
@@ -245,14 +302,16 @@ bool FSM::resetGazeboRobot(){
     _ctrlComp->ioInter->sendRecv(_ctrlComp->lowCmd, _ctrlComp->lowState);
     usleep(30000);
 
+    // 以下任一分支失败都必须保持物理暂停（fail-closed）：模型可能只完成了
+    // 一部分 reset，直接 unpause 会在未知姿态下恢复物理。
     if(!ros::service::waitForService("/gazebo/set_model_configuration", ros::Duration(1.0))){
-        std::cout << "[WARNING] /gazebo/set_model_configuration is not available." << std::endl;
-        callEmptyService("/gazebo/unpause_physics", 1.0);
+        std::cout << "[ERROR] /gazebo/set_model_configuration is not available. "
+                  << "Reset aborted; physics stays paused." << std::endl;
         return false;
     }
     if(!ros::service::waitForService("/gazebo/set_model_state", ros::Duration(1.0))){
-        std::cout << "[WARNING] /gazebo/set_model_state is not available." << std::endl;
-        callEmptyService("/gazebo/unpause_physics", 1.0);
+        std::cout << "[ERROR] /gazebo/set_model_state is not available. "
+                  << "Reset aborted; physics stays paused." << std::endl;
         return false;
     }
 
@@ -279,9 +338,9 @@ bool FSM::resetGazeboRobot(){
     ros::ServiceClient state_client =
         nh.serviceClient<gazebo_msgs::SetModelState>("/gazebo/set_model_state");
     if(!state_client.call(state_srv) || !state_srv.response.success){
-        std::cout << "[WARNING] Failed to reset A1 model state: "
-                  << state_srv.response.status_message << std::endl;
-        callEmptyService("/gazebo/unpause_physics", 1.0);
+        std::cout << "[ERROR] Failed to reset A1 model state: "
+                  << state_srv.response.status_message
+                  << ". Reset aborted; physics stays paused." << std::endl;
         return false;
     }
 
@@ -289,30 +348,42 @@ bool FSM::resetGazeboRobot(){
     config_srv.request.model_name = model_name;
     config_srv.request.urdf_param_name = "robot_description";
     config_srv.request.joint_names.assign(kResetJointNames.begin(), kResetJointNames.end());
-    config_srv.request.joint_positions.assign(kResetJointPositions.begin(), kResetJointPositions.end());
+    const std::array<double, 12> resetConfigPositions = getResetConfigJointPositions();
+    config_srv.request.joint_positions.assign(resetConfigPositions.begin(), resetConfigPositions.end());
+    std::cout << "[INFO] Reset joint configuration calf position: "
+              << resetConfigPositions[2] << " rad (command stays "
+              << kResetJointPositions[2] << " rad)." << std::endl;
 
     ros::ServiceClient config_client =
         nh.serviceClient<gazebo_msgs::SetModelConfiguration>("/gazebo/set_model_configuration");
     if(!config_client.call(config_srv) || !config_srv.response.success){
-        std::cout << "[WARNING] Failed to reset A1 joint configuration: "
-                  << config_srv.response.status_message << std::endl;
-        callEmptyService("/gazebo/unpause_physics", 1.0);
+        std::cout << "[ERROR] Failed to reset A1 joint configuration: "
+                  << config_srv.response.status_message
+                  << ". Reset aborted; physics stays paused." << std::endl;
         return false;
     }
 
     if(!state_client.call(state_srv) || !state_srv.response.success){
-        std::cout << "[WARNING] Failed to apply A1 model state after joint reset: "
-                  << state_srv.response.status_message << std::endl;
-        callEmptyService("/gazebo/unpause_physics", 1.0);
+        std::cout << "[ERROR] Failed to apply A1 model state after joint reset: "
+                  << state_srv.response.status_message
+                  << ". Reset aborted; physics stays paused." << std::endl;
         return false;
     }
 
-    setResetDownCommand();
+    // unpause 前最后一帧命令：与刚写入的配置零位置误差、Kd=0，
+    // 消除 set_model_configuration 传送产生的速度伪差经 Kd 放大导致的力矩饱和。
+    setResetTransitionInitialCommand(resetConfigPositions[2]);
     _ctrlComp->ioInter->sendRecv(_ctrlComp->lowCmd, _ctrlComp->lowState);
     usleep(150000);
 
-    const bool unpause_ok = callEmptyService("/gazebo/unpause_physics", 1.0);
-    return unpause_ok;
+    if(!callEmptyService("/gazebo/unpause_physics", 1.0)){
+        std::cout << "[ERROR] Failed to unpause physics after reset. "
+                  << "Physics stays paused." << std::endl;
+        return false;
+    }
+
+    startResetTransition(resetConfigPositions[2]);
+    return true;
 #endif
 }
 
@@ -336,6 +407,8 @@ void FSM::forcePassiveState(){
 }
 
 void FSM::setResetDownCommand(){
+    // 这是恢复物理后的位置命令（与 State_Passive 下趴保持一致），
+    // 不是 unpause 前写入模型的关节配置；后者见 getResetConfigJointPositions()。
     for(int i = 0; i < 12; ++i){
         _ctrlComp->lowCmd->motorCmd[i].mode = 10;
         _ctrlComp->lowCmd->motorCmd[i].q = static_cast<float>(kResetJointPositions[i]);
@@ -345,4 +418,92 @@ void FSM::setResetDownCommand(){
         _ctrlComp->lowCmd->motorCmd[i].Kd = 2.0f;
     }
     _ctrlComp->setAllSwing();
+}
+
+void FSM::setResetTransitionInitialCommand(double calfConfig){
+    // unpause 前最后一帧命令：与刚写入的模型配置零位置误差、Kd=0。
+    // 否则 set_model_configuration 传送产生的速度伪差（实测 dq≈-57 rad/s）
+    // 会经 Kd=2 放大为 >100 Nm 的需求并顶到 33.5 Nm 限位。
+    for(int i = 0; i < 12; ++i){
+        _ctrlComp->lowCmd->motorCmd[i].mode = 10;
+        _ctrlComp->lowCmd->motorCmd[i].q = static_cast<float>(
+            (i % 3 == 2) ? calfConfig : kResetJointPositions[i]);
+        _ctrlComp->lowCmd->motorCmd[i].dq = 0.0f;
+        _ctrlComp->lowCmd->motorCmd[i].tau = 0.0f;
+        _ctrlComp->lowCmd->motorCmd[i].Kp = 12.0f;
+        _ctrlComp->lowCmd->motorCmd[i].Kd = 0.0f;
+    }
+    _ctrlComp->setAllSwing();
+}
+
+void FSM::startResetTransition(double calfStart){
+    _resetTransitionActive = true;
+    _resetTransitionStartUs = getSystemTime();
+    _resetTransitionCalfStart = calfStart;
+    _resetSettleFrames = 0;
+    _resetFlopSeen = false;
+    std::cout << "[INFO] Reset transition started: calf command ramps from "
+              << calfStart << " to " << kResetJointPositions[2]
+              << " rad with bounded gains." << std::endl;
+}
+
+void FSM::applyResetTransition(){
+    if(!_resetTransitionActive){
+        return;
+    }
+    if(_currentState != _stateList.passive){
+        // 用户已切换到其他状态，立即交还标准控制
+        _resetTransitionActive = false;
+        _resetSettleFrames = 0;
+        return;
+    }
+
+    const long long elapsed = getSystemTime() - _resetTransitionStartUs;
+    const long long rampUs = 1000000;    // calf 位置命令 1 s 斜坡
+    const long long timeoutUs = 8000000; // 有界上限 8 s，不是无限等待
+    double ratio = static_cast<double>(elapsed) / rampUs;
+    if(ratio > 1.0){
+        ratio = 1.0;
+    }
+    const double calfTarget = kResetJointPositions[2];
+    const double calfCmd =
+        _resetTransitionCalfStart + (calfTarget - _resetTransitionCalfStart) * ratio;
+    // 阻尼从 0 渐升到 0.5 并保持到过渡结束：压住传送伪差与落地塌陷速度尖峰
+    // （实测 dq 峰值约 24 rad/s）经 Kd 的放大；结束后由 State_Passive 恢复 Kd=2。
+    const double kd = 0.5 * ratio;
+
+    bool settled = true;
+    for(int i = 0; i < 12; ++i){
+        _ctrlComp->lowCmd->motorCmd[i].Kp = 12.0f;
+        _ctrlComp->lowCmd->motorCmd[i].Kd = static_cast<float>(kd);
+        if(i % 3 == 2){
+            _ctrlComp->lowCmd->motorCmd[i].q = static_cast<float>(calfCmd);
+        }
+        const double qErr =
+            std::fabs(_ctrlComp->lowState->motorState[i].q - kResetJointPositions[i]);
+        const double dqAbs = std::fabs(_ctrlComp->lowState->motorState[i].dq);
+        // 塌陷只在关节接近目标折叠角后发生；以此区分 unpause 时的传送速度伪差，
+        // 避免塌陷前误判“已见过冲击”而提前恢复 Kd=2。
+        if(qErr < 0.2 && dqAbs > 3.0){
+            _resetFlopSeen = true;
+        }
+        if(i % 3 == 2 && (qErr > 0.08 || dqAbs > 0.3)){
+            settled = false;
+        }
+    }
+
+    if(ratio >= 1.0 && settled && _resetFlopSeen){
+        _resetSettleFrames += 1;
+    }else{
+        _resetSettleFrames = 0;
+    }
+    if(_resetSettleFrames >= 50){
+        _resetTransitionActive = false;
+        _resetSettleFrames = 0;
+        std::cout << "[INFO] Reset transition complete. Standard passive hold restored." << std::endl;
+    }else if(elapsed > timeoutUs){
+        _resetTransitionActive = false;
+        _resetSettleFrames = 0;
+        std::cout << "[WARNING] Reset transition timed out; restoring standard passive hold." << std::endl;
+    }
 }

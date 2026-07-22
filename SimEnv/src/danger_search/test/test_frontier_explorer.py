@@ -15,6 +15,14 @@ from danger_search.planner import PlanResult, REACHED, BUDGET_EXHAUSTED, UNREACH
 
 
 class FrontierExplorerTest(unittest.TestCase):
+    def test_invalid_configuration_is_rejected(self):
+        with self.assertRaises(ValueError):
+            FrontierExplorer(min_cluster_size=0)
+        with self.assertRaises(ValueError):
+            FrontierExplorer(blacklist_ttl=math.nan)
+        with self.assertRaises(ValueError):
+            FrontierExplorer(max_planning_candidates=0)
+
     @staticmethod
     def _mark_free_rect(grid: FloorGrid, gx0: int, gx1: int, gy0: int, gy1: int) -> None:
         for gy in range(gy0, gy1 + 1):
