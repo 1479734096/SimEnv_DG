@@ -411,6 +411,11 @@ class MissionManager:
         self._no_frontier_scan_until = 0.0
         self._no_reachable_frontier_confirmations = 0
         self._last_no_frontier_signature = None
+        # 贴墙时不能安全原地扫描。此状态机只允许沿本层真实行驶轨迹后退一次，
+        # 到达较宽处再扫描一次；仍无前沿时结束本层，避免零速重复扫描活锁。
+        self._no_frontier_escape_state = "idle"
+        self._no_frontier_escape_target: tuple[float, float] | None = None
+        self._no_frontier_escape_deadline = 0.0
         self._floor_timeout_logged = False
         self._last_status_publish = 0.0
         self._probe_attempt = 0
@@ -1019,11 +1024,21 @@ class MissionManager:
         self.no_frontier_rotation_min_clearance = float(
             _param("mission/no_frontier_rotation_min_clearance", 0.40)
         )
+        self.no_frontier_retreat_max_distance = float(
+            _param("mission/no_frontier_retreat_max_distance", 2.0)
+        )
+        self.no_frontier_retreat_clearance_margin = float(
+            _param("mission/no_frontier_retreat_clearance_margin", 0.10)
+        )
         if (
             not math.isfinite(self.no_frontier_rotation_min_clearance)
             or self.no_frontier_rotation_min_clearance <= 0.0
+            or not math.isfinite(self.no_frontier_retreat_max_distance)
+            or self.no_frontier_retreat_max_distance < 0.5
+            or not math.isfinite(self.no_frontier_retreat_clearance_margin)
+            or self.no_frontier_retreat_clearance_margin < 0.0
         ):
-            raise ValueError("无前沿原地扫描旋转净距必须为有限正值")
+            raise ValueError("无前沿扫描与沿迹后退参数必须为有限有效值")
         self.probe_distance = float(_param("mission/probe_distance", 1.2))
         self.probe_yaw = float(_param("mission/probe_yaw", math.pi / 2.0))
         self.initial_entry_max_distance = float(
@@ -1063,6 +1078,9 @@ class MissionManager:
         self.door_refresh_timeout = float(
             _param("mission/door_refresh_timeout", 3.0)
         )
+        self.door_refresh_max_center_shift = float(
+            _param("mission/door_refresh_max_center_shift", 0.60)
+        )
         self.door_clearance_margin = float(
             _param("mission/door_clearance_margin", 0.10)
         )
@@ -1073,10 +1091,14 @@ class MissionManager:
             or self.main_entrance_clearance_max_linear <= 0.0
             or not math.isfinite(self.door_refresh_timeout)
             or self.door_refresh_timeout <= 0.0
+            or not math.isfinite(self.door_refresh_max_center_shift)
+            or self.door_refresh_max_center_shift <= 0.0
             or not math.isfinite(self.door_clearance_margin)
             or self.door_clearance_margin < 0.0
         ):
-            raise ValueError("过门/离门限速、近场重观测超时和净空余量必须为有限有效值")
+            raise ValueError(
+                "过门/离门限速、近场重观测超时、中心关联距离和净空余量必须为有限有效值"
+            )
         self.door_clear_radius = float(_param("mission/door_clear_radius", 0.9))
         self.door_transition_duration = float(_param("mission/door_transition_duration", 3.0))
         self.door_transition_hold_distance = float(_param("mission/door_transition_hold_distance", 2.5))
@@ -3208,6 +3230,9 @@ class MissionManager:
         self._try_register_local_elevator(pose)
         if self._tick_elevator_visual_scan(pose):
             return
+        if getattr(self, "_no_frontier_escape_state", "idle") == "moving":
+            self._tick_no_frontier_escape_motion(pose)
+            return
 
         floor_elapsed = now - self.floor_start_time
         mission_elapsed = self._elapsed()
@@ -3283,6 +3308,7 @@ class MissionManager:
         if self._should_open_door(candidate):
             assert candidate is not None
             self.controller.clear_path()
+            self._reset_no_frontier_escape()
             self.current_frontier = None
             self._last_frontier_target = None
             self._last_frontier_score = None
@@ -3365,6 +3391,7 @@ class MissionManager:
                 door_id = self._try_select_door_approach(pose)
                 if door_id is not None:
                     self._start_door_approach(door_id)
+                    self._reset_no_frontier_escape()
                     self._no_frontier_scan_until = 0.0
                     self._no_reachable_frontier_confirmations = 0
                     self._probe_attempt = 0
@@ -3383,11 +3410,18 @@ class MissionManager:
                     and debug.unreachable_count == 0
                     and debug.reachable_count == 0
                 )
-                if (not frontiers or all_inside_tolerance) and self._try_probe_unknown_space(pose):
+                escape_state = getattr(self, "_no_frontier_escape_state", "idle")
+                if (
+                    escape_state == "idle"
+                    and (not frontiers or all_inside_tolerance)
+                    and self._try_probe_unknown_space(pose)
+                ):
+                    self._reset_no_frontier_escape()
                     self._no_reachable_frontier_confirmations = 0
                     return
                 if self._tick_no_frontier_scan(
                     frontiers,
+                    pose=pose,
                     record_failure=(
                         not all_inside_tolerance and not planning_unresolved
                     ),
@@ -3405,6 +3439,7 @@ class MissionManager:
                                 selection_context=selection_context,
                             )
                             if confirmed_frontier is not None and confirmed_path:
+                                self._reset_no_frontier_escape()
                                 self.current_frontier = confirmed_frontier
                                 self.controller.set_path(confirmed_path)
                                 self._no_reachable_frontier_confirmations = 0
@@ -3417,6 +3452,12 @@ class MissionManager:
                                     confirmed_frontier.centroid[1],
                                 )
                                 return
+                    if getattr(self, "_no_frontier_escape_state", "idle") == "exhausted":
+                        self._finish_current_floor(
+                            reason_code="no_frontier_escape_exhausted",
+                            call_site="MissionManager._tick_explore:no_frontier_escape",
+                        )
+                        return
                     self._no_reachable_frontier_confirmations += 1
                     if self._floor_completion_ready(grid, floor_elapsed):
                         self._finish_current_floor(
@@ -3441,6 +3482,7 @@ class MissionManager:
                         )
                 return
             self._log_frontier_switch(frontier, path, pose)
+            self._reset_no_frontier_escape()
             self.current_frontier = frontier
             self.controller.set_path(path)
             self._no_frontier_scan_until = 0.0
@@ -4240,8 +4282,23 @@ class MissionManager:
         if stamp is None or stamp == self._door_refresh_last_stamp:
             return RUNNING
         self._door_refresh_last_stamp = stamp
+
+        existing = self.building_client.doors.get(str(door_id))
+        if existing is None:
+            self._record_failure("主入口近场重观测时缺少已注册门几何")
+            return FAILED
+
+        # detect_opening_ahead 的 yaw 是搜索方向，不是从门框重新拟合出的法向。
+        # 返航时若直接传入机器人斜向航向，会把相邻宽开口当成主入口。这里仅
+        # 复用首次合法注册的门轴，并选择朝向已登记中心的一侧；中心仍完全由
+        # 当前点云重测，允许定位平移误差在局部相对路径中抵消。
+        query_yaw = float(existing.yaw)
+        center_dx = float(existing.x) - float(pose[0])
+        center_dy = float(existing.y) - float(pose[1])
+        if center_dx * math.cos(query_yaw) + center_dy * math.sin(query_yaw) < 0.0:
+            query_yaw = math.atan2(math.sin(query_yaw + math.pi), math.cos(query_yaw + math.pi))
         observation = self.local_detector.detect_opening_ahead(
-            robot_pose=pose,
+            robot_pose=(float(pose[0]), float(pose[1]), query_yaw),
             floor_index=self.current_floor,
             cloud_points=self._latest_cloud_points,
             floor_height=self.mapper.floor_height,
@@ -4259,14 +4316,9 @@ class MissionManager:
             self._door_refresh_observation = None
             return RUNNING
 
-        existing = self.building_client.doors.get(str(door_id))
-        if existing is None:
-            self._record_failure("主入口近场重观测时缺少已注册门几何")
-            return FAILED
         tolerance = self.initial_entry_geometry_tolerance
-        # 门洞法向从门两侧观察时允许相差 pi，但门轴方向不应在返航时突变。
-        # 仅用轴向一致性做关联，不把旧中心投影回新观测坐标，保留当前局部
-        # 传感器对共同定位漂移的抵消能力，同时拒绝走廊拐角等斜向开口。
+        # 查询朝向由已注册门轴约束；仍保留轴向检查，以兼容测试替身或今后
+        # 真正拟合门轴的检测器实现。
         yaw_delta = float(observation.yaw) - float(existing.yaw)
         axis_error = 0.5 * abs(
             math.atan2(math.sin(2.0 * yaw_delta), math.cos(2.0 * yaw_delta))
@@ -4282,6 +4334,30 @@ class MissionManager:
                 existing.yaw,
                 axis_error,
                 tolerance,
+            )
+            return RUNNING
+
+        center_shift = math.hypot(
+            float(observation.world_xy[0]) - float(existing.x),
+            float(observation.world_xy[1]) - float(existing.y),
+        )
+        maximum_center_shift = float(
+            getattr(self, "door_refresh_max_center_shift", 0.60)
+        )
+        if center_shift > maximum_center_shift:
+            self._door_refresh_confirmations = 0
+            self._door_refresh_observation = None
+            rospy.logwarn_throttle(
+                1.0,
+                "主入口近场候选距已注册中心过远，拒绝覆盖："
+                "candidate=(%.2f, %.2f) registered=(%.2f, %.2f) "
+                "shift=%.2f maximum=%.2f",
+                observation.world_xy[0],
+                observation.world_xy[1],
+                existing.x,
+                existing.y,
+                center_shift,
+                maximum_center_shift,
             )
             return RUNNING
 
@@ -5331,9 +5407,23 @@ class MissionManager:
         self,
         frontiers: list[Frontier],
         *,
+        pose: tuple[float, float, float] | None = None,
         record_failure: bool = True,
     ) -> bool:
         now = get_time()
+        escape_state = getattr(self, "_no_frontier_escape_state", "idle")
+        if self._no_frontier_scan_until <= 0.0 and not self._rotation_clearance_is_safe():
+            if escape_state == "idle" and pose is not None:
+                if self._try_start_no_frontier_escape(pose):
+                    return False
+                return True
+            if escape_state == "scan_once":
+                self._no_frontier_escape_state = "exhausted"
+                self.controller.stop(reason="no_frontier_escape_scan_blocked")
+                self._log_rotation_clearance_blocked("no_frontier_escape_scan")
+                return True
+            if escape_state == "exhausted":
+                return True
         if self._no_frontier_scan_until <= 0.0:
             self._no_frontier_scan_until = now + self.no_frontier_scan_duration
             if frontiers:
@@ -5346,11 +5436,164 @@ class MissionManager:
         self.controller.stop()
         self._no_frontier_scan_until = 0.0
         self._no_frontier_rotation_blocked_logged = False
+        if escape_state == "scan_once":
+            self._no_frontier_escape_state = "exhausted"
         if frontiers:
             if record_failure:
                 self._record_failure("无可达前沿")
             rospy.logwarn("扫描后仍无可达前沿，结束当前楼层")
         return True
+
+    def _try_start_no_frontier_escape(
+        self,
+        pose: tuple[float, float, float],
+    ) -> bool:
+        """沿已实际通过的本层轨迹退到可安全旋转的位置，且每轮最多一次。"""
+        grid = self.mapper.floor(self.current_floor)
+        start = grid.world_to_grid(float(pose[0]), float(pose[1]))
+        if start is None or not grid.is_traversable(*start):
+            return self._exhaust_no_frontier_escape("start_not_traversable")
+
+        min_distance = max(0.5, 2.0 * float(grid.resolution))
+        max_distance = float(getattr(self, "no_frontier_retreat_max_distance", 2.0))
+        required_clearance = float(
+            getattr(self, "no_frontier_rotation_min_clearance", 0.40)
+        ) + float(getattr(self, "no_frontier_retreat_clearance_margin", 0.10))
+        trace = list(
+            getattr(self, "_floor_navigation_traces", {}).get(
+                int(self.current_floor), ()
+            )
+        )
+        selected_path: list[tuple[float, float]] | None = None
+        selected_target: tuple[float, float] | None = None
+        for trace_point in reversed(trace):
+            target = (float(trace_point[0]), float(trace_point[1]))
+            distance = math.hypot(target[0] - pose[0], target[1] - pose[1])
+            if distance < min_distance or distance > max_distance:
+                continue
+            target_cell = grid.world_to_grid(*target)
+            if target_cell is None or not grid.is_traversable(*target_cell):
+                continue
+            if not self._grid_cell_has_clearance(
+                grid, target_cell, required_clearance
+            ):
+                continue
+            plan = astar_plan(grid, (pose[0], pose[1]), target)
+            if not plan.reached or len(plan.path) != 2:
+                continue
+            target_direction = math.atan2(target[1] - pose[1], target[0] - pose[0])
+            backward_error = math.atan2(
+                math.sin(target_direction - pose[2] - math.pi),
+                math.cos(target_direction - pose[2] - math.pi),
+            )
+            if abs(backward_error) > 0.35:
+                continue
+            selected_path = plan.path
+            selected_target = target
+            break
+
+        if selected_path is None or selected_target is None:
+            return self._exhaust_no_frontier_escape("no_safe_trace_candidate")
+
+        self._no_frontier_escape_state = "moving"
+        self._no_frontier_escape_target = selected_target
+        reverse_speed = abs(float(getattr(self.controller, "reverse_speed", -0.15)))
+        retreat_distance = math.hypot(
+            selected_target[0] - pose[0], selected_target[1] - pose[1]
+        )
+        self._no_frontier_escape_deadline = get_time() + max(
+            4.0, retreat_distance / max(0.05, reverse_speed) + 2.0
+        )
+        self._no_frontier_scan_until = 0.0
+        self._last_no_frontier_signature = None
+        self._log_structured(
+            {
+                "event": "no_frontier_retreat_started",
+                "current_floor": int(self.current_floor),
+                "target": [round(value, 3) for value in selected_target],
+                "path_length": round(path_length(selected_path), 3),
+                "required_clearance": round(required_clearance, 3),
+            }
+        )
+        return True
+
+    def _tick_no_frontier_escape_motion(
+        self,
+        pose: tuple[float, float, float],
+    ) -> None:
+        """不在贴墙位置掉头，只沿已验证的直线来路低速倒退。"""
+        target = getattr(self, "_no_frontier_escape_target", None)
+        if target is None:
+            self._exhaust_no_frontier_escape("target_missing")
+            return
+        distance = math.hypot(target[0] - pose[0], target[1] - pose[1])
+        if distance <= 0.25:
+            self._no_frontier_escape_state = "scan_once"
+            self._no_frontier_escape_target = None
+            self._no_frontier_escape_deadline = 0.0
+            self._no_frontier_scan_until = 0.0
+            self._last_no_frontier_signature = None
+            self.controller.stop(reason="no_frontier_retreat_completed")
+            self._log_structured(
+                {
+                    "event": "no_frontier_retreat_completed",
+                    "current_floor": int(self.current_floor),
+                    "target": list(target),
+                }
+            )
+            return
+        if get_time() >= float(getattr(self, "_no_frontier_escape_deadline", 0.0)):
+            self._exhaust_no_frontier_escape("retreat_timeout")
+            return
+        target_direction = math.atan2(target[1] - pose[1], target[0] - pose[0])
+        backward_error = math.atan2(
+            math.sin(target_direction - pose[2] - math.pi),
+            math.cos(target_direction - pose[2] - math.pi),
+        )
+        if abs(backward_error) > 0.45:
+            self._exhaust_no_frontier_escape("reverse_heading_diverged")
+            return
+        if not self.controller.reverse_straight(reason="no_frontier_retreat"):
+            self._exhaust_no_frontier_escape("reverse_command_rejected")
+
+    @staticmethod
+    def _grid_cell_has_clearance(
+        grid: FloorGrid,
+        cell: tuple[int, int],
+        required_clearance: float,
+    ) -> bool:
+        """保守检查目标栅格周围旋转包络；地图边界同样视为不可用。"""
+        cx, cy = cell
+        cells = int(math.ceil(required_clearance / grid.resolution))
+        for gy in range(cy - cells, cy + cells + 1):
+            for gx in range(cx - cells, cx + cells + 1):
+                distance = math.hypot(gx - cx, gy - cy) * grid.resolution
+                if distance > required_clearance:
+                    continue
+                if not (0 <= gx < grid.size_x and 0 <= gy < grid.size_y):
+                    return False
+                if int(grid.data[gy, gx]) in (OCC, BLACK, NEGATIVE):
+                    return False
+        return True
+
+    def _exhaust_no_frontier_escape(self, reason: str) -> bool:
+        self._no_frontier_escape_state = "exhausted"
+        self._no_frontier_escape_target = None
+        self._no_frontier_escape_deadline = 0.0
+        self.controller.stop(reason="no_frontier_retreat_unavailable")
+        self._log_structured(
+            {
+                "event": "no_frontier_retreat_unavailable",
+                "current_floor": int(self.current_floor),
+                "reason": str(reason),
+            }
+        )
+        return False
+
+    def _reset_no_frontier_escape(self) -> None:
+        self._no_frontier_escape_state = "idle"
+        self._no_frontier_escape_target = None
+        self._no_frontier_escape_deadline = 0.0
 
     def _rotation_clearance_is_safe(self) -> bool:
         """仅允许在点云确认机身旋转包络有足够净距时原地转向。"""
@@ -5502,6 +5745,7 @@ class MissionManager:
         self._no_frontier_scan_until = 0.0
         self._no_reachable_frontier_confirmations = 0
         self._last_no_frontier_signature = None
+        self._reset_no_frontier_escape()
 
         can_change_floor = (
             self.current_floor + 1 < self.max_floor
@@ -6555,6 +6799,17 @@ class MissionManager:
             "no_reachable_frontier_confirmations": int(
                 getattr(self, "_no_reachable_frontier_confirmations", 0)
             ),
+            "no_frontier_escape": {
+                "state": str(
+                    getattr(self, "_no_frontier_escape_state", "idle")
+                ),
+                "target": (
+                    list(getattr(self, "_no_frontier_escape_target", ()))
+                    if getattr(self, "_no_frontier_escape_target", None)
+                    is not None
+                    else None
+                ),
+            },
             "current_floor": floor,
             "target_floor": getattr(self, "target_floor", None),
             "floor_transition_ambiguous": floor_transition_guard is not None,

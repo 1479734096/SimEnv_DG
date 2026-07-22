@@ -23,13 +23,55 @@ struct PlanarGicpConfig {
   int maximum_iterations = 35;
 };
 
+/// 相邻帧配准的稳定诊断状态；只描述验收结果，不参与融合决策。
+enum class PlanarGicpStatus {
+  kAccepted = 0,
+  kInitialFrame,
+  kInvalidPrior,
+  kInsufficientPoints,
+  kNotConverged,
+  kNonFiniteDelta,
+  kNonFiniteFitness,
+  kTranslationLimit,
+  kFitnessLimit,
+  kCount,
+};
+
+inline const char *PlanarGicpStatusName(PlanarGicpStatus status) {
+  switch (status) {
+    case PlanarGicpStatus::kAccepted:
+      return "accepted";
+    case PlanarGicpStatus::kInitialFrame:
+      return "initial_frame";
+    case PlanarGicpStatus::kInvalidPrior:
+      return "invalid_prior";
+    case PlanarGicpStatus::kInsufficientPoints:
+      return "insufficient_points";
+    case PlanarGicpStatus::kNotConverged:
+      return "not_converged";
+    case PlanarGicpStatus::kNonFiniteDelta:
+      return "nonfinite_delta";
+    case PlanarGicpStatus::kNonFiniteFitness:
+      return "nonfinite_fitness";
+    case PlanarGicpStatus::kTranslationLimit:
+      return "translation_limit";
+    case PlanarGicpStatus::kFitnessLimit:
+      return "fitness_limit";
+    case PlanarGicpStatus::kCount:
+      return "count";
+  }
+  return "unknown";
+}
+
 /// 相邻两帧的平面位移；首帧 accepted 但 ``has_delta=false``。
 struct PlanarGicpResult {
   bool accepted = false;
   bool has_delta = false;
   Eigen::Vector2d delta = Eigen::Vector2d::Zero();
+  Eigen::Vector2d candidate_delta = Eigen::Vector2d::Zero();
   double fitness = 0.0;
   std::size_t point_count = 0;
+  PlanarGicpStatus status = PlanarGicpStatus::kInsufficientPoints;
 };
 
 /// 对已统一旋转的相邻点云执行 GICP，并且只消费平面平移。
@@ -47,15 +89,21 @@ class PlanarGicpOdometry {
       const std::vector<Eigen::Vector3d> &world_oriented_points,
       const Eigen::Vector2d &translation_prior = Eigen::Vector2d::Zero()) {
     if (!translation_prior.allFinite()) {
-      return {false, false, Eigen::Vector2d::Zero(), 0.0, 0};
+      return {false, false, Eigen::Vector2d::Zero(),
+              Eigen::Vector2d::Zero(), 0.0, 0,
+              PlanarGicpStatus::kInvalidPrior};
     }
     Cloud::Ptr current = Downsample(world_oriented_points);
     if (current->size() < config_.minimum_points) {
-      return {false, false, Eigen::Vector2d::Zero(), 0.0, current->size()};
+      return {false, false, Eigen::Vector2d::Zero(),
+              Eigen::Vector2d::Zero(), 0.0, current->size(),
+              PlanarGicpStatus::kInsufficientPoints};
     }
     if (!previous_) {
       previous_ = current;
-      return {true, false, Eigen::Vector2d::Zero(), 0.0, current->size()};
+      return {true, false, Eigen::Vector2d::Zero(),
+              Eigen::Vector2d::Zero(), 0.0, current->size(),
+              PlanarGicpStatus::kInitialFrame};
     }
 
     pcl::GeneralizedIterativeClosestPoint<pcl::PointXYZ, pcl::PointXYZ> gicp;
@@ -76,15 +124,24 @@ class PlanarGicpOdometry {
         relative.block<2, 1>(0, 3).cast<double>();
     const double fitness = gicp.getFitnessScore(
         config_.maximum_correspondence_distance);
-    const bool accepted = gicp.hasConverged() && delta.allFinite() &&
-                          std::isfinite(fitness) &&
-                          delta.norm() <= config_.maximum_frame_translation &&
-                          fitness <= config_.maximum_fitness;
+    PlanarGicpStatus status = PlanarGicpStatus::kAccepted;
+    if (!gicp.hasConverged()) {
+      status = PlanarGicpStatus::kNotConverged;
+    } else if (!delta.allFinite()) {
+      status = PlanarGicpStatus::kNonFiniteDelta;
+    } else if (!std::isfinite(fitness)) {
+      status = PlanarGicpStatus::kNonFiniteFitness;
+    } else if (delta.norm() > config_.maximum_frame_translation) {
+      status = PlanarGicpStatus::kTranslationLimit;
+    } else if (fitness > config_.maximum_fitness) {
+      status = PlanarGicpStatus::kFitnessLimit;
+    }
+    const bool accepted = status == PlanarGicpStatus::kAccepted;
     // 当前帧证据充足但配准失败时仍推进参考帧，让另一传感器承担缺口；
     // 否则恢复后的长基线会永久无法重新进入局部配准域。
     previous_ = current;
     return {accepted, accepted, accepted ? delta : Eigen::Vector2d::Zero(),
-            fitness, current->size()};
+            delta, fitness, current->size(), status};
   }
 
  private:

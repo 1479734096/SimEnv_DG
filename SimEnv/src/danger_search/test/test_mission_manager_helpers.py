@@ -2554,6 +2554,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager._latest_cloud_points = [(0.0, 0.0, 0.5)]
         manager.current_floor = 0
         manager.door_refresh_timeout = 3.0
+        manager.door_refresh_max_center_shift = 0.60
         manager.door_clearance_margin = 0.10
         manager.initial_entry_opening_max_distance = 1.5
         manager.initial_entry_geometry_tolerance = 0.3
@@ -2629,6 +2630,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager._latest_cloud_points = [(0.0, 0.0, 0.5)]
         manager.current_floor = 0
         manager.door_refresh_timeout = 3.0
+        manager.door_refresh_max_center_shift = 0.60
         manager.door_clearance_margin = 0.1
         manager.initial_entry_opening_max_distance = 1.5
         manager.initial_entry_geometry_tolerance = 0.3
@@ -2694,6 +2696,87 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertAlmostEqual(refreshed.y, 0.08)
         self.assertAlmostEqual(refreshed.yaw, math.pi / 2.0 + 0.04)
 
+    def test_return_main_entrance_refresh_rejects_adjacent_opening_by_center_shift(self):
+        manager = MissionManager.__new__(MissionManager)
+        manager._initial_entry_origin_pose = (0.0, -2.2, math.pi / 2.0)
+        manager._initial_entry_completed = True
+        manager._door_refresh_last_stamp = None
+        manager._door_refresh_confirmations = 0
+        manager._door_refresh_observation = None
+        manager._door_refresh_started_at = None
+        manager._last_cloud_stamp = 3.0
+        manager._latest_cloud_points = [(0.0, 0.0, 0.5)]
+        manager.current_floor = 0
+        manager.door_refresh_timeout = 3.0
+        manager.door_refresh_max_center_shift = 0.60
+        manager.door_clearance_margin = 0.1
+        manager.initial_entry_opening_max_distance = 1.5
+        manager.initial_entry_geometry_tolerance = 0.3
+        manager.initial_entry_opening_confirmations = 2
+        manager.ground_support_params = {"sweep_half_width": 0.435393}
+        manager.mapper = SimpleNamespace(floor_height=2.6)
+        manager.building_client = SimpleNamespace(
+            doors={
+                "main_entrance": mission_manager_module.DoorInfo(
+                    "main_entrance",
+                    "main_entrance",
+                    0,
+                    0.12,
+                    -0.09,
+                    1.49,
+                    1.15,
+                )
+            }
+        )
+        observed_queries = []
+
+        def detect_opening_ahead(**kwargs):
+            observed_queries.append(kwargs["robot_pose"])
+            return OpeningObservation(
+                0.7,
+                (-0.34, 0.50),
+                kwargs["robot_pose"][2],
+                2.35,
+                40,
+            )
+
+        manager.local_detector = SimpleNamespace(
+            detect_opening_ahead=detect_opening_ahead
+        )
+        manager._record_failure = lambda reason: self.fail(reason)
+
+        with patch.object(mission_manager_module, "get_time", return_value=20.0), patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(
+                loginfo=lambda *args, **kwargs: None,
+                logwarn_throttle=lambda *args, **kwargs: None,
+            ),
+        ):
+            self.assertEqual(
+                manager.refresh_open_door_geometry(
+                    "main_entrance", (-0.25, 0.33, -2.18)
+                ),
+                RUNNING,
+            )
+
+        unchanged = manager.building_client.doors["main_entrance"]
+        self.assertAlmostEqual(unchanged.x, 0.12)
+        self.assertAlmostEqual(unchanged.y, -0.09)
+        self.assertEqual(manager._door_refresh_confirmations, 0)
+        self.assertEqual(len(observed_queries), 1)
+        query_yaw = observed_queries[0][2]
+        self.assertAlmostEqual(
+            0.5
+            * abs(
+                math.atan2(
+                    math.sin(2.0 * (query_yaw - unchanged.yaw)),
+                    math.cos(2.0 * (query_yaw - unchanged.yaw)),
+                )
+            ),
+            0.0,
+        )
+
     def test_open_main_entrance_refresh_timeout_fails_closed(self):
         manager = MissionManager.__new__(MissionManager)
         manager._initial_entry_origin_pose = (0.0, -3.2, math.pi / 2.0)
@@ -2706,12 +2789,26 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager._latest_cloud_points = [(0.0, 0.0, 0.5)]
         manager.current_floor = 0
         manager.door_refresh_timeout = 3.0
+        manager.door_refresh_max_center_shift = 0.60
         manager.door_clearance_margin = 0.10
         manager.initial_entry_opening_max_distance = 1.5
         manager.initial_entry_geometry_tolerance = 0.3
         manager.initial_entry_opening_confirmations = 2
         manager.ground_support_params = {"sweep_half_width": 0.435393}
         manager.mapper = SimpleNamespace(floor_height=2.6)
+        manager.building_client = SimpleNamespace(
+            doors={
+                "main_entrance": mission_manager_module.DoorInfo(
+                    "main_entrance",
+                    "main_entrance",
+                    0,
+                    0.0,
+                    0.0,
+                    math.pi / 2.0,
+                    1.8,
+                )
+            }
+        )
         manager.local_detector = SimpleNamespace(
             detect_opening_ahead=lambda **kwargs: OpeningObservation(
                 0.8,
@@ -5187,6 +5284,14 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
         manager._no_frontier_scan_until = 0.0
         manager._no_reachable_frontier_confirmations = 0
         manager._last_no_frontier_signature = None
+        manager._no_frontier_escape_state = "idle"
+        manager._no_frontier_escape_target = None
+        manager._no_frontier_escape_deadline = 0.0
+        manager.no_frontier_rotation_min_clearance = 0.40
+        manager.no_frontier_retreat_max_distance = 2.0
+        manager.no_frontier_retreat_clearance_margin = 0.10
+        manager._nearest_radial_obstacle_distance = 1.0
+        manager._floor_navigation_traces = {0: []}
         manager._probe_attempt = 0
         manager._last_frontier_target = None
         manager._last_frontier_score = None
@@ -5231,6 +5336,8 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
             clear_path=lambda *a, **k: None,
             stop=lambda *a, **k: None,
             set_path=lambda p: None,
+            reverse_speed=-0.15,
+            reverse_straight=lambda **kwargs: True,
         )
         manager._door_approach_blacklist = {}
         manager.door_transition_hold_distance = 2.5
@@ -5714,6 +5821,112 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
 
         self.assertFalse(completed)
         self.assertEqual(rotate_calls, [0.45])
+
+    def test_no_frontier_close_wall_retreats_on_traversed_trace_without_mutating_map(self):
+        """贴墙无前沿时只沿真实轨迹退到宽处，不能改写地图制造通路。"""
+        manager = self._make_explore_manager(frontiers_list=[])
+        manager._nearest_radial_obstacle_distance = 0.33
+        manager._floor_navigation_traces = {
+            0: [(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (1.5, 0.0), (2.0, 0.0)]
+        }
+        grid = manager.mapper.floor(0)
+        obstacle = grid.world_to_grid(2.0, 0.5)
+        self.assertIsNotNone(obstacle)
+        grid.mark_occupied(*obstacle)
+        before = np.array(grid.data, copy=True)
+        events = []
+        manager._log_structured = events.append
+
+        with patch.object(mission_manager_module, "get_time", return_value=10.0), patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None, logwarn=lambda *args, **kwargs: None),
+        ):
+            completed = manager._tick_no_frontier_scan(
+                [], pose=(2.0, 0.0, 0.0)
+            )
+
+        self.assertFalse(completed)
+        self.assertEqual(manager._no_frontier_escape_state, "moving")
+        self.assertEqual(manager._no_frontier_escape_target, (1.0, 0.0))
+        self.assertGreater(manager._no_frontier_escape_deadline, 10.0)
+        self.assertTrue(astar_plan(grid, (2.0, 0.0), (1.0, 0.0)).reached)
+        np.testing.assert_array_equal(grid.data, before)
+        self.assertEqual(events[-1]["event"], "no_frontier_retreat_started")
+
+    def test_no_frontier_close_wall_without_safe_trace_finishes_floor_once(self):
+        """没有安全沿迹候选时立即结束本层，不重复零速扫描。"""
+        manager = self._make_explore_manager(frontiers_list=[])
+        manager._nearest_radial_obstacle_distance = 0.33
+        manager._floor_navigation_traces = {0: []}
+        manager._try_probe_unknown_space = lambda pose: False
+        manager._try_select_door_approach = lambda pose: None
+        finish_calls = []
+        manager._finish_current_floor = lambda **kwargs: finish_calls.append(kwargs)
+        manager._log_structured = lambda event: None
+
+        with patch.object(mission_manager_module, "get_time", return_value=10.0), patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None, logwarn=lambda *args, **kwargs: None),
+        ):
+            manager._tick_explore((2.0, 0.0, 0.0))
+
+        self.assertEqual(manager._no_frontier_escape_state, "exhausted")
+        self.assertEqual(len(finish_calls), 1)
+        self.assertEqual(
+            finish_calls[0]["reason_code"], "no_frontier_escape_exhausted"
+        )
+
+    def test_no_frontier_retreat_allows_only_one_followup_scan(self):
+        """退到宽处后的复扫完成即耗尽，不重新进入无界扫描循环。"""
+        manager = self._make_explore_manager(frontiers_list=[])
+        manager._no_frontier_escape_state = "scan_once"
+        manager._nearest_radial_obstacle_distance = 0.65
+        manager.no_frontier_scan_duration = 4.0
+        rotate_calls = []
+        manager.controller.rotate_in_place = rotate_calls.append
+
+        with patch.object(
+            mission_manager_module,
+            "rospy",
+            SimpleNamespace(loginfo=lambda *args, **kwargs: None, logwarn=lambda *args, **kwargs: None),
+        ):
+            with patch.object(mission_manager_module, "get_time", return_value=10.0):
+                self.assertFalse(
+                    manager._tick_no_frontier_scan([], pose=(1.0, 0.0, 0.0))
+                )
+            with patch.object(mission_manager_module, "get_time", return_value=14.1):
+                self.assertTrue(
+                    manager._tick_no_frontier_scan([], pose=(1.0, 0.0, 0.0))
+                )
+
+        self.assertEqual(rotate_calls, [0.45])
+        self.assertEqual(manager._no_frontier_escape_state, "exhausted")
+
+    def test_no_frontier_retreat_reverses_without_turning_then_requests_rescan(self):
+        manager = self._make_explore_manager(frontiers_list=[])
+        manager._no_frontier_escape_state = "moving"
+        manager._no_frontier_escape_target = (1.0, 0.0)
+        manager._no_frontier_escape_deadline = 20.0
+        reverse_calls = []
+        manager.controller.reverse_straight = lambda **kwargs: reverse_calls.append(
+            kwargs
+        ) or True
+        events = []
+        manager._log_structured = events.append
+
+        with patch.object(mission_manager_module, "get_time", return_value=10.0):
+            manager._tick_no_frontier_escape_motion((2.0, 0.0, 0.0))
+        self.assertEqual(reverse_calls, [{"reason": "no_frontier_retreat"}])
+        self.assertEqual(manager._no_frontier_escape_state, "moving")
+
+        with patch.object(mission_manager_module, "get_time", return_value=12.0):
+            manager._tick_no_frontier_escape_motion((1.2, 0.0, 0.0))
+
+        self.assertEqual(manager._no_frontier_escape_state, "scan_once")
+        self.assertIsNone(manager._no_frontier_escape_target)
+        self.assertEqual(events[-1]["event"], "no_frontier_retreat_completed")
 
     def test_nearest_radial_obstacle_distance_filters_height_and_self_returns(self):
         from danger_search.mapper import MultiFloorGridMap

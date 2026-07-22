@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import csv
 import math
 from pathlib import Path
 import sys
@@ -111,6 +112,13 @@ def analyze(args: argparse.Namespace) -> int:
         for topic, message, _ in bag.read_messages(topics=topics):
             messages[topic].append((_stamp(message), message))
 
+    missing_topics = [topic for topic in topics if not messages[topic]]
+    if missing_topics:
+        print(
+            "录包缺少 RGB-D 离线重放所需话题：" + ", ".join(missing_topics),
+            file=sys.stderr,
+        )
+        return 2
     camera_info = messages[CAMERA_INFO_TOPIC][-1][1]
     counters: Counter[str] = Counter()
     maxima = {
@@ -121,6 +129,7 @@ def analyze(args: argparse.Namespace) -> int:
     }
     detections = []
     frame_rows = []
+    candidate_rows = []
     exported_frames = 0
     fx, fy = float(camera_info.K[0]), float(camera_info.K[4])
     for stamp, rgb_message in messages[RGB_TOPIC]:
@@ -159,6 +168,7 @@ def analyze(args: argparse.Namespace) -> int:
             (0.28, 0.0, 0.043),
             (0.0, 0.0, 0.0),
         ) @ _ros_link_from_optical_matrix()
+        width_samples = []
         observations = detector.detect_arrays(
             rgb,
             depth,
@@ -166,7 +176,16 @@ def analyze(args: argparse.Namespace) -> int:
             camera_to_world,
             stamp=stamp,
             diagnostics=counters,
+            panel_width_samples=width_samples,
         )
+        for width_sample in width_samples:
+            candidate_rows.append(
+                {
+                    "stamp": stamp,
+                    "robot_yaw": sample.yaw,
+                    **width_sample,
+                }
+            )
         detections.extend(observations)
         counters["final_observations"] += len(observations)
 
@@ -264,6 +283,82 @@ def analyze(args: argparse.Namespace) -> int:
                     item.plane_rmse,
                 )
             )
+    if candidate_rows:
+        print("  平面候选宽度样本（按宽度降序，最多 15 个）:")
+        for row in sorted(
+            candidate_rows,
+            key=lambda item: float(item["width"]),
+            reverse=True,
+        )[:15]:
+            print(
+                "    t=%.3f robot_yaw=%.3f bearing=%.3f width=%.3f "
+                "depth=%.3f inliers=%d/%d rmse=%.4f xy=(%.3f, %.3f)"
+                % (
+                    float(row["stamp"]),
+                    float(row["robot_yaw"]),
+                    float(row["relative_bearing"]),
+                    float(row["width"]),
+                    float(row["median_depth"]),
+                    int(row["inlier_count"]),
+                    int(row["plane_candidate_count"]),
+                    float(row["plane_rmse"]),
+                    float(row["world_xy"][0]),
+                    float(row["world_xy"][1]),
+                )
+            )
+    if args.csv is not None:
+        args.csv.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "stamp",
+            "robot_yaw",
+            "relative_bearing",
+            "width",
+            "relation",
+            "pixel_area",
+            "valid_depth_count",
+            "plane_candidate_count",
+            "inlier_count",
+            "median_depth",
+            "plane_rmse",
+            "world_x",
+            "world_y",
+            "outward_yaw",
+            "distance",
+            "bbox_x",
+            "bbox_y",
+            "bbox_width",
+            "bbox_height",
+        ]
+        with args.csv.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in candidate_rows:
+                world_xy = row["world_xy"]
+                bbox = row["bbox"]
+                writer.writerow(
+                    {
+                        "stamp": row["stamp"],
+                        "robot_yaw": row["robot_yaw"],
+                        "relative_bearing": row["relative_bearing"],
+                        "width": row["width"],
+                        "relation": row["relation"],
+                        "pixel_area": row["pixel_area"],
+                        "valid_depth_count": row["valid_depth_count"],
+                        "plane_candidate_count": row["plane_candidate_count"],
+                        "inlier_count": row["inlier_count"],
+                        "median_depth": row["median_depth"],
+                        "plane_rmse": row["plane_rmse"],
+                        "world_x": world_xy[0],
+                        "world_y": world_xy[1],
+                        "outward_yaw": row["outward_yaw"],
+                        "distance": row["distance"],
+                        "bbox_x": bbox[0],
+                        "bbox_y": bbox[1],
+                        "bbox_width": bbox[2],
+                        "bbox_height": bbox[3],
+                    }
+                )
+        print(f"  已输出宽度/方位时序: {args.csv}")
     if args.export_dir is not None:
         print(f"  已导出 RGB 帧: {exported_frames} -> {args.export_dir}")
     return 0
@@ -286,6 +381,7 @@ def parse_args() -> argparse.Namespace:
         help="仅用于离线对照的门板最小高度，不修改正式配置",
     )
     parser.add_argument("--export-dir", type=Path)
+    parser.add_argument("--csv", type=Path, help="输出逐候选宽度/方位诊断 CSV")
     parser.add_argument("--export-stride", type=int, default=30)
     parser.add_argument(
         "--config",

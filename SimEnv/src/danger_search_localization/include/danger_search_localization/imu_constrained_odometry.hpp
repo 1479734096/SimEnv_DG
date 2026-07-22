@@ -43,11 +43,41 @@ struct ImuConstrainedOdometryConfig {
   int maximum_iterations = 12;
 };
 
+/// 局部地图校正的稳定诊断状态；只暴露既有分支，不改变验收策略。
+enum class ImuConstrainedOdometryStatus {
+  kAccepted = 0,
+  kInitialFrame,
+  kInsufficientSource,
+  kInsufficientCorrespondences,
+  kCount,
+};
+
+inline const char *ImuConstrainedOdometryStatusName(
+    ImuConstrainedOdometryStatus status) {
+  switch (status) {
+    case ImuConstrainedOdometryStatus::kAccepted:
+      return "accepted";
+    case ImuConstrainedOdometryStatus::kInitialFrame:
+      return "initial_frame";
+    case ImuConstrainedOdometryStatus::kInsufficientSource:
+      return "insufficient_source";
+    case ImuConstrainedOdometryStatus::kInsufficientCorrespondences:
+      return "insufficient_correspondences";
+    case ImuConstrainedOdometryStatus::kCount:
+      return "count";
+  }
+  return "unknown";
+}
+
 /// 一帧局部地图配准的验收结果；拒绝时仍返回安全的上一平移估计。
 struct ImuConstrainedOdometryResult {
   bool accepted = false;
   Eigen::Vector3d translation = Eigen::Vector3d::Zero();
   std::size_t correspondence_count = 0;
+  ImuConstrainedOdometryStatus status =
+      ImuConstrainedOdometryStatus::kInsufficientSource;
+  Eigen::Vector2d unclamped_correction = Eigen::Vector2d::Zero();
+  bool correction_was_clamped = false;
 };
 
 /// 在 IMU 已固定旋转的条件下，仅估计平面平移的局部扫描匹配器。
@@ -71,14 +101,18 @@ class ImuConstrainedOdometry {
     const auto source = kiss_icp::VoxelDownsample(
         map_frame, config_.source_voxel_size);
     if (source.size() < config_.minimum_correspondences) {
-      return Rejected(translation_prior, 0);
+      return Rejected(
+          translation_prior, 0,
+          ImuConstrainedOdometryStatus::kInsufficientSource);
     }
 
     if (!initialized_) {
       UpdateMap(map_frame, translation_prior);
       last_translation_ = translation_prior;
       initialized_ = true;
-      return {true, translation_prior, source.size()};
+      return {true, translation_prior, source.size(),
+              ImuConstrainedOdometryStatus::kInitialFrame,
+              Eigen::Vector2d::Zero(), false};
     }
 
     Eigen::Vector3d estimate = translation_prior;
@@ -136,20 +170,27 @@ class ImuConstrainedOdometry {
       }
     }
     if (!has_valid_iteration || retained_count < config_.minimum_correspondences) {
-      return Rejected(translation_prior, retained_count);
+      return Rejected(
+          translation_prior, retained_count,
+          ImuConstrainedOdometryStatus::kInsufficientCorrespondences);
     }
 
     Eigen::Vector2d correction =
         estimate.head<2>() - translation_prior.head<2>();
+    const Eigen::Vector2d unclamped_correction = correction;
+    bool correction_was_clamped = false;
     if (correction.norm() > config_.maximum_correction_from_prior) {
       correction *= config_.maximum_correction_from_prior / correction.norm();
       estimate.x() = translation_prior.x() + correction.x();
       estimate.y() = translation_prior.y() + correction.y();
+      correction_was_clamped = true;
     }
 
     UpdateMap(map_frame, estimate);
     last_translation_ = estimate;
-    return {true, estimate, retained_count};
+    return {true, estimate, retained_count,
+            ImuConstrainedOdometryStatus::kAccepted,
+            unclamped_correction, correction_was_clamped};
   }
 
  private:
@@ -234,12 +275,14 @@ class ImuConstrainedOdometry {
 
   ImuConstrainedOdometryResult Rejected(
       const Eigen::Vector3d &translation_prior,
-      std::size_t correspondence_count) const {
+      std::size_t correspondence_count,
+      ImuConstrainedOdometryStatus status) const {
     Eigen::Vector3d translation = initialized_
                                       ? last_translation_
                                       : translation_prior;
     translation.z() = translation_prior.z();
-    return {false, translation, correspondence_count};
+    return {false, translation, correspondence_count, status,
+            Eigen::Vector2d::Zero(), false};
   }
 
   std::pair<std::vector<Eigen::Vector3d>, std::vector<Eigen::Vector3d>>

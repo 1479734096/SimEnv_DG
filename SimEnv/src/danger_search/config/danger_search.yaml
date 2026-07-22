@@ -70,6 +70,9 @@ mission:
   no_frontier_scan_duration: 4.0
   # 贴墙时禁止无前沿扫描/普通卡滞恢复原地转向，避免腿部旋转包络扫墙导致倾倒。
   no_frontier_rotation_min_clearance: 0.40
+  # 旋转净距不足时，只沿本层真实行驶轨迹后退一次，到较宽处再扫描一次。
+  no_frontier_retreat_max_distance: 2.0
+  no_frontier_retreat_clearance_margin: 0.10
   probe_distance: 1.0
   probe_yaw: 1.5708
   # 起点存在公开主入口时，先沿当前朝向上由传感器确认的 FREE 走廊深入。
@@ -86,6 +89,8 @@ mission:
   # 越过门面后的轴向离门段需要克服门槛接触，但仍低于普通探索速度。
   main_entrance_clearance_max_linear: 0.4
   door_refresh_timeout: 3.0
+  # 当前点云重测中心可吸收定位平移误差，但不得把相邻走廊开口覆盖成主入口。
+  door_refresh_max_center_shift: 0.60
   # 净空按 A1 扫掠半宽双侧增加余量，不足时禁止尝试穿越。
   door_clearance_margin: 0.10
   # door_commit_distance: 1.8

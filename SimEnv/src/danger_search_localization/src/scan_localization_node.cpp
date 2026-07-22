@@ -3,10 +3,12 @@
 // 初始化 world 系；IMU 固定姿态；RGB-D/Livox 相邻帧 GICP 估计连续平移；Livox
 // 局部结构地图校正漂移；最后发布参赛方内部 odom 与 world 配准点云。
 #include <algorithm>
+#include <array>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <Eigen/Geometry>
 #include <cmath>
+#include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <iostream>
@@ -84,6 +86,28 @@ struct StartPose {
   double z = 0.0;
   double yaw = 0.0;
   bool relative = false;
+};
+
+struct PlanarRegistrationDiagnosticStats {
+  std::array<
+      std::uint64_t,
+      static_cast<std::size_t>(
+          danger_search_localization::PlanarGicpStatus::kCount)>
+      status_counts{};
+  ros::Time interval_start;
+  double maximum_candidate_norm = 0.0;
+};
+
+struct MapRegistrationDiagnosticStats {
+  std::array<
+      std::uint64_t,
+      static_cast<std::size_t>(
+          danger_search_localization::ImuConstrainedOdometryStatus::kCount)>
+      status_counts{};
+  ros::Time interval_start;
+  double maximum_unclamped_norm = 0.0;
+  double maximum_applied_norm = 0.0;
+  std::uint64_t clamped_count = 0;
 };
 
 std::filesystem::path ExpectedSceneInfoPath() {
@@ -222,6 +246,9 @@ class ScanLocalizationNode {
     double velocity_minimum_interval = 0.80;
     double velocity_linear_deadband = 0.05;
     double velocity_angular_deadband = 0.03;
+    double diagnostic_large_translation_threshold = 0.08;
+    double diagnostic_summary_period = 2.0;
+    double scan_to_map_maximum_correction = 0.005;
     std::string depth_cloud_topic = "/real_sense/depth/points";
     std::vector<double> base_to_livox_xyz;
     std::vector<double> base_to_livox_rpy;
@@ -286,6 +313,14 @@ class ScanLocalizationNode {
                       velocity_linear_deadband);
     private_nh_.param("velocity_angular_deadband", velocity_angular_deadband,
                       velocity_angular_deadband);
+    private_nh_.param("diagnostic_large_translation_threshold",
+                      diagnostic_large_translation_threshold,
+                      diagnostic_large_translation_threshold);
+    private_nh_.param("diagnostic_summary_period", diagnostic_summary_period,
+                      diagnostic_summary_period);
+    private_nh_.param("scan_to_map_maximum_correction",
+                      scan_to_map_maximum_correction,
+                      scan_to_map_maximum_correction);
     private_nh_.param("depth_cloud_topic", depth_cloud_topic,
                       depth_cloud_topic);
     if (!std::isfinite(min_range) || !std::isfinite(max_range) || min_range < 0.0 ||
@@ -297,6 +332,20 @@ class ScanLocalizationNode {
         !std::isfinite(command_velocity_scale) ||
         command_velocity_scale <= 0.0 || command_velocity_scale > 2.0) {
       throw std::runtime_error("KISS-ICP 定位参数无效");
+    }
+    if (!std::isfinite(diagnostic_large_translation_threshold) ||
+        diagnostic_large_translation_threshold <= 0.0 ||
+        diagnostic_large_translation_threshold > 1.0) {
+      throw std::runtime_error("定位大平移诊断阈值必须位于 (0, 1.0] m");
+    }
+    if (!std::isfinite(diagnostic_summary_period) ||
+        diagnostic_summary_period < 0.5 || diagnostic_summary_period > 30.0) {
+      throw std::runtime_error("定位诊断汇总周期必须位于 [0.5, 30.0] s");
+    }
+    if (!std::isfinite(scan_to_map_maximum_correction) ||
+        scan_to_map_maximum_correction <= 0.0 ||
+        scan_to_map_maximum_correction > 0.25) {
+      throw std::runtime_error("scan-to-map 单帧校正上限必须位于 (0, 0.25] m");
     }
     if (localization_backend != "kiss_icp" &&
         localization_backend != "imu_constrained" &&
@@ -356,6 +405,9 @@ class ScanLocalizationNode {
     max_range_ = max_range;
     imu_max_delta_ = imu_max_delta;
     command_velocity_scale_ = command_velocity_scale;
+    diagnostic_large_translation_threshold_ =
+        diagnostic_large_translation_threshold;
+    diagnostic_summary_period_ = diagnostic_summary_period;
     stance_health_enabled_ = stance_health_enabled;
     danger_search_localization::StanceInitializationConfig stance_config;
     stance_config.minimum_base_height = initialization_min_base_height;
@@ -389,8 +441,14 @@ class ScanLocalizationNode {
     velocity_estimator_ =
         danger_search_localization::PoseVelocityEstimator(velocity_config);
     if (use_imu_constrained_ || use_rgbd_livox_) {
+      danger_search_localization::ImuConstrainedOdometryConfig imu_config;
+      // scan-to-map 只负责修正点云里程计的慢漂；按 10 Hz /scan 把累计
+      // 校正速度限制在约 0.05 m/s，同时让返回位姿和写入局部地图使用
+      // 同一校正，避免形成两个坐标系。
+      imu_config.maximum_correction_from_prior =
+          scan_to_map_maximum_correction;
       imu_odometry_ = std::make_unique<
-          danger_search_localization::ImuConstrainedOdometry>();
+          danger_search_localization::ImuConstrainedOdometry>(imu_config);
     }
     if (use_rgbd_livox_) {
       danger_search_localization::PlanarGicpConfig depth_config;
@@ -601,8 +659,11 @@ class ScanLocalizationNode {
         (depth_total_ - scale_depth_anchor_).norm();
     const double livox_distance =
         (livox_total_ - scale_livox_anchor_).norm();
+    double ratio = std::numeric_limits<double>::quiet_NaN();
+    const char *status = "insufficient_depth_motion";
+    const double previous_scale = livox_scale_;
     if (depth_distance >= 0.20 && livox_distance >= 0.10) {
-      const double ratio = depth_distance / livox_distance;
+      ratio = depth_distance / livox_distance;
       if (std::isfinite(ratio) && ratio >= 0.70 && ratio <= 2.20) {
         livox_scale_samples_.push_back(ratio);
         while (livox_scale_samples_.size() > 5) {
@@ -610,8 +671,21 @@ class ScanLocalizationNode {
         }
         livox_scale_ = Median(std::vector<double>(
             livox_scale_samples_.begin(), livox_scale_samples_.end()));
+        status = "accepted";
+      } else if (!std::isfinite(ratio)) {
+        status = "nonfinite_ratio";
+      } else {
+        status = "ratio_out_of_range";
       }
+    } else if (depth_distance >= 0.20) {
+      status = "insufficient_livox_motion";
     }
+    ROS_INFO(
+        "localization_scale_window stamp=%.6f status=%s "
+        "depth_distance=%.4f livox_distance=%.4f ratio=%.4f "
+        "previous_scale=%.4f current_scale=%.4f samples=%zu",
+        stamp.toSec(), status, depth_distance, livox_distance, ratio,
+        previous_scale, livox_scale_, livox_scale_samples_.size());
     scale_depth_anchor_ = depth_total_;
     scale_livox_anchor_ = livox_total_;
     scale_window_stamp_ = stamp;
@@ -686,6 +760,9 @@ class ScanLocalizationNode {
         last_depth_registration_stamp_, message->header.stamp,
         world_base_rotation);
     const auto result = depth_gicp_.RegisterFrame(points, command_prior);
+    RecordPlanarRegistrationDiagnostic(
+        "rgbd_frame_gicp", message->header.stamp, result,
+        &depth_registration_diagnostics_);
     if (result.point_count >= 80) {
       last_depth_registration_stamp_ = message->header.stamp;
     }
@@ -694,6 +771,11 @@ class ScanLocalizationNode {
           2.0, "RGB-D 平移配准不可用：points=%zu fitness=%.4f",
           result.point_count, result.fitness);
       return;
+    }
+    if (result.has_delta) {
+      LogLargeTranslationIncrement(
+          "rgbd_frame_gicp", message->header.stamp, result.delta,
+          result.fitness, result.point_count);
     }
     {
       std::lock_guard<std::mutex> fusion_lock(fusion_mutex_);
@@ -850,6 +932,14 @@ class ScanLocalizationNode {
           world_base_rotation);
       const auto result = livox_gicp_.RegisterFrame(
           oriented_points, command_prior);
+      RecordPlanarRegistrationDiagnostic(
+          "livox_frame_gicp", message->header.stamp, result,
+          &livox_registration_diagnostics_);
+      if (result.accepted && result.has_delta) {
+        LogLargeTranslationIncrement(
+            "livox_frame_gicp", message->header.stamp, result.delta,
+            result.fitness, result.point_count);
+      }
       if (result.point_count >= 80) {
         last_livox_registration_stamp_ = message->header.stamp;
       }
@@ -858,6 +948,7 @@ class ScanLocalizationNode {
       Eigen::Vector2d depth_total;
       Eigen::Vector2d livox_total;
       double livox_scale = 1.0;
+      ros::Time depth_accept_stamp;
       {
         std::lock_guard<std::mutex> fusion_lock(fusion_mutex_);
         if (result.accepted && result.has_delta) {
@@ -876,7 +967,10 @@ class ScanLocalizationNode {
         depth_total = depth_total_;
         livox_total = livox_total_;
         livox_scale = livox_scale_;
+        depth_accept_stamp = last_depth_accept_stamp_;
       }
+      RecordDepthFreshnessDiagnostic(
+          message->header.stamp, depth_fresh, depth_accept_stamp);
       // RGB-D 帧间配准提供连续先验，但快速转向后会累积平移误差。
       // 使用 360° Livox 的竖向结构对局部扫描地图校正该先验；结构不足时
       // 保留原先验，不再像纯 IMU 积分后端那样让定位发散或冻结。
@@ -899,12 +993,22 @@ class ScanLocalizationNode {
       }
       const auto map_result = imu_odometry_->RegisterFrame(
           structural_vectors, sensor_translation_prior);
+      Eigen::Vector2d correction = Eigen::Vector2d::Zero();
       if (map_result.accepted) {
         const Eigen::Vector3d corrected_base_translation =
             map_result.translation -
             world_base_rotation * base_to_livox_.translation();
-        const Eigen::Vector2d correction =
+        correction =
             corrected_base_translation.head<2>() - fused_position;
+      }
+      RecordMapRegistrationDiagnostic(
+          "livox_scan_to_map", message->header.stamp, map_result, correction,
+          &map_registration_diagnostics_);
+      if (map_result.accepted) {
+        LogLargeTranslationIncrement(
+            "livox_scan_to_map", message->header.stamp, correction,
+            std::numeric_limits<double>::quiet_NaN(),
+            map_result.correspondence_count);
         {
           std::lock_guard<std::mutex> fusion_lock(fusion_mutex_);
           // 深度回调可在扫描匹配期间推进；把校正作为同一世界系平移量
@@ -1069,6 +1173,178 @@ class ScanLocalizationNode {
     cloud_publisher_.publish(message);
   }
 
+  void RecordPlanarRegistrationDiagnostic(
+      const char *source, const ros::Time &stamp,
+      const danger_search_localization::PlanarGicpResult &result,
+      PlanarRegistrationDiagnosticStats *stats) const {
+    const std::size_t status_index = static_cast<std::size_t>(result.status);
+    if (status_index < stats->status_counts.size()) {
+      ++stats->status_counts[status_index];
+    }
+    const double candidate_norm = result.candidate_delta.norm();
+    if (std::isfinite(candidate_norm)) {
+      stats->maximum_candidate_norm =
+          std::max(stats->maximum_candidate_norm, candidate_norm);
+    }
+    if (stats->interval_start.isZero()) {
+      stats->interval_start = stamp;
+      return;
+    }
+    if (stamp.toSec() - stats->interval_start.toSec() <
+        diagnostic_summary_period_) {
+      return;
+    }
+    const auto count = [stats](
+                           danger_search_localization::PlanarGicpStatus status) {
+      return static_cast<unsigned long long>(
+          stats->status_counts[static_cast<std::size_t>(status)]);
+    };
+    ROS_INFO(
+        "localization_registration_summary source=%s stamp=%.6f "
+        "accepted=%llu initial=%llu invalid_prior=%llu "
+        "insufficient_points=%llu not_converged=%llu "
+        "nonfinite_delta=%llu nonfinite_fitness=%llu "
+        "translation_limit=%llu fitness_limit=%llu "
+        "maximum_candidate_norm=%.4f latest_status=%s "
+        "latest_candidate=(%.4f, %.4f) latest_applied=(%.4f, %.4f) "
+        "latest_fitness=%.6f latest_points=%zu",
+        source, stamp.toSec(),
+        count(danger_search_localization::PlanarGicpStatus::kAccepted),
+        count(danger_search_localization::PlanarGicpStatus::kInitialFrame),
+        count(danger_search_localization::PlanarGicpStatus::kInvalidPrior),
+        count(danger_search_localization::PlanarGicpStatus::kInsufficientPoints),
+        count(danger_search_localization::PlanarGicpStatus::kNotConverged),
+        count(danger_search_localization::PlanarGicpStatus::kNonFiniteDelta),
+        count(danger_search_localization::PlanarGicpStatus::kNonFiniteFitness),
+        count(danger_search_localization::PlanarGicpStatus::kTranslationLimit),
+        count(danger_search_localization::PlanarGicpStatus::kFitnessLimit),
+        stats->maximum_candidate_norm,
+        danger_search_localization::PlanarGicpStatusName(result.status),
+        result.candidate_delta.x(), result.candidate_delta.y(),
+        result.delta.x(), result.delta.y(), result.fitness,
+        result.point_count);
+    stats->status_counts.fill(0);
+    stats->maximum_candidate_norm = 0.0;
+    stats->interval_start = stamp;
+  }
+
+  void RecordMapRegistrationDiagnostic(
+      const char *source, const ros::Time &stamp,
+      const danger_search_localization::ImuConstrainedOdometryResult &result,
+      const Eigen::Vector2d &applied_correction,
+      MapRegistrationDiagnosticStats *stats) const {
+    const std::size_t status_index = static_cast<std::size_t>(result.status);
+    if (status_index < stats->status_counts.size()) {
+      ++stats->status_counts[status_index];
+    }
+    const double raw_norm = result.unclamped_correction.norm();
+    const double applied_norm = applied_correction.norm();
+    if (std::isfinite(raw_norm)) {
+      stats->maximum_unclamped_norm =
+          std::max(stats->maximum_unclamped_norm, raw_norm);
+    }
+    if (std::isfinite(applied_norm)) {
+      stats->maximum_applied_norm =
+          std::max(stats->maximum_applied_norm, applied_norm);
+    }
+    if (result.correction_was_clamped) {
+      ++stats->clamped_count;
+    }
+    if (stats->interval_start.isZero()) {
+      stats->interval_start = stamp;
+      return;
+    }
+    if (stamp.toSec() - stats->interval_start.toSec() <
+        diagnostic_summary_period_) {
+      return;
+    }
+    const auto count = [stats](
+                           danger_search_localization::ImuConstrainedOdometryStatus status) {
+      return static_cast<unsigned long long>(
+          stats->status_counts[static_cast<std::size_t>(status)]);
+    };
+    ROS_INFO(
+        "localization_map_registration_summary source=%s stamp=%.6f "
+        "accepted=%llu initial=%llu insufficient_source=%llu "
+        "insufficient_correspondences=%llu clamped=%llu "
+        "maximum_unclamped_norm=%.4f maximum_applied_norm=%.4f "
+        "latest_status=%s latest_unclamped=(%.4f, %.4f) "
+        "latest_applied=(%.4f, %.4f) latest_correspondences=%zu",
+        source, stamp.toSec(),
+        count(danger_search_localization::ImuConstrainedOdometryStatus::kAccepted),
+        count(danger_search_localization::ImuConstrainedOdometryStatus::kInitialFrame),
+        count(danger_search_localization::ImuConstrainedOdometryStatus::kInsufficientSource),
+        count(danger_search_localization::ImuConstrainedOdometryStatus::kInsufficientCorrespondences),
+        static_cast<unsigned long long>(stats->clamped_count),
+        stats->maximum_unclamped_norm, stats->maximum_applied_norm,
+        danger_search_localization::ImuConstrainedOdometryStatusName(
+            result.status),
+        result.unclamped_correction.x(), result.unclamped_correction.y(),
+        applied_correction.x(), applied_correction.y(),
+        result.correspondence_count);
+    stats->status_counts.fill(0);
+    stats->maximum_unclamped_norm = 0.0;
+    stats->maximum_applied_norm = 0.0;
+    stats->clamped_count = 0;
+    stats->interval_start = stamp;
+  }
+
+  void RecordDepthFreshnessDiagnostic(
+      const ros::Time &stamp, bool depth_fresh,
+      const ros::Time &last_depth_accept_stamp) {
+    if (!depth_freshness_state_initialized_) {
+      depth_freshness_state_initialized_ = true;
+      previous_depth_fresh_ = depth_fresh;
+      if (!depth_fresh) {
+        depth_stale_since_ = stamp;
+      }
+      return;
+    }
+    if (depth_fresh == previous_depth_fresh_) {
+      return;
+    }
+    const double last_accept_age = last_depth_accept_stamp.isZero()
+                                       ? std::numeric_limits<double>::infinity()
+                                       : stamp.toSec() -
+                                             last_depth_accept_stamp.toSec();
+    if (depth_fresh) {
+      const double stale_duration = depth_stale_since_.isZero()
+                                        ? 0.0
+                                        : std::max(
+                                              0.0, stamp.toSec() -
+                                                       depth_stale_since_.toSec());
+      ROS_INFO(
+          "localization_depth_freshness_transition stamp=%.6f fresh=1 "
+          "stale_duration=%.4f last_accept_age=%.4f",
+          stamp.toSec(), stale_duration, last_accept_age);
+      depth_stale_since_ = ros::Time();
+    } else {
+      depth_stale_since_ = stamp;
+      ROS_WARN(
+          "localization_depth_freshness_transition stamp=%.6f fresh=0 "
+          "last_accept_age=%.4f",
+          stamp.toSec(), last_accept_age);
+    }
+    previous_depth_fresh_ = depth_fresh;
+  }
+
+  void LogLargeTranslationIncrement(
+      const char *source, const ros::Time &stamp,
+      const Eigen::Vector2d &increment, double fitness,
+      std::size_t evidence_count) const {
+    const double norm = increment.norm();
+    if (!std::isfinite(norm) ||
+        norm < diagnostic_large_translation_threshold_) {
+      return;
+    }
+    // 只记录稀疏异常事件，不参与融合决策，避免逐帧日志改变控制实时率。
+    ROS_WARN(
+        "localization_large_translation_increment source=%s stamp=%.6f "
+        "delta=(%.4f, %.4f) norm=%.4f fitness=%.6f evidence=%zu",
+        source, stamp.toSec(), increment.x(), increment.y(), norm, fitness,
+        evidence_count);
+  }
+
   bool UpdateAndPublishStanceHealth(
       const ros::Time &stamp,
       const std::optional<ImuSample> &current_imu_sample,
@@ -1167,7 +1443,15 @@ class ScanLocalizationNode {
   double max_range_ = 15.0;
   double imu_max_delta_ = 0.01;
   double command_velocity_scale_ = 1.0;
+  double diagnostic_large_translation_threshold_ = 0.08;
+  double diagnostic_summary_period_ = 2.0;
   double depth_freshness_seconds_ = 0.35;
+  PlanarRegistrationDiagnosticStats depth_registration_diagnostics_;
+  PlanarRegistrationDiagnosticStats livox_registration_diagnostics_;
+  MapRegistrationDiagnosticStats map_registration_diagnostics_;
+  bool depth_freshness_state_initialized_ = false;
+  bool previous_depth_fresh_ = false;
+  ros::Time depth_stale_since_;
   std::deque<ImuSample> imu_samples_;
   mutable std::mutex imu_mutex_;
   mutable std::mutex command_mutex_;

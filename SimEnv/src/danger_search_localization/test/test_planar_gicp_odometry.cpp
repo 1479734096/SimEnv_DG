@@ -45,9 +45,15 @@ TEST(PlanarGicpOdometryTest, RecoversBaseTranslationFromConsecutiveFrames) {
   const auto initial = odometry.RegisterFrame(first);
   ASSERT_TRUE(initial.accepted);
   EXPECT_FALSE(initial.has_delta);
+  EXPECT_EQ(initial.status,
+            danger_search_localization::PlanarGicpStatus::kInitialFrame);
   const auto moved = odometry.RegisterFrame(second);
   ASSERT_TRUE(moved.accepted);
   ASSERT_TRUE(moved.has_delta);
+  EXPECT_EQ(moved.status,
+            danger_search_localization::PlanarGicpStatus::kAccepted);
+  EXPECT_NEAR(moved.candidate_delta.x(), moved.delta.x(), 1e-12);
+  EXPECT_NEAR(moved.candidate_delta.y(), moved.delta.y(), 1e-12);
   EXPECT_NEAR(moved.delta.x(), base_motion.x(), 0.015);
   EXPECT_NEAR(moved.delta.y(), base_motion.y(), 0.015);
 }
@@ -85,6 +91,52 @@ TEST(PlanarGicpOdometryTest, UsesMotionPriorAlongWeaklyObservedWallDirection) {
   ASSERT_TRUE(moved.accepted);
   EXPECT_NEAR(moved.delta.x(), 0.09, 0.025);
   EXPECT_NEAR(moved.delta.y(), 0.0, 0.015);
+}
+
+TEST(PlanarGicpOdometryTest, ReportsInsufficientPointsWithoutChangingBehavior) {
+  danger_search_localization::PlanarGicpConfig config;
+  config.voxel_size = 0.04;
+  config.minimum_points = 20;
+  danger_search_localization::PlanarGicpOdometry odometry(config);
+
+  const auto result = odometry.RegisterFrame({
+      Eigen::Vector3d(0.0, 0.0, 0.0),
+      Eigen::Vector3d(0.2, 0.0, 0.0),
+  });
+
+  EXPECT_FALSE(result.accepted);
+  EXPECT_FALSE(result.has_delta);
+  EXPECT_EQ(result.status,
+            danger_search_localization::PlanarGicpStatus::kInsufficientPoints);
+  EXPECT_STREQ(
+      danger_search_localization::PlanarGicpStatusName(result.status),
+      "insufficient_points");
+}
+
+TEST(PlanarGicpOdometryTest, PreservesRejectedTranslationCandidateForDiagnostics) {
+  danger_search_localization::PlanarGicpConfig config;
+  config.voxel_size = 0.025;
+  config.maximum_correspondence_distance = 0.30;
+  config.maximum_frame_translation = 0.03;
+  config.maximum_fitness = 0.02;
+  config.minimum_points = 60;
+  danger_search_localization::PlanarGicpOdometry odometry(config);
+
+  const auto first = MakeAsymmetricRoomPoints();
+  auto second = first;
+  for (auto &point : second) {
+    point.x() -= 0.08;
+  }
+  ASSERT_TRUE(odometry.RegisterFrame(first).accepted);
+  const auto rejected =
+      odometry.RegisterFrame(second, Eigen::Vector2d(0.08, 0.0));
+
+  EXPECT_FALSE(rejected.accepted);
+  EXPECT_FALSE(rejected.has_delta);
+  EXPECT_EQ(rejected.status,
+            danger_search_localization::PlanarGicpStatus::kTranslationLimit);
+  EXPECT_GT(rejected.candidate_delta.norm(), config.maximum_frame_translation);
+  EXPECT_DOUBLE_EQ(rejected.delta.norm(), 0.0);
 }
 
 }  // namespace

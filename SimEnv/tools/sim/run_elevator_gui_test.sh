@@ -17,6 +17,7 @@ ELEVATOR_GO_TO_DOOR_STALL_WALL="${ELEVATOR_GO_TO_DOOR_STALL_WALL:-120}"
 ELEVATOR_TEST_KEEP_RUNNING="${ELEVATOR_TEST_KEEP_RUNNING:-0}"
 ELEVATOR_TEST_FULL_CYCLE="${ELEVATOR_TEST_FULL_CYCLE:-0}"
 ELEVATOR_TEST_RECORD_DRIFT="${ELEVATOR_TEST_RECORD_DRIFT:-0}"
+ELEVATOR_TEST_RECORD_RGBD="${ELEVATOR_TEST_RECORD_RGBD:-0}"
 ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH="${ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH:-0}"
 LOG_DIR="${ELEVATOR_TEST_LOG_DIR:-/tmp/danger_search_elevator_test_$(date +%Y%m%d_%H%M%S)}"
 
@@ -25,6 +26,7 @@ MISSION_PID=""
 KEEPER_PID=""
 MASTER_PID=""
 BAG_PID=""
+RGBD_BAG_PID=""
 RUNTIME_DIR=""
 RESULT="未完成"
 DETAIL="脚本提前退出"
@@ -49,6 +51,7 @@ usage() {
   ELEVATOR_GO_TO_DOOR_STALL_WALL=120   厅外导航无路径墙钟超时（秒）
   ELEVATOR_TEST_FULL_CYCLE=1            继续验证返程电梯与主入口退出
   ELEVATOR_TEST_RECORD_DRIFT=1          录制自身定位、控制和姿态诊断 bag
+  ELEVATOR_TEST_RECORD_RGBD=1           额外录制 RGB-D 供失败后离线重放
   ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1  同时录制真值供运行结束后离线漂移评估
   ELEVATOR_TEST_KEEP_RUNNING=1         成功后保留 GUI，按 Ctrl-C 清理
   ELEVATOR_TEST_LOG_DIR=/tmp/...       证据目录
@@ -96,8 +99,10 @@ write_summary() {
     printf 'max_runtime=%s\n' "$ELEVATOR_TEST_MAX_RUNTIME"
     printf 'full_cycle=%s\n' "$ELEVATOR_TEST_FULL_CYCLE"
     printf 'record_drift=%s\n' "$ELEVATOR_TEST_RECORD_DRIFT"
+    printf 'record_rgbd=%s\n' "$ELEVATOR_TEST_RECORD_RGBD"
     printf 'offline_truth=%s\n' "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH"
     printf 'diagnostic_bag=%s/elevator_diagnostic.bag\n' "$LOG_DIR"
+    printf 'rgbd_bag=%s/elevator_rgbd.bag\n' "$LOG_DIR"
     printf 'drift_summary=%s/localization_drift.json\n' "$LOG_DIR"
     printf 'mission_log=%s/mission.log\n' "$LOG_DIR"
     printf 'auto_log=%s/auto.log\n' "$LOG_DIR"
@@ -109,8 +114,12 @@ cleanup() {
   local exit_code=$?
   trap - EXIT
   terminate_group "$MISSION_PID" INT
+  terminate_group "$RGBD_BAG_PID" INT
   terminate_group "$BAG_PID" INT
   sleep 1
+  if [[ "$RGBD_BAG_PID" =~ ^[0-9]+$ ]]; then
+    wait "$RGBD_BAG_PID" 2>/dev/null || true
+  fi
   if [[ "$BAG_PID" =~ ^[0-9]+$ ]]; then
     wait "$BAG_PID" 2>/dev/null || true
   fi
@@ -196,7 +205,7 @@ if [[ "$ELEVATOR_TEST_FULL_CYCLE" != "0" && "$ELEVATOR_TEST_FULL_CYCLE" != "1" ]
   printf 'ELEVATOR_TEST_FULL_CYCLE 只能是 0 或 1\n' >&2
   exit 2
 fi
-for flag in "$ELEVATOR_TEST_RECORD_DRIFT" "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH"; do
+for flag in "$ELEVATOR_TEST_RECORD_DRIFT" "$ELEVATOR_TEST_RECORD_RGBD" "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH"; do
   if [[ "$flag" != "0" && "$flag" != "1" ]]; then
     printf '诊断开关只能是 0 或 1：%s\n' "$flag" >&2
     exit 2
@@ -221,6 +230,14 @@ if [[ "$ELEVATOR_TEST_RECORD_DRIFT" == "1" ]]; then
   for command_name in rosbag rosnode; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       printf '缺少诊断命令：%s\n' "$command_name" >&2
+      exit 2
+    fi
+  done
+fi
+if [[ "$ELEVATOR_TEST_RECORD_RGBD" == "1" ]]; then
+  for command_name in rosbag rosnode; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+      printf '缺少 RGB-D 诊断命令：%s\n' "$command_name" >&2
       exit 2
     fi
   done
@@ -346,8 +363,25 @@ registration_reported=0
 change_floor_reported=0
 go_to_door_stall_started=0
 upward_complete=0
+rgbd_recording_started=0
 
 while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
+  if [[ "$ELEVATOR_TEST_RECORD_RGBD" == "1" ]] && \
+     (( rgbd_recording_started == 0 )) && \
+     grep -Fq "开始一次全向 RGB-D 电梯门地标扫描" "$MISSION_LOG"; then
+    # 只录扫描窗口，避免把全程原始深度写入磁盘；独立 rosbag 不进入生产输入链。
+    setsid rosbag record --buffsize=256 \
+      -O "$LOG_DIR/elevator_rgbd.bag" \
+      /real_sense/rgb/image_raw/compressed \
+      /real_sense/depth/image_raw \
+      /real_sense/rgb/camera_info \
+      /real_sense/depth/camera_info \
+      /danger_search/localization/odom \
+      > "$LOG_DIR/rgbd_rosbag.log" 2>&1 &
+    RGBD_BAG_PID=$!
+    rgbd_recording_started=1
+    log "电梯扫描已开始，启动隔离 RGB-D 诊断录包"
+  fi
   if [[ "$ELEVATOR_TEST_FULL_CYCLE" == "1" ]] && \
      grep -F '"event": "mission_result_write"' "$MISSION_LOG" 2>/dev/null | \
      grep -F '"terminal_outcome": "success"' | \
@@ -365,6 +399,12 @@ while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
   if (( registration_reported == 0 )) && \
      grep -Fq "局部传感器连续确认电梯候选并注册运行期竖井几何" "$MISSION_LOG"; then
     registration_reported=1
+    if [[ "$RGBD_BAG_PID" =~ ^[0-9]+$ ]]; then
+      terminate_group "$RGBD_BAG_PID" INT
+      wait "$RGBD_BAG_PID" 2>/dev/null || true
+      RGBD_BAG_PID=""
+      log "电梯注册完成，停止 RGB-D 扫描窗口录包"
+    fi
     log "电梯视觉注册成功"
   fi
 

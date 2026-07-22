@@ -94,6 +94,52 @@ class RgbdDoorDetectorTest(unittest.TestCase):
         self.assertGreater(observation.height, 1.5)
         self.assertGreater(observation.depth_inlier_count, 1000)
 
+    def test_oblique_panel_keeps_full_width_before_plane_residual_filter(self):
+        """斜视门板的光轴深度梯度不能被误当成多个表面裁掉。"""
+        rgb = np.full((120, 160, 3), 210, dtype=np.uint8)
+        depth = np.full((120, 160), 4.0, dtype=np.float32)
+        rgb[12:112, 55:105] = (46, 46, 50)
+        angle = math.radians(41.0)
+        normal_x = math.sin(angle)
+        normal_z = math.cos(angle)
+        plane_distance = 2.2 * normal_z
+        for column in range(55, 105):
+            ray_x = (column - self.camera_k[2]) / self.camera_k[0]
+            depth[12:112, column] = plane_distance / (
+                normal_z + normal_x * ray_x
+            )
+
+        diagnostics = {}
+        observations = self.detector.detect_arrays(
+            rgb,
+            depth,
+            self.camera_k,
+            self.camera_to_world,
+            diagnostics=diagnostics,
+        )
+
+        self.assertEqual(len(observations), 1)
+        self.assertGreater(observations[0].width, 0.65)
+        self.assertLess(observations[0].plane_rmse, 1e-4)
+        self.assertEqual(diagnostics["passed_plane_candidate_pixels"], 1)
+
+    def test_two_depth_surfaces_are_not_merged_into_one_door_panel(self):
+        """同一深色轮廓内的前后表面不能合成一块虚假宽门板。"""
+        rgb = np.full((120, 160, 3), 210, dtype=np.uint8)
+        depth = np.full((120, 160), 4.0, dtype=np.float32)
+        rgb[12:112, 40:120] = (46, 46, 50)
+        depth[12:112, 40:80] = 2.0
+        depth[12:112, 80:120] = 3.0
+
+        observations = self.detector.detect_arrays(
+            rgb,
+            depth,
+            self.camera_k,
+            self.camera_to_world,
+        )
+
+        self.assertEqual(observations, [])
+
     def test_message_path_exposes_read_only_rejection_diagnostics(self):
         rgb, depth = self._door_frame()
         self.detector._bridge = SimpleNamespace(
@@ -118,8 +164,28 @@ class RgbdDoorDetectorTest(unittest.TestCase):
         self.assertEqual(snapshot["last_observation_count"], 1)
         self.assertEqual(snapshot["last"]["accepted_panel"], 1)
         self.assertEqual(snapshot["cumulative"]["accepted_panel"], 1)
+        self.assertEqual(
+            snapshot["cumulative"]["panel_width_within_limits"], 1
+        )
+        self.assertEqual(len(snapshot["recent_panel_width_samples"]), 1)
+        self.assertEqual(
+            snapshot["recent_panel_width_samples"][0]["relation"],
+            "within_limits",
+        )
+        sample = snapshot["recent_panel_width_samples"][0]
+        self.assertGreater(sample["pixel_area"], 0.0)
+        self.assertGreater(sample["valid_depth_count"], 0)
+        self.assertGreater(sample["inlier_count"], 0)
+        self.assertEqual(len(sample["bbox"]), 4)
+        self.assertEqual(len(sample["world_xy"]), 2)
+        self.assertTrue(math.isfinite(sample["relative_bearing"]))
         snapshot["last"]["accepted_panel"] = 99
+        snapshot["recent_panel_width_samples"][0]["width"] = 99.0
         self.assertEqual(self.detector.diagnostics()["last"]["accepted_panel"], 1)
+        self.assertNotEqual(
+            self.detector.diagnostics()["recent_panel_width_samples"][0]["width"],
+            99.0,
+        )
 
     def test_message_path_records_missing_transform_without_fallback(self):
         self.detector._bridge = SimpleNamespace()
@@ -141,6 +207,7 @@ class RgbdDoorDetectorTest(unittest.TestCase):
                 "last": {},
                 "cumulative": {},
                 "last_observation_count": 0,
+                "recent_panel_width_samples": [],
             },
         )
 

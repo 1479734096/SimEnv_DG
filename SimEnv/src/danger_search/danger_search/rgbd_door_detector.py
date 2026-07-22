@@ -135,6 +135,7 @@ class RgbdDoorDetector:
         self._last_diagnostics: dict[str, int] = {}
         self._cumulative_diagnostics: dict[str, int] = {}
         self._last_observation_count = 0
+        self._recent_panel_width_samples: list[dict[str, object]] = []
 
     def detect_messages(
         self,
@@ -165,6 +166,7 @@ class RgbdDoorDetector:
             frame_diagnostics["message_conversion_failed"] = 1
             self._store_diagnostics(frame_diagnostics, 0)
             return []
+        panel_width_samples: list[dict[str, object]] = []
         observations = self.detect_arrays(
             rgb,
             depth,
@@ -172,8 +174,13 @@ class RgbdDoorDetector:
             camera_to_world,
             stamp=stamp,
             diagnostics=frame_diagnostics,
+            panel_width_samples=panel_width_samples,
         )
-        self._store_diagnostics(frame_diagnostics, len(observations))
+        self._store_diagnostics(
+            frame_diagnostics,
+            len(observations),
+            panel_width_samples=panel_width_samples,
+        )
         return observations
 
     def diagnostics(self) -> dict[str, object]:
@@ -183,6 +190,9 @@ class RgbdDoorDetector:
             "last": dict(self._last_diagnostics),
             "cumulative": dict(self._cumulative_diagnostics),
             "last_observation_count": int(self._last_observation_count),
+            "recent_panel_width_samples": [
+                dict(sample) for sample in self._recent_panel_width_samples
+            ],
         }
 
     def reset_diagnostics(self) -> None:
@@ -191,11 +201,14 @@ class RgbdDoorDetector:
         self._last_diagnostics = {}
         self._cumulative_diagnostics = {}
         self._last_observation_count = 0
+        self._recent_panel_width_samples = []
 
     def _store_diagnostics(
         self,
         frame_diagnostics: MutableMapping[str, int],
         observation_count: int,
+        *,
+        panel_width_samples: Sequence[dict[str, object]] = (),
     ) -> None:
         self._diagnostic_frames += 1
         self._last_diagnostics = {
@@ -207,6 +220,12 @@ class RgbdDoorDetector:
             self._cumulative_diagnostics[name] = (
                 int(self._cumulative_diagnostics.get(name, 0)) + int(count)
             )
+        # 只保留有限审计样本；宽度时序不参与检测或任务决策，扫描结束时一次性输出。
+        self._recent_panel_width_samples.extend(
+            dict(sample) for sample in panel_width_samples
+        )
+        if len(self._recent_panel_width_samples) > 256:
+            self._recent_panel_width_samples = self._recent_panel_width_samples[-256:]
 
     def detect_arrays(
         self,
@@ -217,6 +236,7 @@ class RgbdDoorDetector:
         *,
         stamp: float | None = None,
         diagnostics: MutableMapping[str, int] | None = None,
+        panel_width_samples: list[dict[str, object]] | None = None,
     ) -> list[DoorPanelObservation]:
         """检测一帧深色竖直门板并返回几何验证后的候选。
 
@@ -298,20 +318,15 @@ class RgbdDoorDetector:
             record("passed_valid_depth_pixels")
 
             median_depth = float(np.median(z))
-            plane_band = max(0.12, 0.08 * median_depth)
-            near_plane = np.abs(z - median_depth) <= plane_band
-            xs = xs[near_plane]
-            ys = ys[near_plane]
-            z = z[near_plane]
-            if len(z) < self.minimum_depth_pixels:
-                record("rejected_near_plane_pixels")
-                continue
-            record("passed_near_plane_pixels")
+            valid_depth_count = int(len(z))
 
-            # 高分辨率门板像素无需全部进入 SVD；均匀抽样保持控制周期稳定。
+            # 斜视门板在相机光轴 z 方向有真实深度梯度，不能先围绕中位深度裁剪，
+            # 否则会把同一平面的两侧误删并系统性压缩宽度。完整有效轮廓先拟合，
+            # 再由平面残差内点剔除门框、背景等不同表面。
             if len(z) > 5000:
                 indices = np.linspace(0, len(z) - 1, 5000, dtype=int)
                 xs, ys, z = xs[indices], ys[indices], z[indices]
+            record("passed_plane_candidate_pixels")
             optical_points = np.column_stack(
                 (
                     (xs.astype(float) - cx) * z / fx,
@@ -325,7 +340,8 @@ class RgbdDoorDetector:
                 continue
             normal_optical, center_optical, residuals = fit
             inliers = residuals <= max(0.02, 2.5 * self.maximum_plane_rmse)
-            if int(np.count_nonzero(inliers)) < self.minimum_depth_pixels:
+            inlier_count = int(np.count_nonzero(inliers))
+            if inlier_count < self.minimum_depth_pixels:
                 record("rejected_plane_inliers")
                 continue
             refined = _fit_plane(optical_points[inliers])
@@ -374,15 +390,6 @@ class RgbdDoorDetector:
                 np.percentile(world_points[:, 2], 97.5)
                 - np.percentile(world_points[:, 2], 2.5)
             )
-            if not self.minimum_panel_width <= width <= self.maximum_panel_width:
-                record("rejected_panel_width")
-                continue
-            record("passed_panel_width")
-            if height < self.minimum_panel_height:
-                record("rejected_panel_height")
-                continue
-            record("passed_panel_height")
-
             center_world = matrix @ np.asarray(
                 [center_optical[0], center_optical[1], center_optical[2], 1.0],
                 dtype=float,
@@ -395,6 +402,70 @@ class RgbdDoorDetector:
                 float(horizontal_normal[1]), float(horizontal_normal[0])
             )
             distance = float(np.linalg.norm(toward_camera))
+            camera_forward = matrix[:3, :3] @ np.asarray(
+                [0.0, 0.0, 1.0], dtype=float
+            )
+            camera_yaw = math.atan2(
+                float(camera_forward[1]), float(camera_forward[0])
+            )
+            candidate_yaw = math.atan2(
+                float(center_world[1] - camera_world[1]),
+                float(center_world[0] - camera_world[0]),
+            )
+            relative_bearing = math.atan2(
+                math.sin(candidate_yaw - camera_yaw),
+                math.cos(candidate_yaw - camera_yaw),
+            )
+            if width < self.minimum_panel_width:
+                gap = self.minimum_panel_width - width
+                if gap > 0.20:
+                    width_relation = "below_min_over_0.20"
+                elif gap > 0.10:
+                    width_relation = "below_min_0.10_to_0.20"
+                elif gap > 0.05:
+                    width_relation = "below_min_0.05_to_0.10"
+                else:
+                    width_relation = "below_min_under_0.05"
+            elif width > self.maximum_panel_width:
+                width_relation = "above_max"
+            else:
+                width_relation = "within_limits"
+            record(f"panel_width_{width_relation}")
+            if panel_width_samples is not None:
+                panel_width_samples.append(
+                    {
+                        "stamp": (
+                            None
+                            if resolved_stamp is None
+                            else round(resolved_stamp, 3)
+                        ),
+                        "width": round(width, 3),
+                        "relation": width_relation,
+                        "pixel_area": round(float(cv2.contourArea(contour)), 1),
+                        "valid_depth_count": valid_depth_count,
+                        "plane_candidate_count": int(len(optical_points)),
+                        "inlier_count": inlier_count,
+                        "median_depth": round(median_depth, 3),
+                        "plane_rmse": round(plane_rmse, 4),
+                        "bbox": [int(x), int(y), int(width_px), int(height_px)],
+                        "world_xy": [
+                            round(float(center_world[0]), 3),
+                            round(float(center_world[1]), 3),
+                        ],
+                        "outward_yaw": round(float(outward_yaw), 3),
+                        "distance": round(distance, 3),
+                        "relative_bearing": round(relative_bearing, 3),
+                    }
+                )
+            if not self.minimum_panel_width <= width <= self.maximum_panel_width:
+                record("rejected_panel_width")
+                continue
+            record("passed_panel_width")
+            if height < self.minimum_panel_height:
+                record("rejected_panel_height")
+                continue
+            record("passed_panel_height")
+
             center_roi = _center_roi((x, y, width_px, height_px), dark_mask.shape)
             center_dark_fraction = _mask_fraction(dark_mask, center_roi)
             observations.append(

@@ -66,7 +66,10 @@ TEST(ImuConstrainedOdometry, RecoversPlanarTranslationWithKnownOrientation) {
       SensorVectors(world_points, moved_translation), current_height_seed);
 
   ASSERT_TRUE(initialized.accepted);
+  EXPECT_EQ(initialized.status, ImuConstrainedOdometryStatus::kInitialFrame);
   ASSERT_TRUE(moved.accepted);
+  EXPECT_EQ(moved.status, ImuConstrainedOdometryStatus::kAccepted);
+  EXPECT_FALSE(moved.correction_was_clamped);
   EXPECT_GT(moved.correspondence_count, config.minimum_correspondences);
   EXPECT_NEAR(moved.translation.x(), moved_translation.x(), 0.01);
   EXPECT_NEAR(moved.translation.y(), moved_translation.y(), 0.01);
@@ -89,6 +92,10 @@ TEST(ImuConstrainedOdometry, RejectsFrameWithoutEnoughStructure) {
   const auto rejected = odometry.RegisterFrame(isolated_points, initial_translation);
 
   EXPECT_FALSE(rejected.accepted);
+  EXPECT_EQ(rejected.status,
+            ImuConstrainedOdometryStatus::kInsufficientSource);
+  EXPECT_STREQ(ImuConstrainedOdometryStatusName(rejected.status),
+               "insufficient_source");
   EXPECT_EQ(rejected.correspondence_count, 0U);
   EXPECT_NEAR(rejected.translation.x(), initial_translation.x(), 1e-12);
   EXPECT_NEAR(rejected.translation.y(), initial_translation.y(), 1e-12);
@@ -112,6 +119,30 @@ TEST(ImuConstrainedOdometry, SearchesTheFullConfiguredCorrespondenceRadius) {
   ASSERT_TRUE(moved.accepted);
   EXPECT_NEAR(moved.translation.x(), moved_translation.x(), 0.02);
   EXPECT_NEAR(moved.translation.y(), moved_translation.y(), 0.02);
+}
+
+TEST(ImuConstrainedOdometry, ReportsUnclampedCorrectionWhenSafetyLimitApplies) {
+  ImuConstrainedOdometryConfig config;
+  config.minimum_correspondences = 80;
+  config.maximum_correspondence_distance = 0.55;
+  config.maximum_correction_from_prior = 0.005;
+  ImuConstrainedOdometry odometry(config);
+  const auto world_points = MakeAsymmetricStructure();
+  const Eigen::Vector3d initial_translation(-0.20, -3.10, 0.35);
+  const Eigen::Vector3d moved_translation(0.15, -3.10, 0.35);
+  ASSERT_TRUE(odometry.RegisterFrame(
+      SensorVectors(world_points, initial_translation), initial_translation).accepted);
+
+  const auto moved = odometry.RegisterFrame(
+      SensorVectors(world_points, moved_translation), initial_translation);
+
+  ASSERT_TRUE(moved.accepted);
+  EXPECT_EQ(moved.status, ImuConstrainedOdometryStatus::kAccepted);
+  EXPECT_TRUE(moved.correction_was_clamped);
+  EXPECT_GT(moved.unclamped_correction.norm(),
+            config.maximum_correction_from_prior);
+  EXPECT_NEAR((moved.translation - initial_translation).head<2>().norm(),
+              config.maximum_correction_from_prior, 1e-9);
 }
 
 }  // namespace

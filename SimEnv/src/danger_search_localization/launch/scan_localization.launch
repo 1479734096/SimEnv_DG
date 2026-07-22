@@ -25,6 +25,8 @@
   <arg name="health_required_unhealthy_frames" default="3"/>
   <arg name="health_required_unknown_frames" default="30"/>
   <arg name="health_latch_unhealthy" default="true"/>
+  <!-- /scan 为 10 Hz；单帧 5 mm 把慢漂校正速度限制在约 0.05 m/s。 -->
+  <arg name="scan_to_map_maximum_correction" default="0.005"/>
 
   <node pkg="danger_search_localization"
         type="scan_localization_node"
@@ -52,6 +54,11 @@
     <param name="velocity_minimum_interval" value="0.80"/>
     <param name="velocity_linear_deadband" value="0.05"/>
     <param name="velocity_angular_deadband" value="0.03"/>
+    <!-- 诊断只记录既有验收分支和稀疏异常，不改变融合验收或校正。 -->
+    <param name="diagnostic_large_translation_threshold" value="0.08"/>
+    <param name="diagnostic_summary_period" value="2.0"/>
+    <param name="scan_to_map_maximum_correction"
+           value="$(arg scan_to_map_maximum_correction)"/>
     <!-- 世界系建立后的持续姿态健康监控；只用 /scan 与 /trunk_imu。 -->
     <param name="stance_health_enabled" value="$(arg stance_health_enabled)"/>
     <param name="health_min_base_height" value="$(arg health_min_base_height)"/>
