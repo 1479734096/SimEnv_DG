@@ -851,6 +851,92 @@ class TakeElevatorTest(unittest.TestCase):
         self.assertEqual(task.phase, "ALIGN_TO_CURRENT_DOOR")
         self.assertIsNone(task.failure_reason)
 
+    def test_elevator_reverses_once_from_occ_start_then_retries_standard_plan(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        manager.elevator_planning_retry_limit = 3
+        retreat_requests = []
+        manager.elevator_start_retreat_target = (
+            lambda pose, floor: retreat_requests.append((pose, floor)) or (4.0, 3.0)
+        )
+        events = []
+        manager._log_structured = events.append
+        manager.controller.next_tick_status = DONE
+        task = TakeElevator(0, 1)
+
+        with patch(
+            "danger_search.navigation_tasks.astar_plan",
+            side_effect=(
+                PlanResult(status=UNREACHABLE),
+                PlanResult(status=UNREACHABLE),
+                PlanResult(status=UNREACHABLE),
+                PlanResult(path=[(4.0, 3.2), (0.85, 2.6)], status="reached"),
+            ),
+        ), patch(
+            "danger_search.navigation_tasks.get_time",
+            side_effect=(0.0, 0.6, 1.2, 1.2, 1.3, 2.0),
+        ):
+            for _ in range(3):
+                self.assertEqual(
+                    task.tick(manager, (4.0, 4.0, math.pi / 2.0)), RUNNING
+                )
+            self.assertEqual(task.phase, "ELEVATOR_START_RETREAT")
+            self.assertEqual(
+                task.tick(manager, (4.0, 4.0, math.pi / 2.0)), RUNNING
+            )
+            self.assertEqual(
+                manager.controller.reverse_reasons,
+                ["elevator_start_clearance_retreat"],
+            )
+            self.assertEqual(
+                task.tick(manager, (4.0, 3.2, math.pi / 2.0)), RUNNING
+            )
+            self.assertEqual(task.phase, "GO_TO_ELEVATOR_DOOR")
+            self.assertEqual(
+                task.tick(manager, (4.0, 3.2, math.pi / 2.0)), RUNNING
+            )
+
+        self.assertEqual(len(retreat_requests), 1)
+        self.assertEqual(task.phase, "ALIGN_TO_CURRENT_DOOR")
+        self.assertIsNone(task.failure_reason)
+        self.assertEqual(
+            [event["event"] for event in events if "start_retreat" in event["event"]],
+            ["elevator_start_retreat_started", "elevator_start_retreat_completed"],
+        )
+
+    def test_elevator_start_retreat_heading_divergence_fails_closed(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        events = []
+        manager._log_structured = events.append
+        task = TakeElevator(0, 1)
+        task.phase = "ELEVATOR_START_RETREAT"
+        task._start_retreat_target_xy = (3.0, 4.0)
+        task._start_retreat_deadline = 20.0
+
+        with patch("danger_search.navigation_tasks.get_time", return_value=10.0):
+            status = task.tick(manager, (4.0, 4.0, math.pi / 2.0))
+
+        self.assertEqual(status, FAILED)
+        self.assertEqual(task.failure_reason, "elevator_start_retreat_failed")
+        self.assertEqual(manager.controller.reverse_reasons, [])
+        self.assertIn("elevator_start_retreat_failed", manager.controller.stop_reasons)
+        self.assertEqual(events[0]["detail"], "reverse_heading_diverged")
+
     def test_elevator_stuck_recovery_is_bounded(self):
         grid = MultiFloorGridMap(
             resolution=0.1,

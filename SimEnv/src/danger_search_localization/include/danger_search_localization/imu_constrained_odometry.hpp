@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -78,6 +79,28 @@ struct ImuConstrainedOdometryResult {
       ImuConstrainedOdometryStatus::kInsufficientSource;
   Eigen::Vector2d unclamped_correction = Eigen::Vector2d::Zero();
   bool correction_was_clamped = false;
+  std::size_t source_point_count = 0;
+  std::size_t matched_correspondence_count = 0;
+  std::size_t map_point_count = 0;
+  int iteration_count = 0;
+  double residual_p50 = std::numeric_limits<double>::quiet_NaN();
+  double residual_p70 = std::numeric_limits<double>::quiet_NaN();
+  double residual_p90 = std::numeric_limits<double>::quiet_NaN();
+  Eigen::Vector2d residual_mean = Eigen::Vector2d::Constant(
+      std::numeric_limits<double>::quiet_NaN());
+  Eigen::Vector2d residual_median = Eigen::Vector2d::Constant(
+      std::numeric_limits<double>::quiet_NaN());
+  Eigen::Vector2d residual_mad = Eigen::Vector2d::Constant(
+      std::numeric_limits<double>::quiet_NaN());
+  Eigen::Vector2d residual_positive_fraction = Eigen::Vector2d::Constant(
+      std::numeric_limits<double>::quiet_NaN());
+  Eigen::Vector2d residual_negative_fraction = Eigen::Vector2d::Constant(
+      std::numeric_limits<double>::quiet_NaN());
+  double residual_covariance_min_eigenvalue =
+      std::numeric_limits<double>::quiet_NaN();
+  double residual_covariance_max_eigenvalue =
+      std::numeric_limits<double>::quiet_NaN();
+  double residual_anisotropy = std::numeric_limits<double>::quiet_NaN();
 };
 
 /// 在 IMU 已固定旋转的条件下，仅估计平面平移的局部扫描匹配器。
@@ -101,18 +124,26 @@ class ImuConstrainedOdometry {
     const auto source = kiss_icp::VoxelDownsample(
         map_frame, config_.source_voxel_size);
     if (source.size() < config_.minimum_correspondences) {
-      return Rejected(
+      auto rejected = Rejected(
           translation_prior, 0,
           ImuConstrainedOdometryStatus::kInsufficientSource);
+      rejected.source_point_count = source.size();
+      rejected.map_point_count = map_points_.size();
+      return rejected;
     }
 
     if (!initialized_) {
       UpdateMap(map_frame, translation_prior);
       last_translation_ = translation_prior;
       initialized_ = true;
-      return {true, translation_prior, source.size(),
-              ImuConstrainedOdometryStatus::kInitialFrame,
-              Eigen::Vector2d::Zero(), false};
+      ImuConstrainedOdometryResult result;
+      result.accepted = true;
+      result.translation = translation_prior;
+      result.correspondence_count = source.size();
+      result.status = ImuConstrainedOdometryStatus::kInitialFrame;
+      result.source_point_count = source.size();
+      result.map_point_count = map_points_.size();
+      return result;
     }
 
     Eigen::Vector3d estimate = translation_prior;
@@ -120,8 +151,29 @@ class ImuConstrainedOdometry {
     // 竖直墙面把 z 与 xy 的退化方向互相污染。
     estimate.z() = translation_prior.z();
     std::size_t retained_count = 0;
+    std::size_t matched_count = 0;
+    int iteration_count = 0;
+    double residual_p50 = std::numeric_limits<double>::quiet_NaN();
+    double residual_p70 = std::numeric_limits<double>::quiet_NaN();
+    double residual_p90 = std::numeric_limits<double>::quiet_NaN();
+    Eigen::Vector2d residual_mean = Eigen::Vector2d::Constant(
+        std::numeric_limits<double>::quiet_NaN());
+    Eigen::Vector2d residual_median = Eigen::Vector2d::Constant(
+        std::numeric_limits<double>::quiet_NaN());
+    Eigen::Vector2d residual_mad = Eigen::Vector2d::Constant(
+        std::numeric_limits<double>::quiet_NaN());
+    Eigen::Vector2d residual_positive_fraction = Eigen::Vector2d::Constant(
+        std::numeric_limits<double>::quiet_NaN());
+    Eigen::Vector2d residual_negative_fraction = Eigen::Vector2d::Constant(
+        std::numeric_limits<double>::quiet_NaN());
+    double residual_covariance_min_eigenvalue =
+        std::numeric_limits<double>::quiet_NaN();
+    double residual_covariance_max_eigenvalue =
+        std::numeric_limits<double>::quiet_NaN();
+    double residual_anisotropy = std::numeric_limits<double>::quiet_NaN();
     bool has_valid_iteration = false;
     for (int iteration = 0; iteration < config_.maximum_iterations; ++iteration) {
+      iteration_count = iteration + 1;
       std::vector<Eigen::Vector3d> world_source;
       world_source.reserve(source.size());
       for (const auto &point : source) {
@@ -130,6 +182,7 @@ class ImuConstrainedOdometry {
       const auto correspondences = FindCorrespondences(world_source);
       const auto &matched_source = correspondences.first;
       const auto &matched_target = correspondences.second;
+      matched_count = matched_source.size();
       if (matched_source.size() < config_.minimum_correspondences) {
         break;
       }
@@ -140,7 +193,11 @@ class ImuConstrainedOdometry {
         residual_norms.push_back(
             (matched_target[index] - matched_source[index]).head<2>().norm());
       }
-      const double quantile = Quantile(residual_norms, config_.residual_quantile);
+      residual_p50 = Quantile(residual_norms, 0.50);
+      residual_p70 = Quantile(residual_norms, 0.70);
+      residual_p90 = Quantile(residual_norms, 0.90);
+      const double quantile =
+          Quantile(residual_norms, config_.residual_quantile);
       const double cutoff = std::max(config_.minimum_residual_cutoff, quantile);
       std::vector<double> residual_x;
       std::vector<double> residual_y;
@@ -158,7 +215,62 @@ class ImuConstrainedOdometry {
         break;
       }
 
-      Eigen::Vector2d delta(Median(residual_x), Median(residual_y));
+      residual_median =
+          Eigen::Vector2d(Median(residual_x), Median(residual_y));
+      residual_mean.setZero();
+      residual_positive_fraction.setZero();
+      residual_negative_fraction.setZero();
+      for (std::size_t index = 0; index < retained_count; ++index) {
+        residual_mean.x() += residual_x[index];
+        residual_mean.y() += residual_y[index];
+        residual_positive_fraction.x() += residual_x[index] > 0.0 ? 1.0 : 0.0;
+        residual_positive_fraction.y() += residual_y[index] > 0.0 ? 1.0 : 0.0;
+        residual_negative_fraction.x() += residual_x[index] < 0.0 ? 1.0 : 0.0;
+        residual_negative_fraction.y() += residual_y[index] < 0.0 ? 1.0 : 0.0;
+      }
+      const double retained_denominator = static_cast<double>(retained_count);
+      residual_mean /= retained_denominator;
+      residual_positive_fraction /= retained_denominator;
+      residual_negative_fraction /= retained_denominator;
+
+      std::vector<double> absolute_deviation_x;
+      std::vector<double> absolute_deviation_y;
+      absolute_deviation_x.reserve(retained_count);
+      absolute_deviation_y.reserve(retained_count);
+      double covariance_xx = 0.0;
+      double covariance_xy = 0.0;
+      double covariance_yy = 0.0;
+      for (std::size_t index = 0; index < retained_count; ++index) {
+        absolute_deviation_x.push_back(
+            std::abs(residual_x[index] - residual_median.x()));
+        absolute_deviation_y.push_back(
+            std::abs(residual_y[index] - residual_median.y()));
+        const double centered_x = residual_x[index] - residual_mean.x();
+        const double centered_y = residual_y[index] - residual_mean.y();
+        covariance_xx += centered_x * centered_x;
+        covariance_xy += centered_x * centered_y;
+        covariance_yy += centered_y * centered_y;
+      }
+      residual_mad = Eigen::Vector2d(
+          Median(absolute_deviation_x), Median(absolute_deviation_y));
+      covariance_xx /= retained_denominator;
+      covariance_xy /= retained_denominator;
+      covariance_yy /= retained_denominator;
+      const double covariance_trace = covariance_xx + covariance_yy;
+      const double covariance_discriminant = std::sqrt(std::max(
+          0.0, (covariance_xx - covariance_yy) *
+                       (covariance_xx - covariance_yy) +
+                   4.0 * covariance_xy * covariance_xy));
+      residual_covariance_min_eigenvalue =
+          0.5 * (covariance_trace - covariance_discriminant);
+      residual_covariance_max_eigenvalue =
+          0.5 * (covariance_trace + covariance_discriminant);
+      residual_anisotropy = residual_covariance_max_eigenvalue > 1e-12
+                                ? residual_covariance_min_eigenvalue /
+                                      residual_covariance_max_eigenvalue
+                                : 0.0;
+
+      Eigen::Vector2d delta = residual_median;
       if (delta.norm() > config_.maximum_iteration_step) {
         delta *= config_.maximum_iteration_step / delta.norm();
       }
@@ -170,9 +282,14 @@ class ImuConstrainedOdometry {
       }
     }
     if (!has_valid_iteration || retained_count < config_.minimum_correspondences) {
-      return Rejected(
+      auto rejected = Rejected(
           translation_prior, retained_count,
           ImuConstrainedOdometryStatus::kInsufficientCorrespondences);
+      rejected.source_point_count = source.size();
+      rejected.matched_correspondence_count = matched_count;
+      rejected.map_point_count = map_points_.size();
+      rejected.iteration_count = iteration_count;
+      return rejected;
     }
 
     Eigen::Vector2d correction =
@@ -188,9 +305,31 @@ class ImuConstrainedOdometry {
 
     UpdateMap(map_frame, estimate);
     last_translation_ = estimate;
-    return {true, estimate, retained_count,
-            ImuConstrainedOdometryStatus::kAccepted,
-            unclamped_correction, correction_was_clamped};
+    ImuConstrainedOdometryResult result;
+    result.accepted = true;
+    result.translation = estimate;
+    result.correspondence_count = retained_count;
+    result.status = ImuConstrainedOdometryStatus::kAccepted;
+    result.unclamped_correction = unclamped_correction;
+    result.correction_was_clamped = correction_was_clamped;
+    result.source_point_count = source.size();
+    result.matched_correspondence_count = matched_count;
+    result.map_point_count = map_points_.size();
+    result.iteration_count = iteration_count;
+    result.residual_p50 = residual_p50;
+    result.residual_p70 = residual_p70;
+    result.residual_p90 = residual_p90;
+    result.residual_mean = residual_mean;
+    result.residual_median = residual_median;
+    result.residual_mad = residual_mad;
+    result.residual_positive_fraction = residual_positive_fraction;
+    result.residual_negative_fraction = residual_negative_fraction;
+    result.residual_covariance_min_eigenvalue =
+        residual_covariance_min_eigenvalue;
+    result.residual_covariance_max_eigenvalue =
+        residual_covariance_max_eigenvalue;
+    result.residual_anisotropy = residual_anisotropy;
+    return result;
   }
 
  private:

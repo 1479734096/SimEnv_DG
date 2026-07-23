@@ -19,6 +19,7 @@ ELEVATOR_TEST_FULL_CYCLE="${ELEVATOR_TEST_FULL_CYCLE:-0}"
 ELEVATOR_TEST_RECORD_DRIFT="${ELEVATOR_TEST_RECORD_DRIFT:-0}"
 ELEVATOR_TEST_RECORD_RGBD="${ELEVATOR_TEST_RECORD_RGBD:-0}"
 ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH="${ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH:-0}"
+ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS="${ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS:-0}"
 LOG_DIR="${ELEVATOR_TEST_LOG_DIR:-/tmp/danger_search_elevator_test_$(date +%Y%m%d_%H%M%S)}"
 
 AUTO_PID=""
@@ -53,6 +54,7 @@ usage() {
   ELEVATOR_TEST_RECORD_DRIFT=1          录制自身定位、控制和姿态诊断 bag
   ELEVATOR_TEST_RECORD_RGBD=1           额外录制 RGB-D 供失败后离线重放
   ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1  同时录制真值供运行结束后离线漂移评估
+  ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=1  启用逐帧定位日志并在诊断 bag 录制 /scan
   ELEVATOR_TEST_KEEP_RUNNING=1         成功后保留 GUI，按 Ctrl-C 清理
   ELEVATOR_TEST_LOG_DIR=/tmp/...       证据目录
 
@@ -101,9 +103,13 @@ write_summary() {
     printf 'record_drift=%s\n' "$ELEVATOR_TEST_RECORD_DRIFT"
     printf 'record_rgbd=%s\n' "$ELEVATOR_TEST_RECORD_RGBD"
     printf 'offline_truth=%s\n' "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH"
+    printf 'localization_diagnostics=%s\n' "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS"
     printf 'diagnostic_bag=%s/elevator_diagnostic.bag\n' "$LOG_DIR"
     printf 'rgbd_bag=%s/elevator_rgbd.bag\n' "$LOG_DIR"
     printf 'drift_summary=%s/localization_drift.json\n' "$LOG_DIR"
+    printf 'localization_quality=%s/localization_quality.json\n' "$LOG_DIR"
+    printf 'localization_quality_samples=%s/localization_quality.csv\n' "$LOG_DIR"
+    printf 'localization_motion_windows=%s/localization_motion_windows.csv\n' "$LOG_DIR"
     printf 'mission_log=%s/mission.log\n' "$LOG_DIR"
     printf 'auto_log=%s/auto.log\n' "$LOG_DIR"
     printf 'result_file=%s/results/detected_danger.json\n' "$WORKSPACE_ROOT"
@@ -130,6 +136,16 @@ cleanup() {
       --csv "$LOG_DIR/localization_drift.csv" \
       --json "$LOG_DIR/localization_drift.json" \
       > "$LOG_DIR/localization_drift.log" 2>&1 || true
+  fi
+  if [[ "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" == "1" && \
+        "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" == "1" && \
+        -f "$LOG_DIR/elevator_diagnostic.bag" ]]; then
+    python3 "$WORKSPACE_ROOT/tools/offline/analyze_localization_quality_bag.py" \
+      "$LOG_DIR/elevator_diagnostic.bag" \
+      --csv "$LOG_DIR/localization_quality.csv" \
+      --windows-csv "$LOG_DIR/localization_motion_windows.csv" \
+      --json "$LOG_DIR/localization_quality.json" \
+      > "$LOG_DIR/localization_quality.log" 2>&1 || true
   fi
   terminate_group "$MISSION_PID" TERM
   terminate_group "$AUTO_PID" TERM
@@ -205,7 +221,7 @@ if [[ "$ELEVATOR_TEST_FULL_CYCLE" != "0" && "$ELEVATOR_TEST_FULL_CYCLE" != "1" ]
   printf 'ELEVATOR_TEST_FULL_CYCLE 只能是 0 或 1\n' >&2
   exit 2
 fi
-for flag in "$ELEVATOR_TEST_RECORD_DRIFT" "$ELEVATOR_TEST_RECORD_RGBD" "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH"; do
+for flag in "$ELEVATOR_TEST_RECORD_DRIFT" "$ELEVATOR_TEST_RECORD_RGBD" "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS"; do
   if [[ "$flag" != "0" && "$flag" != "1" ]]; then
     printf '诊断开关只能是 0 或 1：%s\n' "$flag" >&2
     exit 2
@@ -213,6 +229,10 @@ for flag in "$ELEVATOR_TEST_RECORD_DRIFT" "$ELEVATOR_TEST_RECORD_RGBD" "$ELEVATO
 done
 if [[ "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" == "1" && "$ELEVATOR_TEST_RECORD_DRIFT" != "1" ]]; then
   printf '启用离线真值时必须同时设置 ELEVATOR_TEST_RECORD_DRIFT=1\n' >&2
+  exit 2
+fi
+if [[ "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" == "1" && "$ELEVATOR_TEST_RECORD_DRIFT" != "1" ]]; then
+  printf '启用逐帧定位诊断时必须同时设置 ELEVATOR_TEST_RECORD_DRIFT=1\n' >&2
   exit 2
 fi
 
@@ -325,6 +345,7 @@ fi
 log "机器人已站立并进入 /cmd_vel 模式，启动正式任务节点"
 setsid roslaunch danger_search danger_search.launch \
   config:="$TEST_CONFIG" \
+  localization_diagnostic_frame_details:="$([[ "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" == "1" ]] && printf true || printf false)" \
   > "$MISSION_LOG" 2>&1 &
 MISSION_PID=$!
 
@@ -339,6 +360,9 @@ if [[ "$ELEVATOR_TEST_RECORD_DRIFT" == "1" ]]; then
   )
   if [[ "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" == "1" ]]; then
     bag_topics+=(/ground_truth/base_w)
+  fi
+  if [[ "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" == "1" ]]; then
+    bag_topics+=(/scan)
   fi
   setsid rosbag record --buffsize=64 \
     -O "$LOG_DIR/elevator_diagnostic.bag" \

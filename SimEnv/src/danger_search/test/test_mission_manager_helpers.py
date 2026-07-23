@@ -26,7 +26,7 @@ from danger_search.ground_support_gate import (
     GroundSupportGateConfig,
     GroundSupportSafetyGate,
 )
-from danger_search.mapper import BLACK, NEGATIVE, OCC, VISITED, MultiFloorGridMap
+from danger_search.mapper import BLACK, FREE, NEGATIVE, OCC, VISITED, MultiFloorGridMap
 import danger_search.mission_manager as mission_manager_module
 from danger_search.mission_manager import (
     CHANGE_FLOOR,
@@ -3381,6 +3381,59 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
 
         self.assertEqual(candidates, [(0.6, 2.3)])
+
+    def test_elevator_start_retreat_uses_only_initial_occ_inflation_and_trace(self):
+        manager = MissionManager.__new__(MissionManager)
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        grid.data[:, :] = FREE
+        start = grid.world_to_grid(2.0, 2.0)
+        for offset in range(3):
+            grid.data[start[1], start[0] - offset] = OCC
+        manager.mapper = SimpleNamespace(floor=lambda _floor: grid)
+        manager._floor_navigation_traces = {
+            1: [(1.0, 2.0), (1.8, 2.0), (2.0, 2.0)]
+        }
+        manager.no_frontier_rotation_min_clearance = 0.40
+        manager.no_frontier_retreat_clearance_margin = 0.10
+
+        target = manager.elevator_start_retreat_target((2.0, 2.0, 0.0), 1)
+
+        self.assertEqual(target, (1.0, 2.0))
+        self.assertEqual(int(grid.data[start[1], start[0]]), OCC)
+
+    def test_elevator_start_retreat_rejects_safety_cells_and_occ_reentry(self):
+        manager = MissionManager.__new__(MissionManager)
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        grid.data[:, :] = FREE
+        manager.mapper = SimpleNamespace(floor=lambda _floor: grid)
+        manager._floor_navigation_traces = {1: [(1.0, 2.0), (2.0, 2.0)]}
+        manager.no_frontier_rotation_min_clearance = 0.40
+        manager.no_frontier_retreat_clearance_margin = 0.10
+        start = grid.world_to_grid(2.0, 2.0)
+        reentry = grid.world_to_grid(1.5, 2.0)
+
+        grid.data[start[1], start[0]] = BLACK
+        self.assertIsNone(
+            manager.elevator_start_retreat_target((2.0, 2.0, 0.0), 1)
+        )
+
+        grid.data[start[1], start[0]] = OCC
+        grid.data[reentry[1], reentry[0]] = OCC
+        self.assertIsNone(
+            manager.elevator_start_retreat_target((2.0, 2.0, 0.0), 1)
+        )
 
     def test_visual_preparation_closes_initially_open_elevator_only_once(self):
         manager = MissionManager.__new__(MissionManager)

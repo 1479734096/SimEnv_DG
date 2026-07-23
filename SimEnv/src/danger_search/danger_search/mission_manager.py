@@ -5134,6 +5134,54 @@ class MissionManager:
                 break
         return selected
 
+    def elevator_start_retreat_target(
+        self,
+        pose: tuple[float, float, float],
+        floor_index: int,
+    ) -> tuple[float, float] | None:
+        """起点仅被实体膨胀覆盖时，选一条已实际走过的直线退路。"""
+        grid = self.mapper.floor(int(floor_index))
+        start_cell = grid.world_to_grid(float(pose[0]), float(pose[1]))
+        if start_cell is None or int(grid.data[start_cell[1], start_cell[0]]) != OCC:
+            return None
+
+        trace = list(
+            getattr(self, "_floor_navigation_traces", {}).get(int(floor_index), ())
+        )
+        required_clearance = float(
+            getattr(self, "no_frontier_rotation_min_clearance", 0.40)
+        ) + float(getattr(self, "no_frontier_retreat_clearance_margin", 0.10))
+        for trace_point in reversed(trace):
+            target = (float(trace_point[0]), float(trace_point[1]))
+            distance = math.hypot(target[0] - pose[0], target[1] - pose[1])
+            if distance < 0.5 or distance > 1.5:
+                continue
+            target_cell = grid.world_to_grid(*target)
+            if target_cell is None or not grid.is_traversable(*target_cell):
+                continue
+            if not self._grid_cell_has_clearance(
+                grid,
+                target_cell,
+                required_clearance,
+            ):
+                continue
+            target_direction = math.atan2(target[1] - pose[1], target[0] - pose[0])
+            backward_error = math.atan2(
+                math.sin(target_direction - pose[2] - math.pi),
+                math.cos(target_direction - pose[2] - math.pi),
+            )
+            if abs(backward_error) > 0.35:
+                continue
+            if not self._initial_occ_escape_segment_is_safe(
+                grid,
+                (float(pose[0]), float(pose[1])),
+                target,
+                maximum_initial_occ_distance=0.35,
+            ):
+                continue
+            return target
+        return None
+
     def _register_elevator_geometry(
         self,
         elevator_feature,
@@ -5575,6 +5623,47 @@ class MissionManager:
                 if int(grid.data[gy, gx]) in (OCC, BLACK, NEGATIVE):
                     return False
         return True
+
+    @staticmethod
+    def _initial_occ_escape_segment_is_safe(
+        grid: FloorGrid,
+        start_xy: tuple[float, float],
+        target_xy: tuple[float, float],
+        *,
+        maximum_initial_occ_distance: float,
+    ) -> bool:
+        """只豁免起点附近连续 OCC 膨胀带，脱离后不允许再次进入障碍。"""
+        distance = math.hypot(
+            target_xy[0] - start_xy[0],
+            target_xy[1] - start_xy[1],
+        )
+        if distance <= 1e-9:
+            return False
+        step_count = max(
+            1,
+            int(math.ceil(distance / max(0.5 * grid.resolution, 1e-6))),
+        )
+        reached_traversable = False
+        for index in range(1, step_count + 1):
+            progress = distance * index / step_count
+            ratio = index / step_count
+            cell = grid.world_to_grid(
+                start_xy[0] + (target_xy[0] - start_xy[0]) * ratio,
+                start_xy[1] + (target_xy[1] - start_xy[1]) * ratio,
+            )
+            if cell is None:
+                return False
+            state = int(grid.data[cell[1], cell[0]])
+            if state in (BLACK, NEGATIVE, UNKNOWN):
+                return False
+            if state == OCC:
+                if reached_traversable or progress > maximum_initial_occ_distance:
+                    return False
+                continue
+            if state not in (FREE, VISITED):
+                return False
+            reached_traversable = True
+        return reached_traversable
 
     def _exhaust_no_frontier_escape(self, reason: str) -> bool:
         self._no_frontier_escape_state = "exhausted"

@@ -664,6 +664,9 @@ class TakeElevator(NavigationTask):
         self._approach_trace_candidates: list[tuple[float, float]] = []
         self._approach_trace_index = 0
         self._approach_trace_attempted = False
+        self._start_retreat_attempted = False
+        self._start_retreat_target_xy: tuple[float, float] | None = None
+        self._start_retreat_deadline = 0.0
 
     def tick(self, manager: MissionManager, pose: tuple[float, float, float]) -> str:
         """推进一个乘梯阶段；任一失败都显式返回 FAILED 而不猜测所在楼层。"""
@@ -702,11 +705,14 @@ class TakeElevator(NavigationTask):
             elif self.failure_reason is not None:
                 if (
                     self.failure_reason == "elevator_navigation_unreachable"
-                    and self._begin_trace_approach(manager)
+                    and self._begin_start_retreat_or_trace_approach(manager, pose)
                 ):
                     return RUNNING
                 return FAILED
             return RUNNING
+
+        if self.phase == "ELEVATOR_START_RETREAT":
+            return self._tick_start_retreat(manager, pose)
 
         if self.phase == "GO_TO_ELEVATOR_TRACE_APPROACH":
             if not self._approach_trace_candidates:
@@ -1754,6 +1760,136 @@ class TakeElevator(NavigationTask):
             float(wait_xy[0]) + extra * dx / norm,
             float(wait_xy[1]) + extra * dy / norm,
         )
+
+    def _begin_start_retreat_or_trace_approach(
+        self,
+        manager: MissionManager,
+        pose: tuple[float, float, float],
+    ) -> bool:
+        if not self._start_retreat_attempted:
+            self._start_retreat_attempted = True
+            target_provider = getattr(manager, "elevator_start_retreat_target", None)
+            target = (
+                target_provider(pose, self.current_floor)
+                if callable(target_provider)
+                else None
+            )
+            if target is not None:
+                self._start_retreat_target_xy = (
+                    float(target[0]),
+                    float(target[1]),
+                )
+                distance = math.hypot(
+                    self._start_retreat_target_xy[0] - pose[0],
+                    self._start_retreat_target_xy[1] - pose[1],
+                )
+                reverse_speed = abs(
+                    float(getattr(manager.controller, "reverse_speed", -0.15))
+                )
+                self._start_retreat_deadline = get_time() + max(
+                    4.0,
+                    distance / max(0.05, reverse_speed) + 2.0,
+                )
+                manager.controller.clear_path(reason="elevator_start_retreat_start")
+                self._reset_navigation_watchdog(clear_failure=True)
+                self.phase = "ELEVATOR_START_RETREAT"
+                self._log_start_retreat(
+                    manager,
+                    "elevator_start_retreat_started",
+                    pose,
+                    self._start_retreat_target_xy,
+                )
+                return True
+        return self._begin_trace_approach(manager)
+
+    def _tick_start_retreat(
+        self,
+        manager: MissionManager,
+        pose: tuple[float, float, float],
+    ) -> str:
+        target = self._start_retreat_target_xy
+        if target is None:
+            return self._fail_start_retreat(manager, pose, "target_missing")
+        distance = math.hypot(target[0] - pose[0], target[1] - pose[1])
+        if distance <= 0.25:
+            manager.controller.stop(reason="elevator_start_retreat_completed")
+            self._log_start_retreat(
+                manager,
+                "elevator_start_retreat_completed",
+                pose,
+                target,
+            )
+            self._start_retreat_target_xy = None
+            self._start_retreat_deadline = 0.0
+            self._reset_navigation_watchdog(clear_failure=True)
+            self.phase = "GO_TO_ELEVATOR_DOOR"
+            return RUNNING
+        if get_time() >= self._start_retreat_deadline:
+            return self._fail_start_retreat(manager, pose, "retreat_timeout")
+        target_direction = math.atan2(target[1] - pose[1], target[0] - pose[0])
+        backward_error = _angle_wrap(target_direction - pose[2] - math.pi)
+        if abs(backward_error) > 0.45:
+            return self._fail_start_retreat(
+                manager,
+                pose,
+                "reverse_heading_diverged",
+            )
+        if not manager.controller.reverse_straight(
+            reason="elevator_start_clearance_retreat"
+        ):
+            return self._fail_start_retreat(
+                manager,
+                pose,
+                "reverse_command_rejected",
+            )
+        return RUNNING
+
+    def _fail_start_retreat(
+        self,
+        manager: MissionManager,
+        pose: tuple[float, float, float],
+        detail: str,
+    ) -> str:
+        target = self._start_retreat_target_xy
+        self._log_start_retreat(
+            manager,
+            "elevator_start_retreat_failed",
+            pose,
+            target,
+            detail=detail,
+        )
+        self._start_retreat_target_xy = None
+        self._start_retreat_deadline = 0.0
+        return self._fail_navigation(
+            manager,
+            "elevator_start_retreat_failed",
+            detail,
+        )
+
+    def _log_start_retreat(
+        self,
+        manager: MissionManager,
+        event: str,
+        pose: tuple[float, float, float],
+        target: tuple[float, float] | None,
+        *,
+        detail: str | None = None,
+    ) -> None:
+        log_structured = getattr(manager, "_log_structured", None)
+        if not callable(log_structured):
+            return
+        payload = {
+            "event": str(event),
+            "task": self.name,
+            "current_floor": int(self.current_floor),
+            "pose": [round(float(pose[0]), 3), round(float(pose[1]), 3)],
+            "target": None
+            if target is None
+            else [round(float(target[0]), 3), round(float(target[1]), 3)],
+        }
+        if detail is not None:
+            payload["detail"] = str(detail)
+        log_structured(payload)
 
     def _begin_trace_approach(self, manager: MissionManager) -> bool:
         if self._approach_trace_attempted:

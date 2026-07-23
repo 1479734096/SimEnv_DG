@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <Eigen/Core>
 #include <random>
 #include <vector>
@@ -67,10 +68,35 @@ TEST(ImuConstrainedOdometry, RecoversPlanarTranslationWithKnownOrientation) {
 
   ASSERT_TRUE(initialized.accepted);
   EXPECT_EQ(initialized.status, ImuConstrainedOdometryStatus::kInitialFrame);
+  EXPECT_EQ(initialized.source_point_count, initialized.correspondence_count);
+  EXPECT_EQ(initialized.matched_correspondence_count, 0U);
+  EXPECT_GT(initialized.map_point_count, 0U);
   ASSERT_TRUE(moved.accepted);
   EXPECT_EQ(moved.status, ImuConstrainedOdometryStatus::kAccepted);
   EXPECT_FALSE(moved.correction_was_clamped);
   EXPECT_GT(moved.correspondence_count, config.minimum_correspondences);
+  EXPECT_GE(moved.source_point_count, moved.matched_correspondence_count);
+  EXPECT_GE(moved.matched_correspondence_count, moved.correspondence_count);
+  EXPECT_GT(moved.map_point_count, 0U);
+  EXPECT_GE(moved.iteration_count, 1);
+  EXPECT_TRUE(std::isfinite(moved.residual_p50));
+  EXPECT_TRUE(std::isfinite(moved.residual_p70));
+  EXPECT_TRUE(std::isfinite(moved.residual_p90));
+  EXPECT_LE(moved.residual_p50, moved.residual_p70);
+  EXPECT_LE(moved.residual_p70, moved.residual_p90);
+  EXPECT_TRUE(moved.residual_mean.allFinite());
+  EXPECT_TRUE(moved.residual_median.allFinite());
+  EXPECT_TRUE(moved.residual_mad.allFinite());
+  EXPECT_GE(moved.residual_mad.minCoeff(), 0.0);
+  EXPECT_GE(moved.residual_positive_fraction.minCoeff(), 0.0);
+  EXPECT_LE(moved.residual_positive_fraction.maxCoeff(), 1.0);
+  EXPECT_GE(moved.residual_negative_fraction.minCoeff(), 0.0);
+  EXPECT_LE(moved.residual_negative_fraction.maxCoeff(), 1.0);
+  EXPECT_GE(moved.residual_covariance_min_eigenvalue, -1e-12);
+  EXPECT_GE(moved.residual_covariance_max_eigenvalue,
+            moved.residual_covariance_min_eigenvalue);
+  EXPECT_GE(moved.residual_anisotropy, 0.0);
+  EXPECT_LE(moved.residual_anisotropy, 1.0);
   EXPECT_NEAR(moved.translation.x(), moved_translation.x(), 0.01);
   EXPECT_NEAR(moved.translation.y(), moved_translation.y(), 0.01);
   EXPECT_DOUBLE_EQ(moved.translation.z(), moved_translation.z());
@@ -97,6 +123,10 @@ TEST(ImuConstrainedOdometry, RejectsFrameWithoutEnoughStructure) {
   EXPECT_STREQ(ImuConstrainedOdometryStatusName(rejected.status),
                "insufficient_source");
   EXPECT_EQ(rejected.correspondence_count, 0U);
+  EXPECT_GT(rejected.map_point_count, 0U);
+  EXPECT_LT(rejected.source_point_count, config.minimum_correspondences);
+  EXPECT_EQ(rejected.matched_correspondence_count, 0U);
+  EXPECT_TRUE(std::isnan(rejected.residual_p50));
   EXPECT_NEAR(rejected.translation.x(), initial_translation.x(), 1e-12);
   EXPECT_NEAR(rejected.translation.y(), initial_translation.y(), 1e-12);
 }
@@ -125,7 +155,7 @@ TEST(ImuConstrainedOdometry, ReportsUnclampedCorrectionWhenSafetyLimitApplies) {
   ImuConstrainedOdometryConfig config;
   config.minimum_correspondences = 80;
   config.maximum_correspondence_distance = 0.55;
-  config.maximum_correction_from_prior = 0.005;
+  config.maximum_correction_from_prior = 0.10;
   ImuConstrainedOdometry odometry(config);
   const auto world_points = MakeAsymmetricStructure();
   const Eigen::Vector3d initial_translation(-0.20, -3.10, 0.35);

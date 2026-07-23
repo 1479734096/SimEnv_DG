@@ -25,8 +25,10 @@
   <arg name="health_required_unhealthy_frames" default="3"/>
   <arg name="health_required_unknown_frames" default="30"/>
   <arg name="health_latch_unhealthy" default="true"/>
-  <!-- /scan 为 10 Hz；单帧 5 mm 把慢漂校正速度限制在约 0.05 m/s。 -->
-  <arg name="scan_to_map_maximum_correction" default="0.005"/>
+  <!-- scan-to-map 是慢漂校正层，不允许一次匹配直接注入旧 0.25 m 上限。 -->
+  <arg name="scan_to_map_maximum_correction" default="0.10"/>
+  <!-- 逐帧质量日志仅用于隔离诊断，正式启动默认关闭。 -->
+  <arg name="diagnostic_frame_details" default="false"/>
 
   <node pkg="danger_search_localization"
         type="scan_localization_node"
@@ -59,6 +61,8 @@
     <param name="diagnostic_summary_period" value="2.0"/>
     <param name="scan_to_map_maximum_correction"
            value="$(arg scan_to_map_maximum_correction)"/>
+    <param name="diagnostic_frame_details"
+           value="$(arg diagnostic_frame_details)"/>
     <!-- 世界系建立后的持续姿态健康监控；只用 /scan 与 /trunk_imu。 -->
     <param name="stance_health_enabled" value="$(arg stance_health_enabled)"/>
     <param name="health_min_base_height" value="$(arg health_min_base_height)"/>

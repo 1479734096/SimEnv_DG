@@ -110,6 +110,20 @@ struct MapRegistrationDiagnosticStats {
   std::uint64_t clamped_count = 0;
 };
 
+struct MotionConsistencyDiagnosticState {
+  bool initialized = false;
+  ros::Time interval_start;
+  Eigen::Vector2d depth_anchor = Eigen::Vector2d::Zero();
+  Eigen::Vector2d livox_anchor = Eigen::Vector2d::Zero();
+  Eigen::Vector2d map_correction_anchor = Eigen::Vector2d::Zero();
+  Eigen::Vector2d fused_anchor = Eigen::Vector2d::Zero();
+  Eigen::Vector2d command_anchor = Eigen::Vector2d::Zero();
+  double previous_yaw = 0.0;
+  double absolute_yaw_change = 0.0;
+  std::size_t frame_count = 0;
+  std::size_t depth_fresh_count = 0;
+};
+
 std::filesystem::path ExpectedSceneInfoPath() {
   const std::string package = ros::package::getPath("danger_search");
   if (package.empty()) {
@@ -248,7 +262,8 @@ class ScanLocalizationNode {
     double velocity_angular_deadband = 0.03;
     double diagnostic_large_translation_threshold = 0.08;
     double diagnostic_summary_period = 2.0;
-    double scan_to_map_maximum_correction = 0.005;
+    double scan_to_map_maximum_correction = 0.10;
+    bool diagnostic_frame_details = false;
     std::string depth_cloud_topic = "/real_sense/depth/points";
     std::vector<double> base_to_livox_xyz;
     std::vector<double> base_to_livox_rpy;
@@ -321,6 +336,8 @@ class ScanLocalizationNode {
     private_nh_.param("scan_to_map_maximum_correction",
                       scan_to_map_maximum_correction,
                       scan_to_map_maximum_correction);
+    private_nh_.param("diagnostic_frame_details", diagnostic_frame_details,
+                      diagnostic_frame_details);
     private_nh_.param("depth_cloud_topic", depth_cloud_topic,
                       depth_cloud_topic);
     if (!std::isfinite(min_range) || !std::isfinite(max_range) || min_range < 0.0 ||
@@ -408,6 +425,7 @@ class ScanLocalizationNode {
     diagnostic_large_translation_threshold_ =
         diagnostic_large_translation_threshold;
     diagnostic_summary_period_ = diagnostic_summary_period;
+    diagnostic_frame_details_ = diagnostic_frame_details;
     stance_health_enabled_ = stance_health_enabled;
     danger_search_localization::StanceInitializationConfig stance_config;
     stance_config.minimum_base_height = initialization_min_base_height;
@@ -442,9 +460,8 @@ class ScanLocalizationNode {
         danger_search_localization::PoseVelocityEstimator(velocity_config);
     if (use_imu_constrained_ || use_rgbd_livox_) {
       danger_search_localization::ImuConstrainedOdometryConfig imu_config;
-      // scan-to-map 只负责修正点云里程计的慢漂；按 10 Hz /scan 把累计
-      // 校正速度限制在约 0.05 m/s，同时让返回位姿和写入局部地图使用
-      // 同一校正，避免形成两个坐标系。
+      // scan-to-map 只负责修正点云里程计的慢漂；限制单帧跳变量，同时让
+      // 返回位姿和写入局部地图使用同一校正，避免形成两个坐标系。
       imu_config.maximum_correction_from_prior =
           scan_to_map_maximum_correction;
       imu_odometry_ = std::make_unique<
@@ -759,11 +776,19 @@ class ScanLocalizationNode {
     const Eigen::Vector2d command_prior = CommandMotionPrior(
         last_depth_registration_stamp_, message->header.stamp,
         world_base_rotation);
+    const double frame_interval = last_depth_registration_stamp_.isZero()
+                                      ? std::numeric_limits<double>::quiet_NaN()
+                                      : message->header.stamp.toSec() -
+                                            last_depth_registration_stamp_.toSec();
     const auto result = depth_gicp_.RegisterFrame(points, command_prior);
     RecordPlanarRegistrationDiagnostic(
-        "rgbd_frame_gicp", message->header.stamp, result,
+        "rgbd_frame_gicp", message->header.stamp, frame_interval, result,
         &depth_registration_diagnostics_);
     if (result.point_count >= 80) {
+      if (diagnostic_frame_details_) {
+        std::lock_guard<std::mutex> fusion_lock(fusion_mutex_);
+        depth_command_total_ += command_prior;
+      }
       last_depth_registration_stamp_ = message->header.stamp;
     }
     if (!result.accepted) {
@@ -930,10 +955,14 @@ class ScanLocalizationNode {
       const Eigen::Vector2d command_prior = CommandMotionPrior(
           last_livox_registration_stamp_, message->header.stamp,
           world_base_rotation);
+      const double frame_interval = last_livox_registration_stamp_.isZero()
+                                        ? std::numeric_limits<double>::quiet_NaN()
+                                        : message->header.stamp.toSec() -
+                                              last_livox_registration_stamp_.toSec();
       const auto result = livox_gicp_.RegisterFrame(
           oriented_points, command_prior);
       RecordPlanarRegistrationDiagnostic(
-          "livox_frame_gicp", message->header.stamp, result,
+          "livox_frame_gicp", message->header.stamp, frame_interval, result,
           &livox_registration_diagnostics_);
       if (result.accepted && result.has_delta) {
         LogLargeTranslationIncrement(
@@ -1016,6 +1045,9 @@ class ScanLocalizationNode {
           fused_planar_position_ += correction;
           depth_fusion_offset_ += correction;
           fused_at_last_depth_ += correction;
+          if (diagnostic_frame_details_) {
+            map_correction_total_ += correction;
+          }
           livox_at_last_depth_ = livox_total_;
           fused_position = fused_planar_position_;
           depth_total = depth_total_;
@@ -1026,6 +1058,9 @@ class ScanLocalizationNode {
             "RGB-D/Livox 局部地图校正：correction=(%.3f, %.3f) corr=%zu",
             correction.x(), correction.y(), map_result.correspondence_count);
       }
+      RecordMotionConsistencyDiagnostic(
+          message->header.stamp, depth_fresh,
+          YawFromRotation(world_base_rotation));
       Eigen::Vector3d world_base_translation =
           initial_world_base_translation_;
       world_base_translation.head<2>() = fused_position;
@@ -1175,8 +1210,22 @@ class ScanLocalizationNode {
 
   void RecordPlanarRegistrationDiagnostic(
       const char *source, const ros::Time &stamp,
+      double frame_interval,
       const danger_search_localization::PlanarGicpResult &result,
       PlanarRegistrationDiagnosticStats *stats) const {
+    if (diagnostic_frame_details_) {
+      ROS_INFO(
+          "localization_planar_registration_frame source=%s scan_stamp=%.6f "
+          "frame_interval=%.6f status=%s accepted=%d has_delta=%d "
+          "candidate=(%.6f, %.6f) applied=(%.6f, %.6f) "
+          "fitness=%.8f points=%zu",
+          source, stamp.toSec(), frame_interval,
+          danger_search_localization::PlanarGicpStatusName(result.status),
+          result.accepted ? 1 : 0, result.has_delta ? 1 : 0,
+          result.candidate_delta.x(), result.candidate_delta.y(),
+          result.delta.x(), result.delta.y(), result.fitness,
+          result.point_count);
+    }
     const std::size_t status_index = static_cast<std::size_t>(result.status);
     if (status_index < stats->status_counts.size()) {
       ++stats->status_counts[status_index];
@@ -1233,6 +1282,37 @@ class ScanLocalizationNode {
       const danger_search_localization::ImuConstrainedOdometryResult &result,
       const Eigen::Vector2d &applied_correction,
       MapRegistrationDiagnosticStats *stats) const {
+    if (diagnostic_frame_details_) {
+      ROS_INFO(
+          "localization_map_registration_frame scan_stamp=%.6f source=%s "
+          "status=%s accepted=%d raw=(%.6f, %.6f) "
+          "applied=(%.6f, %.6f) clamped=%d source_points=%zu matched=%zu "
+          "retained=%zu map_points=%zu iterations=%d "
+          "residual_p50=%.6f residual_p70=%.6f residual_p90=%.6f "
+          "residual_mean=(%.6f, %.6f) residual_median=(%.6f, %.6f) "
+          "residual_mad=(%.6f, %.6f) residual_positive=(%.6f, %.6f) "
+          "residual_negative=(%.6f, %.6f) covariance_eigen=(%.9f, %.9f) "
+          "anisotropy=%.6f",
+          stamp.toSec(), source,
+          danger_search_localization::ImuConstrainedOdometryStatusName(
+              result.status),
+          result.accepted ? 1 : 0, result.unclamped_correction.x(),
+          result.unclamped_correction.y(), applied_correction.x(),
+          applied_correction.y(), result.correction_was_clamped ? 1 : 0,
+          result.source_point_count, result.matched_correspondence_count,
+          result.correspondence_count, result.map_point_count,
+          result.iteration_count, result.residual_p50, result.residual_p70,
+          result.residual_p90, result.residual_mean.x(),
+          result.residual_mean.y(), result.residual_median.x(),
+          result.residual_median.y(), result.residual_mad.x(),
+          result.residual_mad.y(), result.residual_positive_fraction.x(),
+          result.residual_positive_fraction.y(),
+          result.residual_negative_fraction.x(),
+          result.residual_negative_fraction.y(),
+          result.residual_covariance_min_eigenvalue,
+          result.residual_covariance_max_eigenvalue,
+          result.residual_anisotropy);
+    }
     const std::size_t status_index = static_cast<std::size_t>(result.status);
     if (status_index < stats->status_counts.size()) {
       ++stats->status_counts[status_index];
@@ -1269,7 +1349,10 @@ class ScanLocalizationNode {
         "insufficient_correspondences=%llu clamped=%llu "
         "maximum_unclamped_norm=%.4f maximum_applied_norm=%.4f "
         "latest_status=%s latest_unclamped=(%.4f, %.4f) "
-        "latest_applied=(%.4f, %.4f) latest_correspondences=%zu",
+        "latest_applied=(%.4f, %.4f) latest_correspondences=%zu "
+        "latest_source=%zu latest_matched=%zu latest_map=%zu "
+        "latest_iterations=%d latest_residual_p70=%.5f "
+        "latest_residual_mad=(%.5f, %.5f) latest_anisotropy=%.5f",
         source, stamp.toSec(),
         count(danger_search_localization::ImuConstrainedOdometryStatus::kAccepted),
         count(danger_search_localization::ImuConstrainedOdometryStatus::kInitialFrame),
@@ -1281,12 +1364,107 @@ class ScanLocalizationNode {
             result.status),
         result.unclamped_correction.x(), result.unclamped_correction.y(),
         applied_correction.x(), applied_correction.y(),
-        result.correspondence_count);
+        result.correspondence_count, result.source_point_count,
+        result.matched_correspondence_count, result.map_point_count,
+        result.iteration_count, result.residual_p70, result.residual_mad.x(),
+        result.residual_mad.y(), result.residual_anisotropy);
     stats->status_counts.fill(0);
     stats->maximum_unclamped_norm = 0.0;
     stats->maximum_applied_norm = 0.0;
     stats->clamped_count = 0;
     stats->interval_start = stamp;
+  }
+
+  void RecordMotionConsistencyDiagnostic(
+      const ros::Time &stamp, bool depth_fresh, double yaw) {
+    if (!diagnostic_frame_details_) {
+      return;
+    }
+    Eigen::Vector2d depth_total;
+    Eigen::Vector2d livox_total;
+    Eigen::Vector2d map_correction_total;
+    Eigen::Vector2d fused_position;
+    Eigen::Vector2d command_total;
+    {
+      std::lock_guard<std::mutex> fusion_lock(fusion_mutex_);
+      depth_total = depth_total_;
+      livox_total = livox_total_;
+      map_correction_total = map_correction_total_;
+      fused_position = fused_planar_position_;
+      command_total = depth_command_total_;
+    }
+    auto &state = motion_consistency_diagnostics_;
+    if (!state.initialized) {
+      state.initialized = true;
+      state.interval_start = stamp;
+      state.depth_anchor = depth_total;
+      state.livox_anchor = livox_total;
+      state.map_correction_anchor = map_correction_total;
+      state.fused_anchor = fused_position;
+      state.command_anchor = command_total;
+      state.previous_yaw = yaw;
+      return;
+    }
+    const double yaw_delta = std::atan2(
+        std::sin(yaw - state.previous_yaw),
+        std::cos(yaw - state.previous_yaw));
+    state.absolute_yaw_change += std::abs(yaw_delta);
+    state.previous_yaw = yaw;
+    ++state.frame_count;
+    state.depth_fresh_count += depth_fresh ? 1U : 0U;
+    const double duration = stamp.toSec() - state.interval_start.toSec();
+    if (duration < diagnostic_summary_period_) {
+      return;
+    }
+
+    const Eigen::Vector2d depth_delta = depth_total - state.depth_anchor;
+    const Eigen::Vector2d livox_delta = livox_total - state.livox_anchor;
+    const Eigen::Vector2d map_delta =
+        map_correction_total - state.map_correction_anchor;
+    const Eigen::Vector2d fused_delta = fused_position - state.fused_anchor;
+    const Eigen::Vector2d command_delta = command_total - state.command_anchor;
+    const Eigen::Vector2d divergence = livox_delta - depth_delta;
+    const auto axis_relation = [](double correction, double difference) {
+      if (std::abs(correction) < 1e-9 || std::abs(difference) < 1e-9) {
+        return 0;
+      }
+      return correction * difference > 0.0 ? 1 : -1;
+    };
+    const auto axis_ratio = [](double correction, double difference) {
+      return std::abs(difference) > 1e-9
+                 ? std::abs(correction / difference)
+                 : std::numeric_limits<double>::quiet_NaN();
+    };
+    const double fresh_ratio = state.frame_count > 0
+                                   ? static_cast<double>(state.depth_fresh_count) /
+                                         static_cast<double>(state.frame_count)
+                                   : 0.0;
+    ROS_INFO(
+        "localization_motion_consistency_summary scan_stamp=%.6f "
+        "duration=%.6f depth=(%.6f, %.6f) livox=(%.6f, %.6f) "
+        "scan_to_map=(%.6f, %.6f) fused=(%.6f, %.6f) "
+        "command=(%.6f, %.6f) divergence=(%.6f, %.6f) "
+        "axis_relation=(%d, %d) axis_ratio=(%.6f, %.6f) "
+        "imu_abs_yaw=%.6f depth_fresh_ratio=%.6f frames=%zu",
+        stamp.toSec(), duration, depth_delta.x(), depth_delta.y(),
+        livox_delta.x(), livox_delta.y(), map_delta.x(), map_delta.y(),
+        fused_delta.x(), fused_delta.y(), command_delta.x(),
+        command_delta.y(), divergence.x(), divergence.y(),
+        axis_relation(map_delta.x(), divergence.x()),
+        axis_relation(map_delta.y(), divergence.y()),
+        axis_ratio(map_delta.x(), divergence.x()),
+        axis_ratio(map_delta.y(), divergence.y()),
+        state.absolute_yaw_change, fresh_ratio, state.frame_count);
+
+    state.interval_start = stamp;
+    state.depth_anchor = depth_total;
+    state.livox_anchor = livox_total;
+    state.map_correction_anchor = map_correction_total;
+    state.fused_anchor = fused_position;
+    state.command_anchor = command_total;
+    state.absolute_yaw_change = 0.0;
+    state.frame_count = 0;
+    state.depth_fresh_count = 0;
   }
 
   void RecordDepthFreshnessDiagnostic(
@@ -1445,10 +1623,12 @@ class ScanLocalizationNode {
   double command_velocity_scale_ = 1.0;
   double diagnostic_large_translation_threshold_ = 0.08;
   double diagnostic_summary_period_ = 2.0;
+  bool diagnostic_frame_details_ = false;
   double depth_freshness_seconds_ = 0.35;
   PlanarRegistrationDiagnosticStats depth_registration_diagnostics_;
   PlanarRegistrationDiagnosticStats livox_registration_diagnostics_;
   MapRegistrationDiagnosticStats map_registration_diagnostics_;
+  MotionConsistencyDiagnosticState motion_consistency_diagnostics_;
   bool depth_freshness_state_initialized_ = false;
   bool previous_depth_fresh_ = false;
   ros::Time depth_stale_since_;
@@ -1470,6 +1650,8 @@ class ScanLocalizationNode {
   Eigen::Vector2d fused_at_last_depth_ = Eigen::Vector2d::Zero();
   Eigen::Vector2d livox_at_last_depth_ = Eigen::Vector2d::Zero();
   Eigen::Vector2d depth_fusion_offset_ = Eigen::Vector2d::Zero();
+  Eigen::Vector2d map_correction_total_ = Eigen::Vector2d::Zero();
+  Eigen::Vector2d depth_command_total_ = Eigen::Vector2d::Zero();
   ros::Time last_depth_accept_stamp_;
   bool scale_window_initialized_ = false;
   ros::Time scale_window_stamp_;

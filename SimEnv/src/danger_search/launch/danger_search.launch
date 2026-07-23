@@ -7,6 +7,7 @@
   <arg name="config" default="$(find danger_search)/config/danger_search.yaml"/>
   <arg name="result_file" default=""/>
   <arg name="mission_summary_file" default=""/>
+  <arg name="localization_diagnostic_frame_details" default="false"/>
 
   <!-- 参数加载到全局命名空间；MissionManager 只读取并分组，不允许子组件私取配置。 -->
   <rosparam command="load" file="$(arg config)"/>
@@ -19,6 +20,8 @@
          value="$(find danger_search)/../../generated_building/team_scene_info.json"/>
     <arg name="require_team_scene_info" value="true"/>
     <arg name="allow_relative_origin" value="false"/>
+    <arg name="diagnostic_frame_details"
+         value="$(arg localization_diagnostic_frame_details)"/>
   </include>
 
   <node pkg="danger_search"
