@@ -180,7 +180,7 @@ frontier:
 
 controller:
   # PathFollower 的路径跟踪与唯一 /cmd_vel 输出上限；最终仍经过 ground_support 门。
-  # 不得超过地面支撑停车包络最后一档 0.651 m/s。
+  # 两轮独立制动测量封板前冻结在 0.60 m/s，不得提速。
   max_linear: 0.60
   # 0 保持既有全局上限；正数仅限制首次 EXIT_CABIN 通过尝试。
   exit_first_max_linear: 0.0
@@ -213,13 +213,15 @@ ground_support:
   # 明确 DROP 停稳后仅让当前路径失效，并用现有 BLACK 栅格有界重规划。
   negative_obstacle_replan_enabled: true
   maximum_negative_obstacle_replans: 3
-  # 按实测速度上界查保守停车距离，不插值、不向表外外推；有效速度上限取最后一档。
-  # 扩速时新增实测档位并同步复验前视距离，无需修改门控代码或全局控制器速度。
+  # 工程保守停车表，尚待两轮独立测量封板；只按请求速度向上取档。
+  # 不插值、不向表外外推；扩速前必须新增可追溯实测档位并复验完整前视距离。
   stop_distance_table:
     - [0.60, 0.09337727739487302]
     - [0.651, 0.10195826367975175]
-  # 定位差分的单帧速度尖峰先立即停车；连续新 odom 超界才升级为任务失败。
-  speed_out_of_envelope_confirmations: 2
+  # 定位差分只承担停稳确认与有界异常观察，不作为物理速度上界或停车表索引。
+  # 单帧超过独立故障阈值立即零速；持续 2 秒才按定位损坏显式失败。
+  localization_speed_anomaly_threshold: 1.0
+  localization_speed_anomaly_timeout: 2.0
   # 正支撑只看左右足迹带；完整物理宽度仍专用于明确 DROP 检测。
   foot_band_center_offset: 0.14
   foot_band_half_width: 0.10
@@ -344,6 +346,17 @@ local_semantic:
   elevator_visual_scan_duration: 18.0
   elevator_visual_scan_angular_speed: 0.70
   elevator_visual_scan_required_rotation: 5.80
+  # 第 14.3 层只读诊断：冻结首次 RGB-D 电梯门板地标并记录跨层残差。
+  # 正式默认关闭；结果只允许在任务结束后由独立真值评估，不能改变当轮行为。
+  landmark_drift_diagnostic_enabled: false
+  landmark_drift_minimum_width: 0.65
+  landmark_drift_maximum_width: 1.80
+  landmark_drift_maximum_distance: 4.0
+  landmark_drift_maximum_yaw_difference: 0.35
+  landmark_drift_maximum_width_difference: 0.25
+  landmark_drift_required_confirmations: 3
+  landmark_drift_maximum_confirmation_gap: 0.4
+  landmark_drift_maximum_residual_spread: 0.15
   # 仅用于调试：关闭时必须有局部传感器证据，不能只靠 metadata 近距判断开门。
   use_truth_proximity_detector: false
 

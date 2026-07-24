@@ -1035,12 +1035,16 @@ class TakeElevatorTest(unittest.TestCase):
 
         self.assertEqual(task.tick(manager, (0.85, 2.6, 0.0)), RUNNING)
 
-        self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
+        self.assertEqual(task.phase, "GO_TO_REFRESHED_ELEVATOR_DOOR")
         self.assertIsNone(task.failure_reason)
         self.assertIn(
             "elevator_geometry_refresh_unavailable",
             manager.controller.clear_reasons,
         )
+
+        with patch.object(task, "_navigate_to", return_value=True):
+            self.assertEqual(task.tick(manager, (0.85, 2.6, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "ALIGN_TO_REFRESHED_ELEVATOR_DOOR")
 
     def test_elevator_refresh_viewpoint_keeps_camera_farther_from_door(self):
         viewpoint = TakeElevator._refresh_viewpoint(
@@ -1126,6 +1130,33 @@ class TakeElevatorTest(unittest.TestCase):
         self.assertEqual(task.phase, "EXIT_CABIN")
         self.assertEqual(task._retry_count, 0)
         self.assertEqual(manager.controller.reverse_reasons, [])
+
+    def test_active_opened_door_id_requires_confirmed_crossing(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+        task.cabin_transit_stage = "ALIGN"
+
+        self.assertIsNone(task.active_opened_door_id(manager.building_client))
+
+        task.cabin_transit_stage = "CROSS"
+        self.assertIsNone(task.active_opened_door_id(manager.building_client))
+
+        task._door_open_confirmed.add("lift_door_upper")
+        self.assertEqual(
+            task.active_opened_door_id(manager.building_client),
+            "lift_door_upper",
+        )
+
+        task.phase = "DONE"
+        self.assertIsNone(task.active_opened_door_id(manager.building_client))
 
     def test_exit_backoff_rejects_blocked_segment(self):
         grid = MultiFloorGridMap(

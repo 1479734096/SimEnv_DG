@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -72,6 +74,9 @@ struct PlanarGicpResult {
   double fitness = 0.0;
   std::size_t point_count = 0;
   PlanarGicpStatus status = PlanarGicpStatus::kInsufficientPoints;
+  double candidate_yaw = std::numeric_limits<double>::quiet_NaN();
+  double candidate_rotation_angle =
+      std::numeric_limits<double>::quiet_NaN();
 };
 
 /// 对已统一旋转的相邻点云执行 GICP，并且只消费平面平移。
@@ -122,6 +127,20 @@ class PlanarGicpOdometry {
     const Eigen::Matrix4f relative = gicp.getFinalTransformation();
     const Eigen::Vector2d delta =
         relative.block<2, 1>(0, 3).cast<double>();
+    double candidate_yaw = std::numeric_limits<double>::quiet_NaN();
+    double candidate_rotation_angle =
+        std::numeric_limits<double>::quiet_NaN();
+    const Eigen::Matrix3f candidate_rotation = relative.block<3, 3>(0, 0);
+    if (candidate_rotation.allFinite()) {
+      candidate_yaw = std::atan2(
+          static_cast<double>(candidate_rotation(1, 0)),
+          static_cast<double>(candidate_rotation(0, 0)));
+      const double cosine = std::max(
+          -1.0, std::min(1.0,
+                         0.5 * (static_cast<double>(candidate_rotation.trace()) -
+                                1.0)));
+      candidate_rotation_angle = std::acos(cosine);
+    }
     const double fitness = gicp.getFitnessScore(
         config_.maximum_correspondence_distance);
     PlanarGicpStatus status = PlanarGicpStatus::kAccepted;
@@ -141,7 +160,8 @@ class PlanarGicpOdometry {
     // 否则恢复后的长基线会永久无法重新进入局部配准域。
     previous_ = current;
     return {accepted, accepted, accepted ? delta : Eigen::Vector2d::Zero(),
-            delta, fitness, current->size(), status};
+            delta, fitness, current->size(), status, candidate_yaw,
+            candidate_rotation_angle};
   }
 
  private:

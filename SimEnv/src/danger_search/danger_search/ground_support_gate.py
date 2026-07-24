@@ -34,10 +34,11 @@ _LATCHED_STATES = _STOPPING_STATES | {
 
 
 class ConservativeStopEnvelope:
-    """按速度上界查实测停车距离，不插值且绝不向有效域外外推。
+    """按请求速度查工程保守停车距离，不插值且绝不向有效域外外推。
 
-    向上取档保证同一档内使用更保守的距离；超过验证最大速度时返回 ``None``，
-    调用方立即零速并进入超包络处理，不能凭数学外推宣称安全。
+    当前表项尚待两轮独立测量封板。向上取档保证同一档内使用更保守的距离；
+    超过配置最大速度时返回 ``None``，调用方立即零速并进入超包络处理，不能
+    凭数学外推宣称安全。``validated_max_speed`` 名称为兼容既有配置而保留。
     """
 
     def __init__(
@@ -93,7 +94,8 @@ class GroundSupportGateConfig:
         (0.60, 0.09337727739487302),
         (0.651, 0.10195826367975175),
     )
-    speed_out_of_envelope_confirmations: int = 2
+    localization_speed_anomaly_threshold: float = 1.0
+    localization_speed_anomaly_timeout: float = 2.0
     drop_evidence_max_age: float = 0.05
     decision_period: float = 0.10
     rl_receive_delay: float = 0.009
@@ -138,9 +140,11 @@ class GroundSupportAssessment:
 class GroundSupportSafetyGate:
     """只在最终命令出口过滤速度的锁存状态机。
 
-    它同时观察算法请求速度、定位实测速度和最新支撑评估。DROP 必须新鲜、观测
-    充分、与未来扫掠区相交且当前命令朝向缺口才锁存；UNKNOWN 只触发有限观察
-    停车。关闭配置时 ``filter_command`` 原样返回输入，保持控制链完全透明。
+    它同时观察算法请求速度、定位差分速度和最新支撑评估。停车表只按请求速度
+    选档，因为定位差分包含配准校正，不能作为物理速度上界；定位速度仅用于多帧
+    停稳确认和有界异常观察。DROP 必须新鲜、观测充分、与未来扫掠区相交且
+    当前命令朝向缺口才锁存；UNKNOWN 只触发有限观察停车。关闭配置时
+    ``filter_command`` 原样返回输入，保持控制链完全透明。
     """
 
     def __init__(self, config: GroundSupportGateConfig | None = None) -> None:
@@ -170,7 +174,10 @@ class GroundSupportSafetyGate:
             or self.config.safety_stop_timeout <= 0.0
             or int(self.config.release_supported_frames) <= 0
             or int(self.config.stop_confirmation_samples) <= 0
-            or int(self.config.speed_out_of_envelope_confirmations) <= 0
+            or not math.isfinite(self.config.localization_speed_anomaly_threshold)
+            or self.config.localization_speed_anomaly_threshold <= 0.0
+            or not math.isfinite(self.config.localization_speed_anomaly_timeout)
+            or self.config.localization_speed_anomaly_timeout <= 0.0
             or int(self.config.boundary_persistence_confirmations) <= 0
             or self.config.stop_linear_threshold
             < self.config.odometry_linear_deadband
@@ -280,7 +287,7 @@ class GroundSupportSafetyGate:
         angular_speed: float,
         wall_time: float,
     ) -> None:
-        """用定位实测速度确认停车过程及是否超出已验证速度域。"""
+        """用定位差分速度确认停稳，并对异常大值执行有界观察停车。"""
         if not self.enabled:
             return
         try:
@@ -302,28 +309,38 @@ class GroundSupportSafetyGate:
         if is_fresh:
             self._last_odom_stamp = stamp_value
             self._note_control_progress(stamp_value, wall_time)
-            actual_out_of_envelope = (
-                self.envelope.distance_for(self._actual_linear_speed) is None
+            localization_speed_anomaly = (
+                self._actual_linear_speed
+                > self.config.localization_speed_anomaly_threshold
             )
-            if actual_out_of_envelope:
+            if localization_speed_anomaly:
                 self._speed_out_of_envelope_sample_count += 1
                 if (
                     self.state == SPEED_OUT_OF_ENVELOPE_STOPPING
-                    and self._speed_out_of_envelope_sample_count
-                    >= max(
-                        1,
-                        int(self.config.speed_out_of_envelope_confirmations),
-                    )
+                    and self._speed_out_of_envelope_trigger_source
+                    == "localization_odometry"
+                    and self._state_enter_control_time is not None
+                    and stamp_value - self._state_enter_control_time
+                    >= self.config.localization_speed_anomaly_timeout
                 ):
                     self._speed_out_of_envelope_confirmed = True
+                    self._enter_state(
+                        SUPPORT_PATH_UNAVAILABLE,
+                        "localization_speed_abnormal",
+                        wall_time,
+                        control_time=stamp_value,
+                    )
+                    return
             else:
                 self._speed_out_of_envelope_sample_count = 0
                 if (
                     self.state == SPEED_OUT_OF_ENVELOPE_STOPPING
-                    and not self._speed_out_of_envelope_confirmed
+                    and self._speed_out_of_envelope_trigger_source
+                    == "localization_odometry"
                 ):
-                    # 位姿差分速度可能因单帧定位校正产生尖峰。首帧仍立即零速，
-                    # 但只有连续新 odom 超界才升级为不可恢复的安全失败。
+                    # 位姿差分速度不能证明物理超速；异常期间立即零速，但新鲜
+                    # 正常样本到达后自动恢复。持续异常仍由双时钟 watchdog
+                    # 有界失败，不能无限停车。
                     self._leave_speed_out_of_envelope_hold(
                         wall_time,
                         control_time=stamp_value,
@@ -336,7 +353,8 @@ class GroundSupportSafetyGate:
             return
         if (
             self.state == SPEED_OUT_OF_ENVELOPE_STOPPING
-            and not self._speed_out_of_envelope_confirmed
+            and self._speed_out_of_envelope_trigger_source
+            == "localization_odometry"
         ):
             return
         stopped = (
@@ -451,7 +469,10 @@ class GroundSupportSafetyGate:
         requested_speed = math.hypot(requested[0], requested[1])
         self._last_requested_speed = requested_speed
         requested_stop_distance = self.envelope.distance_for(requested_speed)
-        actual_stop_distance = self.envelope.distance_for(self._actual_linear_speed)
+        localization_speed_anomaly = (
+            self._actual_linear_speed
+            > self.config.localization_speed_anomaly_threshold
+        )
         if requested_stop_distance is None:
             self._begin_speed_out_of_envelope_stop(
                 wall_time,
@@ -460,23 +481,18 @@ class GroundSupportSafetyGate:
                 confirmed=True,
             )
             return (0.0, 0.0, 0.0)
-        if actual_stop_distance is None:
+        if localization_speed_anomaly:
             self._begin_speed_out_of_envelope_stop(
                 wall_time,
                 control_now,
                 source="localization_odometry",
-                confirmed=(
-                    self._speed_out_of_envelope_sample_count
-                    >= max(
-                        1,
-                        int(self.config.speed_out_of_envelope_confirmations),
-                    )
-                ),
+                confirmed=False,
             )
             return (0.0, 0.0, 0.0)
 
-        effective_speed = max(requested_speed, self._actual_linear_speed)
-        stop_distance = self.envelope.distance_for(effective_speed)
+        # 表项表达“该请求档位下包含底盘响应的制动距离”，不能用含配准校正的
+        # 定位差分速度重新选档。定位异常已在上方独立 fail-closed。
+        stop_distance = requested_stop_distance
         self.last_stop_distance = stop_distance
 
         if self.state in _TEMPORARY_HOLDS:
@@ -551,7 +567,7 @@ class GroundSupportSafetyGate:
             return requested
 
         guard_distance = self._guard_distance(
-            effective_speed,
+            requested_speed,
             stop_distance,
             data_age=self._latency_data_age(assessment, control_now),
         ) + self.config.boundary_hold_margin
@@ -631,6 +647,14 @@ class GroundSupportSafetyGate:
             "unknown_support_hold_enabled": self._unknown_support_hold_enabled,
             "validated_max_speed": self.envelope.validated_max_speed,
             "stop_distance_table": [list(item) for item in self.envelope.table],
+            "stop_envelope_index_source": "requested_command",
+            "localization_speed_role": "stop_confirmation_and_anomaly_observation",
+            "localization_speed_anomaly_threshold": (
+                self.config.localization_speed_anomaly_threshold
+            ),
+            "localization_speed_anomaly_timeout": (
+                self.config.localization_speed_anomaly_timeout
+            ),
             "last_stop_distance": self.last_stop_distance,
             "actual_linear_speed": self._actual_linear_speed,
             "actual_angular_speed": self._actual_angular_speed,
@@ -754,7 +778,7 @@ class GroundSupportSafetyGate:
             or self._assessment_sequence == self._last_release_sequence
         ):
             return False
-        speed = max(math.hypot(command[0], command[1]), self._actual_linear_speed)
+        speed = math.hypot(command[0], command[1])
         stop_distance = self.envelope.distance_for(speed)
         if stop_distance is None or assessment.supported_distance is None:
             return False

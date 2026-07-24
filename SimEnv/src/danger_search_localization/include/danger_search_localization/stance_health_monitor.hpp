@@ -127,12 +127,15 @@ class StanceHealthMonitor {
     const bool ground_known = std::isfinite(observation.ground_normal_z);
     const bool up_known = std::isfinite(observation.base_up_z);
     const bool angular_known = std::isfinite(observation.angular_speed);
-    if ((height_known &&
-         (observation.base_height < config_.minimum_base_height ||
-          observation.base_height > config_.maximum_base_height)) ||
-        (ground_known &&
-         observation.ground_normal_z < config_.minimum_ground_normal_z) ||
-        (up_known && observation.base_up_z < config_.minimum_base_up_z)) {
+    if (up_known && observation.base_up_z < config_.minimum_base_up_z) {
+      return Evidence::kBad;
+    }
+    const bool reliable_ground =
+        height_known && ground_known &&
+        observation.ground_normal_z >= config_.minimum_ground_normal_z;
+    if (reliable_ground &&
+        (observation.base_height < config_.minimum_base_height ||
+         observation.base_height > config_.maximum_base_height)) {
       return Evidence::kBad;
     }
     // 角速度本身只能说明机身正在快速运动，不能证明已经倾倒。姿态和高度均
@@ -141,15 +144,17 @@ class StanceHealthMonitor {
         observation.angular_speed > config_.maximum_angular_speed) {
       return Evidence::kUnknown;
     }
-    // 楼面 RANSAC 在真实空洞边缘会同时缺失高度和法向；只要 IMU 明确直立且
-    // 稳定，这不是跌倒证据。路径前方支撑由独立 GroundSupportSafetyGate
-    // fail-closed，姿态监控仍会对任何明确倾角立即累计 BAD。
-    if (!height_known && !ground_known && up_known && angular_known) {
+    // 楼面 RANSAC 缺失，或返回与直立 IMU 明显不一致的斜面时，由同一拟合
+    // 派生的法向和高度都不是机身倾倒证据。路径与足印支撑由独立安全门
+    // fail-closed，姿态监控仍会对任何明确 IMU 倾角立即累计 BAD。
+    const bool absent_ground = !height_known && !ground_known;
+    const bool inconsistent_ground =
+        height_known && ground_known && !reliable_ground;
+    if ((absent_ground || inconsistent_ground) && up_known && angular_known) {
       return Evidence::kGood;
     }
-    return height_known && ground_known && up_known && angular_known
-               ? Evidence::kGood
-               : Evidence::kUnknown;
+    return reliable_ground && up_known && angular_known ? Evidence::kGood
+                                                        : Evidence::kUnknown;
   }
 
   StanceHealthMonitorConfig config_;

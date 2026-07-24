@@ -19,7 +19,7 @@ libtorch 和 CUDA 路径在 `src/unitree_guide/unitree_guide/unitree_guide/CMake
 
 ```bash
 source /opt/ros/noetic/setup.bash
-catkin_make -j
+catkin_make -j4
 source ./devel/setup.bash
 ```
 

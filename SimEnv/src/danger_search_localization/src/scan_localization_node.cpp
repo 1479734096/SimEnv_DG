@@ -96,6 +96,7 @@ struct PlanarRegistrationDiagnosticStats {
       status_counts{};
   ros::Time interval_start;
   double maximum_candidate_norm = 0.0;
+  double maximum_candidate_rotation_angle = 0.0;
 };
 
 struct MapRegistrationDiagnosticStats {
@@ -1218,13 +1219,14 @@ class ScanLocalizationNode {
           "localization_planar_registration_frame source=%s scan_stamp=%.6f "
           "frame_interval=%.6f status=%s accepted=%d has_delta=%d "
           "candidate=(%.6f, %.6f) applied=(%.6f, %.6f) "
+          "candidate_yaw=%.8f candidate_rotation_angle=%.8f "
           "fitness=%.8f points=%zu",
           source, stamp.toSec(), frame_interval,
           danger_search_localization::PlanarGicpStatusName(result.status),
           result.accepted ? 1 : 0, result.has_delta ? 1 : 0,
           result.candidate_delta.x(), result.candidate_delta.y(),
-          result.delta.x(), result.delta.y(), result.fitness,
-          result.point_count);
+          result.delta.x(), result.delta.y(), result.candidate_yaw,
+          result.candidate_rotation_angle, result.fitness, result.point_count);
     }
     const std::size_t status_index = static_cast<std::size_t>(result.status);
     if (status_index < stats->status_counts.size()) {
@@ -1234,6 +1236,11 @@ class ScanLocalizationNode {
     if (std::isfinite(candidate_norm)) {
       stats->maximum_candidate_norm =
           std::max(stats->maximum_candidate_norm, candidate_norm);
+    }
+    if (std::isfinite(result.candidate_rotation_angle)) {
+      stats->maximum_candidate_rotation_angle = std::max(
+          stats->maximum_candidate_rotation_angle,
+          result.candidate_rotation_angle);
     }
     if (stats->interval_start.isZero()) {
       stats->interval_start = stamp;
@@ -1254,8 +1261,10 @@ class ScanLocalizationNode {
         "insufficient_points=%llu not_converged=%llu "
         "nonfinite_delta=%llu nonfinite_fitness=%llu "
         "translation_limit=%llu fitness_limit=%llu "
-        "maximum_candidate_norm=%.4f latest_status=%s "
+        "maximum_candidate_norm=%.4f maximum_candidate_rotation_angle=%.6f "
+        "latest_status=%s "
         "latest_candidate=(%.4f, %.4f) latest_applied=(%.4f, %.4f) "
+        "latest_candidate_yaw=%.6f latest_candidate_rotation_angle=%.6f "
         "latest_fitness=%.6f latest_points=%zu",
         source, stamp.toSec(),
         count(danger_search_localization::PlanarGicpStatus::kAccepted),
@@ -1268,12 +1277,14 @@ class ScanLocalizationNode {
         count(danger_search_localization::PlanarGicpStatus::kTranslationLimit),
         count(danger_search_localization::PlanarGicpStatus::kFitnessLimit),
         stats->maximum_candidate_norm,
+        stats->maximum_candidate_rotation_angle,
         danger_search_localization::PlanarGicpStatusName(result.status),
         result.candidate_delta.x(), result.candidate_delta.y(),
-        result.delta.x(), result.delta.y(), result.fitness,
-        result.point_count);
+        result.delta.x(), result.delta.y(), result.candidate_yaw,
+        result.candidate_rotation_angle, result.fitness, result.point_count);
     stats->status_counts.fill(0);
     stats->maximum_candidate_norm = 0.0;
+    stats->maximum_candidate_rotation_angle = 0.0;
     stats->interval_start = stamp;
   }
 

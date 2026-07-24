@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 
 #include <vector>
 
@@ -56,6 +57,35 @@ TEST(PlanarGicpOdometryTest, RecoversBaseTranslationFromConsecutiveFrames) {
   EXPECT_NEAR(moved.candidate_delta.y(), moved.delta.y(), 1e-12);
   EXPECT_NEAR(moved.delta.x(), base_motion.x(), 0.015);
   EXPECT_NEAR(moved.delta.y(), base_motion.y(), 0.015);
+  EXPECT_NEAR(moved.candidate_yaw, 0.0, 0.02);
+  EXPECT_NEAR(moved.candidate_rotation_angle, 0.0, 0.02);
+}
+
+TEST(PlanarGicpOdometryTest, ReportsHiddenRotationWithoutChangingAcceptance) {
+  danger_search_localization::PlanarGicpConfig config;
+  config.voxel_size = 0.025;
+  config.maximum_correspondence_distance = 0.35;
+  config.maximum_frame_translation = 0.20;
+  config.maximum_fitness = 0.03;
+  config.minimum_points = 60;
+  danger_search_localization::PlanarGicpOdometry odometry(config);
+
+  const auto first = MakeAsymmetricRoomPoints();
+  auto second = first;
+  const double yaw = 0.08;
+  const Eigen::Matrix3d rotation =
+      Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  const Eigen::Vector3d translation(0.05, -0.02, 0.0);
+  for (auto &point : second) {
+    point = rotation.transpose() * (point - translation);
+  }
+
+  ASSERT_TRUE(odometry.RegisterFrame(first).accepted);
+  const auto moved = odometry.RegisterFrame(second, translation.head<2>());
+  ASSERT_TRUE(moved.accepted);
+  EXPECT_TRUE(moved.has_delta);
+  EXPECT_NEAR(moved.candidate_yaw, yaw, 0.025);
+  EXPECT_NEAR(moved.candidate_rotation_angle, std::abs(yaw), 0.025);
 }
 
 TEST(PlanarGicpOdometryTest, RejectsInvalidConfiguration) {

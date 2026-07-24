@@ -768,14 +768,14 @@ class TakeElevator(NavigationTask):
                 if rospy is not None:
                     rospy.logwarn(
                         "[%s] 电梯近场几何未刷新，保留此前连续确认几何并继续；"
-                        "开门和跨越仍需局部传感器确认",
+                        "先到既有候梯点，开门和跨越仍需局部传感器确认",
                         self.name,
                     )
                 manager.controller.clear_path(
                     reason="elevator_geometry_refresh_unavailable"
                 )
                 self._reset_navigation_watchdog(clear_failure=True)
-                self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+                self.phase = "GO_TO_REFRESHED_ELEVATOR_DOOR"
                 return RUNNING
             if status != DONE:
                 self.failure_reason = "elevator_geometry_refresh_failed"
@@ -1080,6 +1080,22 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         return DONE
+
+    def active_opened_door_id(self, client) -> str | None:
+        """返回当前已确认开放且正在直线跨越的电梯门 ID。"""
+        if self.cabin_transit_stage != "CROSS":
+            return None
+        if self.phase == "ENTER_CABIN":
+            floor = self.current_floor
+        elif self.phase == "EXIT_CABIN":
+            floor = self.target_floor
+        else:
+            return None
+        try:
+            door_id = str(client.elevator_door_id(floor))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return door_id if door_id in self._door_open_confirmed else None
 
     def _begin_door_open_confirmation(self, manager: MissionManager, door_id: str) -> None:
         if door_id in self._door_confirmation_started:

@@ -230,11 +230,18 @@ def main() -> int:
     if len(pairs) < 2:
         parser.error("时间匹配样本不足，无法计算漂移")
     samples = _compute_drift(pairs)
+    first_estimate_stamp = float(estimates[0].stamp)
+    first_truth_stamp = float(truths[0].stamp)
+    first_aligned_estimate_stamp = float(pairs[0][0].stamp)
     result = {
         "bag": str(args.bag.resolve()),
         "odom_topic": args.odom_topic,
         "truth_topic": args.truth_topic,
         "maximum_sync_gap": args.maximum_sync_gap,
+        "first_estimate_stamp": first_estimate_stamp,
+        "first_truth_stamp": first_truth_stamp,
+        "first_aligned_estimate_stamp": first_aligned_estimate_stamp,
+        "elapsed_time_origin": "first_aligned_estimate_header_stamp",
         **_summary(samples),
     }
 

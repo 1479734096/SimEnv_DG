@@ -76,6 +76,10 @@ from danger_search.rgbd_door_detector import (
     DoorPanelObservation,
     RgbdDoorDetector,
 )
+from danger_search.landmark_drift_monitor import (
+    LandmarkDriftConfig,
+    LandmarkDriftMonitor,
+)
 from danger_search.result_writer import ResultWriter
 from danger_search.sensor_buffer import (
     SensorBuffer,
@@ -489,6 +493,9 @@ class MissionManager:
         self._return_home_last_failed_signature: tuple[int, int] | None = None
         self._return_home_candidate_reject_count = 0
         self._return_home_last_stuck_obstacle: dict[str, object] | None = None
+        self._return_home_retreat_target: tuple[float, float] | None = None
+        self._return_home_retreat_deadline = 0.0
+        self._return_home_retreat_anchor: tuple[float, float] | None = None
         self._mission_success_eligible = True
         self._normal_completion = False
         self._terminal_outcome = "running"
@@ -566,6 +573,9 @@ class MissionManager:
         # 参数及公开接口先全部校验，再创建各运行组件。构造顺序体现依赖方向：
         # 数据源 -> 环境表示/决策 -> 控制 -> 外部服务 -> 结果输出。
         self._load_params()
+        self._landmark_drift_monitor = LandmarkDriftMonitor(
+            self.landmark_drift_config
+        )
         self._status_publisher = None
         self.sensor_buffer = SensorBuffer(
             cloud_topic=self.cloud_topic,
@@ -656,8 +666,11 @@ class MissionManager:
             stop_linear_threshold=params["stop_linear_threshold"],
             stop_angular_threshold=params["stop_angular_threshold"],
             stop_confirmation_samples=params["stop_confirmation_samples"],
-            speed_out_of_envelope_confirmations=params[
-                "speed_out_of_envelope_confirmations"
+            localization_speed_anomaly_threshold=params[
+                "localization_speed_anomaly_threshold"
+            ],
+            localization_speed_anomaly_timeout=params[
+                "localization_speed_anomaly_timeout"
             ],
         )
         sweep_half_width = params["sweep_half_width"]
@@ -1177,14 +1190,11 @@ class MissionManager:
             # 有效速度域由可替换停车表最后一档决定，避免扩速时双参数漂移。
             "validated_max_speed": float(stop_distance_table[-1][0]),
             "stop_distance_table": stop_distance_table,
-            "speed_out_of_envelope_confirmations": max(
-                1,
-                int(
-                    _param(
-                        "ground_support/speed_out_of_envelope_confirmations",
-                        2,
-                    )
-                ),
+            "localization_speed_anomaly_threshold": float(
+                _param("ground_support/localization_speed_anomaly_threshold", 1.0)
+            ),
+            "localization_speed_anomaly_timeout": float(
+                _param("ground_support/localization_speed_anomaly_timeout", 2.0)
             ),
             "sweep_half_width": float(
                 _param("ground_support/sweep_half_width", 0.435393)
@@ -1492,6 +1502,35 @@ class MissionManager:
         )
         self.elevator_visual_scan_required_rotation = float(
             _param("local_semantic/elevator_visual_scan_required_rotation", 5.80)
+        )
+        self.landmark_drift_config = LandmarkDriftConfig(
+            enabled=bool(
+                _param("local_semantic/landmark_drift_diagnostic_enabled", False)
+            ),
+            minimum_width=float(
+                _param("local_semantic/landmark_drift_minimum_width", 0.65)
+            ),
+            maximum_width=float(
+                _param("local_semantic/landmark_drift_maximum_width", 1.80)
+            ),
+            maximum_distance=float(
+                _param("local_semantic/landmark_drift_maximum_distance", 4.0)
+            ),
+            maximum_yaw_difference=float(
+                _param("local_semantic/landmark_drift_maximum_yaw_difference", 0.35)
+            ),
+            maximum_width_difference=float(
+                _param("local_semantic/landmark_drift_maximum_width_difference", 0.25)
+            ),
+            required_confirmations=int(
+                _param("local_semantic/landmark_drift_required_confirmations", 3)
+            ),
+            maximum_confirmation_gap=float(
+                _param("local_semantic/landmark_drift_maximum_confirmation_gap", 0.4)
+            ),
+            maximum_residual_spread=float(
+                _param("local_semantic/landmark_drift_maximum_residual_spread", 0.15)
+            ),
         )
         if not (
             math.isfinite(self.elevator_visual_min_width)
@@ -2491,11 +2530,74 @@ class MissionManager:
             )
             self._latest_rgbd_door_stamp = image_stamp
             self._latest_rgbd_door_observations = door_observations
+            self._update_landmark_drift_diagnostic(
+                door_observations,
+                image_stamp=image_stamp,
+            )
             self._update_elevator_door_visual_change(
                 bundle,
                 image_stamp,
                 camera_to_world,
             )
+
+    def _update_landmark_drift_diagnostic(
+        self,
+        observations: list[DoorPanelObservation],
+        *,
+        image_stamp: float | None,
+    ) -> None:
+        """记录电梯地标残差；诊断结果不得影响本轮任务行为。"""
+        monitor = getattr(self, "_landmark_drift_monitor", None)
+        if monitor is None or not monitor.config.enabled:
+            return
+        features = getattr(self, "building_features", None)
+        elevator_features = getattr(features, "elevator_features", {})
+        evaluation = monitor.observe(
+            observations,
+            stamp=image_stamp,
+            floor=int(getattr(self, "current_floor", 0)),
+            ordinary_exploration=(
+                getattr(self, "state", None) == EXPLORE_FLOOR
+                and getattr(self, "current_task", None) is None
+                and getattr(self, "_floor_transition_guard", None) is None
+            ),
+            elevator_count=len(elevator_features),
+        )
+        if evaluation.status not in {"candidate", "confirmed"}:
+            return
+        observation = evaluation.observation
+        self._log_structured(
+            {
+                "event": "landmark_drift_observation",
+                "status": evaluation.status,
+                "elapsed": round(float(self._elapsed()), 3),
+                "observation_stamp": evaluation.stamp,
+                "sequence_start_stamp": evaluation.sequence_start_stamp,
+                "floor": int(self.current_floor),
+                "candidate_count": int(evaluation.candidate_count),
+                "confirmations": int(evaluation.confirmations),
+                "confirmed": bool(evaluation.confirmed),
+                "residual_xy": list(evaluation.residual_xy or ()),
+                "residual_norm": evaluation.residual_norm,
+                "normal_residual": evaluation.normal_residual,
+                "tangent_residual": evaluation.tangent_residual,
+                "observation": (
+                    {
+                        "world_xy": list(observation.world_xy),
+                        "outward_yaw": float(observation.outward_yaw),
+                        "width": float(observation.width),
+                        "distance": float(observation.distance),
+                        "plane_rmse": float(observation.plane_rmse),
+                        "depth_inlier_count": int(
+                            observation.depth_inlier_count
+                        ),
+                        "panel_state": str(observation.panel_state),
+                    }
+                    if observation is not None
+                    else None
+                ),
+            }
+        )
 
     def _record_pose_lookup(
         self,
@@ -2806,7 +2908,8 @@ class MissionManager:
             return True
         if state in {SAFETY_BLOCKED, SAFETY_STOP_TIMEOUT} or (
             state == SUPPORT_PATH_UNAVAILABLE
-            and reason == "support_speed_out_of_envelope"
+            and reason
+            in {"support_speed_out_of_envelope", "localization_speed_abnormal"}
         ):
             self._record_failure(reason)
             self._mission_success_eligible = False
@@ -2821,6 +2924,7 @@ class MissionManager:
         if state == SUPPORT_PATH_UNAVAILABLE:
             interrupted_task = self.current_task
             task_phase = getattr(interrupted_task, "phase", None)
+            interrupted_frontier_target = self._last_frontier_target
             if (
                 reason == "ground_support_path_unavailable"
                 and interrupted_task is None
@@ -2857,11 +2961,11 @@ class MissionManager:
                     )
             if interrupted_task is not None:
                 retry_key = ("task", id(interrupted_task), task_phase)
-            elif self._last_frontier_target is not None:
+            elif interrupted_frontier_target is not None:
                 retry_key = (
                     "frontier",
-                    round(float(self._last_frontier_target[0]), 3),
-                    round(float(self._last_frontier_target[1]), 3),
+                    round(float(interrupted_frontier_target[0]), 3),
+                    round(float(interrupted_frontier_target[1]), 3),
                 )
             else:
                 retry_key = ("state", self.state)
@@ -3753,27 +3857,53 @@ class MissionManager:
     ) -> tuple[float, float, float, float, float] | None:
         """返回当前主动过门阶段可忽略的已开门洞棱柱。"""
         task = getattr(self, "current_task", None)
-        if not isinstance(task, OpenDoorAndPass):
+        if isinstance(task, OpenDoorAndPass):
+            if getattr(task, "phase", None) not in {"GO_PASS_POINT", "GO_COMMIT_POINT"}:
+                return None
+            # 服务成功、完成门洞对准并提交直线路径后才允许过滤。这样等待点导航
+            # 和普通探索仍保留完整正障碍制动，门服务失败也不会被掩盖。
+            if not bool(getattr(task, "_pass_path_started", False)):
+                return None
+            door_id = task.door_id
+            elevator_crossing = False
+        elif isinstance(task, TakeElevator):
+            active_door_id = getattr(task, "active_opened_door_id", None)
+            if not callable(active_door_id):
+                return None
+            building_client = getattr(self, "building_client", None)
+            door_id = active_door_id(building_client)
+            if door_id is None:
+                return None
+            elevator_crossing = True
+        else:
             return None
-        if getattr(task, "phase", None) not in {"GO_PASS_POINT", "GO_COMMIT_POINT"}:
-            return None
-        # 服务成功、完成门洞对准并提交直线路径后才允许过滤。这样等待点导航
-        # 和普通探索仍保留完整正障碍制动，门服务失败也不会被掩盖。
-        if not bool(getattr(task, "_pass_path_started", False)):
-            return None
-        door = getattr(self.building_client, "doors", {}).get(task.door_id)
+
+        door = getattr(getattr(self, "building_client", None), "doors", {}).get(door_id)
         if door is None:
             return None
         edge_margin = max(0.05, float(self.mapper.resolution))
-        half_width = max(0.0, 0.5 * float(door.width) - edge_margin)
+        if elevator_crossing:
+            # RGB-D 电梯注册宽度表示单扇滑动门板，而不是完整门洞。仅在门已由
+            # 传感器确认打开且任务提交直线跨越后，按一扇门板宽度估计门洞半宽。
+            half_width = max(0.0, float(door.width) - edge_margin)
+        else:
+            half_width = max(0.0, 0.5 * float(door.width) - edge_margin)
         if half_width <= 0.0:
             return None
-        half_depth = max(
-            float(self.door_clear_radius),
-            float(self.door_pass_offset)
-            + float(self.mapper.obstacle_inflation_radius)
-            + float(self.mapper.resolution),
-        )
+        if elevator_crossing:
+            # 只忽略门平面附近的门板/门框回波；门后实体仍进入前向停车链。
+            half_depth = max(
+                2.0 * float(self.mapper.resolution),
+                float(self.mapper.obstacle_inflation_radius)
+                + float(self.mapper.resolution),
+            )
+        else:
+            half_depth = max(
+                float(self.door_clear_radius),
+                float(self.door_pass_offset)
+                + float(self.mapper.obstacle_inflation_radius)
+                + float(self.mapper.resolution),
+            )
         return (
             float(door.x),
             float(door.y),
@@ -4041,22 +4171,24 @@ class MissionManager:
             )
             return True
 
-        if not bool(getattr(entrance, "initial_open", False)):
-            if getattr(self, "_initial_entry_service_task", None) is None:
-                self._initial_entry_service_task = self.building_client.open_door(
-                    "main_entrance"
-                )
-                self.controller.stop(reason="initial_entry_opening")
-                return True
-            if not self._initial_entry_service_task.done():
-                self.controller.stop(reason="initial_entry_opening")
-                return True
-            if not self._initial_entry_service_task.ok():
-                self._record_failure(
-                    "主入口服务失败: " + self._initial_entry_service_task.message()
-                )
-                self._initial_entry_failed = True
-                return False
+        # initial_open 是公开场景的期望初态，不是运行期物理确认。公开开门服务
+        # 本身幂等，因此每轮入场仍只请求一次，避免生成/启动时序使关门实体与
+        # 声明不一致后永久等待 FREE 走廊。
+        if getattr(self, "_initial_entry_service_task", None) is None:
+            self._initial_entry_service_task = self.building_client.open_door(
+                "main_entrance"
+            )
+            self.controller.stop(reason="initial_entry_opening")
+            return True
+        if not self._initial_entry_service_task.done():
+            self.controller.stop(reason="initial_entry_opening")
+            return True
+        if not self._initial_entry_service_task.ok():
+            self._record_failure(
+                "主入口服务失败: " + self._initial_entry_service_task.message()
+            )
+            self._initial_entry_failed = True
+            return False
 
         if (
             getattr(self, "_initial_entry_target", None) is None
@@ -5194,6 +5326,28 @@ class MissionManager:
         evidence_count: int,
     ) -> None:
         """把传感器派生几何关联到公开 ID，并只在本次运行内缓存。"""
+        monitor = getattr(self, "_landmark_drift_monitor", None)
+        if monitor is not None and monitor.freeze_anchor(
+            stamp=getattr(self, "_latest_rgbd_door_stamp", None),
+            floor=int(getattr(self, "current_floor", 0)),
+            world_xy=world_xy,
+            outward_yaw=outward_yaw,
+            width=width,
+            source=source,
+        ):
+            anchor = monitor.anchor
+            self._log_structured(
+                {
+                    "event": "landmark_drift_anchor_frozen",
+                    "elapsed": round(float(self._elapsed()), 3),
+                    "observation_stamp": anchor.stamp,
+                    "floor": anchor.floor,
+                    "world_xy": list(anchor.world_xy),
+                    "outward_yaw": anchor.outward_yaw,
+                    "width": anchor.width,
+                    "source": anchor.source,
+                }
+            )
         lobby_poses = {
             int(floor): (
                 float(world_xy[0]),
@@ -5926,6 +6080,9 @@ class MissionManager:
                 call_site="MissionManager._tick_return_home",
             )
             return
+        if getattr(self, "_return_home_retreat_target", None) is not None:
+            self._tick_return_home_retreat(pose)
+            return
         stuck_anchor = getattr(self, "_return_home_stuck_anchor", None)
         if stuck_anchor is not None and math.hypot(
             pose[0] - stuck_anchor[0], pose[1] - stuck_anchor[1]
@@ -6216,7 +6373,134 @@ class MissionManager:
         if stuck_count >= int(getattr(self, "return_home_max_stuck_retries", 4)):
             self._fail_return_home_stuck(reason_code="return_home_stuck_exhausted")
             return
-        self.controller.recover(reason="return_home_stuck")
+        if self._rotation_clearance_is_safe():
+            self.controller.recover(reason="return_home_stuck")
+            return
+        if self._try_start_return_home_retreat(pose):
+            return
+        self.controller.clear_path(reason="return_home_retreat_unavailable")
+        self.controller.stop(reason="return_home_retreat_unavailable")
+
+    def _try_start_return_home_retreat(
+        self,
+        pose: tuple[float, float, float],
+    ) -> bool:
+        """贴墙返航时只沿已走直线后退一次，不在未知空间或障碍内转身。"""
+        previous_anchor = getattr(self, "_return_home_retreat_anchor", None)
+        if previous_anchor is not None and math.hypot(
+            pose[0] - previous_anchor[0], pose[1] - previous_anchor[1]
+        ) <= 0.75:
+            return False
+
+        grid = self.mapper.floor(self.current_floor)
+        start = grid.world_to_grid(float(pose[0]), float(pose[1]))
+        if start is None or not grid.is_traversable(*start):
+            return False
+        required_clearance = float(
+            getattr(self, "no_frontier_rotation_min_clearance", 0.40)
+        ) + float(getattr(self, "no_frontier_retreat_clearance_margin", 0.10))
+        max_distance = float(getattr(self, "no_frontier_retreat_max_distance", 2.0))
+        selected_target = None
+        selected_path = None
+        trace = list(
+            getattr(self, "_floor_navigation_traces", {}).get(
+                int(self.current_floor), ()
+            )
+        )
+        for trace_point in reversed(trace):
+            target = (float(trace_point[0]), float(trace_point[1]))
+            distance = math.hypot(target[0] - pose[0], target[1] - pose[1])
+            if distance < 0.5 or distance > max_distance:
+                continue
+            target_cell = grid.world_to_grid(*target)
+            if target_cell is None or not grid.is_traversable(*target_cell):
+                continue
+            if not self._grid_cell_has_clearance(
+                grid, target_cell, required_clearance
+            ):
+                continue
+            plan = astar_plan(grid, (pose[0], pose[1]), target)
+            if not plan.reached or len(plan.path) != 2:
+                continue
+            target_direction = math.atan2(target[1] - pose[1], target[0] - pose[0])
+            backward_error = math.atan2(
+                math.sin(target_direction - pose[2] - math.pi),
+                math.cos(target_direction - pose[2] - math.pi),
+            )
+            if abs(backward_error) > 0.35:
+                continue
+            selected_target = target
+            selected_path = plan.path
+            break
+        self._return_home_retreat_anchor = (float(pose[0]), float(pose[1]))
+        if selected_target is None or selected_path is None:
+            self._log_structured(
+                {
+                    "event": "return_home_retreat_unavailable",
+                    "current_floor": int(self.current_floor),
+                    "stuck_pose": [round(float(value), 3) for value in pose],
+                }
+            )
+            return False
+
+        self.controller.clear_path(reason="return_home_retreat_started")
+        self._return_home_planner = None
+        self._return_home_retreat_target = selected_target
+        reverse_speed = abs(float(getattr(self.controller, "reverse_speed", -0.15)))
+        retreat_distance = math.hypot(
+            selected_target[0] - pose[0], selected_target[1] - pose[1]
+        )
+        self._return_home_retreat_deadline = get_time() + max(
+            4.0, retreat_distance / max(0.05, reverse_speed) + 2.0
+        )
+        self._log_structured(
+            {
+                "event": "return_home_retreat_started",
+                "current_floor": int(self.current_floor),
+                "target": [round(value, 3) for value in selected_target],
+                "path_length": round(path_length(selected_path), 3),
+                "required_clearance": round(required_clearance, 3),
+            }
+        )
+        return True
+
+    def _tick_return_home_retreat(
+        self,
+        pose: tuple[float, float, float],
+    ) -> None:
+        target = self._return_home_retreat_target
+        if target is None:
+            return
+        distance = math.hypot(target[0] - pose[0], target[1] - pose[1])
+        if distance <= 0.25:
+            self._return_home_retreat_target = None
+            self._return_home_retreat_deadline = 0.0
+            self._return_home_next_plan_time = 0.0
+            self.controller.stop(reason="return_home_retreat_completed")
+            self._log_structured(
+                {
+                    "event": "return_home_retreat_completed",
+                    "current_floor": int(self.current_floor),
+                    "target": list(target),
+                }
+            )
+            return
+        if get_time() >= self._return_home_retreat_deadline:
+            self._return_home_retreat_target = None
+            self.controller.stop(reason="return_home_retreat_timeout")
+            self._fail_return_home_stuck(reason_code="return_home_retreat_failed")
+            return
+        target_direction = math.atan2(target[1] - pose[1], target[0] - pose[0])
+        backward_error = math.atan2(
+            math.sin(target_direction - pose[2] - math.pi),
+            math.cos(target_direction - pose[2] - math.pi),
+        )
+        if abs(backward_error) > 0.45 or not self.controller.reverse_straight(
+            reason="return_home_retreat"
+        ):
+            self._return_home_retreat_target = None
+            self.controller.stop(reason="return_home_retreat_failed")
+            self._fail_return_home_stuck(reason_code="return_home_retreat_failed")
 
     def _fail_return_home_stuck(self, *, reason_code: str) -> None:
         """返航局部反馈耗尽时保持零速并写出明确失败结果。"""
@@ -6950,6 +7234,9 @@ class MissionManager:
         self._return_home_last_failed_signature = None
         self._return_home_candidate_reject_count = 0
         self._return_home_last_stuck_obstacle = None
+        self._return_home_retreat_target = None
+        self._return_home_retreat_deadline = 0.0
+        self._return_home_retreat_anchor = None
 
     @staticmethod
     def _log_structured(payload: dict[str, object]) -> None:

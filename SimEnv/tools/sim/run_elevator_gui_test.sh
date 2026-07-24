@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 电梯专项 GUI 测试：缩短楼层 0 预算，只验证生产链的电梯视觉注册与 0→1 换层。
+# 电梯专项 GUI 测试：默认验证两层，可显式扩展到三层完整往返。
 
 set -Eeuo pipefail
 
@@ -9,6 +9,7 @@ DEVEL_SETUP="$WORKSPACE_ROOT/devel/setup.bash"
 
 SEED="${SEED:-42}"
 GUI="${GUI:-true}"
+ELEVATOR_TEST_FLOOR_COUNT="${ELEVATOR_TEST_FLOOR_COUNT:-2}"
 ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-33.0}"
 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME="${ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME:-$ELEVATOR_TEST_FLOOR_TIMEOUT}"
 ELEVATOR_TEST_MAX_RUNTIME="${ELEVATOR_TEST_MAX_RUNTIME:-180.0}"
@@ -20,6 +21,7 @@ ELEVATOR_TEST_RECORD_DRIFT="${ELEVATOR_TEST_RECORD_DRIFT:-0}"
 ELEVATOR_TEST_RECORD_RGBD="${ELEVATOR_TEST_RECORD_RGBD:-0}"
 ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH="${ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH:-0}"
 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS="${ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS:-0}"
+ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS="${ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS:-0}"
 LOG_DIR="${ELEVATOR_TEST_LOG_DIR:-/tmp/danger_search_elevator_test_$(date +%Y%m%d_%H%M%S)}"
 
 AUTO_PID=""
@@ -38,13 +40,14 @@ usage() {
   tools/sim/run_elevator_gui_test.sh
 
 目标：
-  复用正式定位和 MissionManager，只缩短测试配置中的楼层 0 预算；成功条件是
-  电梯门板完成传感器注册，并完成 0→1 电梯任务后重新进入楼层 1 探索；可选
-  继续验证 1→0 返程、主入口退出和结果写出。
+  复用正式定位和 MissionManager，只缩短专项楼层预算；成功条件是电梯门板
+  完成传感器注册，并到达显式楼层数的最高层；可选继续验证从最高层返回 0 层、
+  主入口退出和结果写出。
 
 常用环境变量：
   SEED=42                              场景种子
   GUI=true                             是否打开 Gazebo GUI
+  ELEVATOR_TEST_FLOOR_COUNT=2          楼层数，仅支持 2 或 3
   ELEVATOR_TEST_FLOOR_TIMEOUT=33.0     楼层 0 专项预算（仿真秒）
   ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=5.0  每层最小驻留（仿真秒）
   ELEVATOR_TEST_MAX_RUNTIME=180.0      专项总预算（仿真秒）
@@ -55,11 +58,12 @@ usage() {
   ELEVATOR_TEST_RECORD_RGBD=1           额外录制 RGB-D 供失败后离线重放
   ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1  同时录制真值供运行结束后离线漂移评估
   ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=1  启用逐帧定位日志并在诊断 bag 录制 /scan
+  ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS=1  启用只读电梯地标漂移诊断
   ELEVATOR_TEST_KEEP_RUNNING=1         成功后保留 GUI，按 Ctrl-C 清理
   ELEVATOR_TEST_LOG_DIR=/tmp/...       证据目录
 
 返回码：
-  0  电梯视觉注册和 0→1 换层成功
+  0  电梯视觉注册和目标换层链成功
   1  算法失败或专项超时
   2  启动/环境前置失败
 
@@ -96,6 +100,7 @@ write_summary() {
     printf 'result=%s\n' "$RESULT"
     printf 'detail=%s\n' "$DETAIL"
     printf 'seed=%s\n' "$SEED"
+    printf 'floor_count=%s\n' "$ELEVATOR_TEST_FLOOR_COUNT"
     printf 'floor_timeout=%s\n' "$ELEVATOR_TEST_FLOOR_TIMEOUT"
     printf 'min_floor_explore_time=%s\n' "$ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME"
     printf 'max_runtime=%s\n' "$ELEVATOR_TEST_MAX_RUNTIME"
@@ -104,12 +109,15 @@ write_summary() {
     printf 'record_rgbd=%s\n' "$ELEVATOR_TEST_RECORD_RGBD"
     printf 'offline_truth=%s\n' "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH"
     printf 'localization_diagnostics=%s\n' "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS"
+    printf 'landmark_drift_diagnostics=%s\n' "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS"
     printf 'diagnostic_bag=%s/elevator_diagnostic.bag\n' "$LOG_DIR"
     printf 'rgbd_bag=%s/elevator_rgbd.bag\n' "$LOG_DIR"
     printf 'drift_summary=%s/localization_drift.json\n' "$LOG_DIR"
     printf 'localization_quality=%s/localization_quality.json\n' "$LOG_DIR"
     printf 'localization_quality_samples=%s/localization_quality.csv\n' "$LOG_DIR"
     printf 'localization_motion_windows=%s/localization_motion_windows.csv\n' "$LOG_DIR"
+    printf 'localization_sensor_windows=%s/localization_sensor_windows.csv\n' "$LOG_DIR"
+    printf 'landmark_drift_summary=%s/landmark_drift.json\n' "$LOG_DIR"
     printf 'mission_log=%s/mission.log\n' "$LOG_DIR"
     printf 'auto_log=%s/auto.log\n' "$LOG_DIR"
     printf 'result_file=%s/results/detected_danger.json\n' "$WORKSPACE_ROOT"
@@ -144,8 +152,20 @@ cleanup() {
       "$LOG_DIR/elevator_diagnostic.bag" \
       --csv "$LOG_DIR/localization_quality.csv" \
       --windows-csv "$LOG_DIR/localization_motion_windows.csv" \
+      --sensor-windows-csv "$LOG_DIR/localization_sensor_windows.csv" \
       --json "$LOG_DIR/localization_quality.json" \
       > "$LOG_DIR/localization_quality.log" 2>&1 || true
+  fi
+  if [[ "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS" == "1" && \
+        -f "$LOG_DIR/mission.log" && \
+        -f "$LOG_DIR/localization_drift.csv" && \
+        -f "$LOG_DIR/localization_drift.json" ]]; then
+    python3 "$WORKSPACE_ROOT/tools/offline/analyze_landmark_drift.py" \
+      "$LOG_DIR/mission.log" \
+      "$LOG_DIR/localization_drift.csv" \
+      "$LOG_DIR/localization_drift.json" \
+      --json "$LOG_DIR/landmark_drift.json" \
+      > "$LOG_DIR/landmark_drift.log" 2>&1 || true
   fi
   terminate_group "$MISSION_PID" TERM
   terminate_group "$AUTO_PID" TERM
@@ -160,6 +180,16 @@ cleanup() {
     wait "$AUTO_PID" 2>/dev/null || true
   fi
   terminate_group "$KEEPER_PID" TERM
+  if [[ "$KEEPER_PID" =~ ^[0-9]+$ ]]; then
+    for _attempt in 1 2 3; do
+      if ! kill -0 "$KEEPER_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+    terminate_group "$KEEPER_PID" KILL
+    wait "$KEEPER_PID" 2>/dev/null || true
+  fi
   if [[ "$MASTER_PID" =~ ^[0-9]+$ ]] && kill -0 "$MASTER_PID" 2>/dev/null; then
     kill -TERM "$MASTER_PID" 2>/dev/null || true
   fi
@@ -204,6 +234,10 @@ if (( $# > 0 )); then
   usage >&2
   exit 2
 fi
+if [[ "$ELEVATOR_TEST_FLOOR_COUNT" != "2" && "$ELEVATOR_TEST_FLOOR_COUNT" != "3" ]]; then
+  printf 'ELEVATOR_TEST_FLOOR_COUNT 只能是 2 或 3\n' >&2
+  exit 2
+fi
 
 for value in "$ELEVATOR_TEST_FLOOR_TIMEOUT" "$ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME" "$ELEVATOR_TEST_MAX_RUNTIME"; do
   if ! is_positive_number "$value"; then
@@ -221,7 +255,7 @@ if [[ "$ELEVATOR_TEST_FULL_CYCLE" != "0" && "$ELEVATOR_TEST_FULL_CYCLE" != "1" ]
   printf 'ELEVATOR_TEST_FULL_CYCLE 只能是 0 或 1\n' >&2
   exit 2
 fi
-for flag in "$ELEVATOR_TEST_RECORD_DRIFT" "$ELEVATOR_TEST_RECORD_RGBD" "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS"; do
+for flag in "$ELEVATOR_TEST_RECORD_DRIFT" "$ELEVATOR_TEST_RECORD_RGBD" "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS"; do
   if [[ "$flag" != "0" && "$flag" != "1" ]]; then
     printf '诊断开关只能是 0 或 1：%s\n' "$flag" >&2
     exit 2
@@ -233,6 +267,12 @@ if [[ "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" == "1" && "$ELEVATOR_TEST_RECORD_DRI
 fi
 if [[ "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" == "1" && "$ELEVATOR_TEST_RECORD_DRIFT" != "1" ]]; then
   printf '启用逐帧定位诊断时必须同时设置 ELEVATOR_TEST_RECORD_DRIFT=1\n' >&2
+  exit 2
+fi
+if [[ "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS" == "1" && \
+      ( "$ELEVATOR_TEST_RECORD_DRIFT" != "1" || \
+        "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" != "1" ) ]]; then
+  printf '启用电梯地标漂移诊断时必须同时录制定位和独立离线真值\n' >&2
   exit 2
 fi
 
@@ -278,16 +318,22 @@ trap cleanup EXIT
 trap 'RESULT="中止"; DETAIL="收到用户或外部终止信号"; exit 130' INT TERM
 
 # 仅生成证据目录中的专项副本；精确匹配可以在正式配置字段改名时 fail-closed。
+LANDMARK_DIAGNOSTIC_VALUE=false
+if [[ "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS" == "1" ]]; then
+  LANDMARK_DIAGNOSTIC_VALUE=true
+fi
 sed \
   -e "s/^  max_runtime: 900[.]0$/  max_runtime: $ELEVATOR_TEST_MAX_RUNTIME/" \
   -e "s/^  runtime_by_floor: \[\[1, 300[.]0\], \[2, 620[.]0\], \[3, 840[.]0\]\]$/  runtime_by_floor: [[1, $ELEVATOR_TEST_MAX_RUNTIME], [2, $ELEVATOR_TEST_MAX_RUNTIME], [3, $ELEVATOR_TEST_MAX_RUNTIME]]/" \
   -e "s/^  floor_timeout: 280[.]0$/  floor_timeout: $ELEVATOR_TEST_FLOOR_TIMEOUT/" \
   -e "s/^  min_floor_explore_time: 60[.]0$/  min_floor_explore_time: $ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME/" \
+  -e "s/^  landmark_drift_diagnostic_enabled: false$/  landmark_drift_diagnostic_enabled: $LANDMARK_DIAGNOSTIC_VALUE/" \
   "$BASE_CONFIG" > "$TEST_CONFIG"
 
 if ! grep -Fq "  floor_timeout: $ELEVATOR_TEST_FLOOR_TIMEOUT" "$TEST_CONFIG" || \
    ! grep -Fq "  min_floor_explore_time: $ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME" "$TEST_CONFIG" || \
-   ! grep -Fq "  runtime_by_floor: [[1, $ELEVATOR_TEST_MAX_RUNTIME], [2, $ELEVATOR_TEST_MAX_RUNTIME], [3, $ELEVATOR_TEST_MAX_RUNTIME]]" "$TEST_CONFIG"; then
+   ! grep -Fq "  runtime_by_floor: [[1, $ELEVATOR_TEST_MAX_RUNTIME], [2, $ELEVATOR_TEST_MAX_RUNTIME], [3, $ELEVATOR_TEST_MAX_RUNTIME]]" "$TEST_CONFIG" || \
+   ! grep -Fq "  landmark_drift_diagnostic_enabled: $LANDMARK_DIAGNOSTIC_VALUE" "$TEST_CONFIG"; then
   fail "专项配置覆盖失败，正式配置字段可能已变化" 2
   exit $?
 fi
@@ -299,7 +345,7 @@ if [[ -n "$(ss -ltn 2>/dev/null | awk '$4 ~ /:11311$/ {print; exit}')" ]]; then
 fi
 
 log "证据目录：$LOG_DIR"
-log "启动 seed=$SEED、floor_timeout=$ELEVATOR_TEST_FLOOR_TIMEOUT 的两层 GUI 环境"
+log "启动 seed=$SEED、floor_count=$ELEVATOR_TEST_FLOOR_COUNT、floor_timeout=$ELEVATOR_TEST_FLOOR_TIMEOUT 的 GUI 环境"
 
 setsid bash -c 'exec 3<>"$1"; sleep 1000000' _ "$FIFO" \
   > "$LOG_DIR/fifo_keeper.log" 2>&1 &
@@ -307,7 +353,7 @@ KEEPER_PID=$!
 
 setsid env \
   SEED="$SEED" \
-  FLOOR_COUNT=2 \
+  FLOOR_COUNT="$ELEVATOR_TEST_FLOOR_COUNT" \
   GUI="$GUI" \
   PAUSED=true \
   AUTO_UNPAUSE=1 \
@@ -383,6 +429,7 @@ if grep -Eq '/ground_truth/|/Odometry_gazebo' "$LOG_DIR/production_node_info.txt
 fi
 
 started=$SECONDS
+highest_floor=$((ELEVATOR_TEST_FLOOR_COUNT - 1))
 registration_reported=0
 change_floor_reported=0
 go_to_door_stall_started=0
@@ -411,7 +458,11 @@ while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
      grep -F '"terminal_outcome": "success"' | \
      grep -Fq '"return_home_completed": true'; then
     RESULT="通过"
-    DETAIL="电梯视觉注册、0→1 换层、1→0 返程和主入口返航闭环成功"
+    if [[ "$ELEVATOR_TEST_FLOOR_COUNT" == "3" ]]; then
+      DETAIL="电梯视觉注册、0→1→2 换层、2→0 返程和主入口返航闭环成功"
+    else
+      DETAIL="电梯视觉注册、0→1 换层、1→0 返程和主入口返航闭环成功"
+    fi
     log "$DETAIL"
     exit 0
   fi
@@ -445,7 +496,7 @@ while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
   fi
 
   if grep -F '"event": "mission_state_transition"' "$MISSION_LOG" 2>/dev/null | \
-     grep -F '"current_floor": 1' | \
+     grep -F "\"current_floor\": $highest_floor" | \
      grep -F '"new_state": "EXPLORE_FLOOR"' | \
      grep -Fq '"old_state": "CHANGE_FLOOR"'; then
     if (( registration_reported == 0 )); then
@@ -455,11 +506,19 @@ while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
     if [[ "$ELEVATOR_TEST_FULL_CYCLE" == "1" ]]; then
       if (( upward_complete == 0 )); then
         upward_complete=1
-        log "0→1 换层成功，继续验证二层探索、返程电梯和主入口退出"
+        if [[ "$ELEVATOR_TEST_FLOOR_COUNT" == "3" ]]; then
+          log "0→1→2 换层成功，继续验证三层探索、返程电梯和主入口退出"
+        else
+          log "0→1 换层成功，继续验证二层探索、返程电梯和主入口退出"
+        fi
       fi
     else
       RESULT="通过"
-      DETAIL="电梯视觉注册与 0→1 换层闭环成功"
+      if [[ "$ELEVATOR_TEST_FLOOR_COUNT" == "3" ]]; then
+        DETAIL="电梯视觉注册与 0→1→2 换层闭环成功"
+      else
+        DETAIL="电梯视觉注册与 0→1 换层闭环成功"
+      fi
       log "$DETAIL"
       if [[ "$ELEVATOR_TEST_KEEP_RUNNING" == "1" ]]; then
         log "GUI 保持运行；按 Ctrl-C 清理"

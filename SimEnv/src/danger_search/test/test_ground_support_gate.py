@@ -38,7 +38,8 @@ def _config(**overrides) -> GroundSupportGateConfig:
         "stop_linear_threshold": 0.05,
         "stop_angular_threshold": 0.05,
         "stop_confirmation_samples": 3,
-        "speed_out_of_envelope_confirmations": 2,
+        "localization_speed_anomaly_threshold": 1.0,
+        "localization_speed_anomaly_timeout": 2.0,
     }
     values.update(overrides)
     return GroundSupportGateConfig(**values)
@@ -280,7 +281,7 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
     def test_single_actual_speed_spike_stops_then_resumes_on_fresh_odom(self):
         gate = GroundSupportSafetyGate(_config())
         gate.update_assessment(_assessment())
-        gate.observe_odometry(1.0, linear_speed=0.61, angular_speed=0.0, wall_time=99.9)
+        gate.observe_odometry(1.0, linear_speed=1.01, angular_speed=0.0, wall_time=99.9)
 
         command = gate.filter_command((0.30, 0.0, 0.0), pose_yaw=0.0, wall_time=100.0)
 
@@ -297,23 +298,93 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
             "localization_odometry",
         )
 
-    def test_two_consecutive_actual_speed_samples_confirm_terminal_stop(self):
+    def test_repeated_localization_speed_anomaly_recovers_without_terminal_claim(self):
         gate = GroundSupportSafetyGate(_config(stop_confirmation_samples=1))
         gate.update_assessment(_assessment())
-        gate.observe_odometry(1.0, linear_speed=0.61, angular_speed=0.0, wall_time=99.9)
+        gate.observe_odometry(1.0, linear_speed=1.01, angular_speed=0.0, wall_time=99.9)
         gate.filter_command((0.30, 0.0, 0.0), pose_yaw=0.0, wall_time=100.0)
 
-        gate.observe_odometry(1.1, linear_speed=0.62, angular_speed=0.0, wall_time=100.1)
-        self.assertTrue(gate.snapshot()["speed_out_of_envelope_confirmed"])
+        gate.observe_odometry(1.1, linear_speed=1.02, angular_speed=0.0, wall_time=100.1)
+        self.assertFalse(gate.snapshot()["speed_out_of_envelope_confirmed"])
         gate.observe_odometry(1.2, linear_speed=0.01, angular_speed=0.0, wall_time=100.2)
+
+        self.assertEqual(gate.state, CLEAR)
+        self.assertEqual(gate.automatic_resume_count, 1)
+        self.assertFalse(gate.terminal)
+
+    def test_persistent_localization_speed_anomaly_fails_after_two_seconds(self):
+        gate = GroundSupportSafetyGate(_config())
+        gate.update_assessment(_assessment())
+        gate.observe_odometry(
+            1.0,
+            linear_speed=1.01,
+            angular_speed=0.0,
+            wall_time=100.0,
+        )
+        gate.filter_command(
+            (0.30, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.0,
+            control_time=1.0,
+        )
+
+        gate.observe_odometry(
+            2.9,
+            linear_speed=1.02,
+            angular_speed=0.0,
+            wall_time=101.9,
+        )
+        self.assertEqual(gate.state, SPEED_OUT_OF_ENVELOPE_STOPPING)
+        gate.observe_odometry(
+            3.0,
+            linear_speed=1.03,
+            angular_speed=0.0,
+            wall_time=102.0,
+        )
+
+        self.assertEqual(gate.state, SUPPORT_PATH_UNAVAILABLE)
+        self.assertEqual(gate.reason_code, "localization_speed_abnormal")
+        self.assertTrue(gate.terminal)
+        self.assertTrue(gate.snapshot()["speed_out_of_envelope_confirmed"])
+
+    def test_requested_speed_above_envelope_still_becomes_terminal_after_stop(self):
+        gate = GroundSupportSafetyGate(_config(stop_confirmation_samples=1))
+        gate.update_assessment(_assessment())
+
+        gate.filter_command((0.61, 0.0, 0.0), pose_yaw=0.0, wall_time=100.0)
+        gate.observe_odometry(
+            1.0,
+            linear_speed=0.01,
+            angular_speed=0.0,
+            wall_time=100.1,
+        )
 
         self.assertEqual(gate.state, SUPPORT_PATH_UNAVAILABLE)
         self.assertEqual(gate.reason_code, "support_speed_out_of_envelope")
+        self.assertTrue(gate.terminal)
+
+    def test_stop_distance_is_indexed_only_by_requested_command(self):
+        gate = GroundSupportSafetyGate(_config())
+        gate.update_assessment(_assessment(supported_distance=0.80))
+        gate.observe_odometry(1.0, linear_speed=0.59, angular_speed=0.0, wall_time=99.9)
+
+        command = gate.filter_command(
+            (0.30, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.0,
+        )
+
+        self.assertEqual(command, (0.30, 0.0, 0.0))
+        self.assertAlmostEqual(gate.last_stop_distance, 0.06)
+        self.assertEqual(
+            gate.snapshot()["stop_envelope_index_source"],
+            "requested_command",
+        )
 
     def test_repeated_filter_calls_do_not_confirm_single_odom_spike(self):
         gate = GroundSupportSafetyGate(_config())
         gate.update_assessment(_assessment())
-        gate.observe_odometry(1.0, linear_speed=0.61, angular_speed=0.0, wall_time=99.9)
+        gate.observe_odometry(1.0, linear_speed=1.01, angular_speed=0.0, wall_time=99.9)
 
         gate.filter_command((0.30, 0.0, 0.0), pose_yaw=0.0, wall_time=100.0)
         gate.filter_command((0.30, 0.0, 0.0), pose_yaw=0.0, wall_time=100.01)
@@ -588,6 +659,40 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
 
         self.assertEqual(command, (0.0, 0.0, 0.0))
         self.assertEqual(gate.state, OBSERVATION_HOLD)
+
+    def test_hold_release_ignores_localization_speed_for_envelope_index(self):
+        gate = GroundSupportSafetyGate(_config(release_supported_frames=2))
+        gate.update_assessment(
+            _assessment(
+                observation_adequate=False,
+                supported_distance=0.10,
+            )
+        )
+        gate.filter_command((0.30, 0.0, 0.0), pose_yaw=0.0, wall_time=100.0)
+
+        gate.observe_odometry(
+            1.0,
+            linear_speed=0.59,
+            angular_speed=0.0,
+            wall_time=100.05,
+        )
+        for index in range(2):
+            gate.update_assessment(
+                _assessment(
+                    stamp=10.1 + 0.1 * index,
+                    received_wall_time=100.1 + 0.1 * index,
+                    supported_distance=0.24,
+                    support_boundary_detected=True,
+                )
+            )
+            command = gate.filter_command(
+                (0.0, 0.0, 0.0),
+                pose_yaw=0.0,
+                wall_time=100.1 + 0.1 * index,
+            )
+
+        self.assertEqual(command, (0.0, 0.0, 0.0))
+        self.assertEqual(gate.state, CLEAR)
 
     def test_drop_stop_confirms_immediately_after_three_fresh_odom_samples(self):
         gate = GroundSupportSafetyGate(_config())

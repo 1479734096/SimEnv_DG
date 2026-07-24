@@ -161,6 +161,58 @@ TEST(StanceHealthMonitor, ExplicitImuTiltStillFailsWithoutGroundPlane) {
   EXPECT_EQ(monitor.consecutive_bad_frames(), 2U);
 }
 
+TEST(StanceHealthMonitor, InconsistentGroundPlaneDoesNotOverrideUprightImu) {
+  StanceHealthMonitorConfig config;
+  config.minimum_base_height = 0.14;
+  config.maximum_base_height = 0.60;
+  config.minimum_ground_normal_z = 0.85;
+  config.minimum_base_up_z = 0.71;
+  config.required_healthy_frames = 1;
+  config.required_unhealthy_frames = 3;
+  StanceHealthMonitor monitor(config);
+
+  ASSERT_TRUE(monitor.Update(Good()));
+  const StanceObservation stage13_false_positive{0.483, 0.797, 1.0, 0.407};
+  EXPECT_TRUE(monitor.Update(stage13_false_positive));
+  EXPECT_TRUE(monitor.Update(stage13_false_positive));
+  EXPECT_TRUE(monitor.Update(stage13_false_positive));
+  EXPECT_EQ(monitor.consecutive_bad_frames(), 0U);
+}
+
+TEST(StanceHealthMonitor, InconsistentGroundNeverMasksExplicitImuTilt) {
+  StanceHealthMonitorConfig config;
+  config.minimum_base_height = 0.14;
+  config.maximum_base_height = 0.60;
+  config.minimum_ground_normal_z = 0.85;
+  config.minimum_base_up_z = 0.71;
+  config.required_healthy_frames = 1;
+  config.required_unhealthy_frames = 3;
+  StanceHealthMonitor monitor(config);
+
+  ASSERT_TRUE(monitor.Update(Good()));
+  const StanceObservation tilted{0.483, 0.797, 0.60, 0.407};
+  EXPECT_TRUE(monitor.Update(tilted));
+  EXPECT_TRUE(monitor.Update(tilted));
+  EXPECT_FALSE(monitor.Update(tilted));
+  EXPECT_EQ(monitor.consecutive_bad_frames(), 3U);
+}
+
+TEST(StanceHealthMonitor, ReliableGroundHeightStillDetectsProneRobot) {
+  StanceHealthMonitorConfig config;
+  config.minimum_base_height = 0.14;
+  config.maximum_base_height = 0.60;
+  config.required_healthy_frames = 1;
+  config.required_unhealthy_frames = 3;
+  StanceHealthMonitor monitor(config);
+
+  ASSERT_TRUE(monitor.Update(Good()));
+  const StanceObservation prone{0.058, 0.999, 1.0, 0.02};
+  EXPECT_TRUE(monitor.Update(prone));
+  EXPECT_TRUE(monitor.Update(prone));
+  EXPECT_FALSE(monitor.Update(prone));
+  EXPECT_EQ(monitor.consecutive_bad_frames(), 3U);
+}
+
 TEST(StanceHealthMonitor, UprightDynamicAngularSpikeIsBoundedUnknown) {
   StanceHealthMonitorConfig config;
   config.required_healthy_frames = 1;
