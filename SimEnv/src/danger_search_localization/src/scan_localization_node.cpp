@@ -1,7 +1,6 @@
 // 参赛方定位节点：只读取初始接口文档授权的 Livox、RGB-D、机身 IMU 和
-// 自身 /cmd_vel 输出。正式 rgbd_livox 数据流为：公开起点 + 连续站立楼面证据
-// 初始化 world 系；IMU 固定姿态；RGB-D/Livox 相邻帧 GICP 估计连续平移；Livox
-// 局部结构地图校正漂移；最后发布参赛方内部 odom 与 world 配准点云。
+// 自身 /cmd_vel 输出。默认关闭的 adaptive_shared_map 让 RGB-D 与 Livox 对同一
+// 局部地图生成平移候选，IMU 固定姿态，只有最终选中的位姿和当前 Livox 帧可事务提交。
 #include <algorithm>
 #include <array>
 #include <boost/property_tree/json_parser.hpp>
@@ -22,6 +21,7 @@
 #include <vector>
 
 #include <danger_search_localization/point_range_filter.hpp>
+#include <danger_search_localization/adaptive_translation_selector.hpp>
 #include <danger_search_localization/ground_plane_initializer.hpp>
 #include <danger_search_localization/imu_constrained_odometry.hpp>
 #include <danger_search_localization/imu_motion_predictor.hpp>
@@ -228,9 +228,8 @@ class ScanLocalizationNode {
  public:
   /// 校验全部参数和公开输入后建立订阅/发布关系。
   ///
-  /// 支持 kiss_icp、imu_constrained、rgbd_livox 三个后端；正式 launch 选择
-  /// rgbd_livox。构造期间任何接口、外参或场景信息异常都会抛出并终止节点，
-  /// 不会退回 Gazebo 真值或相对原点。
+  /// 支持五个固定后端；正式 launch 默认仍选择 rgbd_livox。构造期间任何接口、外参或场景
+  /// 信息异常都会抛出并终止节点，不会退回 Gazebo 真值或相对原点。
   ScanLocalizationNode() : nh_(), private_nh_("~") {
     std::string raw_cloud_topic = "/scan";
     std::string localization_backend = "kiss_icp";
@@ -264,6 +263,12 @@ class ScanLocalizationNode {
     double diagnostic_large_translation_threshold = 0.08;
     double diagnostic_summary_period = 2.0;
     double scan_to_map_maximum_correction = 0.10;
+    double livox_imu_maximum_speed = 0.70;
+    double livox_imu_translation_margin = 0.02;
+    double livox_imu_absolute_translation_cap = 0.30;
+    double shared_map_depth_max_age = 0.35;
+    double shared_map_max_source_divergence = 0.05;
+    double shared_map_max_map_commit_difference = 0.05;
     bool diagnostic_frame_details = false;
     std::string depth_cloud_topic = "/real_sense/depth/points";
     std::vector<double> base_to_livox_xyz;
@@ -337,6 +342,22 @@ class ScanLocalizationNode {
     private_nh_.param("scan_to_map_maximum_correction",
                       scan_to_map_maximum_correction,
                       scan_to_map_maximum_correction);
+    private_nh_.param("livox_imu_maximum_speed", livox_imu_maximum_speed,
+                      livox_imu_maximum_speed);
+    private_nh_.param("livox_imu_translation_margin",
+                      livox_imu_translation_margin,
+                      livox_imu_translation_margin);
+    private_nh_.param("livox_imu_absolute_translation_cap",
+                      livox_imu_absolute_translation_cap,
+                      livox_imu_absolute_translation_cap);
+    private_nh_.param("shared_map_depth_max_age", shared_map_depth_max_age,
+                      shared_map_depth_max_age);
+    private_nh_.param("shared_map_max_source_divergence",
+                      shared_map_max_source_divergence,
+                      shared_map_max_source_divergence);
+    private_nh_.param("shared_map_max_map_commit_difference",
+                      shared_map_max_map_commit_difference,
+                      shared_map_max_map_commit_difference);
     private_nh_.param("diagnostic_frame_details", diagnostic_frame_details,
                       diagnostic_frame_details);
     private_nh_.param("depth_cloud_topic", depth_cloud_topic,
@@ -365,11 +386,33 @@ class ScanLocalizationNode {
         scan_to_map_maximum_correction > 0.25) {
       throw std::runtime_error("scan-to-map 单帧校正上限必须位于 (0, 0.25] m");
     }
+    if (!std::isfinite(livox_imu_maximum_speed) ||
+        livox_imu_maximum_speed <= 0.0 ||
+        !std::isfinite(livox_imu_translation_margin) ||
+        livox_imu_translation_margin < 0.0 ||
+        !std::isfinite(livox_imu_absolute_translation_cap) ||
+        livox_imu_absolute_translation_cap <= 0.0) {
+      throw std::runtime_error("Livox-IMU 平面运动学上界参数无效");
+    }
+    if (!std::isfinite(shared_map_depth_max_age) ||
+        shared_map_depth_max_age <= 0.0 || shared_map_depth_max_age > 1.0 ||
+        !std::isfinite(shared_map_max_source_divergence) ||
+        shared_map_max_source_divergence <= 0.0 ||
+        shared_map_max_source_divergence > 0.30 ||
+        !std::isfinite(shared_map_max_map_commit_difference) ||
+        shared_map_max_map_commit_difference <= 0.0 ||
+        shared_map_max_map_commit_difference > 0.30) {
+      throw std::runtime_error(
+          "共享地图候选年龄必须位于 (0, 1.0] s，距离阈值必须位于 (0, 0.30] m");
+    }
     if (localization_backend != "kiss_icp" &&
         localization_backend != "imu_constrained" &&
+        localization_backend != "livox_imu_local_map" &&
+        localization_backend != "adaptive_shared_map" &&
         localization_backend != "rgbd_livox") {
       throw std::runtime_error(
-          "localization_backend 仅支持 kiss_icp、imu_constrained 或 rgbd_livox");
+          "localization_backend 仅支持 kiss_icp、imu_constrained、"
+          "livox_imu_local_map、adaptive_shared_map 或 rgbd_livox");
     }
     if (!private_nh_.getParam("base_to_livox_xyz", base_to_livox_xyz) ||
         !private_nh_.getParam("base_to_livox_rpy", base_to_livox_rpy)) {
@@ -379,23 +422,32 @@ class ScanLocalizationNode {
       throw std::runtime_error("正式定位仅允许使用初始文档授权的 /scan");
     }
     use_imu_constrained_ = localization_backend == "imu_constrained";
+    use_livox_imu_local_map_ =
+        localization_backend == "livox_imu_local_map";
+    use_adaptive_shared_map_ =
+        localization_backend == "adaptive_shared_map";
     use_rgbd_livox_ = localization_backend == "rgbd_livox";
     const bool requires_imu =
-        use_imu_constrained_ || use_rgbd_livox_ || stance_health_enabled;
-    if (use_rgbd_livox_ && depth_cloud_topic != "/real_sense/depth/points") {
+        use_imu_constrained_ || use_livox_imu_local_map_ ||
+        use_adaptive_shared_map_ || use_rgbd_livox_ || stance_health_enabled;
+    if ((use_rgbd_livox_ || use_adaptive_shared_map_) &&
+        depth_cloud_topic != "/real_sense/depth/points") {
       throw std::runtime_error(
           "RGB-D/Livox 定位仅允许使用 /real_sense/depth/points");
     }
     const StartPose start = ReadPublicStartPose(
         scene_info_path, require_scene_info, allow_relative_origin,
-        requires_imu, use_rgbd_livox_, use_rgbd_livox_);
-    if ((use_imu_constrained_ || use_rgbd_livox_) && start.relative) {
+        requires_imu, use_rgbd_livox_ || use_adaptive_shared_map_,
+        use_livox_imu_local_map_ || use_adaptive_shared_map_ || use_rgbd_livox_);
+    if ((use_imu_constrained_ || use_livox_imu_local_map_ ||
+         use_adaptive_shared_map_ || use_rgbd_livox_) &&
+        start.relative) {
       throw std::runtime_error("IMU 融合定位必须使用公开世界系起点");
     }
     start_pose_ = start;
     base_to_livox_ = SE3d(RotationFromRpy(base_to_livox_rpy),
                            VectorFromParam(base_to_livox_xyz, "base_to_livox_xyz"));
-    if (use_rgbd_livox_) {
+    if (use_rgbd_livox_ || use_adaptive_shared_map_) {
       if (!private_nh_.getParam("base_to_depth_xyz", base_to_depth_xyz) ||
           !private_nh_.getParam("base_to_depth_rpy", base_to_depth_rpy)) {
         throw std::runtime_error("缺少已公开的 base_to_depth 固定外参");
@@ -423,6 +475,15 @@ class ScanLocalizationNode {
     max_range_ = max_range;
     imu_max_delta_ = imu_max_delta;
     command_velocity_scale_ = command_velocity_scale;
+    livox_imu_maximum_speed_ = livox_imu_maximum_speed;
+    livox_imu_translation_margin_ = livox_imu_translation_margin;
+    livox_imu_absolute_translation_cap_ =
+        livox_imu_absolute_translation_cap;
+    adaptive_selector_config_.maximum_proposal_age = shared_map_depth_max_age;
+    adaptive_selector_config_.maximum_source_divergence =
+        shared_map_max_source_divergence;
+    adaptive_selector_config_.maximum_map_commit_difference =
+        shared_map_max_map_commit_difference;
     diagnostic_large_translation_threshold_ =
         diagnostic_large_translation_threshold;
     diagnostic_summary_period_ = diagnostic_summary_period;
@@ -459,10 +520,11 @@ class ScanLocalizationNode {
     velocity_config.angular_deadband = velocity_angular_deadband;
     velocity_estimator_ =
         danger_search_localization::PoseVelocityEstimator(velocity_config);
-    if (use_imu_constrained_ || use_rgbd_livox_) {
+    if (use_imu_constrained_ || use_livox_imu_local_map_ ||
+        use_adaptive_shared_map_ || use_rgbd_livox_) {
       danger_search_localization::ImuConstrainedOdometryConfig imu_config;
-      // scan-to-map 只负责修正点云里程计的慢漂；限制单帧跳变量，同时让
-      // 返回位姿和写入局部地图使用同一校正，避免形成两个坐标系。
+      // 正式后端把 scan-to-map 用作慢漂校正，候选后端用它估计完整平移；
+      // 两者都让返回位姿和地图写入使用同一校正，避免形成两个坐标系。
       imu_config.maximum_correction_from_prior =
           scan_to_map_maximum_correction;
       imu_odometry_ = std::make_unique<
@@ -497,11 +559,14 @@ class ScanLocalizationNode {
       imu_subscriber_ = nh_.subscribe(
           "/trunk_imu", 200, &ScanLocalizationNode::OnImu, this);
     }
-    if (use_rgbd_livox_) {
-      depth_subscriber_ = nh_.subscribe(
-          depth_cloud_topic, 1, &ScanLocalizationNode::OnDepthCloud, this);
+    if (use_livox_imu_local_map_ || use_adaptive_shared_map_ ||
+        use_rgbd_livox_) {
       command_subscriber_ = nh_.subscribe(
           "/cmd_vel", 50, &ScanLocalizationNode::OnCommand, this);
+    }
+    if (use_rgbd_livox_ || use_adaptive_shared_map_) {
+      depth_subscriber_ = nh_.subscribe(
+          depth_cloud_topic, 1, &ScanLocalizationNode::OnDepthCloud, this);
     }
     ROS_INFO(
         "scan_localization 已启动：输入 /scan，后端=%s，deskew 关闭，坐标系=%s",
@@ -522,7 +587,7 @@ class ScanLocalizationNode {
   };
 
   void OnCommand(const geometry_msgs::Twist::ConstPtr &message) {
-    // 缓存本算法已经发出的机体系平移命令，按时间积分后仅作为 GICP 初值；
+    // 缓存本算法已经发出的机体系平移命令，按时间积分后仅作为配准初值；
     // 点云证据仍决定是否接受位移，因此控制命令不能自证定位结果。
     const double linear_x = message->linear.x;
     const double linear_y = message->linear.y;
@@ -584,8 +649,9 @@ class ScanLocalizationNode {
   }
 
   void OnImu(const sensor_msgs::Imu::ConstPtr &message) {
-    // 只缓存有限、归一化且带有效时间戳的 IMU；rgbd_livox 在各点云回调中按
-    // 时间查最近样本，imu_constrained 还会在此更新短时平移积分先验。
+    // 只缓存有限、归一化且带有效时间戳的 IMU；livox_imu_local_map 与
+    // rgbd_livox 在各点云回调中按时间查最近样本，imu_constrained 还会在此
+    // 更新短时平移积分先验。
     const auto &q = message->orientation;
     const auto &a = message->linear_acceleration;
     const auto &w = message->angular_velocity;
@@ -710,21 +776,25 @@ class ScanLocalizationNode {
   }
 
   void OnDepthCloud(const sensor_msgs::PointCloud2::ConstPtr &message) {
-    // RGB-D 支路提供高频连续平移：时间匹配 IMU 固定旋转，规则采样深度点，
-    // 命令积分作初值执行平面 GICP。只有验收通过的 delta 才进入融合累计量。
-    if (!use_rgbd_livox_ || message->header.stamp.isZero()) {
+    // 正式旧后端继续累计帧间 GICP；共享地图候选只读估计绝对平移，不在深度回调写状态。
+    if ((!use_rgbd_livox_ && !use_adaptive_shared_map_) ||
+        message->header.stamp.isZero()) {
       return;
     }
     std::lock_guard<std::mutex> depth_lock(depth_processing_mutex_);
     Eigen::Matrix3d initial_world_base_rotation;
     Eigen::Matrix3d initial_imu_rotation;
+    double base_height = 0.0;
     {
       std::lock_guard<std::mutex> state_lock(initialization_mutex_);
-      if (!world_frame_initialized_ || !fusion_initialized_) {
+      if (!world_frame_initialized_ ||
+          (use_rgbd_livox_ && !fusion_initialized_) ||
+          (use_adaptive_shared_map_ && !adaptive_pose_initialized_)) {
         return;
       }
       initial_world_base_rotation = initial_world_base_rotation_;
       initial_imu_rotation = initial_imu_rotation_;
+      base_height = initial_world_base_translation_.z();
     }
     if (!last_depth_process_stamp_.isZero() &&
         message->header.stamp.toSec() - last_depth_process_stamp_.toSec() < 0.18) {
@@ -772,6 +842,71 @@ class ScanLocalizationNode {
       }
     } catch (const std::runtime_error &error) {
       ROS_ERROR_THROTTLE(2.0, "深度点云字段无效：%s", error.what());
+      return;
+    }
+    if (use_adaptive_shared_map_) {
+      std::vector<Eigen::Vector3d> structural_vectors;
+      structural_vectors.reserve(points.size());
+      for (const auto &point : points) {
+        const double floor_relative_height = base_height + point.z();
+        if (floor_relative_height > 0.22 && floor_relative_height < 1.90) {
+          structural_vectors.push_back(point);
+        }
+      }
+      std::lock_guard<std::mutex> shared_lock(shared_map_mutex_);
+      adaptive_depth_proposal_ = {};
+      adaptive_depth_proposal_stamp_ = message->header.stamp;
+      if (!imu_odometry_->initialized()) {
+        return;
+      }
+      if (last_adaptive_output_stamp_.isZero() ||
+          message->header.stamp < last_adaptive_output_stamp_) {
+        ROS_WARN_THROTTLE(
+            2.0,
+            "深度候选时间戳早于最近正式定位，拒绝用新位姿配旧点云："
+            "depth=%.3f output=%.3f",
+            message->header.stamp.toSec(),
+            last_adaptive_output_stamp_.toSec());
+        return;
+      }
+      const double frame_interval = last_adaptive_output_stamp_.isZero()
+                                        ? std::numeric_limits<double>::quiet_NaN()
+                                        : message->header.stamp.toSec() -
+                                              last_adaptive_output_stamp_.toSec();
+      Eigen::Vector3d translation_prior = adaptive_base_translation_;
+      translation_prior.head<2>() += CommandMotionPrior(
+          last_adaptive_output_stamp_, message->header.stamp,
+          world_base_rotation);
+      const double translation_limit =
+          frame_interval <= 0.0
+              ? std::min(livox_imu_translation_margin_,
+                         livox_imu_absolute_translation_cap_)
+              : danger_search_localization::PlanarTranslationLimit(
+                    frame_interval, livox_imu_maximum_speed_,
+                    livox_imu_translation_margin_,
+                    livox_imu_absolute_translation_cap_);
+      const auto result = imu_odometry_->EstimateFrame(
+          structural_vectors, translation_prior, adaptive_base_translation_,
+          translation_limit);
+      adaptive_depth_proposal_.accepted = result.accepted;
+      adaptive_depth_proposal_.translation = result.translation;
+      adaptive_depth_proposal_.age_seconds = 0.0;
+      adaptive_depth_proposal_.map_generation = result.map_generation;
+      Eigen::Vector2d delta = Eigen::Vector2d::Zero();
+      if (result.accepted) {
+        delta = (result.translation - adaptive_base_translation_).head<2>();
+      }
+      RecordMapRegistrationDiagnostic(
+          "adaptive_rgbd_proposal", message->header.stamp, result, delta,
+          &map_registration_diagnostics_);
+      ROS_INFO_THROTTLE(
+          2.0,
+          "共享地图 RGB-D 候选：accepted=%d stamp=%.3f generation=%lu "
+          "position=(%.3f, %.3f) corr=%zu",
+          result.accepted ? 1 : 0, message->header.stamp.toSec(),
+          static_cast<unsigned long>(result.map_generation),
+          result.translation.x(), result.translation.y(),
+          result.correspondence_count);
       return;
     }
     const Eigen::Vector2d command_prior = CommandMotionPrior(
@@ -825,7 +960,8 @@ class ScanLocalizationNode {
 
   void OnCloud(const sensor_msgs::PointCloud::ConstPtr &message) {
     // Livox 是世界系初始化和最终输出的主时钟。首个有效帧先估计楼面；之后按
-    // 后端执行纯 KISS-ICP、IMU 约束局部地图，或 RGB-D 连续里程 + Livox 校正。
+    // 后端执行纯 KISS-ICP、IMU 加速度积分旧后端、Livox-IMU 局部地图，或
+    // RGB-D 连续里程 + Livox 校正。
     std::vector<Eigen::Vector3d> points;
     points.reserve(message->points.size());
     for (const auto &point : message->points) {
@@ -840,11 +976,15 @@ class ScanLocalizationNode {
       return;
     }
 
-    std::unique_lock<std::mutex> process_lock(
-        use_rgbd_livox_ ? rgbd_scan_mutex_ : processing_mutex_);
+    std::mutex &process_mutex =
+        use_adaptive_shared_map_
+            ? shared_map_mutex_
+            : (use_rgbd_livox_ ? rgbd_scan_mutex_ : processing_mutex_);
+    std::unique_lock<std::mutex> process_lock(process_mutex);
 
     std::optional<ImuSample> current_imu_sample;
-    if (use_imu_constrained_ || use_rgbd_livox_ || stance_health_enabled_) {
+    if (use_imu_constrained_ || use_livox_imu_local_map_ ||
+        use_adaptive_shared_map_ || use_rgbd_livox_ || stance_health_enabled_) {
       double imu_delta = std::numeric_limits<double>::infinity();
       current_imu_sample = ImuSampleAt(message->header.stamp, &imu_delta);
       if (!current_imu_sample.has_value()) {
@@ -909,7 +1049,8 @@ class ScanLocalizationNode {
         world_livox0_ = world_base0 * base_to_livox_;
         initial_world_base_rotation_ = world_base0.rotationMatrix();
         initial_world_base_translation_ = world_base0.translation();
-        if (use_imu_constrained_ || use_rgbd_livox_) {
+        if (use_imu_constrained_ || use_livox_imu_local_map_ ||
+            use_adaptive_shared_map_ || use_rgbd_livox_) {
           initial_imu_rotation_ = current_imu_sample->rotation;
           imu_anchor_initialized_ = true;
         }
@@ -926,6 +1067,13 @@ class ScanLocalizationNode {
           depth_fusion_offset_ = fused_planar_position_;
           fusion_initialized_ = true;
         }
+        if (use_livox_imu_local_map_) {
+          local_map_base_translation_ = world_base0.translation();
+        }
+        if (use_adaptive_shared_map_) {
+          adaptive_base_translation_ = world_base0.translation();
+          adaptive_pose_initialized_ = true;
+        }
         world_frame_initialized_ = true;
         ROS_INFO(
             "定位世界系已由 Livox 楼面初始化：base_z=%.3f normal=(%.3f, %.3f, %.3f) "
@@ -937,7 +1085,250 @@ class ScanLocalizationNode {
     }
 
     SE3d world_livox;
-    if (use_rgbd_livox_) {
+    if (use_adaptive_shared_map_) {
+      const Eigen::Matrix3d world_base_rotation =
+          danger_search_localization::AnchorImuOrientation(
+              initial_world_base_rotation_, initial_imu_rotation_,
+              current_imu_sample->rotation);
+      const Eigen::Matrix3d world_livox_rotation =
+          world_base_rotation * base_to_livox_.rotationMatrix();
+      const Eigen::Vector3d base_to_livox_world =
+          world_base_rotation * base_to_livox_.translation();
+      std::vector<Eigen::Vector3d> structural_vectors;
+      structural_vectors.reserve(points.size());
+      for (const auto &point : points) {
+        const Eigen::Vector3d base_centered =
+            world_livox_rotation * point + base_to_livox_world;
+        const double floor_relative_height =
+            adaptive_base_translation_.z() + base_centered.z();
+        if (floor_relative_height > 0.22 && floor_relative_height < 1.90 &&
+            point.norm() < 12.0) {
+          structural_vectors.push_back(base_centered);
+        }
+      }
+
+      if (!imu_odometry_->initialized()) {
+        if (!imu_odometry_->CommitFrame(
+                structural_vectors, adaptive_base_translation_,
+                imu_odometry_->map_generation())) {
+          ROS_WARN_THROTTLE(
+              2.0, "共享地图首帧结构不足，等待下一份有效 Livox 帧");
+          UpdateAndPublishStanceHealth(
+              message->header.stamp, current_imu_sample, current_ground);
+          return;
+        }
+        adaptive_depth_proposal_ = {};
+        adaptive_depth_proposal_stamp_ = ros::Time();
+        last_adaptive_output_stamp_ = message->header.stamp;
+        world_livox = SE3d(
+            SO3d(world_livox_rotation),
+            adaptive_base_translation_ + base_to_livox_world);
+        ROS_INFO(
+            "共享地图自适应定位已初始化：generation=%lu map_points=%zu",
+            static_cast<unsigned long>(imu_odometry_->map_generation()),
+            imu_odometry_->map_point_count());
+      } else {
+        const double frame_interval =
+            message->header.stamp.toSec() - last_adaptive_output_stamp_.toSec();
+        if (!std::isfinite(frame_interval) || frame_interval <= 0.0) {
+          ROS_WARN_THROTTLE(
+              2.0, "共享地图收到非单调 Livox 时间戳，停止发布本帧定位");
+          UpdateAndPublishStanceHealth(
+              message->header.stamp, current_imu_sample, current_ground);
+          return;
+        }
+        const double translation_limit =
+            danger_search_localization::PlanarTranslationLimit(
+                frame_interval, livox_imu_maximum_speed_,
+                livox_imu_translation_margin_,
+                livox_imu_absolute_translation_cap_);
+        Eigen::Vector3d livox_prior = adaptive_base_translation_;
+        livox_prior.head<2>() += CommandMotionPrior(
+            last_adaptive_output_stamp_, message->header.stamp,
+            world_base_rotation);
+        const auto livox_result = imu_odometry_->EstimateFrame(
+            structural_vectors, livox_prior, adaptive_base_translation_,
+            translation_limit);
+        danger_search_localization::TranslationProposal livox_proposal;
+        livox_proposal.accepted = livox_result.accepted;
+        livox_proposal.translation = livox_result.translation;
+        livox_proposal.age_seconds = 0.0;
+        livox_proposal.map_generation = livox_result.map_generation;
+
+        auto rgbd_proposal = adaptive_depth_proposal_;
+        const ros::Time rgbd_stamp = adaptive_depth_proposal_stamp_;
+        adaptive_depth_proposal_ = {};
+        adaptive_depth_proposal_stamp_ = ros::Time();
+        if (!rgbd_stamp.isZero()) {
+          rgbd_proposal.age_seconds =
+              message->header.stamp.toSec() - rgbd_stamp.toSec();
+          if (rgbd_proposal.accepted &&
+              std::isfinite(rgbd_proposal.age_seconds) &&
+              rgbd_proposal.age_seconds >= 0.0) {
+            rgbd_proposal.translation.head<2>() += CommandMotionPrior(
+                rgbd_stamp, message->header.stamp, world_base_rotation);
+            if (std::isfinite(translation_limit) &&
+                (rgbd_proposal.translation - adaptive_base_translation_)
+                        .head<2>()
+                        .norm() > translation_limit) {
+              rgbd_proposal.accepted = false;
+            }
+          }
+        }
+
+        const auto decision =
+            danger_search_localization::DecideAdaptiveTranslation(
+                rgbd_proposal, livox_proposal,
+                imu_odometry_->map_generation(), adaptive_selector_config_);
+        Eigen::Vector2d livox_delta = Eigen::Vector2d::Zero();
+        if (livox_result.accepted) {
+          livox_delta =
+              (livox_result.translation - adaptive_base_translation_).head<2>();
+        }
+        RecordMapRegistrationDiagnostic(
+            "adaptive_livox_proposal", message->header.stamp, livox_result,
+            livox_delta, &map_registration_diagnostics_);
+
+        if (!decision.accepted) {
+          ++adaptive_both_invalid_count_;
+          ROS_WARN_THROTTLE(
+              1.0,
+              "共享地图两路平移候选均无效，停止更新 odom："
+              "livox_status=%s rgbd_age=%.3f generation=%lu count=%lu",
+              danger_search_localization::ImuConstrainedOdometryStatusName(
+                  livox_result.status),
+              rgbd_proposal.age_seconds,
+              static_cast<unsigned long>(imu_odometry_->map_generation()),
+              static_cast<unsigned long>(adaptive_both_invalid_count_));
+          UpdateAndPublishStanceHealth(
+              message->header.stamp, current_imu_sample, current_ground);
+          return;
+        }
+
+        bool map_committed = false;
+        if (decision.commit_livox_map) {
+          map_committed = imu_odometry_->CommitFrame(
+              structural_vectors, decision.translation,
+              livox_result.map_generation);
+          if (!map_committed) {
+            ROS_ERROR_THROTTLE(
+                1.0,
+                "共享地图事务提交失败，停止发布本帧定位以避免位姿和地图分叉");
+            UpdateAndPublishStanceHealth(
+                message->header.stamp, current_imu_sample, current_ground);
+            return;
+          }
+        }
+
+        const Eigen::Vector2d selected_delta =
+            (decision.translation - adaptive_base_translation_).head<2>();
+        adaptive_base_translation_ = decision.translation;
+        last_adaptive_output_stamp_ = message->header.stamp;
+        if (decision.source ==
+            danger_search_localization::AdaptiveTranslationSource::kRgbd) {
+          ++adaptive_rgbd_selected_count_;
+        } else {
+          ++adaptive_livox_selected_count_;
+        }
+        LogLargeTranslationIncrement(
+            "adaptive_shared_map", message->header.stamp, selected_delta,
+            std::numeric_limits<double>::quiet_NaN(),
+            livox_result.correspondence_count);
+        ROS_INFO_THROTTLE(
+            1.0,
+            "共享地图自适应定位：source=%s reason=%s position=(%.3f, %.3f) "
+            "delta=(%.3f, %.3f) divergence=%.3f rgbd_age=%.3f "
+            "generation=%lu map_commit=%d selected=(rgbd:%lu livox:%lu) "
+            "both_invalid=%lu",
+            danger_search_localization::AdaptiveTranslationSourceName(
+                decision.source),
+            danger_search_localization::AdaptiveTranslationReasonName(
+                decision.reason),
+            adaptive_base_translation_.x(), adaptive_base_translation_.y(),
+            selected_delta.x(), selected_delta.y(), decision.source_divergence,
+            rgbd_proposal.age_seconds,
+            static_cast<unsigned long>(imu_odometry_->map_generation()),
+            map_committed ? 1 : 0,
+            static_cast<unsigned long>(adaptive_rgbd_selected_count_),
+            static_cast<unsigned long>(adaptive_livox_selected_count_),
+            static_cast<unsigned long>(adaptive_both_invalid_count_));
+        world_livox = SE3d(
+            SO3d(world_livox_rotation),
+            adaptive_base_translation_ + base_to_livox_world);
+      }
+    } else if (use_livox_imu_local_map_) {
+      const Eigen::Matrix3d world_base_rotation =
+          danger_search_localization::AnchorImuOrientation(
+              initial_world_base_rotation_, initial_imu_rotation_,
+              current_imu_sample->rotation);
+      const Eigen::Matrix3d world_livox_rotation =
+          world_base_rotation * base_to_livox_.rotationMatrix();
+      const Eigen::Vector3d base_to_livox_world =
+          world_base_rotation * base_to_livox_.translation();
+      std::vector<Eigen::Vector3d> structural_vectors;
+      structural_vectors.reserve(points.size());
+      for (const auto &point : points) {
+        // 以 base 为配准中心，IMU 只负责旋转；局部地图优化变量始终是 base
+        // 平移，避免原地转向时 Livox 安装臂长形成伪平移。
+        const Eigen::Vector3d base_centered =
+            world_livox_rotation * point + base_to_livox_world;
+        const double floor_relative_height =
+            local_map_base_translation_.z() + base_centered.z();
+        if (floor_relative_height > 0.22 && floor_relative_height < 1.90 &&
+            point.norm() < 12.0) {
+          structural_vectors.push_back(base_centered);
+        }
+      }
+      const double frame_interval = last_local_map_accept_stamp_.isZero()
+                                        ? std::numeric_limits<double>::quiet_NaN()
+                                        : message->header.stamp.toSec() -
+                                              last_local_map_accept_stamp_.toSec();
+      Eigen::Vector3d translation_prior = local_map_base_translation_;
+      translation_prior.head<2>() += CommandMotionPrior(
+          last_local_map_accept_stamp_, message->header.stamp,
+          world_base_rotation);
+      const double translation_limit =
+          danger_search_localization::PlanarTranslationLimit(
+              frame_interval, livox_imu_maximum_speed_,
+              livox_imu_translation_margin_,
+              livox_imu_absolute_translation_cap_);
+      const auto result = imu_odometry_->RegisterFrame(
+          structural_vectors, translation_prior, translation_limit);
+      Eigen::Vector2d accepted_delta = Eigen::Vector2d::Zero();
+      if (result.accepted) {
+        accepted_delta = result.translation.head<2>() -
+                         local_map_base_translation_.head<2>();
+      }
+      RecordMapRegistrationDiagnostic(
+          "livox_imu_local_map", message->header.stamp, result,
+          accepted_delta, &map_registration_diagnostics_);
+      if (result.accepted) {
+        local_map_base_translation_ = result.translation;
+        last_local_map_accept_stamp_ = message->header.stamp;
+        LogLargeTranslationIncrement(
+            "livox_imu_local_map", message->header.stamp, accepted_delta,
+            std::numeric_limits<double>::quiet_NaN(),
+            result.correspondence_count);
+      } else {
+        ROS_WARN_THROTTLE(
+            2.0,
+            "Livox-IMU 局部地图拒绝当前平移，保持上一已接受位姿："
+            "status=%s corr=%zu limit=%.3f",
+            danger_search_localization::ImuConstrainedOdometryStatusName(
+                result.status),
+            result.correspondence_count, translation_limit);
+      }
+      world_livox = SE3d(
+          SO3d(world_livox_rotation),
+          local_map_base_translation_ + base_to_livox_world);
+      ROS_INFO_THROTTLE(
+          2.0,
+          "Livox-IMU 局部地图定位：accepted=%d position=(%.3f, %.3f) "
+          "delta=(%.3f, %.3f) corr=%zu",
+          result.accepted ? 1 : 0, local_map_base_translation_.x(),
+          local_map_base_translation_.y(), accepted_delta.x(),
+          accepted_delta.y(), result.correspondence_count);
+    } else if (use_rgbd_livox_) {
       const Eigen::Matrix3d world_base_rotation =
           danger_search_localization::AnchorImuOrientation(
               initial_world_base_rotation_, initial_imu_rotation_,
@@ -1357,7 +1748,7 @@ class ScanLocalizationNode {
     ROS_INFO(
         "localization_map_registration_summary source=%s stamp=%.6f "
         "accepted=%llu initial=%llu insufficient_source=%llu "
-        "insufficient_correspondences=%llu clamped=%llu "
+        "insufficient_correspondences=%llu translation_limit=%llu clamped=%llu "
         "maximum_unclamped_norm=%.4f maximum_applied_norm=%.4f "
         "latest_status=%s latest_unclamped=(%.4f, %.4f) "
         "latest_applied=(%.4f, %.4f) latest_correspondences=%zu "
@@ -1369,6 +1760,7 @@ class ScanLocalizationNode {
         count(danger_search_localization::ImuConstrainedOdometryStatus::kInitialFrame),
         count(danger_search_localization::ImuConstrainedOdometryStatus::kInsufficientSource),
         count(danger_search_localization::ImuConstrainedOdometryStatus::kInsufficientCorrespondences),
+        count(danger_search_localization::ImuConstrainedOdometryStatus::kTranslationLimit),
         static_cast<unsigned long long>(stats->clamped_count),
         stats->maximum_unclamped_norm, stats->maximum_applied_norm,
         danger_search_localization::ImuConstrainedOdometryStatusName(
@@ -1625,13 +2017,21 @@ class ScanLocalizationNode {
   bool world_frame_initialized_ = false;
   bool stance_health_enabled_ = true;
   bool use_imu_constrained_ = false;
+  bool use_livox_imu_local_map_ = false;
+  bool use_adaptive_shared_map_ = false;
   bool use_rgbd_livox_ = false;
   bool imu_anchor_initialized_ = false;
   bool fusion_initialized_ = false;
+  bool adaptive_pose_initialized_ = false;
   double min_range_ = 0.5;
   double max_range_ = 15.0;
   double imu_max_delta_ = 0.01;
   double command_velocity_scale_ = 1.0;
+  double livox_imu_maximum_speed_ = 0.70;
+  double livox_imu_translation_margin_ = 0.02;
+  double livox_imu_absolute_translation_cap_ = 0.30;
+  danger_search_localization::AdaptiveTranslationConfig
+      adaptive_selector_config_;
   double diagnostic_large_translation_threshold_ = 0.08;
   double diagnostic_summary_period_ = 2.0;
   bool diagnostic_frame_details_ = false;
@@ -1648,12 +2048,16 @@ class ScanLocalizationNode {
   mutable std::mutex command_mutex_;
   std::mutex processing_mutex_;
   std::mutex rgbd_scan_mutex_;
+  std::mutex shared_map_mutex_;
   std::mutex depth_processing_mutex_;
   std::mutex initialization_mutex_;
   std::mutex fusion_mutex_;
   ros::Time last_depth_process_stamp_;
   ros::Time last_depth_registration_stamp_;
   ros::Time last_livox_registration_stamp_;
+  ros::Time last_local_map_accept_stamp_;
+  ros::Time last_adaptive_output_stamp_;
+  ros::Time adaptive_depth_proposal_stamp_;
   std::deque<CommandSample> command_samples_;
   Eigen::Vector2d depth_total_ = Eigen::Vector2d::Zero();
   Eigen::Vector2d livox_total_ = Eigen::Vector2d::Zero();
@@ -1662,6 +2066,12 @@ class ScanLocalizationNode {
   Eigen::Vector2d livox_at_last_depth_ = Eigen::Vector2d::Zero();
   Eigen::Vector2d depth_fusion_offset_ = Eigen::Vector2d::Zero();
   Eigen::Vector2d map_correction_total_ = Eigen::Vector2d::Zero();
+  Eigen::Vector3d local_map_base_translation_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d adaptive_base_translation_ = Eigen::Vector3d::Zero();
+  danger_search_localization::TranslationProposal adaptive_depth_proposal_;
+  std::uint64_t adaptive_rgbd_selected_count_ = 0;
+  std::uint64_t adaptive_livox_selected_count_ = 0;
+  std::uint64_t adaptive_both_invalid_count_ = 0;
   Eigen::Vector2d depth_command_total_ = Eigen::Vector2d::Zero();
   ros::Time last_depth_accept_stamp_;
   bool scale_window_initialized_ = false;

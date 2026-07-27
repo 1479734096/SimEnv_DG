@@ -102,6 +102,15 @@ if(CATKIN_ENABLE_TESTING)
     gtest_main
   )
 
+  catkin_add_gtest(test_adaptive_translation_selector
+    test/test_adaptive_translation_selector.cpp)
+  target_compile_features(test_adaptive_translation_selector PRIVATE cxx_std_17)
+  target_include_directories(test_adaptive_translation_selector PRIVATE
+    include
+    ${EIGEN3_INCLUDE_DIRS}
+  )
+  target_link_libraries(test_adaptive_translation_selector gtest_main)
+
   catkin_add_gtest(test_imu_motion_predictor test/test_imu_motion_predictor.cpp)
   target_compile_features(test_imu_motion_predictor PRIVATE cxx_std_17)
   target_include_directories(test_imu_motion_predictor PRIVATE

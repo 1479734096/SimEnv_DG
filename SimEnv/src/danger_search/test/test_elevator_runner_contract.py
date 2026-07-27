@@ -26,6 +26,7 @@ class ElevatorRunnerContractTest(unittest.TestCase):
             "ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS=1",
             result.stdout,
         )
+        self.assertIn("ELEVATOR_TEST_LOCALIZATION_BACKEND=kiss_icp", result.stdout)
         self.assertIn("到达显式楼层数的最高层", result.stdout)
         self.assertNotIn("完成 0→1 电梯任务", result.stdout)
 
@@ -78,6 +79,53 @@ class ElevatorRunnerContractTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertIn("必须同时录制定位和独立离线真值", result.stderr)
+
+    def test_invalid_localization_backend_fails_before_starting_ros(self):
+        environment = dict(os.environ)
+        environment["ELEVATOR_TEST_LOCALIZATION_BACKEND"] = "unknown"
+        result = subprocess.run(
+            ["bash", str(RUNNER)],
+            cwd=SIMENV_ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(
+            "仅支持 kiss_icp、imu_constrained、livox_imu_local_map、"
+            "adaptive_shared_map 或 rgbd_livox",
+            result.stderr,
+        )
+
+    def test_runner_accepts_adaptive_shared_map_without_starting_ros(self):
+        environment = dict(os.environ)
+        environment["ELEVATOR_TEST_LOCALIZATION_BACKEND"] = "adaptive_shared_map"
+        environment["ELEVATOR_TEST_RECORD_DRIFT"] = "2"
+        result = subprocess.run(
+            ["bash", str(RUNNER)],
+            cwd=SIMENV_ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("诊断开关只能是 0 或 1", result.stderr)
+        self.assertNotIn("LOCALIZATION_BACKEND 仅支持", result.stderr)
+
+    def test_runner_passes_localization_backend_to_formal_launch(self):
+        source = RUNNER.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'localization_backend:="$ELEVATOR_TEST_LOCALIZATION_BACKEND"', source
+        )
+        self.assertIn(
+            "printf 'localization_backend=%s\\n' \"$ELEVATOR_TEST_LOCALIZATION_BACKEND\"",
+            source,
+        )
 
 
 if __name__ == "__main__":

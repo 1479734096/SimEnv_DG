@@ -9,7 +9,7 @@ source /opt/ros/noetic/setup.bash
 source devel/setup.bash
 ```
 
-Python 文件当前没有可执行权限，应使用 `python3 tools/offline/xxx.py` 调用。仿真 runner
+离线分析器通常使用 `python3 tools/offline/xxx.py` 调用；定位矩阵汇总器和仿真 runner
 可以直接执行。
 
 ## 1. 目录与工具总览
@@ -18,10 +18,12 @@ Python 文件当前没有可执行权限，应使用 `python3 tools/offline/xxx.
 tools/
 ├── usetools.md
 ├── sim/
-│   └── run_elevator_gui_test.sh
+│   ├── run_elevator_gui_test.sh
+│   └── run_localization_seed_matrix.sh
 └── offline/
     ├── README.md
     ├── check_production_boundary.py
+    ├── summarize_localization_matrix.py
     ├── analyze_mission_timing.py
     ├── analyze_localization_drift_bag.py
     ├── analyze_localization_quality_bag.py
@@ -35,8 +37,10 @@ tools/
 | 工具 | 主要用途 | 是否需要离线真值 |
 |---|---|---|
 | `sim/run_elevator_gui_test.sh` | 启动两层/三层 GUI 电梯专项并归档证据 | 默认不需要；可显式录制 |
+| `sim/run_localization_seed_matrix.sh` | 串行运行并恢复预登记的 20-seed 定位矩阵 | 是，仅离线裁决 |
 | `offline/README.md` | 说明离线工具与生产闭包的隔离原则 | 否 |
 | `offline/check_production_boundary.py` | 检查生产包没有导入离线/真值工具 | 否 |
+| `offline/summarize_localization_matrix.py` | 汇总矩阵证据并按冻结门槛裁决 | 是，读取 runner 产物 |
 | `offline/analyze_mission_timing.py` | 统计任务耗时、运动、覆盖、安全事件和失败类型 | 否；定位误差/评分为可选 sidecar |
 | `offline/analyze_localization_drift_bag.py` | 计算生产定位相对真值的漂移 | 是 |
 | `offline/analyze_localization_quality_bag.py` | 分析 GICP、scan-to-map 和传感器短窗质量 | 是 |

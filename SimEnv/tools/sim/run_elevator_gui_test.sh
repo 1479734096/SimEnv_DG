@@ -22,6 +22,7 @@ ELEVATOR_TEST_RECORD_RGBD="${ELEVATOR_TEST_RECORD_RGBD:-0}"
 ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH="${ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH:-0}"
 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS="${ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS:-0}"
 ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS="${ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS:-0}"
+ELEVATOR_TEST_LOCALIZATION_BACKEND="${ELEVATOR_TEST_LOCALIZATION_BACKEND:-rgbd_livox}"
 LOG_DIR="${ELEVATOR_TEST_LOG_DIR:-/tmp/danger_search_elevator_test_$(date +%Y%m%d_%H%M%S)}"
 
 AUTO_PID=""
@@ -59,6 +60,7 @@ usage() {
   ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1  同时录制真值供运行结束后离线漂移评估
   ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=1  启用逐帧定位日志并在诊断 bag 录制 /scan
   ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS=1  启用只读电梯地标漂移诊断
+  ELEVATOR_TEST_LOCALIZATION_BACKEND=kiss_icp  选择定位后端，默认 rgbd_livox
   ELEVATOR_TEST_KEEP_RUNNING=1         成功后保留 GUI，按 Ctrl-C 清理
   ELEVATOR_TEST_LOG_DIR=/tmp/...       证据目录
 
@@ -110,6 +112,7 @@ write_summary() {
     printf 'offline_truth=%s\n' "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH"
     printf 'localization_diagnostics=%s\n' "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS"
     printf 'landmark_drift_diagnostics=%s\n' "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS"
+    printf 'localization_backend=%s\n' "$ELEVATOR_TEST_LOCALIZATION_BACKEND"
     printf 'diagnostic_bag=%s/elevator_diagnostic.bag\n' "$LOG_DIR"
     printf 'rgbd_bag=%s/elevator_rgbd.bag\n' "$LOG_DIR"
     printf 'drift_summary=%s/localization_drift.json\n' "$LOG_DIR"
@@ -255,6 +258,13 @@ if [[ "$ELEVATOR_TEST_FULL_CYCLE" != "0" && "$ELEVATOR_TEST_FULL_CYCLE" != "1" ]
   printf 'ELEVATOR_TEST_FULL_CYCLE 只能是 0 或 1\n' >&2
   exit 2
 fi
+case "$ELEVATOR_TEST_LOCALIZATION_BACKEND" in
+  kiss_icp|imu_constrained|livox_imu_local_map|adaptive_shared_map|rgbd_livox) ;;
+  *)
+    printf 'ELEVATOR_TEST_LOCALIZATION_BACKEND 仅支持 kiss_icp、imu_constrained、livox_imu_local_map、adaptive_shared_map 或 rgbd_livox\n' >&2
+    exit 2
+    ;;
+esac
 for flag in "$ELEVATOR_TEST_RECORD_DRIFT" "$ELEVATOR_TEST_RECORD_RGBD" "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS"; do
   if [[ "$flag" != "0" && "$flag" != "1" ]]; then
     printf '诊断开关只能是 0 或 1：%s\n' "$flag" >&2
@@ -391,6 +401,7 @@ fi
 log "机器人已站立并进入 /cmd_vel 模式，启动正式任务节点"
 setsid roslaunch danger_search danger_search.launch \
   config:="$TEST_CONFIG" \
+  localization_backend:="$ELEVATOR_TEST_LOCALIZATION_BACKEND" \
   localization_diagnostic_frame_details:="$([[ "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" == "1" ]] && printf true || printf false)" \
   > "$MISSION_LOG" 2>&1 &
 MISSION_PID=$!

@@ -12,6 +12,23 @@ Gazebo 状态或生成场景，但其输出不得回流到同一轮任务的感�
 python3 tools/offline/check_production_boundary.py
 ```
 
+预登记定位矩阵由根目录 runner 串行执行，证据目录可断点续跑：
+
+```bash
+LOCALIZATION_MATRIX_OUTPUT_ROOT=/tmp/stage17_adaptive_shared_map_matrix \
+  tools/sim/run_localization_seed_matrix.sh
+```
+
+任务退出并完成离线漂移分析后，可单独重建汇总：
+
+```bash
+python3 tools/offline/summarize_localization_matrix.py \
+  /tmp/stage17_adaptive_shared_map_matrix
+```
+
+汇总器只读取 `TEST_SUMMARY.txt`、任务日志和漂移 sidecar，不进入生产启动链，也不向
+运行中的定位、规划或控制反馈结果。
+
 该命令检查 `danger_search` 的 Python 安装清单、模块导入和 launch 入口，防止后续修改
 把离线评测依赖带回生产包。
 

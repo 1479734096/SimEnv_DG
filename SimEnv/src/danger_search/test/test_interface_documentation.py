@@ -47,7 +47,13 @@ class InterfaceDocumentationTest(unittest.TestCase):
             arguments.get("team_scene_info_path"),
             "$(find danger_search)/../../generated_building/team_scene_info.json",
         )
-        self.assertEqual(arguments.get("localization_backend"), "rgbd_livox")
+        launch_arguments = {
+            arg.get("name"): arg.get("default") for arg in root.findall("arg")
+        }
+        self.assertEqual(launch_arguments.get("localization_backend"), "rgbd_livox")
+        self.assertEqual(
+            arguments.get("localization_backend"), "$(arg localization_backend)"
+        )
         formal_node = next(
             node for node in root.findall("node") if node.get("name") == "danger_search"
         )
@@ -91,6 +97,13 @@ class InterfaceDocumentationTest(unittest.TestCase):
         string_parameters = {item.get("name") for item in node.findall("param")}
         arguments = {item.get("name"): item.get("default") for item in root.findall("arg")}
         self.assertEqual(arguments.get("localization_backend"), "kiss_icp")
+        self.assertEqual(arguments.get("shared_map_depth_max_age"), "0.35")
+        self.assertEqual(
+            arguments.get("shared_map_max_source_divergence"), "0.05"
+        )
+        self.assertEqual(
+            arguments.get("shared_map_max_map_commit_difference"), "0.05"
+        )
         self.assertEqual(
             next(
                 item.get("value")

@@ -175,5 +175,127 @@ TEST(ImuConstrainedOdometry, ReportsUnclampedCorrectionWhenSafetyLimitApplies) {
               config.maximum_correction_from_prior, 1e-9);
 }
 
+TEST(ImuConstrainedOdometry, ComputesCappedKinematicTranslationLimit) {
+  EXPECT_NEAR(PlanarTranslationLimit(0.20, 0.70, 0.02, 0.30), 0.16, 1e-12);
+  EXPECT_NEAR(PlanarTranslationLimit(1.00, 0.70, 0.02, 0.30), 0.30, 1e-12);
+  EXPECT_TRUE(std::isinf(PlanarTranslationLimit(
+      std::numeric_limits<double>::quiet_NaN(), 0.70, 0.02, 0.30)));
+  EXPECT_THROW(PlanarTranslationLimit(0.10, 0.0, 0.02, 0.30),
+               std::invalid_argument);
+}
+
+TEST(ImuConstrainedOdometry, RejectsTranslationBeforeUpdatingLocalMap) {
+  ImuConstrainedOdometryConfig config;
+  config.minimum_correspondences = 80;
+  config.maximum_correspondence_distance = 0.55;
+  config.maximum_correction_from_prior = 0.50;
+  ImuConstrainedOdometry odometry(config);
+  const auto world_points = MakeAsymmetricStructure();
+  const Eigen::Vector3d initial_translation(0.0, -3.0, 0.35);
+  ASSERT_TRUE(odometry.RegisterFrame(
+      SensorVectors(world_points, initial_translation), initial_translation).accepted);
+
+  const Eigen::Vector3d excessive_translation(0.20, -3.0, 0.35);
+  const auto rejected = odometry.RegisterFrame(
+      SensorVectors(world_points, excessive_translation), excessive_translation,
+      0.10);
+
+  EXPECT_FALSE(rejected.accepted);
+  EXPECT_EQ(rejected.status, ImuConstrainedOdometryStatus::kTranslationLimit);
+  EXPECT_STREQ(ImuConstrainedOdometryStatusName(rejected.status),
+               "translation_limit");
+  EXPECT_NEAR(rejected.translation.x(), initial_translation.x(), 1e-12);
+  EXPECT_NEAR(rejected.translation.y(), initial_translation.y(), 1e-12);
+
+  const Eigen::Vector3d valid_translation(0.05, -3.0, 0.35);
+  const auto accepted = odometry.RegisterFrame(
+      SensorVectors(world_points, valid_translation), valid_translation, 0.10);
+  ASSERT_TRUE(accepted.accepted);
+  EXPECT_NEAR(accepted.translation.x(), valid_translation.x(), 0.01);
+  EXPECT_NEAR(accepted.translation.y(), valid_translation.y(), 0.01);
+}
+
+TEST(ImuConstrainedOdometry, EstimatesWithoutMutatingMapUntilExplicitCommit) {
+  ImuConstrainedOdometryConfig config;
+  config.minimum_correspondences = 80;
+  config.maximum_correspondence_distance = 0.55;
+  ImuConstrainedOdometry odometry(config);
+  const auto world_points = MakeAsymmetricStructure();
+  const Eigen::Vector3d initial_translation(0.0, -3.0, 0.35);
+  const Eigen::Vector3d moved_translation(0.06, -3.02, 0.36);
+  ASSERT_TRUE(odometry.RegisterFrame(
+      SensorVectors(world_points, initial_translation), initial_translation).accepted);
+  const std::uint64_t generation_before = odometry.map_generation();
+  const std::size_t map_points_before = odometry.map_point_count();
+
+  const auto estimated = odometry.EstimateFrame(
+      SensorVectors(world_points, moved_translation), moved_translation,
+      initial_translation, 0.10);
+
+  ASSERT_TRUE(estimated.accepted);
+  EXPECT_EQ(estimated.map_generation, generation_before);
+  EXPECT_EQ(odometry.map_generation(), generation_before);
+  EXPECT_EQ(odometry.map_point_count(), map_points_before);
+  EXPECT_TRUE(odometry.last_committed_translation().isApprox(
+      initial_translation, 1e-12));
+  ASSERT_TRUE(odometry.CommitFrame(
+      SensorVectors(world_points, moved_translation), estimated.translation,
+      estimated.map_generation));
+  EXPECT_EQ(odometry.map_generation(), generation_before + 1U);
+  EXPECT_TRUE(odometry.last_committed_translation().isApprox(
+      estimated.translation, 1e-12));
+}
+
+TEST(ImuConstrainedOdometry, RejectsStaleMapGenerationWithoutMutation) {
+  ImuConstrainedOdometry odometry;
+  const auto world_points = MakeAsymmetricStructure();
+  const Eigen::Vector3d initial_translation(0.0, -3.0, 0.35);
+  ASSERT_TRUE(odometry.RegisterFrame(
+      SensorVectors(world_points, initial_translation), initial_translation).accepted);
+  const std::uint64_t current_generation = odometry.map_generation();
+  const std::size_t map_points_before = odometry.map_point_count();
+
+  EXPECT_FALSE(odometry.CommitFrame(
+      SensorVectors(world_points, initial_translation), initial_translation,
+      current_generation - 1U));
+  EXPECT_EQ(odometry.map_generation(), current_generation);
+  EXPECT_EQ(odometry.map_point_count(), map_points_before);
+}
+
+TEST(ImuConstrainedOdometry, UsesExplicitPublishedPoseForMotionLimit) {
+  ImuConstrainedOdometryConfig config;
+  config.maximum_correspondence_distance = 0.55;
+  config.maximum_correction_from_prior = 0.50;
+  ImuConstrainedOdometry odometry(config);
+  const auto world_points = MakeAsymmetricStructure();
+  const Eigen::Vector3d map_commit_translation(0.0, -3.0, 0.35);
+  ASSERT_TRUE(odometry.RegisterFrame(
+      SensorVectors(world_points, map_commit_translation),
+      map_commit_translation).accepted);
+  const Eigen::Vector3d latest_published_translation(0.20, -3.0, 0.35);
+  const Eigen::Vector3d current_translation(0.25, -3.0, 0.35);
+
+  const auto estimated = odometry.EstimateFrame(
+      SensorVectors(world_points, current_translation), current_translation,
+      latest_published_translation, 0.10);
+
+  ASSERT_TRUE(estimated.accepted);
+  EXPECT_NEAR(estimated.translation.x(), current_translation.x(), 0.02);
+}
+
+TEST(ImuConstrainedOdometry, ReportsUninitializedMapForReadOnlyEstimate) {
+  ImuConstrainedOdometry odometry;
+  const auto world_points = MakeAsymmetricStructure();
+  const Eigen::Vector3d translation(0.0, -3.0, 0.35);
+
+  const auto estimated = odometry.EstimateFrame(
+      SensorVectors(world_points, translation), translation, translation);
+
+  EXPECT_FALSE(estimated.accepted);
+  EXPECT_EQ(estimated.status,
+            ImuConstrainedOdometryStatus::kMapUninitialized);
+  EXPECT_EQ(estimated.map_generation, 0U);
+}
+
 }  // namespace
 }  // namespace danger_search_localization

@@ -55,6 +55,20 @@
 
 正式 `rgbd_livox` 定位节点的外部订阅闭包为 `/scan`、`/trunk_imu`、`/real_sense/depth/points` 和本系统已发布的 `/cmd_vel`。它不订阅 TF、Gazebo 状态或任何真值话题。
 
+默认关闭的 `livox_imu_local_map` 候选只订阅 `/scan`、`/trunk_imu` 和本系统已发布的
+`/cmd_vel`；构造时不要求 `/real_sense/depth/points`。这只缩小定位输入闭包，不影响
+MissionManager 对 RGB-D 图像、深度和内参的合法感知订阅。候选没有通过 Stage15
+闭环验收，正式 launch 默认仍是 `rgbd_livox`，运行期间禁止自动切换后端。
+
+默认关闭的 `adaptive_shared_map` 实验后端订阅 `/scan`、`/trunk_imu`、
+`/real_sense/depth/points` 和本系统已发布的 `/cmd_vel`，没有扩大正式后端已有的外部
+输入闭包。Livox 和 RGB-D 只在同一个固定后端内部对同一地图产生候选，最终仍只有一条
+`world → base` 位姿输出；这不允许 MissionManager 按楼层、任务阶段或状态切换后端。
+候选 generation 不一致或两路都无效时不提交地图、不发布该帧 odom/cloud，也不回退到
+真值、TF 或禁用文件。Stage16 只完成三组 seed，且曾使用不同运动进度的短窗提前停止
+矩阵，证据不足以晋级；正式 launch 默认保持 `rgbd_livox`，等待冻结门槛的 20-seed
+完整闭环裁决。
+
 姿态 health 不增加外部输入：它只复用 `/scan` 与 `/trunk_imu`。缺失、非有限或无法
 估计楼面的证据按异常帧累计；health=false 时同帧不再发布 odom/cloud，避免下游继续
 消费已知不可信位姿。正式 profile 不允许关闭 MissionManager 的 health 门控。

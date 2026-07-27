@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <unordered_map>
@@ -50,6 +51,9 @@ enum class ImuConstrainedOdometryStatus {
   kInitialFrame,
   kInsufficientSource,
   kInsufficientCorrespondences,
+  kTranslationLimit,
+  kMapUninitialized,
+  kMapGenerationMismatch,
   kCount,
 };
 
@@ -64,10 +68,31 @@ inline const char *ImuConstrainedOdometryStatusName(
       return "insufficient_source";
     case ImuConstrainedOdometryStatus::kInsufficientCorrespondences:
       return "insufficient_correspondences";
+    case ImuConstrainedOdometryStatus::kTranslationLimit:
+      return "translation_limit";
+    case ImuConstrainedOdometryStatus::kMapUninitialized:
+      return "map_uninitialized";
+    case ImuConstrainedOdometryStatus::kMapGenerationMismatch:
+      return "map_generation_mismatch";
     case ImuConstrainedOdometryStatus::kCount:
       return "count";
   }
   return "unknown";
+}
+
+inline double PlanarTranslationLimit(double frame_interval,
+                                     double maximum_speed,
+                                     double margin,
+                                     double absolute_cap) {
+  if (!std::isfinite(maximum_speed) || maximum_speed <= 0.0 ||
+      !std::isfinite(margin) || margin < 0.0 ||
+      !std::isfinite(absolute_cap) || absolute_cap <= 0.0) {
+    throw std::invalid_argument("平面运动学上界参数无效");
+  }
+  if (!std::isfinite(frame_interval) || frame_interval <= 0.0) {
+    return std::numeric_limits<double>::infinity();
+  }
+  return std::min(absolute_cap, maximum_speed * frame_interval + margin);
 }
 
 /// 一帧局部地图配准的验收结果；拒绝时仍返回安全的上一平移估计。
@@ -101,6 +126,7 @@ struct ImuConstrainedOdometryResult {
   double residual_covariance_max_eigenvalue =
       std::numeric_limits<double>::quiet_NaN();
   double residual_anisotropy = std::numeric_limits<double>::quiet_NaN();
+  std::uint64_t map_generation = 0;
 };
 
 /// 在 IMU 已固定旋转的条件下，仅估计平面平移的局部扫描匹配器。
@@ -116,7 +142,84 @@ class ImuConstrainedOdometry {
 
   ImuConstrainedOdometryResult RegisterFrame(
       const std::vector<Eigen::Vector3d> &world_oriented_vectors,
-      const Eigen::Vector3d &translation_prior) {
+      const Eigen::Vector3d &translation_prior,
+      double maximum_translation_from_last =
+          std::numeric_limits<double>::infinity()) {
+    ValidateTranslationLimit(maximum_translation_from_last);
+    const auto map_frame = kiss_icp::VoxelDownsample(
+        world_oriented_vectors, config_.map_voxel_size);
+    const auto source = kiss_icp::VoxelDownsample(
+        map_frame, config_.source_voxel_size);
+    if (source.size() < config_.minimum_correspondences) {
+      auto rejected = Rejected(
+          RejectionFallback(
+              initialized_ ? last_translation_ : translation_prior,
+              translation_prior),
+          0,
+          ImuConstrainedOdometryStatus::kInsufficientSource);
+      rejected.source_point_count = source.size();
+      rejected.map_point_count = map_points_.size();
+      rejected.map_generation = map_generation_;
+      return rejected;
+    }
+    if (!initialized_) {
+      const std::uint64_t expected_generation = map_generation_;
+      if (!CommitFrame(world_oriented_vectors, translation_prior,
+                       expected_generation)) {
+        auto rejected = Rejected(
+            translation_prior, 0,
+            ImuConstrainedOdometryStatus::kMapGenerationMismatch);
+        rejected.source_point_count = source.size();
+        rejected.map_point_count = map_points_.size();
+        rejected.map_generation = map_generation_;
+        return rejected;
+      }
+      ImuConstrainedOdometryResult result;
+      result.accepted = true;
+      result.translation = translation_prior;
+      result.correspondence_count = source.size();
+      result.status = ImuConstrainedOdometryStatus::kInitialFrame;
+      result.source_point_count = source.size();
+      result.map_point_count = map_points_.size();
+      result.map_generation = map_generation_;
+      return result;
+    }
+
+    auto result = EstimateFrame(
+        world_oriented_vectors, translation_prior, last_translation_,
+        maximum_translation_from_last);
+    if (!result.accepted) {
+      return result;
+    }
+    if (!CommitFrame(world_oriented_vectors, result.translation,
+                     result.map_generation)) {
+      auto rejected = Rejected(
+          last_translation_, result.correspondence_count,
+          ImuConstrainedOdometryStatus::kMapGenerationMismatch);
+      rejected.source_point_count = result.source_point_count;
+      rejected.matched_correspondence_count =
+          result.matched_correspondence_count;
+      rejected.map_point_count = map_points_.size();
+      rejected.map_generation = map_generation_;
+      return rejected;
+    }
+    result.map_point_count = map_points_.size();
+    result.map_generation = map_generation_;
+    return result;
+  }
+
+  /// 只读估计当前帧平移；运动学上界始终相对上一正式发布位姿，而不是地图提交位姿。
+  ImuConstrainedOdometryResult EstimateFrame(
+      const std::vector<Eigen::Vector3d> &world_oriented_vectors,
+      const Eigen::Vector3d &translation_prior,
+      const Eigen::Vector3d &motion_reference_translation,
+      double maximum_translation_from_reference =
+          std::numeric_limits<double>::infinity()) const {
+    ValidateTranslationLimit(maximum_translation_from_reference);
+    if (!translation_prior.allFinite() ||
+        !motion_reference_translation.allFinite()) {
+      throw std::invalid_argument("平移先验和运动参考必须为有限数");
+    }
     // 两级体素分别控制地图密度与当前帧计算量；首个有效帧只初始化局部地图，
     // 没有上一地图时不虚构相对运动。
     const auto map_frame = kiss_icp::VoxelDownsample(
@@ -125,7 +228,9 @@ class ImuConstrainedOdometry {
         map_frame, config_.source_voxel_size);
     if (source.size() < config_.minimum_correspondences) {
       auto rejected = Rejected(
-          translation_prior, 0,
+          RejectionFallback(
+              motion_reference_translation, translation_prior),
+          0,
           ImuConstrainedOdometryStatus::kInsufficientSource);
       rejected.source_point_count = source.size();
       rejected.map_point_count = map_points_.size();
@@ -133,17 +238,14 @@ class ImuConstrainedOdometry {
     }
 
     if (!initialized_) {
-      UpdateMap(map_frame, translation_prior);
-      last_translation_ = translation_prior;
-      initialized_ = true;
-      ImuConstrainedOdometryResult result;
-      result.accepted = true;
-      result.translation = translation_prior;
-      result.correspondence_count = source.size();
-      result.status = ImuConstrainedOdometryStatus::kInitialFrame;
-      result.source_point_count = source.size();
-      result.map_point_count = map_points_.size();
-      return result;
+      auto rejected = Rejected(
+          RejectionFallback(
+              motion_reference_translation, translation_prior),
+          0,
+          ImuConstrainedOdometryStatus::kMapUninitialized);
+      rejected.source_point_count = source.size();
+      rejected.map_generation = map_generation_;
+      return rejected;
     }
 
     Eigen::Vector3d estimate = translation_prior;
@@ -283,7 +385,9 @@ class ImuConstrainedOdometry {
     }
     if (!has_valid_iteration || retained_count < config_.minimum_correspondences) {
       auto rejected = Rejected(
-          translation_prior, retained_count,
+          RejectionFallback(
+              motion_reference_translation, translation_prior),
+          retained_count,
           ImuConstrainedOdometryStatus::kInsufficientCorrespondences);
       rejected.source_point_count = source.size();
       rejected.matched_correspondence_count = matched_count;
@@ -303,8 +407,26 @@ class ImuConstrainedOdometry {
       correction_was_clamped = true;
     }
 
-    UpdateMap(map_frame, estimate);
-    last_translation_ = estimate;
+    if (std::isfinite(maximum_translation_from_reference) &&
+        (estimate - motion_reference_translation).head<2>().norm() >
+            maximum_translation_from_reference) {
+      auto rejected = Rejected(
+          RejectionFallback(
+              motion_reference_translation, translation_prior),
+          retained_count,
+          ImuConstrainedOdometryStatus::kTranslationLimit);
+      rejected.unclamped_correction = unclamped_correction;
+      rejected.correction_was_clamped = correction_was_clamped;
+      rejected.source_point_count = source.size();
+      rejected.matched_correspondence_count = matched_count;
+      rejected.map_point_count = map_points_.size();
+      rejected.iteration_count = iteration_count;
+      rejected.residual_p50 = residual_p50;
+      rejected.residual_p70 = residual_p70;
+      rejected.residual_p90 = residual_p90;
+      return rejected;
+    }
+
     ImuConstrainedOdometryResult result;
     result.accepted = true;
     result.translation = estimate;
@@ -329,7 +451,39 @@ class ImuConstrainedOdometry {
     result.residual_covariance_max_eigenvalue =
         residual_covariance_max_eigenvalue;
     result.residual_anisotropy = residual_anisotropy;
+    result.map_generation = map_generation_;
     return result;
+  }
+
+  /// 仅在地图代次仍与候选估计一致时提交一帧；调用方负责把位姿选择和地图写入串行化。
+  bool CommitFrame(
+      const std::vector<Eigen::Vector3d> &world_oriented_vectors,
+      const Eigen::Vector3d &translation, std::uint64_t expected_generation) {
+    if (!translation.allFinite() || expected_generation != map_generation_) {
+      return false;
+    }
+    const auto map_frame = kiss_icp::VoxelDownsample(
+        world_oriented_vectors, config_.map_voxel_size);
+    const auto source = kiss_icp::VoxelDownsample(
+        map_frame, config_.source_voxel_size);
+    if (source.size() < config_.minimum_correspondences) {
+      return false;
+    }
+    UpdateMap(map_frame, translation);
+    last_translation_ = translation;
+    initialized_ = true;
+    ++map_generation_;
+    return true;
+  }
+
+  bool initialized() const { return initialized_; }
+
+  std::uint64_t map_generation() const { return map_generation_; }
+
+  std::size_t map_point_count() const { return map_points_.size(); }
+
+  const Eigen::Vector3d &last_committed_translation() const {
+    return last_translation_;
   }
 
  private:
@@ -394,6 +548,22 @@ class ImuConstrainedOdometry {
     return config;
   }
 
+  static void ValidateTranslationLimit(double maximum_translation) {
+    if ((!std::isfinite(maximum_translation) &&
+         !std::isinf(maximum_translation)) ||
+        maximum_translation <= 0.0) {
+      throw std::invalid_argument("单帧平移上界必须为正数或正无穷");
+    }
+  }
+
+  static Eigen::Vector3d RejectionFallback(
+      const Eigen::Vector3d &motion_reference_translation,
+      const Eigen::Vector3d &translation_prior) {
+    Eigen::Vector3d fallback = motion_reference_translation;
+    fallback.z() = translation_prior.z();
+    return fallback;
+  }
+
   static double Quantile(std::vector<double> values, double quantile) {
     const std::size_t index = static_cast<std::size_t>(
         std::floor(quantile * static_cast<double>(values.size() - 1)));
@@ -413,15 +583,16 @@ class ImuConstrainedOdometry {
   }
 
   ImuConstrainedOdometryResult Rejected(
-      const Eigen::Vector3d &translation_prior,
+      const Eigen::Vector3d &fallback_translation,
       std::size_t correspondence_count,
       ImuConstrainedOdometryStatus status) const {
-    Eigen::Vector3d translation = initialized_
-                                      ? last_translation_
-                                      : translation_prior;
-    translation.z() = translation_prior.z();
-    return {false, translation, correspondence_count, status,
-            Eigen::Vector2d::Zero(), false};
+    ImuConstrainedOdometryResult result;
+    result.accepted = false;
+    result.translation = fallback_translation;
+    result.correspondence_count = correspondence_count;
+    result.status = status;
+    result.map_generation = map_generation_;
+    return result;
   }
 
   std::pair<std::vector<Eigen::Vector3d>, std::vector<Eigen::Vector3d>>
@@ -491,6 +662,7 @@ class ImuConstrainedOdometry {
   pcl::KdTreeFLANN<pcl::PointXYZ> search_tree_;
   bool initialized_ = false;
   Eigen::Vector3d last_translation_ = Eigen::Vector3d::Zero();
+  std::uint64_t map_generation_ = 0;
 };
 
 }  // namespace danger_search_localization
