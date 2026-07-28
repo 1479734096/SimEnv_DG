@@ -8,8 +8,8 @@
   <arg name="result_file" default=""/>
   <arg name="mission_summary_file" default=""/>
   <arg name="localization_diagnostic_frame_details" default="false"/>
-  <!-- 仅允许定位节点自身白名单中的后端；正式默认保持 rgbd_livox。 -->
-  <arg name="localization_backend" default="rgbd_livox"/>
+  <!-- 仅允许定位节点自身白名单中的后端；正式默认使用共享地图自适应后端。 -->
+  <arg name="localization_backend" default="adaptive_shared_map"/>
 
   <!-- 参数加载到全局命名空间；MissionManager 只读取并分组，不允许子组件私取配置。 -->
   <rosparam command="load" file="$(arg config)"/>

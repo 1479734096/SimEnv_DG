@@ -1,6 +1,6 @@
 # SimEnv 已完成与历史归档
 
-最后更新：2026-07-24
+最后更新：2026-07-28
 
 本文归档已经完成的机制、有效验证和历史失败结论。尚未完成的事项只维护在 [fix.md](fix.md)。
 
@@ -91,7 +91,11 @@
 
 ## 8. 定位与健康门
 
-- 正式定位使用 RGB-D/Livox 平移配准和 `/trunk_imu` 姿态约束；yaw 在现有仿真中稳定。
+- 正式定位默认使用 `adaptive_shared_map`：RGB-D 与 Livox 对同一张局部地图生成平移
+  候选，由 Livox 回调统一提交地图并发布单一位姿；`/trunk_imu` 直接约束姿态。
+- 两路候选共享 generation 和事务提交语义；过期、无效或代次不一致时不提交地图，
+  两路都无效时不发布 odom/cloud，使既有定位陈旧门 fail-closed。
+- 旧 `rgbd_livox` 保留为启动级显式回退，禁止在运行中按楼层、任务阶段或离线真值切换。
 - 定位 stance health 仅依赖公开 `/scan` 和 `/trunk_imu`，异常时撤销 ready，MissionManager 零速并显式失败。
 - `floor_local` z 语义已统一，当前所有消费者使用配置 `map/floor_height: 2.6`。
 - 定位 M0 只读诊断已完成：记录 GICP 拒绝原因、scan-to-map 校正、尺度窗口和运动一致性，不改变融合行为。
@@ -122,12 +126,31 @@ M3 结论：
 M4～M6 结论：
 
 - 局部前向/侧向、结构主轴和短窗分歧没有形成跨轮稳定判据，M4 停止在离线诊断层。
-- M5 的全局 Livox 候选已在 `11797de` 回退；当前生产行为恢复为 RGB-D 主链、Livox 仅在 RGB-D 过期时兜底。
+- M5 的全局 Livox 候选已在 `11797de` 回退；当时生产行为恢复为 RGB-D 主链、Livox
+  仅在 RGB-D 过期时兜底。该结论不等于后续共享地图事务式候选。
 - M6 seed=8072 完整完成 `0→1→0→主入口→home`，仿真 `161.962 s`，覆盖率 `0.339`；定位 RMSE `0.0563 m`、P95 `0.0838 m`、最大 `0.1494 m`、最终 `0.1168 m`，最大 yaw 误差 `0.0031 rad`。
 - M6 隐藏旋转主特征 AUC `0.6531`，低于预注册门槛 `0.70`，因此没有实现在线门控，也不再继续为该假设扫参。
-- 当前仍值得验证的唯一定位机制是跨楼层 scan-to-map 局部地图生命周期；它只列入 `fix.md`，尚未改变生产行为。
 
-证据：`../codeDG_rebuild/reports/STAGE12_M0_REPORT.md`、`../codeDG_rebuild/reports/STAGE12_M2_REPORT.md`、`../codeDG_rebuild/reports/STAGE12_M3_DIAGNOSTIC_REPORT.md`、`../codeDG_rebuild/reports/STAGE12_M6_GICP_ROTATION_DIAGNOSTIC_CHECKPOINT.md`、`../codeDG_rebuild/reports/STAGE12_M6_HIDDEN_ROTATION_REJECTION.md`。
+Stage15～17 当前结论：
+
+- 纯 KISS-ICP 与 `livox_imu_local_map` 均完成同 seed 定向测试，但都在二层失败；后者
+  RMSE `0.05598 m`、最大 yaw 误差 `0.00294 rad`，仍未形成正式切换证据，保留为默认
+  关闭实验后端。
+- `adaptive_shared_map` 通过共享地图、只读估计和事务提交消除了两路独立累计后的坐标
+  分叉；Stage16 三个固定 seed 候选均完成闭环，但样本不足，保持默认关闭。
+- Stage17 已有八个有效 seed，完整闭环 `8/8`、RMSE `<0.1 m` 为 `7/8`、定位诱发失败
+  为 `0`，平均 odom 频率均不低于 `9.93 Hz`，最大输出间隔均不超过 `0.202 s`。
+- 冻结的 20-seed 矩阵仍未完成；seed `42` 的 RMSE 为 `0.1012 m`，seed `1612` 的末端
+  误差为 `0.2529 m`，所以统计矩阵不能晋级。用户明确接受该残余风险后，Stage17 按工程
+  验收通过并将 `adaptive_shared_map` 切为正式默认；不得表述为冻结矩阵通过。
+
+证据：`../codeDG_rebuild/reports/STAGE12_M0_REPORT.md`、
+`../codeDG_rebuild/reports/STAGE12_M2_REPORT.md`、
+`../codeDG_rebuild/reports/STAGE12_M3_DIAGNOSTIC_REPORT.md`、
+`../codeDG_rebuild/reports/STAGE12_M6_GICP_ROTATION_DIAGNOSTIC_CHECKPOINT.md`、
+`../codeDG_rebuild/reports/STAGE12_M6_HIDDEN_ROTATION_REJECTION.md`、
+`../codeDG_rebuild/reports/STAGE15_REPORT.md`、`../codeDG_rebuild/reports/STAGE16_REPORT.md`
+和 `../codeDG_rebuild/reports/STAGE17_REPORT.md`。
 
 ## 9. 历史失败检查点
 
@@ -143,7 +166,7 @@ M4～M6 结论：
 
 原始运行目录和详细时间线继续保留在既有阶段报告与 `results/runs/`，不在当前待办中重复展开。
 
-## 10. 第 0～14.3 层逐层尝试档案
+## 10. 第 0～17 层逐层尝试档案
 
 ### 第 0 层：官方底座
 
@@ -364,20 +387,52 @@ M4～M6 结论：
 - 诊断失败：59 个对齐观测、49 个确认，但真值漂移增量最大仅 `0.23392 m`，未复现
   预注册 `>=0.30 m` 高漂移，也没有 `<=0.15 m` 低漂移负对照；向量误差
   P50/P95 为 `0.22909/0.30201 m`。
-- 裁决：最佳样本虽仅差 `0.00241 m`，不能代替完整分布；不实现定位回写、地图重锚或
-  第二轮同假设仿真。诊断默认关闭，定位专项恢复暂停。
+- 当时裁决：最佳样本虽仅差 `0.00241 m`，不能代替完整分布；不实现定位回写、地图重锚
+  或第二轮同假设仿真。诊断默认关闭，定位专项在该路径上恢复暂停。
+
+### 第 15 层：Livox-IMU 局部地图候选
+
+- 尝试：先量化纯 KISS-ICP，再实现只用 IMU 定姿、Livox 局部地图估计平移且拒绝帧不
+  污染地图的 `livox_imu_local_map` 后端；没有新增第三方依赖。
+- 结果：纯 KISS 和新候选都完成 `0→1`，但均在二层失败；候选 RMSE `0.05598 m`、
+  最大 yaw 误差 `0.00294 rad`，没有证明相对正式基线的净改善。
+- 裁决：正式默认保持当时的 `rgbd_livox`，不扫残差阈值，不引入缺少可信逐点时间前提
+  的 FAST-LIO2、LIO-SAM 或因子图。
+
+### 第 16 层：共享地图事务式自适应定位
+
+- 尝试：让 RGB-D 与 Livox 从同一地图只读估计候选，只由最终选中的 Livox 时钟帧按
+  generation 事务提交，避免未选候选和过期结果污染地图。
+- 结果：`seed=8127/1612/8072` 三轮候选均完成双层闭环，最大 yaw 误差均小于
+  `0.005 rad`；RGB-D 选中比例仍仅约 `3.7%～12.5%`。
+- 裁决：原同时间、不同路程的 seed 8072 对照无效；修正为同路程后候选改善，但三组
+  seed 仍不足以切默认，因此冻结实现和门槛，转入预登记矩阵。
+
+### 第 17 层：自适应定位正式后端验收
+
+- 尝试：增加固定 20-seed 矩阵 runner、离线汇总和暂停续跑语义，并把任务闭环与定位
+  RMSE、P95、末端、最大误差、yaw 和输出连续性分别验收。
+- 结果：当前八个有效 seed 全部完成双层闭环，定位诱发失败为 `0`；其中 `7/8` 的 RMSE
+  小于 `0.1 m`。seed `2027` 因 Gazebo/控制链未就绪暂停，矩阵仍为
+  `insufficient_evidence`。
+- 裁决：seed `42` 已使明显提升门槛不可达，seed `1612` 已违反末端误差硬门。用户明确
+  接受残余风险后按工程验收通过，正式默认切为 `adaptive_shared_map`，旧
+  `rgbd_livox` 保留为显式回退；未完成矩阵只继续量化风险。
 
 ## 11. 当前验证与合规基线
 
 - 参赛 Python 全包：`558 passed, 1 warning`。
-- 第 13.6 层定位构建与测试：`106 tests, 0 errors, 0 failures`；第 14.3 层没有 C++
-  修改，未重复 catkin 构建。
-- 生产/离线边界、`py_compile`、runner `bash -n` 和两个仓库的
-  `git diff --check`：通过。
-- 最新 GUI 轮使用 `GUI=true`；结束后 ROS master、Gazebo、控制器、任务、rosbag 和
-  FIFO keeper 均已清理，11311 端口为空。
+- Stage17 定位包构建与测试：`130 tests, 0 errors, 0 failures`；默认值、runner、矩阵与
+  接口契约定向测试 `25 passed`。
+- 生产/离线边界、矩阵汇总器 `py_compile`、runner `bash -n`、正式 launch 短时参数与
+  订阅检查均通过；正式运行时后端确认为 `adaptive_shared_map`。
+- 八轮生产订阅审计均未发现真值输入；正式定位节点只订阅 `/scan`、`/trunk_imu`、
+  `/real_sense/depth/points` 和本系统 `/cmd_vel`。真值只由独立 runner 录制并在任务结束
+  后离线评估。
+- Stage17 正式启动检查结束后 ROS master、Gazebo、控制器、任务和 rosbag 相关进程已
+  清理，11311 端口为空。
 - 官方哈希为 5 项已知差异：`auto.sh`、`FSM.h`、`FSM.cpp`、`gazebo.xacro`，以及用户
-  明确保留 `catkin_make -j4` 的 `docs/quick-start.md`。第 13.4～14.3 层没有扩大受保护
-  文件差异。
-- 当前生产定位仍为 RGB-D 主平移、RGB-D 过期时 Livox 兜底、scan-to-map 局部校正和
-  IMU yaw；所有未通过准入的定位候选均未进入生产行为。
+  明确保留 `catkin_make -j4` 的 `docs/quick-start.md`。第 15～17 层没有扩大受保护文件
+  差异。
+- 当前生产定位为共享地图自适应平移和 IMU 姿态约束；20-seed 矩阵尚未完成且已有硬门
+  失败，只能称工程验收通过，不能称统计准入通过。

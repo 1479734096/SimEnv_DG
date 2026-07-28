@@ -38,7 +38,7 @@ catkin_test_results build/test_results
 ```bash
 source devel/setup.bash
 roslaunch danger_search_localization scan_localization.launch \
-  localization_backend:=rgbd_livox
+  localization_backend:=adaptive_shared_map
 ```
 
 `livox_imu_local_map` 仅用于固定后端诊断，不是正式默认：
@@ -51,9 +51,9 @@ roslaunch danger_search_localization scan_localization.launch \
 
 该候选只用 `/scan`、`/trunk_imu` 和自身 `/cmd_vel` 做定位；RGB-D 仍由任务节点用于
 危险源、门和电梯感知。Stage15 固定 seed 闭环未通过，禁止在正式运行中选择该候选，
-也禁止根据任务阶段或实时输入在它与 `rgbd_livox` 之间自动切换。
+也禁止根据任务阶段或实时输入在它与正式 `adaptive_shared_map` 之间自动切换。
 
-`adaptive_shared_map` 同样只允许固定后端诊断：
+正式启动默认使用 `adaptive_shared_map`；也可用下面命令独立诊断：
 
 ```bash
 source devel/setup.bash
@@ -64,10 +64,17 @@ roslaunch danger_search_localization scan_localization.launch \
 该后端使用 `/trunk_imu` 定姿、Livox 维护唯一局部地图，并让 RGB-D 与 Livox 针对同一
 地图逐帧竞争平移候选。它不是任务阶段切源：启动后后端保持不变，PoseProvider 仍只有
 一条正式位姿。两路都无效时会停止发布新 odom/cloud，调用方必须保留既有陈旧定位和
-3 秒不可用门，不能用旧位姿伪造新时间戳。Stage16 的三个 seed 都完成闭环；seed
-`8072` 按同一 `1.529 m` 路程比较时 RMSE、P95 和末端误差均改善，原相同时间比较因
-运动进度不同而无效。但三轮样本不足以晋级，因此在 20-seed 完整矩阵裁决前禁止改成
-正式默认，也禁止现场修改 `shared_map_*` 阈值。
+3 秒不可用门，不能用旧位姿伪造新时间戳。Stage17 当前 `8/20` 个有效 seed 全部完成
+闭环且没有定位诱发失败，但矩阵尚未完成，seed `1612` 的末端误差也超过冻结硬门。
+正式默认是按用户明确决策直接切换，不代表矩阵已经通过；禁止现场修改
+`shared_map_*` 阈值。Stage17 工程验收状态为通过，剩余矩阵属于后续风险量化。
+
+需要回退旧后端时必须显式指定，避免把诊断行为误当成正式默认：
+
+```bash
+roslaunch danger_search danger_search.launch \
+  localization_backend:=rgbd_livox
+```
 
 节点启动后先锁存发布 `ready=false`。机器人站立稳定、连续楼面证据满足门槛后才发布 `ready=true`、里程计和配准点云；调用方不得用固定等待替代该就绪信号。
 

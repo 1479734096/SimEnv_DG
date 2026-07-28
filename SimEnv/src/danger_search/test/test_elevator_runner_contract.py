@@ -26,7 +26,9 @@ class ElevatorRunnerContractTest(unittest.TestCase):
             "ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS=1",
             result.stdout,
         )
-        self.assertIn("ELEVATOR_TEST_LOCALIZATION_BACKEND=kiss_icp", result.stdout)
+        self.assertIn(
+            "ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map", result.stdout
+        )
         self.assertIn("到达显式楼层数的最高层", result.stdout)
         self.assertNotIn("完成 0→1 电梯任务", result.stdout)
 
@@ -119,6 +121,10 @@ class ElevatorRunnerContractTest(unittest.TestCase):
     def test_runner_passes_localization_backend_to_formal_launch(self):
         source = RUNNER.read_text(encoding="utf-8")
 
+        self.assertIn(
+            'ELEVATOR_TEST_LOCALIZATION_BACKEND="${ELEVATOR_TEST_LOCALIZATION_BACKEND:-adaptive_shared_map}"',
+            source,
+        )
         self.assertIn(
             'localization_backend:="$ELEVATOR_TEST_LOCALIZATION_BACKEND"', source
         )

@@ -50,7 +50,9 @@ class InterfaceDocumentationTest(unittest.TestCase):
         launch_arguments = {
             arg.get("name"): arg.get("default") for arg in root.findall("arg")
         }
-        self.assertEqual(launch_arguments.get("localization_backend"), "rgbd_livox")
+        self.assertEqual(
+            launch_arguments.get("localization_backend"), "adaptive_shared_map"
+        )
         self.assertEqual(
             arguments.get("localization_backend"), "$(arg localization_backend)"
         )

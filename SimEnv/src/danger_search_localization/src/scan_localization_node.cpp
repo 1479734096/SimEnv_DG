@@ -1,5 +1,5 @@
 // 参赛方定位节点：只读取初始接口文档授权的 Livox、RGB-D、机身 IMU 和
-// 自身 /cmd_vel 输出。默认关闭的 adaptive_shared_map 让 RGB-D 与 Livox 对同一
+// 自身 /cmd_vel 输出。正式 adaptive_shared_map 让 RGB-D 与 Livox 对同一
 // 局部地图生成平移候选，IMU 固定姿态，只有最终选中的位姿和当前 Livox 帧可事务提交。
 #include <algorithm>
 #include <array>
@@ -228,7 +228,7 @@ class ScanLocalizationNode {
  public:
   /// 校验全部参数和公开输入后建立订阅/发布关系。
   ///
-  /// 支持五个固定后端；正式 launch 默认仍选择 rgbd_livox。构造期间任何接口、外参或场景
+  /// 支持五个固定后端；正式 launch 默认选择 adaptive_shared_map。构造期间任何接口、外参或场景
   /// 信息异常都会抛出并终止节点，不会退回 Gazebo 真值或相对原点。
   ScanLocalizationNode() : nh_(), private_nh_("~") {
     std::string raw_cloud_topic = "/scan";

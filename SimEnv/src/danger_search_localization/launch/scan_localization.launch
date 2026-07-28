@@ -2,8 +2,8 @@
   <!--
     定位子系统入口。外部输入只允许 /scan、/real_sense/depth/points、
     /trunk_imu 和本算法自己的 /cmd_vel；输出全部位于 /danger_search/localization。
-    正式父 launch 默认选择 rgbd_livox；livox_imu_local_map 和
-    adaptive_shared_map 是默认关闭的候选，默认 kiss_icp 主要保留独立诊断兼容。
+    正式父 launch 默认选择 adaptive_shared_map；本文件的默认 kiss_icp 仅保留
+    独立诊断兼容，正式运行由父 launch 显式传入后端。
   -->
   <arg name="raw_cloud_topic" default="/scan"/>
   <arg name="depth_cloud_topic" default="/real_sense/depth/points"/>
