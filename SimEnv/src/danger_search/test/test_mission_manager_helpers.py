@@ -693,6 +693,7 @@ class MissionManagerHelperTest(unittest.TestCase):
                 )
                 or {
                 "action": "update",
+                "support_lookahead_distance": 0.60,
                 "confirmed_negative_cells": [],
                 "confirmed_supported_cells": [],
                 "local_corridor_assessment": {
@@ -705,11 +706,17 @@ class MissionManagerHelperTest(unittest.TestCase):
                     "drop_distance": None,
                     "drop_direction_world": None,
                     "support_boundary_cells_world": [],
+                    "boundary_observable": True,
+                    "boundary_reason_counts": {},
                 },
             }
             )
         )
         manager._ground_support_gate = SimpleNamespace(
+            support_sweep_context_snapshot=lambda _fallback: (
+                (0.30, 0.0, 0.0),
+                9,
+            ),
             update_assessment=assessments.append,
             evaluate_latest_drop=lambda command, **_kwargs: (
                 evaluated_commands.append(command) or False
@@ -735,8 +742,11 @@ class MissionManagerHelperTest(unittest.TestCase):
             )
 
         self.assertEqual(len(assessments), 1)
-        self.assertEqual(processed_commands, [(0.0, 0.10)])
+        self.assertEqual(processed_commands, [(0.30, 0.10)])
         self.assertEqual(evaluated_commands, [(0.20, 0.0, 0.0)])
+        self.assertEqual(assessments[0].hold_context_id, 9)
+        self.assertEqual(assessments[0].support_command, (0.30, 0.0, 0.0))
+        self.assertEqual(assessments[0].support_lookahead_distance, 0.60)
 
     def test_ground_support_timer_consumes_each_new_cloud_once(self):
         updates = []

@@ -136,6 +136,11 @@ class GroundSupportAssessment:
     support_boundary_detected: bool = False
     drop_point_world: tuple[float, float] | None = None
     support_boundary_cells_world: tuple[tuple[float, float], ...] = ()
+    hold_context_id: int = 0
+    support_command: tuple[float, float, float] | None = None
+    support_lookahead_distance: float | None = None
+    boundary_observable: bool | None = None
+    boundary_reason_counts: tuple[tuple[str, int], ...] = ()
 
 
 class GroundSupportSafetyGate:
@@ -216,6 +221,8 @@ class GroundSupportSafetyGate:
         self._last_requested_speed = 0.0
         self._temporary_hold_command: tuple[float, float, float] | None = None
         self._temporary_hold_pose_yaw: float | None = None
+        self._hold_context_sequence = 0
+        self._temporary_hold_context_id: int | None = None
         self._unknown_support_hold_enabled = True
         self._latched_drop_point_world: tuple[float, float] | None = None
         self._boundary_candidate_centroid: tuple[float, float] | None = None
@@ -260,7 +267,14 @@ class GroundSupportSafetyGate:
             return
         self._assessment = assessment
         self._assessment_sequence += 1
-        self._update_boundary_candidate(assessment)
+        support_context_matches = (
+            self.state not in _TEMPORARY_HOLDS
+            or self._assessment_matches_temporary_hold(assessment)
+        )
+        if support_context_matches:
+            self._update_boundary_candidate(assessment)
+        else:
+            self._reset_boundary_candidate()
         control_time = (
             assessment.received_control_time
             if assessment.received_control_time is not None
@@ -268,7 +282,8 @@ class GroundSupportSafetyGate:
         )
         self._note_control_progress(control_time, assessment.received_wall_time)
         if (
-            assessment.observation_adequate
+            support_context_matches
+            and assessment.observation_adequate
             and assessment.current_footprint_supported
             and assessment.data_age <= self.config.drop_evidence_max_age
         ):
@@ -281,6 +296,28 @@ class GroundSupportSafetyGate:
         if not self.enabled:
             return
         self._unknown_support_hold_enabled = bool(enabled)
+
+    def support_sweep_context_snapshot(
+        self,
+        fallback_command: tuple[float, float, float],
+    ) -> tuple[tuple[float, float, float], int]:
+        """返回本帧 RequiredSupportSweep 必须绑定的命令和 HOLD 上下文。"""
+        if (
+            self.state in _TEMPORARY_HOLDS
+            and self._temporary_hold_command is not None
+            and self._temporary_hold_context_id is not None
+        ):
+            return (
+                tuple(self._temporary_hold_command),
+                int(self._temporary_hold_context_id),
+            )
+        try:
+            command = tuple(float(value) for value in fallback_command)
+        except (TypeError, ValueError):
+            command = ()
+        if len(command) != 3 or not all(math.isfinite(value) for value in command):
+            command = (0.0, 0.0, 0.0)
+        return command, 0
 
     def observe_odometry(
         self,
@@ -544,8 +581,7 @@ class GroundSupportSafetyGate:
         if assessment is None:
             if not self._unknown_support_hold_enabled:
                 return requested
-            self._temporary_hold_command = requested
-            self._temporary_hold_pose_yaw = float(pose_yaw)
+            self._begin_temporary_hold_context(requested, pose_yaw)
             self.stale_data_hold_count += 1
             self._enter_state(
                 STALE_DATA_HOLD,
@@ -583,8 +619,7 @@ class GroundSupportSafetyGate:
         )
         if not near_supported_boundary:
             return requested
-        self._temporary_hold_command = requested
-        self._temporary_hold_pose_yaw = float(pose_yaw)
+        self._begin_temporary_hold_context(requested, pose_yaw)
         if not fresh:
             self.stale_data_hold_count += 1
             self._enter_state(
@@ -694,6 +729,13 @@ class GroundSupportSafetyGate:
                 else None
             ),
             "boundary_confirmation_count": self._boundary_confirmation_count,
+            "hold_context_id": self._temporary_hold_context_id,
+            "hold_context_sequence": self._hold_context_sequence,
+            "hold_command": (
+                list(self._temporary_hold_command)
+                if self._temporary_hold_command is not None
+                else None
+            ),
             "latched_boundary_cells_world": [
                 list(point) for point in self._latched_boundary_cells_world
             ],
@@ -721,6 +763,7 @@ class GroundSupportSafetyGate:
         self._stopped_sample_count = 0
         self._temporary_hold_command = None
         self._temporary_hold_pose_yaw = None
+        self._temporary_hold_context_id = None
         self._latched_drop_point_world = None
         self._reset_boundary_candidate()
         return True
@@ -739,6 +782,7 @@ class GroundSupportSafetyGate:
         self._stopped_sample_count = 0
         self._temporary_hold_command = None
         self._temporary_hold_pose_yaw = None
+        self._temporary_hold_context_id = None
         self._reset_boundary_candidate()
         return True
 
@@ -748,6 +792,9 @@ class GroundSupportSafetyGate:
             return
         self._assessment = None
         self._fresh_supported_sequence_count = 0
+        if self.state in _TEMPORARY_HOLDS and self._temporary_hold_command is not None:
+            self._hold_context_sequence += 1
+            self._temporary_hold_context_id = self._hold_context_sequence
         self._reset_boundary_candidate()
 
     def _guard_distance(
@@ -779,6 +826,7 @@ class GroundSupportSafetyGate:
             assessment is None
             or command is None
             or self._assessment_sequence == self._last_release_sequence
+            or not self._assessment_matches_temporary_hold(assessment)
         ):
             return False
         speed = math.hypot(command[0], command[1])
@@ -821,7 +869,41 @@ class GroundSupportSafetyGate:
         self._last_release_sequence = self._assessment_sequence
         self._temporary_hold_command = None
         self._temporary_hold_pose_yaw = None
+        self._temporary_hold_context_id = None
         self._reset_boundary_candidate()
+
+    def _begin_temporary_hold_context(
+        self,
+        command: tuple[float, float, float],
+        pose_yaw: float,
+    ) -> None:
+        """冻结触发 HOLD 的非零意图；安全零速不得改写该上下文。"""
+        if self.state not in _TEMPORARY_HOLDS or self._temporary_hold_context_id is None:
+            self._hold_context_sequence += 1
+            self._temporary_hold_context_id = self._hold_context_sequence
+            self._fresh_supported_sequence_count = 0
+        self._temporary_hold_command = tuple(float(value) for value in command)
+        self._temporary_hold_pose_yaw = float(pose_yaw)
+
+    def _assessment_matches_temporary_hold(
+        self,
+        assessment: GroundSupportAssessment,
+    ) -> bool:
+        context_id = self._temporary_hold_context_id
+        command = self._temporary_hold_command
+        assessed_command = assessment.support_command
+        if (
+            context_id is None
+            or command is None
+            or int(assessment.hold_context_id) != int(context_id)
+            or assessed_command is None
+            or assessment.support_lookahead_distance is None
+        ):
+            return False
+        return len(assessed_command) == 3 and all(
+            abs(float(actual) - float(expected)) <= 1e-9
+            for actual, expected in zip(assessed_command, command)
+        )
 
     def _update_boundary_candidate(self, assessment: GroundSupportAssessment) -> None:
         cells = tuple(assessment.support_boundary_cells_world or ())
@@ -1009,6 +1091,37 @@ class GroundSupportSafetyGate:
             for value in (assessment.supported_distance, assessment.drop_distance):
                 if value is not None and (
                     not math.isfinite(float(value)) or float(value) < 0.0
+                ):
+                    return False
+            if (
+                isinstance(assessment.hold_context_id, bool)
+                or int(assessment.hold_context_id) < 0
+            ):
+                return False
+            if assessment.support_command is not None and (
+                len(assessment.support_command) != 3
+                or not all(
+                    math.isfinite(float(value))
+                    for value in assessment.support_command
+                )
+            ):
+                return False
+            if assessment.support_lookahead_distance is not None and (
+                not math.isfinite(float(assessment.support_lookahead_distance))
+                or float(assessment.support_lookahead_distance) < 0.0
+            ):
+                return False
+            if assessment.boundary_observable is not None and not isinstance(
+                assessment.boundary_observable,
+                bool,
+            ):
+                return False
+            for reason, count in assessment.boundary_reason_counts:
+                if (
+                    not isinstance(reason, str)
+                    or not reason
+                    or isinstance(count, bool)
+                    or int(count) < 0
                 ):
                     return False
             for point in (assessment.drop_direction_world, assessment.drop_point_world):

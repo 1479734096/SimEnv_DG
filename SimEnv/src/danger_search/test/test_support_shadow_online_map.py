@@ -104,6 +104,9 @@ class ShadowSupportOnlineMapTest(unittest.TestCase):
             result["lookahead_distance"],
             result["drop_lookahead_distance"],
         )
+        assessment = result["local_corridor_assessment"]
+        self.assertIn("boundary_observable", assessment)
+        self.assertIn("boundary_reason_counts", assessment)
 
 
 if __name__ == "__main__":

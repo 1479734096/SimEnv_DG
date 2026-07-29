@@ -512,3 +512,15 @@ Stage15～17 当前结论：
   UNKNOWN hold 均自动恢复，无 DROP、控制输出故障、wall stall 或定位终态。
 - 完整优化尝试、两次非成功运行的原因、时基分类和运行证据见
   [STAGE17_1_REPORT.md](reports/STAGE17_1_REPORT.md)。
+
+## 14. 2026-07-29 UNKNOWN HOLD 语义反馈环修复
+
+- HOLD 期间 RequiredSupportSweep 绑定触发 HOLD 的完整候选命令和上下文 ID；安全零速
+  与 keepalive 不再把扫描缩短后冒充原命令释放证据。
+- DROP 继续独立使用 active motion；定位健康切换会更新 HOLD 上下文，旧评估不能释放。
+- 参赛 Python 全包 `587 passed, 1 warning`，生产边界、Python 编译、runner 语法、
+  官方哈希边界和 diff 检查完成。
+- `seed=6946` GUI 闭环最终完成 `0→1→0→home`。旧轮 13 次短 HOLD/自动恢复变为
+  1 个真实 HOLD episode、0 次自动恢复、1 次有界重规划，任务在仿真 `170.518 s` 成功。
+- 详细根因、两轮运行结果和残余风险见
+  [UNKNOWN_HOLD_FEEDBACK_REPORT.md](reports/UNKNOWN_HOLD_FEEDBACK_REPORT.md)。

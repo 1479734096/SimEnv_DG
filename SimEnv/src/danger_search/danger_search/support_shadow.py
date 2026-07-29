@@ -1172,6 +1172,12 @@ class ShadowSupportGrid:
         boundary_observable = bool(boundary_records) and all(
             bool(record["observable"]) for record in boundary_records
         )
+        boundary_reason_counts = Counter(
+            str(cell_payload[cell].get("reason", "unknown"))
+            for record in boundary_records
+            for cell in record["cells"]
+            if cell in cell_payload
+        )
         observation_adequate = (
             boundary_observable
             if boundary_cells
@@ -1196,6 +1202,8 @@ class ShadowSupportGrid:
             "fresh_drop_cell_count": len(fresh_drop_cells),
             "boundary_cell_count": len(boundary_cells),
             "support_boundary_cells_world": boundary_cells_world,
+            "boundary_observable": boundary_observable,
+            "boundary_reason_counts": dict(boundary_reason_counts),
             "minimum_left_foot_band_coverage": minimum_left_coverage,
             "minimum_right_foot_band_coverage": minimum_right_coverage,
             "longitudinal_support_ratio": longitudinal_support_ratio,

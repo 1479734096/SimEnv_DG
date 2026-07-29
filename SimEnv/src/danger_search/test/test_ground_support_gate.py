@@ -60,6 +60,9 @@ def _assessment(**overrides) -> GroundSupportAssessment:
         "drop_distance": None,
         "drop_direction_world": None,
         "received_control_time": 100.0,
+        "hold_context_id": 0,
+        "support_command": None,
+        "support_lookahead_distance": None,
     }
     values.update(overrides)
     if "received_control_time" not in overrides:
@@ -572,12 +575,18 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
             )
         )
         held = gate.filter_command((0.30, 0.0, 0.0), pose_yaw=0.0, wall_time=100.0)
+        support_command, hold_context_id = gate.support_sweep_context_snapshot(
+            (0.0, 0.0, 0.0)
+        )
 
         gate.update_assessment(
             _assessment(
                 stamp=10.1,
                 received_wall_time=100.1,
                 supported_distance=0.60,
+                hold_context_id=hold_context_id,
+                support_command=support_command,
+                support_lookahead_distance=0.60,
             )
         )
         still_held = gate.filter_command((0.30, 0.0, 0.0), pose_yaw=0.0, wall_time=100.1)
@@ -586,6 +595,9 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
                 stamp=10.2,
                 received_wall_time=100.2,
                 supported_distance=0.60,
+                hold_context_id=hold_context_id,
+                support_command=support_command,
+                support_lookahead_distance=0.60,
             )
         )
         released = gate.filter_command((0.30, 0.0, 0.0), pose_yaw=0.0, wall_time=100.2)
@@ -595,6 +607,102 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
         self.assertEqual(released, (0.30, 0.0, 0.0))
         self.assertEqual(gate.state, CLEAR)
         self.assertEqual(gate.snapshot()["automatic_resume_count"], 1)
+
+    def test_zero_command_assessment_cannot_release_nonzero_hold(self):
+        gate = GroundSupportSafetyGate(_config())
+        gate.update_assessment(
+            _assessment(observation_adequate=True, supported_distance=0.10)
+        )
+        gate.filter_command(
+            (0.30, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.0,
+        )
+        _, hold_context_id = gate.support_sweep_context_snapshot(
+            (0.0, 0.0, 0.0)
+        )
+
+        for index in range(1, 4):
+            gate.update_assessment(
+                _assessment(
+                    stamp=10.0 + index * 0.1,
+                    received_wall_time=100.0 + index * 0.1,
+                    support_boundary_detected=False,
+                    supported_distance=0.20,
+                    hold_context_id=0,
+                    support_command=(0.0, 0.0, 0.0),
+                    support_lookahead_distance=0.50,
+                )
+            )
+            emitted = gate.filter_command(
+                (0.0, 0.0, 0.0),
+                pose_yaw=0.0,
+                wall_time=100.0 + index * 0.1,
+            )
+            self.assertEqual(emitted, (0.0, 0.0, 0.0))
+            self.assertEqual(gate.state, OBSERVATION_HOLD)
+
+        self.assertGreater(hold_context_id, 0)
+        self.assertEqual(gate.automatic_resume_count, 0)
+
+    def test_hold_context_is_stable_across_zero_keepalive(self):
+        gate = GroundSupportSafetyGate(_config())
+        gate.update_assessment(_assessment(supported_distance=0.10))
+        gate.filter_command(
+            (0.30, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.0,
+        )
+        first = gate.support_sweep_context_snapshot((0.0, 0.0, 0.0))
+
+        gate.filter_command(
+            (0.0, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.1,
+        )
+        second = gate.support_sweep_context_snapshot((0.0, 0.0, 0.0))
+
+        self.assertEqual(first, second)
+        self.assertEqual(first[0], (0.30, 0.0, 0.0))
+        self.assertGreater(first[1], 0)
+
+    def test_invalidating_assessment_rebinds_temporary_hold_context(self):
+        gate = GroundSupportSafetyGate(_config(release_supported_frames=1))
+        gate.update_assessment(_assessment(supported_distance=0.10))
+        gate.filter_command(
+            (0.30, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.0,
+        )
+        support_command, old_context_id = gate.support_sweep_context_snapshot(
+            (0.0, 0.0, 0.0)
+        )
+
+        gate.invalidate_assessment()
+        _, new_context_id = gate.support_sweep_context_snapshot(
+            (0.0, 0.0, 0.0)
+        )
+        gate.update_assessment(
+            _assessment(
+                stamp=10.1,
+                received_wall_time=100.1,
+                support_boundary_detected=False,
+                supported_distance=0.60,
+                hold_context_id=old_context_id,
+                support_command=support_command,
+                support_lookahead_distance=0.60,
+            )
+        )
+
+        emitted = gate.filter_command(
+            (0.0, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.1,
+        )
+
+        self.assertGreater(new_context_id, old_context_id)
+        self.assertEqual(emitted, (0.0, 0.0, 0.0))
+        self.assertEqual(gate.state, OBSERVATION_HOLD)
 
     def test_fresh_but_inconclusive_unknown_near_boundary_still_holds(self):
         gate = GroundSupportSafetyGate(_config())
@@ -670,6 +778,9 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
             )
         )
         gate.filter_command((0.30, 0.0, 0.0), pose_yaw=0.0, wall_time=100.0)
+        support_command, hold_context_id = gate.support_sweep_context_snapshot(
+            (0.0, 0.0, 0.0)
+        )
 
         gate.observe_odometry(
             1.0,
@@ -684,6 +795,9 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
                     received_wall_time=100.1 + 0.1 * index,
                     supported_distance=0.24,
                     support_boundary_detected=True,
+                    hold_context_id=hold_context_id,
+                    support_command=support_command,
+                    support_lookahead_distance=0.60,
                 )
             )
             command = gate.filter_command(

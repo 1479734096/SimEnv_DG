@@ -792,6 +792,13 @@ class MissionManager:
         self._localization_health_stamp = stamp_value
         if previous is not None and previous != value:
             self._ground_support_localization_epoch += 1
+            gate = getattr(self, "_ground_support_gate", None)
+            invalidate = getattr(gate, "invalidate_assessment", None)
+            if callable(invalidate):
+                with _controller_command_transaction(
+                    getattr(self, "controller", None)
+                ):
+                    invalidate()
         if not value:
             rospy.logwarn_throttle(
                 2.0, "定位姿态健康异常：%s=false", LOCALIZATION_HEALTH_TOPIC
@@ -2820,19 +2827,31 @@ class MissionManager:
             "committed_command_snapshot",
             None,
         )
-        active_motion = (
-            active_snapshot()
-            if callable(active_snapshot)
-            else getattr(self.controller, "last_command", (0.0, 0.0, 0.0))
-        )
-        committed_command = (
-            committed_snapshot()
-            if callable(committed_snapshot)
-            else getattr(self.controller, "last_command", (0.0, 0.0, 0.0))
-        )
+        with _controller_command_transaction(self.controller):
+            active_motion = (
+                active_snapshot()
+                if callable(active_snapshot)
+                else getattr(self.controller, "last_command", (0.0, 0.0, 0.0))
+            )
+            committed_command = (
+                committed_snapshot()
+                if callable(committed_snapshot)
+                else getattr(self.controller, "last_command", (0.0, 0.0, 0.0))
+            )
+            support_context_snapshot = getattr(
+                gate,
+                "support_sweep_context_snapshot",
+                None,
+            )
+            if callable(support_context_snapshot):
+                support_command, hold_context_id = support_context_snapshot(
+                    committed_command
+                )
+            else:
+                support_command, hold_context_id = committed_command, 0
         support_command_linear = math.hypot(
-            float(committed_command[0]),
-            float(committed_command[1]),
+            float(support_command[0]),
+            float(support_command[1]),
         )
         drop_command_linear = math.hypot(
             float(active_motion[0]),
@@ -2881,6 +2900,20 @@ class MissionManager:
             and math.isfinite(float(point[0]))
             and math.isfinite(float(point[1]))
         )
+        raw_boundary_reason_counts = payload.get("boundary_reason_counts", {})
+        if not isinstance(raw_boundary_reason_counts, dict):
+            raw_boundary_reason_counts = {}
+        valid_boundary_reason_counts = []
+        for reason, count in raw_boundary_reason_counts.items():
+            if not isinstance(reason, str) or not reason or isinstance(count, bool):
+                continue
+            try:
+                count_value = int(count)
+            except (TypeError, ValueError):
+                continue
+            if count_value >= 0:
+                valid_boundary_reason_counts.append((reason, count_value))
+        boundary_reason_counts = tuple(sorted(valid_boundary_reason_counts))
         assessment = GroundSupportAssessment(
             stamp=float(cloud_stamp),
             received_wall_time=time.monotonic(),
@@ -2908,6 +2941,17 @@ class MissionManager:
             received_control_time=ros_now,
             drop_point_world=drop_point_world,
             support_boundary_cells_world=boundary_cells_world,
+            hold_context_id=int(hold_context_id),
+            support_command=tuple(float(value) for value in support_command),
+            support_lookahead_distance=_optional_finite(
+                result.get("support_lookahead_distance")
+            ),
+            boundary_observable=(
+                bool(payload.get("boundary_observable"))
+                if payload.get("boundary_observable") is not None
+                else None
+            ),
+            boundary_reason_counts=boundary_reason_counts,
         )
         with _controller_command_transaction(self.controller):
             active_motion = (
@@ -3267,7 +3311,8 @@ class MissionManager:
                 and not self._post_door_context_satisfied(pose)
             ):
                 enabled = False
-            setter(enabled)
+            with _controller_command_transaction(getattr(self, "controller", None)):
+                setter(enabled)
 
     # ------------------------------------------------------------------
     # 方案 C：全局时间预算与楼层/返航决策层
