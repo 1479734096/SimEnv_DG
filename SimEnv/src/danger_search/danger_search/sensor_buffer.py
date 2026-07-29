@@ -15,7 +15,7 @@ import numpy as np
 
 from danger_search.interface_policy import (
     require_allowed_input_topic,
-    require_internal_topic,
+    require_internal_input_topic,
 )
 
 try:
@@ -36,6 +36,7 @@ class ImageBundle:
     rgb_msg: object
     depth_msg: object
     camera_info_msg: object
+    generation: int
 
 
 @dataclass
@@ -43,6 +44,8 @@ class SensorSnapshot:
     """主状态机读取时刻的最近点云与最近 RGB-D 组合。"""
     cloud_msg: object | None
     image_bundle: ImageBundle | None
+    cloud_generation: int
+    image_generation: int
 
 
 class SensorBuffer:
@@ -61,10 +64,12 @@ class SensorBuffer:
         camera_info_topic: str,
         sync_slop: float = 0.08,
         sync_queue_size: int = 10,
+        cloud_frame: str | None = None,
+        rgbd_frame: str = "real_sense_optical_frame",
     ):
         normalized_cloud_topic = str(cloud_topic).strip()
         if normalized_cloud_topic.startswith(("/danger_search/", "/nav/")):
-            self.cloud_topic = require_internal_topic(
+            self.cloud_topic = require_internal_input_topic(
                 normalized_cloud_topic,
                 purpose="参赛方配准建图点云输入",
             )
@@ -84,13 +89,26 @@ class SensorBuffer:
         )
         self.sync_slop = float(sync_slop)
         self.sync_queue_size = int(sync_queue_size)
+        default_cloud_frame = (
+            "world"
+            if normalized_cloud_topic.startswith("/danger_search/")
+            else "laser_livox"
+        )
+        self.cloud_frame = str(cloud_frame or default_cloud_frame).strip()
+        self.rgbd_frame = str(rgbd_frame).strip()
         if not np.isfinite(self.sync_slop) or self.sync_slop < 0.0:
             raise ValueError("RGB-D 同步容差必须为非负有限数")
         if self.sync_queue_size <= 0:
             raise ValueError("RGB-D 同步队列长度必须为正数")
+        if not self.cloud_frame or not self.rgbd_frame:
+            raise ValueError("传感器 frame_id 契约不能为空")
         self._lock = Lock()
         self._cloud_msg = None
         self._image_bundle: ImageBundle | None = None
+        self._cloud_generation = 0
+        self._image_generation = 0
+        self.rejected_cloud_count = 0
+        self.rejected_image_bundle_count = 0
         self._subscribers = []
 
     def start(self) -> None:
@@ -117,6 +135,8 @@ class SensorBuffer:
             return SensorSnapshot(
                 cloud_msg=self._cloud_msg,
                 image_bundle=self._image_bundle,
+                cloud_generation=self._cloud_generation,
+                image_generation=self._image_generation,
             )
 
     def read_cloud_xyz(self, cloud_msg, *, max_points: int = 25000, stride: int = 1) -> list[tuple[float, float, float]]:
@@ -146,12 +166,36 @@ class SensorBuffer:
     def _on_cloud(self, msg) -> None:
         """点云回调：以最新帧覆盖旧帧，防止处理落后时形成无界积压。"""
         with self._lock:
+            if not message_contract_valid(msg, expected_frame=self.cloud_frame):
+                self.rejected_cloud_count += 1
+                return
+            self._cloud_generation += 1
             self._cloud_msg = msg
 
     def _on_image_bundle(self, rgb_msg, depth_msg, camera_info_msg) -> None:
         """同步回调：把三路同一观测窗口内的消息作为不可拆组合保存。"""
         with self._lock:
-            self._image_bundle = ImageBundle(rgb_msg=rgb_msg, depth_msg=depth_msg, camera_info_msg=camera_info_msg)
+            messages = (rgb_msg, depth_msg, camera_info_msg)
+            stamps = [message_stamp_seconds(message) for message in messages]
+            if (
+                not all(
+                    message_contract_valid(
+                        message,
+                        expected_frame=self.rgbd_frame,
+                    )
+                    for message in messages
+                )
+                or max(stamps) - min(stamps) > self.sync_slop
+            ):
+                self.rejected_image_bundle_count += 1
+                return
+            self._image_generation += 1
+            self._image_bundle = ImageBundle(
+                rgb_msg=rgb_msg,
+                depth_msg=depth_msg,
+                camera_info_msg=camera_info_msg,
+                generation=self._image_generation,
+            )
 
 
 def odom_pose_xy_yaw(odom_msg) -> tuple[float, float, float] | None:
@@ -218,10 +262,32 @@ def quaternion_to_yaw(x: float, y: float, z: float, w: float) -> float:
     return float(np.arctan2(siny_cosp, cosy_cosp))
 
 
-def _message_stamp_seconds(message) -> float | None:
+def message_stamp_seconds(message) -> float | None:
+    """返回严格有效的 ROS 时间；零、负数、缺失和非有限值均拒绝。"""
     stamp = getattr(getattr(message, "header", None), "stamp", None)
     to_sec = getattr(stamp, "to_sec", None)
     if not callable(to_sec):
         return None
-    value = float(to_sec())
-    return value if np.isfinite(value) else None
+    try:
+        value = float(to_sec())
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if np.isfinite(value) and value > 0.0 else None
+
+
+def message_frame_id(message) -> str | None:
+    """返回非空 frame_id，缺失或空白时返回 ``None``。"""
+    value = str(getattr(getattr(message, "header", None), "frame_id", "")).strip()
+    return value or None
+
+
+def message_contract_valid(message, *, expected_frame: str) -> bool:
+    """检查生产传感器消息的时间与坐标系契约。"""
+    return (
+        message_stamp_seconds(message) is not None
+        and message_frame_id(message) == str(expected_frame).strip()
+    )
+
+
+# 兼容既有只读测试和外部工具；生产代码使用无下划线的严格接口。
+_message_stamp_seconds = message_stamp_seconds

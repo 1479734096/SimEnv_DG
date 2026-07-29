@@ -7,6 +7,9 @@
   -->
   <arg name="raw_cloud_topic" default="/scan"/>
   <arg name="depth_cloud_topic" default="/real_sense/depth/points"/>
+  <arg name="raw_cloud_frame" default="laser_livox"/>
+  <arg name="imu_frame" default="imu_link"/>
+  <arg name="depth_cloud_frame" default="real_sense_optical_frame"/>
   <arg name="localization_backend" default="kiss_icp"/>
   <arg name="team_scene_info_path" default="$(find danger_search)/../../generated_building/team_scene_info.json"/>
   <arg name="require_team_scene_info" default="true"/>
@@ -47,6 +50,9 @@
     <!-- C++ 构造函数还会再次检查话题固定值和公开场景 allowed_interfaces。 -->
     <param name="raw_cloud_topic" value="$(arg raw_cloud_topic)"/>
     <param name="depth_cloud_topic" value="$(arg depth_cloud_topic)"/>
+    <param name="raw_cloud_frame" value="$(arg raw_cloud_frame)"/>
+    <param name="imu_frame" value="$(arg imu_frame)"/>
+    <param name="depth_cloud_frame" value="$(arg depth_cloud_frame)"/>
     <param name="localization_backend" value="$(arg localization_backend)"/>
     <param name="team_scene_info_path" value="$(arg team_scene_info_path)"/>
     <param name="require_team_scene_info" value="$(arg require_team_scene_info)"/>

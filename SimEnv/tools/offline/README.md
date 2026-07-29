@@ -4,7 +4,7 @@
 `danger_search.launch`、`setup.py` 或 CMake 安装。这里的工具可以读取真值、bag、
 Gazebo 状态或生成场景，但其输出不得回流到同一轮任务的感知、规划、控制、预算或结果。
 
-## 生产闭包审计
+## 静态 Python/离线边界
 
 在工作区根目录执行：
 
@@ -29,8 +29,20 @@ python3 tools/offline/summarize_localization_matrix.py \
 汇总器只读取 `TEST_SUMMARY.txt`、任务日志和漂移 sidecar，不进入生产启动链，也不向
 运行中的定位、规划或控制反馈结果。
 
-该命令检查 `danger_search` 的 Python 安装清单、模块导入和 launch 入口，防止后续修改
-把离线评测依赖带回生产包。
+该命令只检查 `danger_search` 的 Python 安装清单、模块导入和 launch 入口，防止后续
+修改把离线评测依赖带回生产包。它不能证明整机运行闭包合规。
+
+## 完整运行图审计
+
+正式节点和控制器全部启动后，在同一 ROS master 下执行：
+
+```bash
+python3 tools/offline/check_runtime_ros_graph.py
+```
+
+该检查覆盖所有节点的禁用真值订阅、`/cmd_vel` 与 `/joy` publisher，以及内部定位
+话题的唯一生产者。当前延期保留的 `junior_ctrl` 真值订阅会使此检查明确失败；在
+`COMPLIANCE-001` 关闭前不得把静态 Python 边界通过描述为完整生产闭包通过。
 
 ## 官方结果评测
 

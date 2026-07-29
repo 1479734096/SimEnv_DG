@@ -663,6 +663,81 @@ class MissionManagerHelperTest(unittest.TestCase):
             1.0,
         )
 
+    def test_ground_support_assessment_survives_command_change_during_cloud_processing(self):
+        assessments = []
+        evaluated_commands = []
+        processed_commands = []
+        commands = iter(((0.10, 0.0, 0.0), (0.20, 0.0, 0.0)))
+        manager = MissionManager.__new__(MissionManager)
+        manager.current_floor = 0
+        manager._ground_support_map_epoch = 4
+        manager._ground_support_localization_epoch = 7
+        manager.ground_support_params = {
+            "base_to_livox_xyz": (0.2, 0.0, 0.08),
+            "base_to_livox_rpy": (0.0, 0.785, 0.0),
+            "decision_period": 0.10,
+        }
+        manager.pose_provider = SimpleNamespace(
+            sensor_to_world_matrix=lambda *_args, **_kwargs: np.eye(4)
+        )
+        manager.controller = SimpleNamespace(
+            followed_path_snapshot=lambda: [(0.0, 0.0), (1.0, 0.0)],
+            active_motion_command_snapshot=lambda: next(commands),
+            committed_command_snapshot=lambda: (0.0, 0.0, 0.0),
+            command_transaction=lambda: mission_manager_module.nullcontext(),
+        )
+        manager._ground_support_grid = SimpleNamespace(
+            process_frame=lambda **kwargs: (
+                processed_commands.append(
+                    (kwargs["command_linear"], kwargs["drop_command_linear"])
+                )
+                or {
+                "action": "update",
+                "confirmed_negative_cells": [],
+                "confirmed_supported_cells": [],
+                "local_corridor_assessment": {
+                    "supported_distance": 0.8,
+                    "support_boundary_detected": False,
+                    "current_footprint_supported": True,
+                    "observation_adequate": True,
+                    "drop_confirmed": False,
+                    "drop_intersects_sweep": False,
+                    "drop_distance": None,
+                    "drop_direction_world": None,
+                    "support_boundary_cells_world": [],
+                },
+            }
+            )
+        )
+        manager._ground_support_gate = SimpleNamespace(
+            update_assessment=assessments.append,
+            evaluate_latest_drop=lambda command, **_kwargs: (
+                evaluated_commands.append(command) or False
+            ),
+        )
+        manager._queue_ground_support_map_updates = lambda _result: None
+        pose_sample = mission_manager_module.PoseSample(
+            stamp=10.002,
+            xyz=(0.0, 0.0, 0.39),
+            quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+            linear_xyz=(0.0, 0.0, 0.0),
+            angular_xyz=(0.0, 0.0, 0.0),
+        )
+
+        with patch("danger_search.mission_manager.rospy.get_time", return_value=10.05):
+            manager._update_ground_support_assessment(
+                SimpleNamespace(),
+                (0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.39),
+                pose_sample,
+                [(0.5, 0.0, 0.0)],
+                10.0,
+            )
+
+        self.assertEqual(len(assessments), 1)
+        self.assertEqual(processed_commands, [(0.0, 0.10)])
+        self.assertEqual(evaluated_commands, [(0.20, 0.0, 0.0)])
+
     def test_ground_support_timer_consumes_each_new_cloud_once(self):
         updates = []
         reads = []
@@ -1638,8 +1713,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         bundle = SimpleNamespace(
             rgb_msg=rgb_msg,
-            depth_msg=SimpleNamespace(),
-            camera_info_msg=SimpleNamespace(),
+            depth_msg=rgb_msg,
+            camera_info_msg=rgb_msg,
         )
         snapshot = self._mapping_snapshot(
             cloud_stamp=1.0,
@@ -2116,8 +2191,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         bundle = SimpleNamespace(
             rgb_msg=rgb_msg,
-            depth_msg=SimpleNamespace(),
-            camera_info_msg=SimpleNamespace(),
+            depth_msg=rgb_msg,
+            camera_info_msg=rgb_msg,
         )
 
         manager._update_mapping_and_detection(
@@ -2175,8 +2250,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         bundle = SimpleNamespace(
             rgb_msg=rgb_msg,
-            depth_msg=SimpleNamespace(),
-            camera_info_msg=SimpleNamespace(),
+            depth_msg=rgb_msg,
+            camera_info_msg=rgb_msg,
         )
 
         manager._update_mapping_and_detection(
@@ -2222,8 +2297,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         bundle = SimpleNamespace(
             rgb_msg=rgb_msg,
-            depth_msg=SimpleNamespace(),
-            camera_info_msg=SimpleNamespace(),
+            depth_msg=rgb_msg,
+            camera_info_msg=rgb_msg,
         )
 
         manager._update_mapping_and_detection(
@@ -4735,7 +4810,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         task._pass_point = (0.0, 0.8)
         task._commit_point = (0.0, 1.8)
 
-        before = mission_manager_module.time.time()
+        before = mission_manager_module.get_time()
         manager._remember_completed_door(task, (0.0, 1.75, math.pi / 2.0))
 
         self.assertEqual(manager.last_door_id, "main_entrance")

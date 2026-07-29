@@ -15,7 +15,7 @@ topics:
   rgb: /real_sense/rgb/image_raw
   depth: /real_sense/depth/image_raw
   camera_info: /real_sense/rgb/camera_info
-  status: /danger_search/status
+  status: /nav/status
   map: /nav/map_debug
   path_raw: /danger_search/path_raw
   path_followed: /danger_search/path_followed
@@ -207,8 +207,8 @@ controller:
 # 局部地面支撑安全门。正式配置必须开启；只消费未来足迹走廊，不改占据地图。
 ground_support:
   production_gate_enabled: true
-  # UNKNOWN 临时观察停车可独立关闭；显式低层回波 DROP 仍会锁存停车。
-  # 默认保留完整语义，门/电梯闭环回归可用覆盖配置验证 explicit-DROP-only 模式。
+  # UNKNOWN 临时观察停车可独立关闭；门和电梯只按已验证任务上下文局部放行，
+  # 显式低层回波 DROP 始终锁存停车。
   unknown_support_hold_enabled: true
   # 明确 DROP 停稳后仅让当前路径失效，并用现有 BLACK 栅格有界重规划。
   negative_obstacle_replan_enabled: true
@@ -256,7 +256,9 @@ ground_support:
   release_hysteresis: 0.10
   release_supported_frames: 2
   observation_hold_timeout: 2.0
+  # Gate 已输出零速后，/clock 或 odom 完全不推进的单调墙钟故障上限。
   safety_stop_timeout: 3.0
+  wall_stall_timeout: 30.0
   # 与定位发布速度死区构成显式契约，停稳阈值不能比死区更小。
   odometry_linear_deadband: 0.05
   odometry_angular_deadband: 0.03

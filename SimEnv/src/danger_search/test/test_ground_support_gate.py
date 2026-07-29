@@ -33,6 +33,7 @@ def _config(**overrides) -> GroundSupportGateConfig:
         "release_supported_frames": 2,
         "observation_hold_timeout": 2.0,
         "safety_stop_timeout": 3.0,
+        "wall_stall_timeout": 30.0,
         "odometry_linear_deadband": 0.05,
         "odometry_angular_deadband": 0.03,
         "stop_linear_threshold": 0.05,
@@ -808,7 +809,9 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
         self.assertEqual(gate.state, OBSERVATION_HOLD)
 
     def test_frozen_sim_clock_uses_wall_watchdog_not_path_timeout(self):
-        gate = GroundSupportSafetyGate(_config(safety_stop_timeout=3.0))
+        gate = GroundSupportSafetyGate(
+            _config(safety_stop_timeout=3.0, wall_stall_timeout=30.0)
+        )
         gate.update_assessment(_assessment(supported_distance=0.10, received_control_time=10.0))
         gate.filter_command(
             (0.20, 0.0, 0.0),
@@ -817,7 +820,11 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
             control_time=10.0,
         )
 
-        gate.check_wall_timeout(103.01)
+        gate.check_wall_timeout(129.99)
+
+        self.assertEqual(gate.state, OBSERVATION_HOLD)
+
+        gate.check_wall_timeout(130.01)
 
         self.assertEqual(gate.state, SAFETY_STOP_TIMEOUT)
         self.assertEqual(gate.reason_code, "ground_support_clock_or_odom_stalled")

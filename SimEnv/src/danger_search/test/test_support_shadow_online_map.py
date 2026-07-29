@@ -82,6 +82,29 @@ class ShadowSupportOnlineMapTest(unittest.TestCase):
             )
         )
 
+    def test_drop_and_required_support_use_independent_lookahead(self):
+        result = self.grid.process_frame(
+            stamp=2.0,
+            floor=0,
+            robot_xy=np.asarray((0.0, 0.0)),
+            robot_yaw=0.0,
+            sensor_origin=self.sensor_origin,
+            sensor_rotation=self.sensor_rotation,
+            points=np.empty((0, 3), dtype=float),
+            path=self.path,
+            command_linear=0.0,
+            drop_command_linear=0.6,
+            ambiguous=False,
+            local_only=True,
+        )
+
+        self.assertEqual(result["support_lookahead_distance"], 0.5)
+        self.assertGreater(result["drop_lookahead_distance"], 0.5)
+        self.assertEqual(
+            result["lookahead_distance"],
+            result["drop_lookahead_distance"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

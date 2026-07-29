@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""检查离线工具是否与正式 danger_search 运行闭包隔离。"""
+"""检查参赛 Python 包是否与离线工具隔离。"""
 
 from __future__ import annotations
 
@@ -137,11 +137,11 @@ def main() -> int:
     args = parser.parse_args()
     errors = audit_workspace(args.workspace)
     if errors:
-        print("生产/离线边界审计失败：")
+        print("参赛 Python/离线边界审计失败：")
         for error in errors:
             print(f"- {error}")
         return 1
-    print("生产/离线边界审计通过。")
+    print("参赛 Python/离线边界审计通过。")
     return 0
 
 

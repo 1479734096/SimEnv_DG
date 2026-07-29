@@ -67,6 +67,27 @@ FORBIDDEN_SCENE_FILE_NAMES = frozenset(
 
 PUBLIC_SCENE_INFO_NAME = "team_scene_info.json"
 
+INTERNAL_INPUT_TOPICS = frozenset(
+    {
+        "/danger_search/localization/odom",
+        "/danger_search/localization/cloud_registered",
+        "/danger_search/localization/health",
+        "/danger_search/localization/ready",
+    }
+)
+
+INTERNAL_OUTPUT_TOPICS = frozenset(
+    {
+        "/nav/status",
+        "/nav/map_debug",
+        "/danger_search/path_raw",
+        "/danger_search/path_followed",
+        "/danger_search/local_target",
+    }
+)
+
+MANUAL_CONTROL_TOPICS = frozenset({"/nav/goal"})
+
 
 def _lexical_absolute(path: str | Path) -> Path:
     """生成不解析符号链接的规范词法绝对路径。
@@ -159,18 +180,49 @@ def require_allowed_output_topic(topic: str, *, purpose: str) -> str:
     return normalized
 
 
-def require_internal_topic(topic: str, *, purpose: str) -> str:
-    """确认参赛方内部总线不会伪装成赛方外部接口。
-
-    内部定位、配准点云和诊断数据可以被生产模块消费，但必须可从允许的传感器
-    追溯得到，并统一放在 ``/danger_search/`` 或 ``/nav/`` 命名空间。
-    """
+def _require_exact_internal_topic(
+    topic: str,
+    *,
+    allowed_topics: frozenset[str],
+    purpose: str,
+    direction: str,
+) -> str:
     normalized = str(topic).strip()
-    if not normalized.startswith(("/danger_search/", "/nav/")):
+    if normalized not in allowed_topics:
         raise ValueError(
-            f"{purpose} 必须使用 /danger_search/ 或 /nav/ 命名空间内部话题: {normalized}"
+            f"{purpose} 不在参赛方{direction}精确白名单中: {normalized}"
         )
     return normalized
+
+
+def require_internal_input_topic(topic: str, *, purpose: str) -> str:
+    """确认内部生产输入具有固定名称和明确生产者契约。"""
+    return _require_exact_internal_topic(
+        topic,
+        allowed_topics=INTERNAL_INPUT_TOPICS,
+        purpose=purpose,
+        direction="内部输入",
+    )
+
+
+def require_internal_output_topic(topic: str, *, purpose: str) -> str:
+    """确认参赛方只发布已登记的内部派生或诊断话题。"""
+    return _require_exact_internal_topic(
+        topic,
+        allowed_topics=INTERNAL_OUTPUT_TOPICS,
+        purpose=purpose,
+        direction="内部输出",
+    )
+
+
+def require_manual_control_topic(topic: str, *, purpose: str) -> str:
+    """确认会改变任务状态的测试控制入口，不把它伪装成只读诊断。"""
+    return _require_exact_internal_topic(
+        topic,
+        allowed_topics=MANUAL_CONTROL_TOPICS,
+        purpose=purpose,
+        direction="手动控制",
+    )
 
 
 def require_allowed_service(service: str, *, purpose: str) -> str:

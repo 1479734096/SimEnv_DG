@@ -400,6 +400,7 @@ fi
 
 log "机器人已站立并进入 /cmd_vel 模式，启动正式任务节点"
 setsid roslaunch danger_search danger_search.launch \
+  controller_ready_ack:=true \
   config:="$TEST_CONFIG" \
   localization_backend:="$ELEVATOR_TEST_LOCALIZATION_BACKEND" \
   localization_diagnostic_frame_details:="$([[ "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" == "1" ]] && printf true || printf false)" \

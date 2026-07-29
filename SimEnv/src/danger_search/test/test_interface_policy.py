@@ -16,6 +16,9 @@ from danger_search.interface_policy import (
     require_allowed_output_topic,
     require_allowed_service,
     require_allowed_topic,
+    require_internal_input_topic,
+    require_internal_output_topic,
+    require_manual_control_topic,
     require_public_scene_info,
 )
 from danger_search.building_feature_provider import BuildingFeatureProvider
@@ -131,6 +134,31 @@ class InterfacePolicyTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             require_allowed_service("/gazebo/set_model_state", purpose="测试")
+
+    def test_internal_topics_use_exact_directional_allowlists(self):
+        self.assertEqual(
+            require_internal_input_topic(
+                "/danger_search/localization/odom",
+                purpose="测试",
+            ),
+            "/danger_search/localization/odom",
+        )
+        self.assertEqual(
+            require_internal_output_topic("/nav/status", purpose="测试"),
+            "/nav/status",
+        )
+        self.assertEqual(
+            require_manual_control_topic("/nav/goal", purpose="测试"),
+            "/nav/goal",
+        )
+        for topic in (
+            "/danger_search/fake_odom",
+            "/danger_search/ground_truth_relay",
+            "/nav/hidden_pose",
+        ):
+            with self.subTest(topic=topic):
+                with self.assertRaises(ValueError):
+                    require_internal_input_topic(topic, purpose="测试")
 
     def test_official_absolute_path_is_accepted(self):
         with tempfile.TemporaryDirectory() as directory:

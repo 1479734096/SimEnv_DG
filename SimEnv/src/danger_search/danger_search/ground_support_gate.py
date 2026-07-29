@@ -107,6 +107,7 @@ class GroundSupportGateConfig:
     release_supported_frames: int = 2
     observation_hold_timeout: float = 2.0
     safety_stop_timeout: float = 3.0
+    wall_stall_timeout: float = 30.0
     odometry_linear_deadband: float = 0.05
     odometry_angular_deadband: float = 0.03
     stop_linear_threshold: float = 0.05
@@ -159,6 +160,7 @@ class GroundSupportSafetyGate:
             self.config.release_hysteresis,
             self.config.observation_hold_timeout,
             self.config.safety_stop_timeout,
+            self.config.wall_stall_timeout,
             self.config.odometry_linear_deadband,
             self.config.odometry_angular_deadband,
             self.config.stop_linear_threshold,
@@ -172,6 +174,7 @@ class GroundSupportSafetyGate:
             or self.config.decision_period <= 0.0
             or self.config.observation_hold_timeout <= 0.0
             or self.config.safety_stop_timeout <= 0.0
+            or self.config.wall_stall_timeout <= 0.0
             or int(self.config.release_supported_frames) <= 0
             or int(self.config.stop_confirmation_samples) <= 0
             or not math.isfinite(self.config.localization_speed_anomaly_threshold)
@@ -416,7 +419,7 @@ class GroundSupportSafetyGate:
         ):
             return
         elapsed = max(0.0, float(wall_time) - self._last_progress_wall_time)
-        if elapsed < self.config.safety_stop_timeout:
+        if elapsed < self.config.wall_stall_timeout:
             return
         self._enter_state(
             SAFETY_STOP_TIMEOUT,

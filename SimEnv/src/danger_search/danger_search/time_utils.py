@@ -1,7 +1,7 @@
 """统一任务计时来源。
 
 Gazebo 运行时严格使用 ROS ``/clock``，否则仿真暂停或实时率下降会错误消耗
-任务预算；没有 ROS 或尚未 ``init_node`` 的离线进程使用系统墙钟。ROS 节点
+任务预算；没有 ROS 或尚未 ``init_node`` 的离线进程使用单调墙钟。ROS 节点
 初始化后读取失败必须显式报错，不能在一次任务中悄悄切换时间域。
 """
 import math
@@ -28,4 +28,4 @@ def get_time() -> float:
         if not math.isfinite(value) or value < 0.0:
             raise RuntimeError(f"ROS 任务时间非法: {value!r}")
         return value
-    return time.time()
+    return time.monotonic()

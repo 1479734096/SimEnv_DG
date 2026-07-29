@@ -445,6 +445,87 @@ class LocalControllerTest(unittest.TestCase):
         self.assertGreaterEqual(snapshot["wall_command_age"], 0.0)
         json.dumps(follower.command_debug_summary(), allow_nan=False)
 
+    def test_publish_failure_does_not_commit_command_and_latches_zero(self):
+        class FakeTwist:
+            def __init__(self):
+                self.linear = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+                self.angular = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+        class FailOncePublisher:
+            def __init__(self):
+                self.messages = []
+                self.failed = False
+
+            def publish(self, msg):
+                if not self.failed:
+                    self.failed = True
+                    raise RuntimeError("publish failed")
+                self.messages.append(msg)
+
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower._publisher = FailOncePublisher()
+        with patch("danger_search.navigator.Twist", FakeTwist):
+            with self.assertRaises(RuntimeError):
+                follower._publish(0.3, 0.0)
+            follower._publish(0.3, 0.0)
+
+        self.assertEqual(follower.command_count, 1)
+        self.assertEqual(follower.last_command, (0.0, 0.0, 0.0))
+        self.assertEqual(
+            follower.active_motion_command_snapshot(),
+            (0.0, 0.0, 0.0),
+        )
+        self.assertTrue(
+            follower.tracking_debug_snapshot()["publish_failure_latched"]
+        )
+        self.assertEqual(follower._publisher.messages[0].linear.x, 0.0)
+
+    def test_active_motion_persists_until_fresh_odometry_confirms_stop(self):
+        class FakeTwist:
+            def __init__(self):
+                self.linear = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+                self.angular = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+        class FakePublisher:
+            def publish(self, _msg):
+                return None
+
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower._publisher = FakePublisher()
+        with patch("danger_search.navigator.Twist", FakeTwist):
+            follower._publish(0.3, 0.0)
+            follower.stop(reason="test_braking")
+
+        self.assertEqual(
+            follower.active_motion_command_snapshot(),
+            (0.3, 0.0, 0.0),
+        )
+        self.assertEqual(
+            follower.committed_command_snapshot(),
+            (0.0, 0.0, 0.0),
+        )
+        for stamp in (1.0, 2.0):
+            follower.observe_motion_odometry(
+                stamp,
+                linear_speed=0.0,
+                angular_speed=0.0,
+                wall_time=stamp,
+            )
+        self.assertEqual(
+            follower.active_motion_command_snapshot(),
+            (0.3, 0.0, 0.0),
+        )
+        follower.observe_motion_odometry(
+            3.0,
+            linear_speed=0.0,
+            angular_speed=0.0,
+            wall_time=3.0,
+        )
+        self.assertEqual(
+            follower.active_motion_command_snapshot(),
+            (0.0, 0.0, 0.0),
+        )
+
     def test_path_diagnostics_are_noop_without_publishers(self):
         """rospy 已导入但未 init_node、publisher 为 None 时 set_path 不得报错。"""
         follower = PathFollower(cmd_vel_topic="/cmd_vel")

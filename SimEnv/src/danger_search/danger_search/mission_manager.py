@@ -21,6 +21,7 @@ import json
 import math
 import os
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -83,6 +84,7 @@ from danger_search.landmark_drift_monitor import (
 from danger_search.result_writer import ResultWriter
 from danger_search.sensor_buffer import (
     SensorBuffer,
+    message_stamp_seconds,
 )
 from danger_search.pose_provider import (
     POSE_EXPIRED,
@@ -99,7 +101,9 @@ from danger_search.localization_runtime import (
 from danger_search.interface_policy import (
     require_allowed_input_topic,
     require_allowed_output_topic,
-    require_internal_topic,
+    require_internal_input_topic,
+    require_internal_output_topic,
+    require_manual_control_topic,
 )
 from danger_search.building_feature_provider import BuildingFeatureProvider
 from danger_search.support_shadow import ShadowSupportConfig, ShadowSupportGrid
@@ -410,6 +414,8 @@ class MissionManager:
         self.current_frontier: Frontier | None = None
         self._last_image_stamp: float | None = None
         self._last_cloud_stamp: float | None = None
+        self._last_image_generation = 0
+        self._last_cloud_generation = 0
         self._service_task = None
         self._change_phase: str | None = None
         self._no_frontier_scan_until = 0.0
@@ -555,6 +561,7 @@ class MissionManager:
         self._ground_support_grid: ShadowSupportGrid | None = None
         self._ground_support_sensor_mount: np.ndarray | None = None
         self._last_ground_support_cloud_stamp: float | None = None
+        self._last_ground_support_cloud_generation = 0
         self._ground_support_timer = None
         self._ground_support_last_state = GROUND_SUPPORT_CLEAR
         self._ground_support_wall_stop = Event()
@@ -569,6 +576,8 @@ class MissionManager:
         self._ground_support_map_update_lock = Lock()
         self._ground_support_pending_negative: dict[int, set[tuple[int, int]]] = {}
         self._ground_support_pending_supported: dict[int, set[tuple[int, int]]] = {}
+        self._ground_support_map_epoch = 0
+        self._ground_support_localization_epoch = 0
 
         # 参数及公开接口先全部校验，再创建各运行组件。构造顺序体现依赖方向：
         # 数据源 -> 环境表示/决策 -> 控制 -> 外部服务 -> 结果输出。
@@ -661,6 +670,7 @@ class MissionManager:
             release_supported_frames=params["release_supported_frames"],
             observation_hold_timeout=params["observation_hold_timeout"],
             safety_stop_timeout=params["safety_stop_timeout"],
+            wall_stall_timeout=params["wall_stall_timeout"],
             odometry_linear_deadband=params["odometry_linear_deadband"],
             odometry_angular_deadband=params["odometry_angular_deadband"],
             stop_linear_threshold=params["stop_linear_threshold"],
@@ -734,7 +744,7 @@ class MissionManager:
             self._map_publisher = None
         if self.manual_goal_enabled and PoseStamped is not None:
             self._goal_subscriber = rospy.Subscriber(self.goal_topic, PoseStamped, self._goal_callback)
-        health_topic = require_internal_topic(
+        health_topic = require_internal_input_topic(
             LOCALIZATION_HEALTH_TOPIC,
             purpose="定位持续姿态健康输入",
         )
@@ -777,8 +787,11 @@ class MissionManager:
             stamp_value = float(get_time())
         if not math.isfinite(stamp_value):
             return
+        previous = self._localization_health
         self._localization_health = value
         self._localization_health_stamp = stamp_value
+        if previous is not None and previous != value:
+            self._ground_support_localization_epoch += 1
         if not value:
             rospy.logwarn_throttle(
                 2.0, "定位姿态健康异常：%s=false", LOCALIZATION_HEALTH_TOPIC
@@ -788,14 +801,17 @@ class MissionManager:
         """仿真时钟冻结时仍能执行安全停车异常上限。"""
         gate = self._ground_support_gate
         while gate is not None and not self._ground_support_wall_stop.wait(0.05):
-            gate.check_wall_timeout(time.monotonic())
-            if gate.state != SAFETY_STOP_TIMEOUT:
+            with _controller_command_transaction(self.controller):
+                gate.check_wall_timeout(time.monotonic())
+                timed_out = gate.state == SAFETY_STOP_TIMEOUT
+                reason = gate.reason_code or "ground_support_safety_stop_timeout"
+                if timed_out:
+                    self.controller.stop(reason=reason)
+            if not timed_out:
                 continue
-            reason = gate.reason_code or "ground_support_safety_stop_timeout"
             self._ground_support_forced_shutdown_reason = reason
             self._mission_success_eligible = False
             self._record_failure(reason)
-            self.controller.stop(reason=reason)
             self._shutdown_requested = True
             rospy.signal_shutdown(reason)
             return
@@ -869,11 +885,11 @@ class MissionManager:
         )
         if self.building_features is not None:
             self.building_features.require_topic(self.cmd_vel_topic, purpose="导航控制输出")
-        self.localization_odom_topic = require_internal_topic(_param(
+        self.localization_odom_topic = require_internal_input_topic(_param(
             "topics/localization_odom",
             "/danger_search/localization/odom",
         ), purpose="参赛方定位输出")
-        self.cloud_topic = require_internal_topic(_param(
+        self.cloud_topic = require_internal_input_topic(_param(
             "topics/cloud",
             "/danger_search/localization/cloud_registered",
         ), purpose="参赛方配准点云")
@@ -921,15 +937,15 @@ class MissionManager:
             or self.localization_unavailable_timeout <= self.localization_stale_minimum
         ):
             raise ValueError("定位新鲜度阈值必须为正，且不可用超时必须更长")
-        self.status_topic = require_internal_topic(_param("topics/status", "/nav/status"), purpose="任务状态")
-        self.goal_topic = require_internal_topic(_param("topics/goal", "/nav/goal"), purpose="诊断目标")
-        self.map_topic = require_internal_topic(_param("topics/map", "/nav/map_debug"), purpose="地图调试")
-        self.path_raw_topic = require_internal_topic(_param("topics/path_raw", "/danger_search/path_raw"), purpose="原始路径调试")
-        self.path_followed_topic = require_internal_topic(_param(
+        self.status_topic = require_internal_output_topic(_param("topics/status", "/nav/status"), purpose="任务状态")
+        self.goal_topic = require_manual_control_topic(_param("topics/goal", "/nav/goal"), purpose="手动控制型测试目标")
+        self.map_topic = require_internal_output_topic(_param("topics/map", "/nav/map_debug"), purpose="地图调试")
+        self.path_raw_topic = require_internal_output_topic(_param("topics/path_raw", "/danger_search/path_raw"), purpose="原始路径调试")
+        self.path_followed_topic = require_internal_output_topic(_param(
             "topics/path_followed",
             "/danger_search/path_followed",
         ), purpose="跟踪路径调试")
-        self.local_target_topic = require_internal_topic(_param(
+        self.local_target_topic = require_internal_output_topic(_param(
             "topics/local_target",
             "/danger_search/local_target",
         ), purpose="局部目标调试")
@@ -1276,6 +1292,9 @@ class MissionManager:
             ),
             "safety_stop_timeout": float(
                 _param("ground_support/safety_stop_timeout", 3.0)
+            ),
+            "wall_stall_timeout": float(
+                _param("ground_support/wall_stall_timeout", 30.0)
             ),
             # 必须与第 2 层定位发布速度死区一致；停车阈值不得小于测量死区。
             "odometry_linear_deadband": float(
@@ -1983,10 +2002,14 @@ class MissionManager:
             explicit_transition=True,
         )
         self._floor_transition_guard = guard
+        self._ground_support_map_epoch = (
+            int(getattr(self, "_ground_support_map_epoch", 0)) + 1
+        )
         support_gate = getattr(self, "_ground_support_gate", None)
         invalidate_support = getattr(support_gate, "invalidate_assessment", None)
         if callable(invalidate_support):
-            invalidate_support()
+            with _controller_command_transaction(self.controller):
+                invalidate_support()
         self._log_structured(
             {
                 "event": "floor_transition_ambiguous_enter",
@@ -2021,6 +2044,12 @@ class MissionManager:
             odom_stamp = None
         self.current_floor = target_floor
         self.floor_start_time = get_time()
+        self._ground_support_map_epoch = (
+            int(getattr(self, "_ground_support_map_epoch", 0)) + 1
+        )
+        self._ground_support_localization_epoch = (
+            int(getattr(self, "_ground_support_localization_epoch", 0)) + 1
+        )
         guard.confirmed_floor = target_floor
         guard.confirmation_odom_stamp = odom_stamp
         guard.alignment_floor = target_floor
@@ -2109,7 +2138,8 @@ class MissionManager:
             support_gate = getattr(self, "_ground_support_gate", None)
             invalidate_support = getattr(support_gate, "invalidate_assessment", None)
             if callable(invalidate_support):
-                invalidate_support()
+                with _controller_command_transaction(self.controller):
+                    invalidate_support()
             self._log_structured(
                 {
                     "event": "floor_transition_ambiguous_enter",
@@ -2319,20 +2349,38 @@ class MissionManager:
             )
 
     def _update_mapping_and_detection(self, snapshot, pose, xyz, pose_sample=None) -> None:
-        cloud_stamp = _message_stamp_seconds(snapshot.cloud_msg)
+        cloud_msg = snapshot.cloud_msg
+        cloud_stamp = message_stamp_seconds(cloud_msg)
+        cloud_generation = int(
+            getattr(
+                snapshot,
+                "cloud_generation",
+                id(cloud_msg) if cloud_msg is not None else 0,
+            )
+        )
+        cloud_is_new = (
+            cloud_msg is not None
+            and cloud_generation
+            != int(getattr(self, "_last_cloud_generation", 0))
+        )
         if pose_sample is None:
             pose_sample = _pose_sample_from_values(
                 stamp=cloud_stamp if cloud_stamp is not None else 0.0,
                 pose=pose,
                 xyz=xyz,
             )
-        cloud_is_new = cloud_stamp is None or cloud_stamp != getattr(self, "_last_cloud_stamp", None)
         localization_runtime = self._get_localization_runtime()
-        cloud_lookup = localization_runtime.lookup(
-            cloud_stamp,
-            allow_legacy_at=False,
+        cloud_lookup = None
+        if cloud_is_new and cloud_stamp is not None:
+            cloud_lookup = localization_runtime.lookup(
+                cloud_stamp,
+                allow_legacy_at=False,
+            )
+        mapping_sample = (
+            cloud_lookup.sample
+            if cloud_lookup is not None and cloud_lookup.sample is not None
+            else pose_sample
         )
-        mapping_sample = cloud_lookup.sample if cloud_lookup.sample is not None else pose_sample
         mapping_pose = mapping_sample.xy_yaw
         raw_mapping_xyz = mapping_sample.xyz
         estimated_floor = self._estimated_floor_for_pose(raw_mapping_xyz)
@@ -2343,7 +2391,17 @@ class MissionManager:
         if estimated_floor == self.current_floor:
             self._last_floor_alignment_mismatch_key = None
         if cloud_is_new:
-            if cloud_stamp is not None and cloud_lookup.status == POSE_PENDING:
+            if cloud_stamp is None:
+                self._last_cloud_generation = cloud_generation
+                self._log_structured(
+                    {
+                        "event": "cloud_rejected",
+                        "elapsed": round(float(self._elapsed()), 3),
+                        "reason": "invalid_or_missing_timestamp",
+                        "cloud_generation": cloud_generation,
+                    }
+                )
+            elif cloud_lookup.status == POSE_PENDING:
                 if self._record_pose_lookup(
                     "cloud", cloud_lookup, stamp=cloud_stamp
                 ):
@@ -2355,8 +2413,9 @@ class MissionManager:
                             "pose_delta": cloud_lookup.delta,
                         }
                     )
-            elif cloud_stamp is not None and cloud_lookup.status == POSE_EXPIRED:
+            elif cloud_lookup.status == POSE_EXPIRED:
                 self._record_pose_lookup("cloud", cloud_lookup)
+                self._last_cloud_generation = cloud_generation
                 self._last_cloud_stamp = cloud_stamp
                 self._log_structured(
                     {
@@ -2370,6 +2429,7 @@ class MissionManager:
             elif floor_scoped_updates_blocked:
                 self._record_pose_lookup("cloud", cloud_lookup)
                 # 被门控的 cloud 必须标记为已消费，避免对齐后重放旧帧。
+                self._last_cloud_generation = cloud_generation
                 self._last_cloud_stamp = cloud_stamp
                 self._record_skipped_floor_scoped_update(
                     cloud_stamp=cloud_stamp,
@@ -2384,6 +2444,7 @@ class MissionManager:
                 )
                 points = self._logical_floor_points(points, self.current_floor)
                 self._latest_cloud_points = points
+                self._last_cloud_generation = cloud_generation
                 self._last_cloud_stamp = cloud_stamp
                 self.mapper.update_from_cloud(
                     floor_index=self.current_floor,
@@ -2451,12 +2512,41 @@ class MissionManager:
         bundle = snapshot.image_bundle
         if bundle is None:
             return
-        stamp = bundle.rgb_msg.header.stamp.to_sec() if hasattr(bundle.rgb_msg.header.stamp, "to_sec") else None
-        if stamp is not None and self._last_image_stamp == stamp:
+        image_generation = int(
+            getattr(
+                snapshot,
+                "image_generation",
+                getattr(bundle, "generation", id(bundle)),
+            )
+        )
+        if image_generation == int(getattr(self, "_last_image_generation", 0)):
             return
-        image_stamp = _message_stamp_seconds(bundle.rgb_msg)
+        image_stamps = tuple(
+            message_stamp_seconds(message)
+            for message in (
+                bundle.rgb_msg,
+                bundle.depth_msg,
+                bundle.camera_info_msg,
+            )
+        )
+        sync_slop = float(getattr(self.sensor_buffer, "sync_slop", 0.08))
+        if (
+            any(stamp is None for stamp in image_stamps)
+            or max(image_stamps) - min(image_stamps) > sync_slop
+        ):
+            self._last_image_generation = image_generation
+            self._log_structured(
+                {
+                    "event": "rgbd_rejected",
+                    "elapsed": round(float(self._elapsed()), 3),
+                    "reason": "invalid_or_unsynchronized_timestamps",
+                    "image_generation": image_generation,
+                }
+            )
+            return
+        image_stamp = float(image_stamps[0])
         image_lookup = localization_runtime.lookup(image_stamp)
-        if image_stamp is not None and image_lookup.status == POSE_PENDING:
+        if image_lookup.status == POSE_PENDING:
             if not self._record_pose_lookup(
                 "rgbd", image_lookup, stamp=image_stamp
             ):
@@ -2470,9 +2560,10 @@ class MissionManager:
                 }
             )
             return
-        if image_stamp is not None and image_lookup.status == POSE_EXPIRED:
+        if image_lookup.status == POSE_EXPIRED:
             self._record_pose_lookup("rgbd", image_lookup)
-            self._last_image_stamp = stamp
+            self._last_image_generation = image_generation
+            self._last_image_stamp = image_stamp
             # 不使用最近云帧位姿、TF 或 Gazebo 真值兜底，避免 RGB-D 检测
             # 与彩色图像不同步导致伪目标。
             now = get_time()
@@ -2489,7 +2580,8 @@ class MissionManager:
                 )
             return
         self._record_pose_lookup("rgbd", image_lookup)
-        self._last_image_stamp = stamp
+        self._last_image_generation = image_generation
+        self._last_image_stamp = image_stamp
         image_pose = image_lookup.sample
         if image_pose is None:
             return
@@ -2619,7 +2711,10 @@ class MissionManager:
         gate = getattr(self, "_ground_support_gate", None)
         if gate is None:
             return
-        gate.observe_odometry(
+        observe = getattr(self.controller, "observe_motion_odometry", None)
+        if not callable(observe):
+            observe = gate.observe_odometry
+        observe(
             pose_sample.stamp,
             linear_speed=pose_sample.planar_speed,
             angular_speed=pose_sample.angular_speed,
@@ -2633,10 +2728,23 @@ class MissionManager:
         if gate is None or grid is None:
             return
         snapshot = self.sensor_buffer.snapshot()
-        cloud_stamp = _message_stamp_seconds(snapshot.cloud_msg)
-        if cloud_stamp is None or cloud_stamp <= (
-            getattr(self, "_last_ground_support_cloud_stamp", None) or -math.inf
+        cloud_msg = snapshot.cloud_msg
+        cloud_generation = int(
+            getattr(
+                snapshot,
+                "cloud_generation",
+                id(cloud_msg) if cloud_msg is not None else 0,
+            )
+        )
+        if (
+            cloud_msg is None
+            or cloud_generation
+            == int(getattr(self, "_last_ground_support_cloud_generation", 0))
         ):
+            return
+        self._last_ground_support_cloud_generation = cloud_generation
+        cloud_stamp = message_stamp_seconds(cloud_msg)
+        if cloud_stamp is None:
             return
         # 支撑层有独立消费游标。即使本帧因换层歧义或 TF 缺失跳过，也不得重放旧帧。
         self._last_ground_support_cloud_stamp = cloud_stamp
@@ -2657,7 +2765,8 @@ class MissionManager:
             )
         )
         if transition_ambiguous:
-            gate.invalidate_assessment()
+            with _controller_command_transaction(self.controller):
+                gate.invalidate_assessment()
             return
         points = self.sensor_buffer.read_cloud_xyz(
             snapshot.cloud_msg,
@@ -2701,8 +2810,34 @@ class MissionManager:
             np.asarray(point, dtype=float)
             for point in self.controller.followed_path_snapshot()
         ]
-        emitted = getattr(self.controller, "last_command", (0.0, 0.0, 0.0))
-        command_linear = math.hypot(float(emitted[0]), float(emitted[1]))
+        active_snapshot = getattr(
+            self.controller,
+            "active_motion_command_snapshot",
+            None,
+        )
+        committed_snapshot = getattr(
+            self.controller,
+            "committed_command_snapshot",
+            None,
+        )
+        active_motion = (
+            active_snapshot()
+            if callable(active_snapshot)
+            else getattr(self.controller, "last_command", (0.0, 0.0, 0.0))
+        )
+        committed_command = (
+            committed_snapshot()
+            if callable(committed_snapshot)
+            else getattr(self.controller, "last_command", (0.0, 0.0, 0.0))
+        )
+        support_command_linear = math.hypot(
+            float(committed_command[0]),
+            float(committed_command[1]),
+        )
+        drop_command_linear = math.hypot(
+            float(active_motion[0]),
+            float(active_motion[1]),
+        )
         result = grid.process_frame(
             stamp=cloud_stamp,
             floor=self.current_floor,
@@ -2712,7 +2847,8 @@ class MissionManager:
             sensor_rotation=sensor_rotation,
             points=np.asarray(points, dtype=float),
             path=followed_path,
-            command_linear=command_linear,
+            command_linear=support_command_linear,
+            drop_command_linear=drop_command_linear,
             ambiguous=False,
             local_only=True,
         )
@@ -2745,49 +2881,52 @@ class MissionManager:
             and math.isfinite(float(point[0]))
             and math.isfinite(float(point[1]))
         )
-        gate.update_assessment(
-            GroundSupportAssessment(
-                stamp=float(cloud_stamp),
-                received_wall_time=time.monotonic(),
-                data_age=float(data_age),
-                supported_distance=_optional_finite(payload.get("supported_distance")),
-                support_boundary_detected=bool(
-                    payload.get("support_boundary_detected", False)
-                ),
-                current_footprint_supported=bool(
-                    payload.get("current_footprint_supported", False)
-                ),
-                observation_adequate=bool(
-                    payload.get("observation_adequate", False)
-                ),
-                drop_confirmed=bool(payload.get("drop_confirmed", False)),
-                drop_intersects_sweep=bool(
-                    payload.get("drop_intersects_sweep", False)
-                ),
-                drop_distance=_optional_finite(payload.get("drop_distance")),
-                drop_direction_world=(
-                    (float(direction[0]), float(direction[1]))
-                    if isinstance(direction, (list, tuple)) and len(direction) >= 2
-                    else None
-                ),
-                received_control_time=ros_now,
-                drop_point_world=drop_point_world,
-                support_boundary_cells_world=boundary_cells_world,
+        assessment = GroundSupportAssessment(
+            stamp=float(cloud_stamp),
+            received_wall_time=time.monotonic(),
+            data_age=float(data_age),
+            supported_distance=_optional_finite(payload.get("supported_distance")),
+            support_boundary_detected=bool(
+                payload.get("support_boundary_detected", False)
+            ),
+            current_footprint_supported=bool(
+                payload.get("current_footprint_supported", False)
+            ),
+            observation_adequate=bool(
+                payload.get("observation_adequate", False)
+            ),
+            drop_confirmed=bool(payload.get("drop_confirmed", False)),
+            drop_intersects_sweep=bool(
+                payload.get("drop_intersects_sweep", False)
+            ),
+            drop_distance=_optional_finite(payload.get("drop_distance")),
+            drop_direction_world=(
+                (float(direction[0]), float(direction[1]))
+                if isinstance(direction, (list, tuple)) and len(direction) >= 2
+                else None
+            ),
+            received_control_time=ros_now,
+            drop_point_world=drop_point_world,
+            support_boundary_cells_world=boundary_cells_world,
+        )
+        with _controller_command_transaction(self.controller):
+            active_motion = (
+                active_snapshot()
+                if callable(active_snapshot)
+                else getattr(
+                    self.controller,
+                    "last_command",
+                    (0.0, 0.0, 0.0),
+                )
             )
-        )
-        requested_snapshot = getattr(self.controller, "requested_command_snapshot", None)
-        requested = (
-            requested_snapshot()
-            if callable(requested_snapshot)
-            else (0.0, 0.0, 0.0)
-        )
-        if gate.evaluate_latest_drop(
-            requested,
-            pose_yaw=pose[2],
-            wall_time=time.monotonic(),
-            control_time=ros_now,
-        ):
-            self.controller.stop(reason="negative_obstacle")
+            gate.update_assessment(assessment)
+            if gate.evaluate_latest_drop(
+                active_motion,
+                pose_yaw=pose[2],
+                wall_time=time.monotonic(),
+                control_time=ros_now,
+            ):
+                self.controller.stop(reason="negative_obstacle")
 
     @staticmethod
     def _ground_support_grid_cells(payload) -> set[tuple[int, int]]:
@@ -2863,13 +3002,18 @@ class MissionManager:
         gate = getattr(self, "_ground_support_gate", None)
         if gate is None:
             return False
-        check_control_timeout = getattr(gate, "check_control_timeout", None)
-        if callable(check_control_timeout):
-            check_control_timeout(
-                float(get_time()),
-                wall_time=time.monotonic(),
-            )
-        state = gate.state
+        with _controller_command_transaction(self.controller):
+            check_control_timeout = getattr(gate, "check_control_timeout", None)
+            if callable(check_control_timeout):
+                check_control_timeout(
+                    float(get_time()),
+                    wall_time=time.monotonic(),
+                )
+            state = gate.state
+            reason = gate.reason_code or "ground_support_safety_failure"
+            gate_snapshot = gate.snapshot()
+            if state != GROUND_SUPPORT_CLEAR:
+                self.controller.stop(reason=reason)
         last_state = getattr(self, "_ground_support_last_state", GROUND_SUPPORT_CLEAR)
         if state != last_state:
             self._log_structured(
@@ -2878,8 +3022,8 @@ class MissionManager:
                     "elapsed": round(float(self._elapsed()), 3),
                     "old_state": last_state,
                     "new_state": state,
-                    "reason_code": gate.reason_code,
-                    "gate": gate.snapshot(),
+                    "reason_code": reason,
+                    "gate": gate_snapshot,
                 }
             )
             self._ground_support_last_state = state
@@ -2889,7 +3033,6 @@ class MissionManager:
         reset_progress = getattr(self.controller, "reset_progress_timer", None)
         if callable(reset_progress):
             reset_progress(pose)
-        self.controller.stop(reason=gate.reason_code or "ground_support_hold")
         # 临时 hold 和停车过程都在任务 tick 之前截断，普通 STUCK/recover 无法接管。
         if state in {
             OBSERVATION_HOLD,
@@ -2899,7 +3042,6 @@ class MissionManager:
         }:
             return True
 
-        reason = gate.reason_code or "ground_support_safety_failure"
         if (
             state == SAFETY_BLOCKED
             and reason == "negative_obstacle"
@@ -3021,8 +3163,9 @@ class MissionManager:
                         },
                     )
                 return True
-            gate.reset_path_unavailable()
-            self._ground_support_last_state = gate.state
+            with _controller_command_transaction(self.controller):
+                gate.reset_path_unavailable()
+                self._ground_support_last_state = gate.state
             return True
         return True
 
@@ -3069,11 +3212,11 @@ class MissionManager:
         self._last_frontier_target = None
         self._last_frontier_score = None
         self._last_frontier_used_fallback = False
-        if not gate.reset_negative_obstacle_after_replan():
-            return False
-
+        with _controller_command_transaction(self.controller):
+            if not gate.reset_negative_obstacle_after_replan():
+                return False
+            self._ground_support_last_state = gate.state
         self._ground_support_negative_replan_count = count + 1
-        self._ground_support_last_state = gate.state
         self._log_structured(
             {
                 "event": "negative_obstacle_local_replan",
@@ -7424,16 +7567,6 @@ def nearest_forward_obstacle_observation(
     return best_observation
 
 
-def _message_stamp_seconds(message) -> float | None:
-    if message is None:
-        return None
-    stamp = getattr(getattr(message, "header", None), "stamp", None)
-    if stamp is None:
-        return None
-    to_sec = getattr(stamp, "to_sec", None)
-    return float(to_sec()) if callable(to_sec) else None
-
-
 def _pose_sample_from_values(*, stamp: float, pose, xyz) -> PoseSample:
     half_yaw = float(pose[2]) * 0.5
     return PoseSample(
@@ -7469,6 +7602,12 @@ def _ground_support_unknown_hold_enabled(task, *, configured: bool = True) -> bo
         and bool(getattr(task, "opening_sensor_confirmed", False))
     )
     return not (controlled_elevator_threshold or controlled_open_door_threshold)
+
+
+def _controller_command_transaction(controller):
+    """兼容生产 PathFollower 与轻量测试替身的控制事务上下文。"""
+    transaction = getattr(controller, "command_transaction", None)
+    return transaction() if callable(transaction) else nullcontext()
 
 
 def _ground_support_data_age(
@@ -7643,7 +7782,7 @@ def _wait_for_localization_ready(
     """等待定位节点锁存站立就绪；等待期不启动任务预算或控制发布器。"""
     if rospy is None or Bool is None:
         raise RuntimeError("当前环境没有 ROS Bool 消息，无法等待定位就绪")
-    topic = require_internal_topic(
+    topic = require_internal_input_topic(
         LOCALIZATION_READY_TOPIC,
         purpose="定位站立就绪输入",
     )
@@ -7676,6 +7815,17 @@ def main() -> int:
     if rospy is None:
         raise RuntimeError("当前环境没有 rospy，无法运行 danger_search_node")
     rospy.init_node("danger_search")
+    runtime_profile = str(
+        rospy.get_param("~runtime/profile", "formal")
+    ).strip().lower()
+    if (
+        runtime_profile == "formal"
+        and not bool(rospy.get_param("~controller_ready_ack", False))
+    ):
+        rospy.logfatal(
+            "正式任务拒绝启动：尚未确认 junior_ctrl 已进入 RL /cmd_vel 模式"
+        )
+        return 2
     if bool(rospy.get_param("~wait_for_localization_ready", True)):
         rospy.loginfo("等待定位站立证据与世界系初始化完成")
         if not _wait_for_localization_ready():

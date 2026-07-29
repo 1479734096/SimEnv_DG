@@ -189,7 +189,7 @@ runner 返回码：
 - `2`：参数、端口、启动或环境前置失败；
 - `130`：用户或外部信号中止。
 
-## 4. 生产边界检查
+## 4. 参赛 Python/离线边界检查
 
 ```bash
 python3 tools/offline/check_production_boundary.py
@@ -202,8 +202,16 @@ python3 tools/offline/check_production_boundary.py \
   --workspace /home/xbh/tzb26/codeDG_rebuild
 ```
 
-输出“生产/离线边界审计通过。”且返回 `0` 表示通过；发现生产安装、import 或 launch
-闭包包含离线工具时返回 `1` 并逐条列出问题。
+输出“参赛 Python/离线边界审计通过。”且返回 `0` 表示通过；发现生产安装、import 或
+launch 闭包包含离线工具时返回 `1` 并逐条列出问题。该命令不证明整机运行闭包合规。
+
+完整系统启动后另执行：
+
+```bash
+python3 tools/offline/check_runtime_ros_graph.py
+```
+
+该运行时检查覆盖真值订阅、`/cmd_vel`、`/joy` 和内部定位生产者。
 
 ## 5. 任务时间、覆盖和失败账本
 

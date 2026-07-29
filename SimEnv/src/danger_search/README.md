@@ -21,10 +21,12 @@ python3 -m pytest -q src/danger_search/test
 ```bash
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
-roslaunch danger_search danger_search.launch
+roslaunch danger_search danger_search.launch controller_ready_ack:=true
 ```
 
-正式节点等待 `/danger_search/localization/ready=true` 后才创建 `MissionManager`，
+该确认参数只能在 `junior_ctrl` 已输出 `Entered RL /cmd_vel mode.` 后传入；
+缺省值为 `false`，正式任务会拒绝启动。随后节点等待
+`/danger_search/localization/ready=true` 后才创建 `MissionManager`，
 因此定位未建立世界系时不会开始任务预算，也不会建立控制发布器。结果路径由
 `generated_building/team_scene_info.json` 公布，formal 模式拒绝改写到其他位置。
 运行期间定位持续用公开 `/scan` 和 `/trunk_imu` 发布姿态 health；连续异常会撤销
@@ -61,6 +63,6 @@ python3 tools/offline/check_production_boundary.py
 `reports/STAGE8_3_REPORT.md`。
 
 第 10.1 层已通过 GUI 仿真验证主入口闭环：远场门洞只建立入场轴，公开服务开门后以
-两帧近场点云重新估计门洞，再限速直线通过。只有服务成功且传感器确认的门槛及其有界
-离门阶段会关闭地面支撑 `UNKNOWN` 临时停车，显式 `DROP` 始终保持生效。证据见
-`reports/STAGE10_1_REPORT.md`。
+两帧近场点云重新估计门洞，再限速直线通过。传感器确认的主入口通过阶段、电梯
+`ENTER_CABIN/EXIT_CABIN` 阶段及有界离门上下文只关闭地面支撑 `UNKNOWN`
+临时停车，显式 `DROP` 始终保持生效。

@@ -73,8 +73,11 @@ roslaunch danger_search_localization scan_localization.launch \
 
 ```bash
 roslaunch danger_search danger_search.launch \
+  controller_ready_ack:=true \
   localization_backend:=rgbd_livox
 ```
+
+该确认只能在 `junior_ctrl` 已输出 `Entered RL /cmd_vel mode.` 后传入。
 
 节点启动后先锁存发布 `ready=false`。机器人站立稳定、连续楼面证据满足门槛后才发布 `ready=true`、里程计和配准点云；调用方不得用固定等待替代该就绪信号。
 
@@ -189,10 +192,11 @@ Gazebo 日志、bag、生成场景和真值不提交到 Git，只把与结论直
 ```bash
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
-roslaunch danger_search danger_search.launch
+roslaunch danger_search danger_search.launch controller_ready_ack:=true
 ```
 
-不得为 formal 模式传入任意结果路径。正式结果文件只能使用
+该参数只能在 `junior_ctrl` 已输出 `Entered RL /cmd_vel mode.` 后传入；缺省时
+正式入口拒绝创建任务。不得为 formal 模式传入任意结果路径。正式结果文件只能使用
 `generated_building/team_scene_info.json` 的 `allowed_interfaces.result_file`；路径不一致时
 节点会在建立任何任务控制前显式失败。节点还会等待内部定位 ready，等待期间不创建
 `MissionManager`，也不计入任务预算。

@@ -5,6 +5,8 @@ import xml.etree.ElementTree as ElementTree
 
 import yaml
 
+from danger_search.interface_policy import require_internal_output_topic
+
 
 SIMENV_ROOT = Path(__file__).resolve().parents[3]
 REFERENCE_PATH = SIMENV_ROOT / "docs" / "reference.md"
@@ -27,6 +29,16 @@ TRUTH_RESTRICTION = (
 
 
 class InterfaceDocumentationTest(unittest.TestCase):
+    def test_formal_status_topic_matches_internal_output_contract(self):
+        config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
+        status_topic = config["topics"]["status"]
+
+        self.assertEqual(status_topic, "/nav/status")
+        self.assertEqual(
+            require_internal_output_topic(status_topic, purpose="任务状态"),
+            status_topic,
+        )
+
     def test_formal_launch_explicitly_passes_public_scene_path_to_localization(self):
         root = ElementTree.parse(FORMAL_LAUNCH_PATH).getroot()
         self.assertFalse(
@@ -54,6 +66,10 @@ class InterfaceDocumentationTest(unittest.TestCase):
             launch_arguments.get("localization_backend"), "adaptive_shared_map"
         )
         self.assertEqual(
+            launch_arguments.get("controller_ready_ack"),
+            "false",
+        )
+        self.assertEqual(
             arguments.get("localization_backend"), "$(arg localization_backend)"
         )
         formal_node = next(
@@ -70,6 +86,10 @@ class InterfaceDocumentationTest(unittest.TestCase):
         self.assertEqual(
             node_parameters.get("wait_for_localization_ready"),
             "true",
+        )
+        self.assertEqual(
+            node_parameters.get("controller_ready_ack"),
+            "$(arg controller_ready_ack)",
         )
         localization_arguments = {
             arg.get("name"): arg.get("value")
@@ -100,6 +120,12 @@ class InterfaceDocumentationTest(unittest.TestCase):
         arguments = {item.get("name"): item.get("default") for item in root.findall("arg")}
         self.assertEqual(arguments.get("localization_backend"), "kiss_icp")
         self.assertEqual(arguments.get("shared_map_depth_max_age"), "0.35")
+        self.assertEqual(arguments.get("raw_cloud_frame"), "laser_livox")
+        self.assertEqual(arguments.get("imu_frame"), "imu_link")
+        self.assertEqual(
+            arguments.get("depth_cloud_frame"),
+            "real_sense_optical_frame",
+        )
         self.assertEqual(
             arguments.get("shared_map_max_source_divergence"), "0.05"
         )
@@ -116,6 +142,11 @@ class InterfaceDocumentationTest(unittest.TestCase):
         )
         self.assertNotIn("base_to_livox_xyz", string_parameters)
         self.assertNotIn("base_to_livox_rpy", string_parameters)
+        configured_values = {
+            item.get("name"): item.get("value") for item in node.findall("param")
+        }
+        for name in ("raw_cloud_frame", "imu_frame", "depth_cloud_frame"):
+            self.assertEqual(configured_values.get(name), f"$(arg {name})")
 
     def test_truth_restriction_is_listed_in_all_interface_documents(self):
         for path in (ALGORITHM_INTERFACES_PATH, REFERENCE_PATH):

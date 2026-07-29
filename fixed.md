@@ -1,17 +1,26 @@
 # SimEnv 已完成与历史归档
 
-最后更新：2026-07-28
+最后更新：2026-07-29
 
 本文归档已经完成的机制、有效验证和历史失败结论。尚未完成的事项只维护在 [fix.md](fix.md)。
 
-## 1. 合规生产边界
+范围更正：本文此前所称“生产节点订阅审计”实际只覆盖 `danger_search` 和参赛定位节点，
+不覆盖完整机器人控制闭包。官方 ZIP 自带的 `junior_ctrl`、环境 converter/relay、TF
+及 `/joy` publisher 必须另计；相关未关闭项已登记到 `fix.md`。
 
-- 正式启动链只使用赛方公开传感器、`/cmd_vel`、门/电梯服务和 `team_scene_info.json`。
-- 生产节点不订阅 `/Odometry_gazebo`、`/ground_truth/*`，不读取 world、truth、layout metadata 或固定场景坐标。
+## 1. 已完成的参赛节点边界
+
+- `danger_search` 和参赛定位节点的显式 ROS/文件输入已收敛到赛方公开传感器、
+  `/cmd_vel`、门/电梯服务和 `team_scene_info.json`。
+- 已审计的上述节点不订阅 `/Odometry_gazebo`、`/ground_truth/*`，不读取 world、
+  truth、layout metadata 或固定 XY 场景坐标；该结论不能外推到 `junior_ctrl`。
 - 位姿统一由合法传感器定位产生并通过 `PoseProvider` 提供。
-- 点云和 RGB-D 使用时间匹配 pose；PENDING 延迟消费，EXPIRED 跳过，不用最新 pose 兜底。
+- 点云和同步 RGB-D bundle 使用唯一接收 generation；合法时间戳使用时间匹配 pose，
+  PENDING 延迟消费，EXPIRED 或非法时间戳拒绝并只消费一次，不再调用最新 pose 兜底。
 - 门、电梯公开 ID、`served_floors`、文件 schema 和服务调用均 fail-closed 校验。
-- 真值只由独立诊断进程录制并在任务结束后离线使用，不进入生产决策。
+- 真值工具已从参赛 Python 生产包、安装清单和正式 launch 隔离。该局部隔离不证明同一
+  ROS master 中的真值只供离线使用：当前 `junior_ctrl` 仍会消费
+  `/ground_truth/base_w`。
 - 正式结果保持官方 `detected_danger.json` 格式；额外摘要仅在 runner 显式指定时写入运行归档。
 
 ## 2. 启动与控制链
@@ -19,11 +28,17 @@
 - 启动竞争已通过条件同步关闭：等待模型延迟关节配置、控制主循环首帧和关节反馈后再恢复物理。
 - 机器人可稳定完成 Passive → FixedStand → RL `/cmd_vel` 控制交接。
 - 按键 8 reset 已改为有界、边沿触发、失败保持暂停的安全流程，并完成 reset 后再次站立 GUI 验证。
-- 所有生产速度命令继续经过唯一 `PathFollower` 出口，没有新增竞争 `/cmd_vel` 发布者。
+- `junior_ctrl` 来自赛方 ZIP 内的 Unitree 控制器，由 `auto.sh` 启动；它把参赛任务发布
+  的 `/cmd_vel` 经 RL 策略转换为 12 个关节控制量，不是参赛方新增的控制器，但属于
+  完整生产依赖闭包。
+- 参赛任务的 `/cmd_vel` 发布已收敛到唯一 `PathFollower` 出口，没有新增竞争
+  `/cmd_vel` publisher。最终 publish 提交、DROP 锁存、active motion、keepalive 和
+  wall watchdog 已使用同一事务锁；发布成功只表示本地 `publish()` 正常返回。
 
 说明：`auto.sh`、`FSM.h`、`FSM.cpp`、用户保留的 `gazebo.xacro`，以及用户明确要求保留
-`catkin_make -j4` 的 `docs/quick-start.md` 是已知官方哈希差异；后续不得继续扩大
-赛方文件修改。
+`catkin_make -j4` 的 `docs/quick-start.md` 是已知官方哈希差异。内部授权只说明变更
+来源，不等于赛方接受正式部署差异。`auto.sh` 的默认出生点已恢复 ZIP 的
+`ROBOT_Y=-3.2`。
 
 ## 3. MissionManager 已关闭问题
 
@@ -97,7 +112,9 @@
   两路都无效时不发布 odom/cloud，使既有定位陈旧门 fail-closed。
 - 旧 `rgbd_livox` 保留为启动级显式回退，禁止在运行中按楼层、任务阶段或离线真值切换。
 - 定位 stance health 仅依赖公开 `/scan` 和 `/trunk_imu`，异常时撤销 ready，MissionManager 零速并显式失败。
-- `floor_local` z 语义已统一，当前所有消费者使用配置 `map/floor_height: 2.6`。
+- `floor_local` z 的实现语义已统一，当前所有消费者一致使用配置
+  `map/floor_height: 2.6`。这只证明工程实现一致，不证明该值有公开接口依据；固定层高
+  参与绝对世界 Z 的问题已作为 `COMPLIANCE-002` 打开。
 - 定位 M0 只读诊断已完成：记录 GICP 拒绝原因、scan-to-map 校正、尺度窗口和运动一致性，不改变融合行为。
 - M2 已将 scan-to-map 单帧上限参数化并保留 `0.10 m` 大跳变保护。
 - M3 已完成逐帧质量与反事实分析，证明现有单一残差、对应点数量或固定轴符号不足以可靠在线降权。
@@ -230,7 +247,8 @@ Stage15～17 当前结论：
 ### 第 8 层：正式 launch、runner 与健康闭环
 
 - 第 8.0 层尝试：接通正式配置、launch、定位 ready 门、公开结果路径和失败写出。
-  生产闭包完成，但固定 seed 动力学轮在 RL 交接后跌倒，未宣称完整通过。
+  `danger_search`/定位启动边界接通，但固定 seed 动力学轮在 RL 交接后跌倒，未宣称
+  完整通过；普通 formal 入口至今仍缺少可审计的 RL 模式握手。
 - 第 8.1 层成功：姿态健康只使用 `/scan` 和 `/trunk_imu`，倾倒后撤销 health/ready，
   MissionManager 零速并写出 `localization_stance_unhealthy`。
 - 第 8.2 层成功：真实 Gazebo 传感器链完成可控侧倾闭环，`WRITE_RESULT → FAILED`
@@ -244,7 +262,8 @@ Stage15～17 当前结论：
 - 尝试：把真值评测、bag 回放和诊断工具移出正式 Python 包、安装清单和 launch。
 - 成功：生产安装产物不包含离线工具，生产/离线边界检查通过；正确 ROS 环境下 401 项
   测试通过。
-- 原因：保证真值只能在任务结束后由独立进程离线使用。
+- 边界：只保证参赛 Python 包不会导入或安装离线工具；没有审计
+  `junior_ctrl`，不能据此保证同 master 真值不会影响控制。
 
 ### 第 10 层：单层任务闭环
 
@@ -381,7 +400,9 @@ Stage15～17 当前结论：
 ### 第 14.3 层：电梯语义地标漂移诊断
 
 - 尝试：默认关闭地冻结首次 0 层 RGB-D 电梯锚点，在高层普通探索中记录关闭门板
-  三帧 X/Y、门法向和切向残差；真值只在任务结束后离线比较。
+  三帧 X/Y、门法向和切向残差；真值数据在任务结束后离线比较，但若该轮在同一 master
+  发布了 `/ground_truth/base_w`，当前 `junior_ctrl` 会在运行中同时消费，不能称为纯
+  离线真值轮。
 - GUI 结果：唯一 `GUI=true` seed 8127 轮完成 `0→1→0→home`；240 秒专项预算未到
   2 层，不能作为三层验收。
 - 诊断失败：59 个对齐观测、49 个确认，但真值漂移增量最大仅 `0.23392 m`，未复现
@@ -419,20 +440,75 @@ Stage15～17 当前结论：
   接受残余风险后按工程验收通过，正式默认切为 `adaptive_shared_map`，旧
   `rgbd_livox` 保留为显式回退；未完成矩阵只继续量化风险。
 
-## 11. 当前验证与合规基线
+## 11. 当前验证与审计范围
 
 - 参赛 Python 全包：`558 passed, 1 warning`。
 - Stage17 定位包构建与测试：`130 tests, 0 errors, 0 failures`；默认值、runner、矩阵与
   接口契约定向测试 `25 passed`。
-- 生产/离线边界、矩阵汇总器 `py_compile`、runner `bash -n`、正式 launch 短时参数与
-  订阅检查均通过；正式运行时后端确认为 `adaptive_shared_map`。
-- 八轮生产订阅审计均未发现真值输入；正式定位节点只订阅 `/scan`、`/trunk_imu`、
-  `/real_sense/depth/points` 和本系统 `/cmd_vel`。真值只由独立 runner 录制并在任务结束
-  后离线评估。
+- 当时的参赛 Python/离线边界、矩阵汇总器 `py_compile`、runner `bash -n`、正式
+  launch 短时参数与局部订阅检查均通过；正式运行时后端确认为
+  `adaptive_shared_map`。这些历史检查不等于新增的完整 ROS graph 审计通过。
+- 八轮订阅审计未在 `danger_search` 和参赛定位节点发现真值输入；正式定位节点只订阅
+  `/scan`、`/trunk_imu`、`/real_sense/depth/points` 和本系统 `/cmd_vel`。审计未覆盖
+  `junior_ctrl`，因此不构成完整生产闭包零真值证明。
+- 启用真值并与 `junior_ctrl` 共用 ROS master 的历史轮次，相关数值仍可作为该工程条件
+  下的观测，但不能证明无真值控制闭环；`COMPLIANCE-001` 关闭前不得把它们称为纯离线
+  真值证据。
 - Stage17 正式启动检查结束后 ROS master、Gazebo、控制器、任务和 rosbag 相关进程已
   清理，11311 端口为空。
-- 官方哈希为 5 项已知差异：`auto.sh`、`FSM.h`、`FSM.cpp`、`gazebo.xacro`，以及用户
-  明确保留 `catkin_make -j4` 的 `docs/quick-start.md`。第 15～17 层没有扩大受保护文件
-  差异。
+- 当前受保护文件差异包括 `auto.sh`、`main.cpp`、`FSM.h`、`FSM.cpp`、
+  `gazebo.xacro`，以及用户明确保留 `catkin_make -j4` 的
+  `docs/quick-start.md`。`auto.sh` 的出生点已恢复 ZIP 默认 `-3.2`，其余启动稳定化差异
+  和用户冻结文件仍按 `fix.md` 管理。
+- 未记录显式 `ROBOT_Y=-3.2` 覆盖的历史运行不能直接作为官方默认出生点闭环证据；明确
+  使用 `-2.2` 的运行只保留为非官方默认条件下的工程证据。
 - 当前生产定位为共享地图自适应平移和 IMU 姿态约束；20-seed 矩阵尚未完成且已有硬门
   失败，只能称工程验收通过，不能称统计准入通过。
+- 固定层高绝对 Z 和 `junior_ctrl` 真值观测仍在 `fix.md` 延期项；其他本轮问题已关闭。
+
+## 12. 2026-07-28 合规与安全收口
+
+- `CONFIG-002`：`auto.sh` 默认出生点恢复为 ZIP 基线 `ROBOT_Y=-3.2`；旧 `-2.2`
+  运行继续只作为非官方默认条件下的工程证据。
+- `CONTROL-TXN-001`：`publisher.publish()` 正常返回后才提交输出状态；异常锁存零速。
+  DROP 更新、最终过滤、发布、keepalive 和 wall watchdog 共用事务锁；支撑评估使用
+  active motion 检查 DROP，并保持到三份新鲜里程计确认停稳。本节原有 publish
+  generation 丢弃评估机制已于 2026-07-29 撤销，原因见第 13 节。
+- `SUPPORT-PERMIT-001` 的一次性 `ControlledSupportPermit` 实现已于 2026-07-29 撤销；
+  当前恢复为仅在已确认主入口通过和电梯进出阶段使用任务上下文 UNKNOWN 豁免，显式
+  DROP、定位健康、楼层及 epoch 检查不受豁免影响。
+- `DATA-TIME-001`：点云及 RGB/depth/camera_info bundle 均有唯一 generation；
+  缺失、零、非有限或不同步时间戳 fail-closed，不再调用 `lookup(None)`。
+- `FRAME-CONTRACT-001`：Python 传感器缓存和 C++ 定位入口分别校验公开固定 frame；
+  `/scan=laser_livox`、`/trunk_imu=imu_link`、RealSense 深度/RGB-D 为
+  `real_sense_optical_frame`、内部配准点云为 `world`。
+- 内部话题不再按 `/danger_search`、`/nav` 前缀整体信任，而是按输入、输出和手动控制
+  三类精确白名单校验。
+- `STARTUP-CTRL-001`：formal launch 的 `controller_ready_ack` 默认 `false`，未确认
+  `junior_ctrl` 日志 `Entered RL /cmd_vel mode.` 时拒绝创建任务；电梯 runner 只在
+  等到该日志后传入确认。
+- `AUDIT-CLOSURE-001`：静态工具更名为“参赛 Python/离线边界”，另增完整运行时
+  ROS graph 审计，覆盖所有真值订阅、所有 `/cmd_vel` 与 `/joy` publisher，以及内部
+  定位话题生产者和参赛节点 TF 订阅；环境 TF publisher 只列清单，不因存在即判违规。
+  当前延期的 `junior_ctrl` 真值订阅会让完整审计如实失败。
+- 本轮验证：参赛 Python 全包 `549` 项通过；定位包编译成功，C++ gtest 目标通过；
+  合成 `/scan` 与 `/trunk_imu` 的 ROS 集成测试 `1/1` 通过；静态 Python/离线边界、
+  runner `bash -n` 和 `git diff --check` 通过。完整 ROS graph 需在整机运行时执行，
+  本轮未伪造通过结论。
+
+## 13. 2026-07-29 可用性回退与双时钟复核
+
+- 撤销以每次 publish 都递增的 generation 判废支撑评估，消除低 RTF 下 keepalive/零速
+  发布导致的评估饥饿；评估改为绑定候选命令和 active motion 语义。
+- 移除无法覆盖完整电梯周期的 `ControlledSupportPermit`，恢复主入口和电梯进出阶段的
+  局部任务上下文 UNKNOWN 豁免；DROP 仍由 active motion 持续检查到 odom 确认停稳。
+- RequiredSupportSweep 使用最新已提交命令，DropSweep 使用最后非零 active motion，
+  解决零速停车期间支撑判断与制动防坠需要不同命令快照的问题。
+- ROS/仿真时间统一负责消息时间戳、新鲜度、同步、TTL、停稳序列、状态截止和任务预算；
+  `time.monotonic()` 负责进程卡死、`/clock` 或 odom 停滞、回调断流和外部测试总超时。
+- 参赛 Python 全包 `584 passed, 1 warning`，定位 ROS 集成测试 `1/1` 通过，生产边界、
+  Python 编译、runner 语法和 diff 检查通过。
+- `seed=6946` 最终完成 `0→1→0→home`，任务在仿真时间 `162.276 s` 成功；13 次短时
+  UNKNOWN hold 均自动恢复，无 DROP、控制输出故障、wall stall 或定位终态。
+- 完整优化尝试、两次非成功运行的原因、时基分类和运行证据见
+  [STAGE17_1_REPORT.md](reports/STAGE17_1_REPORT.md)。

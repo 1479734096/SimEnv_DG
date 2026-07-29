@@ -7,6 +7,8 @@
   <arg name="config" default="$(find danger_search)/config/danger_search.yaml"/>
   <arg name="result_file" default=""/>
   <arg name="mission_summary_file" default=""/>
+  <!-- junior_ctrl 未发布模式状态；必须由已观察到模式 6 日志的 runner 显式确认。 -->
+  <arg name="controller_ready_ack" default="false"/>
   <arg name="localization_diagnostic_frame_details" default="false"/>
   <!-- 仅允许定位节点自身白名单中的后端；正式默认使用共享地图自适应后端。 -->
   <arg name="localization_backend" default="adaptive_shared_map"/>
@@ -34,6 +36,7 @@
     <!-- formal 强制公开 schema/接口校验，并禁用相对原点、手动目标和真值回退。 -->
     <param name="runtime/profile" value="formal"/>
     <param name="wait_for_localization_ready" value="true"/>
+    <param name="controller_ready_ack" value="$(arg controller_ready_ack)"/>
     <param name="result_file" value="$(arg result_file)"/>
     <param name="mission_summary_file" value="$(arg mission_summary_file)"/>
     <param name="localization/team_scene_info_path"

@@ -1246,6 +1246,7 @@ class ShadowSupportGrid:
         path: Sequence[np.ndarray],
         command_linear: float,
         ambiguous: bool,
+        drop_command_linear: float | None = None,
         local_only: bool = False,
     ) -> dict[str, object]:
         """消费一帧并返回局部走廊、告警和诊断载荷。
@@ -1289,13 +1290,23 @@ class ShadowSupportGrid:
 
         floor_index = int(floor)
         floor_z = floor_index * self.config.floor_height
-        lookahead = self._lookahead(command_linear)
-        drop_polyline = _future_polyline(robot_xy, robot_yaw, path, lookahead)
+        support_lookahead = self._lookahead(command_linear)
+        drop_lookahead = self._lookahead(
+            command_linear
+            if drop_command_linear is None
+            else drop_command_linear
+        )
+        drop_polyline = _future_polyline(
+            robot_xy,
+            robot_yaw,
+            path,
+            drop_lookahead,
+        )
         support_polyline = _planned_motion_footprint_polyline(
             robot_xy,
             robot_yaw,
             path,
-            distance=lookahead,
+            distance=support_lookahead,
             footprint_front_reach=self.config.footprint_front_reach,
             goal_tolerance=self.config.path_goal_tolerance,
         )
@@ -1472,7 +1483,9 @@ class ShadowSupportGrid:
             "lower_crossing_count": int(lower_crossings.shape[0]),
             "support_cell_count": len(support_counts),
             "lower_crossing_cell_count": len(lower_counts),
-            "lookahead_distance": lookahead,
+            "lookahead_distance": max(support_lookahead, drop_lookahead),
+            "drop_lookahead_distance": drop_lookahead,
+            "support_lookahead_distance": support_lookahead,
             "positive_support_lookahead_distance": _polyline_length(
                 support_polyline
             ),

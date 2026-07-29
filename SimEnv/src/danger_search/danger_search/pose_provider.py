@@ -17,7 +17,7 @@ from typing import Iterable
 
 import numpy as np
 
-from danger_search.interface_policy import require_internal_topic
+from danger_search.interface_policy import require_internal_input_topic
 
 try:
     import rospy
@@ -96,7 +96,7 @@ class PoseProvider:
     """
 
     def __init__(self, odom_topic: str, *, max_samples: int = 256):
-        self.odom_topic = require_internal_topic(
+        self.odom_topic = require_internal_input_topic(
             odom_topic,
             purpose="统一位姿入口",
         )

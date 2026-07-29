@@ -3,6 +3,7 @@
 
 import math
 import threading
+import time
 import unittest
 
 import rospy
@@ -81,7 +82,7 @@ class StanceHealthRosTest(unittest.TestCase):
         stamp = rospy.Time.now()
         imu = Imu()
         imu.header.stamp = stamp
-        imu.header.frame_id = "trunk_imu"
+        imu.header.frame_id = "imu_link"
         if fallen:
             imu.orientation.x = math.sin(math.pi / 4.0)
             imu.orientation.w = math.cos(math.pi / 4.0)
@@ -89,14 +90,14 @@ class StanceHealthRosTest(unittest.TestCase):
             imu.orientation.w = 1.0
         imu.linear_acceleration.z = 9.81
         self._imu_publisher.publish(imu)
-        rospy.sleep(0.02)
+        time.sleep(0.02)
 
         cloud = PointCloud()
         cloud.header.stamp = stamp
         cloud.header.frame_id = "laser_livox"
         cloud.points = self._floor_points
         self._scan_publisher.publish(cloud)
-        rospy.sleep(0.08)
+        time.sleep(0.08)
 
     def _connections_ready(self):
         return (
@@ -105,11 +106,11 @@ class StanceHealthRosTest(unittest.TestCase):
         )
 
     def _wait_for_connections(self):
-        deadline = rospy.Time.now() + rospy.Duration(8.0)
-        while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+        deadline = time.monotonic() + 8.0
+        while not rospy.is_shutdown() and time.monotonic() < deadline:
             if self._connections_ready():
                 return
-            rospy.sleep(0.05)
+            time.sleep(0.05)
         self.fail("定位节点未在时限内订阅合成 /scan 与 /trunk_imu")
 
     def test_health_and_ready_revoke_after_fall(self):

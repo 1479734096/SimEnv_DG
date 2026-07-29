@@ -11,9 +11,7 @@ SimEnv/logs/
 SimEnv/results/
 SimEnv/reports/
 codeDG/results/
-SimEnv/src/unitree_guide/logs/
 log/
-logs/
 *.log
 
 # 常见编译中间文件和二进制产物

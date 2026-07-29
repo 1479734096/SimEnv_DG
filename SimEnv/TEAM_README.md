@@ -24,9 +24,10 @@ GUI=false ./auto.sh
 
 ```bash
 source devel/setup.bash
-roslaunch danger_search danger_search.launch
+roslaunch danger_search danger_search.launch controller_ready_ack:=true
 ```
 
+只有在 `junior_ctrl` 已输出 `Entered RL /cmd_vel mode.` 后才能传入该确认。
 正式节点等待定位 ready 后才开始任务预算，并严格使用
 `generated_building/team_scene_info.json` 公布的结果路径。默认启动竞争、标准 RL
 交接和跌倒健康闭环已完成定向验收；第 10 层仍需完成单层、多层、安全与性能总验收。

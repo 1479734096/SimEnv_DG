@@ -7,10 +7,15 @@ pure-pursuit 前视目标，并根据航向误差、局部曲率和前向实体�
 ``_publish``，避免出现绕过安全锁存的竞争 publisher。
 """
 from __future__ import annotations
+from contextlib import contextmanager
+from threading import RLock
 from typing import Iterator
 
 from .time_utils import get_time
-from .interface_policy import require_allowed_output_topic, require_internal_topic
+from .interface_policy import (
+    require_allowed_output_topic,
+    require_internal_output_topic,
+)
 
 from dataclasses import dataclass, field
 import math
@@ -70,7 +75,7 @@ class PathFollower:
     _raw_path: list[tuple[float, float]] = field(default_factory=list, init=False)
     _path: list[tuple[float, float]] = field(default_factory=list, init=False)
     _waypoint_index: int = field(default=0, init=False)
-    _last_progress_time: float = field(default_factory=time.time, init=False)
+    _last_progress_time: float = field(default_factory=get_time, init=False)
     _last_goal_distance: float = field(default=math.inf, init=False)
     _last_progress_pose: tuple[float, float, float] | None = field(default=None, init=False)
     _recover_until: float = field(default=0.0, init=False)
@@ -99,8 +104,21 @@ class PathFollower:
     _debug_zero_command_reason: str | None = field(default=None, init=False)
     _last_requested_command: tuple[float, float, float] = field(default=(0.0, 0.0, 0.0), init=False)
     _last_emitted_command: tuple[float, float, float] = field(default=(0.0, 0.0, 0.0), init=False)
+    _active_motion_command: tuple[float, float, float] = field(
+        default=(0.0, 0.0, 0.0),
+        init=False,
+    )
     _command_gate: object | None = field(default=None, init=False)
     _last_command_wall_time: float | None = field(default=None, init=False)
+    _active_motion_last_odom_stamp: float | None = field(default=None, init=False)
+    _active_motion_stop_samples: int = field(default=0, init=False)
+    _publish_failure_latched: bool = field(default=False, init=False)
+    _publish_failure_reason: str | None = field(default=None, init=False)
+    _command_transaction_lock: RLock = field(
+        default_factory=RLock,
+        init=False,
+        repr=False,
+    )
     keepalive_publish_count: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
@@ -108,15 +126,15 @@ class PathFollower:
             self.cmd_vel_topic,
             purpose="PathFollower 控制输出",
         )
-        self.path_raw_topic = require_internal_topic(
+        self.path_raw_topic = require_internal_output_topic(
             self.path_raw_topic,
             purpose="原始路径诊断输出",
         )
-        self.path_followed_topic = require_internal_topic(
+        self.path_followed_topic = require_internal_output_topic(
             self.path_followed_topic,
             purpose="跟踪路径诊断输出",
         )
-        self.local_target_topic = require_internal_topic(
+        self.local_target_topic = require_internal_output_topic(
             self.local_target_topic,
             purpose="局部目标诊断输出",
         )
@@ -229,7 +247,14 @@ class PathFollower:
 
     def set_command_gate(self, gate: object | None) -> None:
         """设置最终速度出口的可选安全门；None 保持原有命令链完全透明。"""
-        self._command_gate = gate
+        with self._command_transaction_lock:
+            self._command_gate = gate
+
+    @contextmanager
+    def command_transaction(self) -> Iterator[None]:
+        """串行化 Gate 状态变更、最终过滤、发布与成功状态提交。"""
+        with self._command_transaction_lock:
+            yield
 
     def reset_progress_timer(
         self,
@@ -514,11 +539,28 @@ class PathFollower:
         linear_y: float = 0.0,
         zero_reason: str | None = None,
     ) -> None:
-        """过滤、记录并发布一条速度命令，是生产控制的最终出口。
+        """过滤并发布一条速度命令，是生产控制的最终出口。
 
-        先保存算法请求值，再让安全门产生实际发送值，两者都进入诊断快照。
-        publisher 尚未启动时仍更新诊断，便于离线测试验证控制计算而不触碰 ROS。
+        生产状态只在 ``publish`` 正常返回后提交。publisher 尚未启动时只更新
+        离线诊断值，不把它视为已经发送的活动运动命令。
         """
+        with self._command_transaction_lock:
+            self._publish_locked(
+                linear_x,
+                angular_z,
+                linear_y=linear_y,
+                zero_reason=zero_reason,
+            )
+
+    def _publish_locked(
+        self,
+        linear_x: float,
+        angular_z: float,
+        *,
+        linear_y: float = 0.0,
+        zero_reason: str | None = None,
+    ) -> None:
+        """在 ``_command_transaction_lock`` 内完成一次最终发送事务。"""
         try:
             requested = (float(linear_x), float(linear_y), float(angular_z))
         except (TypeError, ValueError):
@@ -528,10 +570,12 @@ class PathFollower:
             requested = (0.0, 0.0, 0.0)
             zero_reason = "invalid_requested_command"
         self._last_requested_command = requested
-        emitted = requested
+        emitted = (0.0, 0.0, 0.0) if self._publish_failure_latched else requested
+        if self._publish_failure_latched:
+            zero_reason = self._publish_failure_reason or "command_publish_failure_latched"
         gate = self._command_gate
         wall_now = time.monotonic()
-        if gate is not None:
+        if gate is not None and not self._publish_failure_latched:
             filter_command = getattr(gate, "filter_command", None)
             if callable(filter_command):
                 pose_yaw = self._debug_pose[2] if self._debug_pose is not None else 0.0
@@ -551,18 +595,33 @@ class PathFollower:
                 ):
                     emitted = (0.0, 0.0, 0.0)
                     zero_reason = "invalid_command_gate_output"
-        self._last_emitted_command = emitted
+        resolved_zero_reason = None
         if all(abs(value) <= 1e-4 for value in emitted):
-            if emitted != requested and gate is not None:
+            if (
+                emitted != requested
+                and gate is not None
+                and not self._publish_failure_latched
+            ):
                 reason = getattr(gate, "reason_code", None) or "ground_support_gate"
                 zero_reason = f"ground_support_gate:{reason}"
-            self._debug_zero_command_reason = str(zero_reason or "zero_command")
-        else:
-            self._debug_zero_command_reason = None
+            resolved_zero_reason = str(zero_reason or "zero_command")
         if self._publisher is None or Twist is None:
+            self._last_emitted_command = emitted
+            self._debug_zero_command_reason = resolved_zero_reason
             return
         msg = Twist()
         msg.linear.x, msg.linear.y, msg.angular.z = emitted
+        try:
+            self._publisher.publish(msg)
+        except Exception as exc:
+            self._publish_failure_latched = True
+            self._publish_failure_reason = "command_publish_failure_latched"
+            self._debug_zero_command_reason = self._publish_failure_reason
+            raise RuntimeError("最终 /cmd_vel 发布失败，控制输出已锁存为零速") from exc
+
+        # 以下字段只描述已经成功交给 ROS publisher 的命令。
+        self._last_emitted_command = emitted
+        self._debug_zero_command_reason = resolved_zero_reason
         self.command_count += 1
         if abs(msg.linear.x) > 1e-4 or abs(msg.linear.y) > 1e-4:
             self.nonzero_linear_count += 1
@@ -571,28 +630,30 @@ class PathFollower:
         self.max_abs_angular_z = max(self.max_abs_angular_z, abs(msg.angular.z))
         self.last_command = (msg.linear.x, msg.linear.y, msg.angular.z)
         self._last_command_wall_time = wall_now
-        self._publisher.publish(msg)
+        if any(abs(value) > 1e-4 for value in emitted):
+            self._active_motion_command = emitted
+            self._active_motion_stop_samples = 0
 
     def _on_keepalive_timer(self, _event) -> None:
-        """控制回调被规划阻塞时持续发布最近命令，避免底层 0.5 秒超时。"""
-        if self._publisher is None or Twist is None:
-            return
-        now = time.monotonic()
-        if self._last_command_wall_time is None:
-            return
-        minimum_age = max(0.02, self.command_keepalive_period * 0.8)
-        if now - self._last_command_wall_time < minimum_age:
-            return
-        # 只重发上一次真正下发的安全命令；临时 hold 解除后必须等新的控制 tick，
-        # 不能由 keepalive 重放 hold 前的旧非零命令。
-        linear_x, linear_y, angular_z = self._last_emitted_command
-        self.keepalive_publish_count += 1
-        self._publish(
-            linear_x,
-            angular_z,
-            linear_y=linear_y,
-            zero_reason=self._debug_zero_command_reason,
-        )
+        """控制回调被规划阻塞时，按 ROS 时间节拍重复提交最近命令。"""
+        with self._command_transaction_lock:
+            if self._publisher is None or Twist is None:
+                return
+            now = time.monotonic()
+            if self._last_command_wall_time is None:
+                return
+            minimum_age = max(0.02, self.command_keepalive_period * 0.8)
+            if now - self._last_command_wall_time < minimum_age:
+                return
+            # 事务锁保证读取的成功命令与重发之间不会插入 DROP 锁存。
+            linear_x, linear_y, angular_z = self._last_emitted_command
+            self._publish_locked(
+                linear_x,
+                angular_z,
+                linear_y=linear_y,
+                zero_reason=self._debug_zero_command_reason,
+            )
+            self.keepalive_publish_count += 1
 
     def raw_path_snapshot(self) -> list[tuple[float, float]]:
         return list(self._raw_path)
@@ -601,7 +662,72 @@ class PathFollower:
         return list(self._path)
 
     def requested_command_snapshot(self) -> tuple[float, float, float]:
-        return tuple(self._last_requested_command)
+        with self._command_transaction_lock:
+            return tuple(self._last_requested_command)
+
+    def committed_command_snapshot(self) -> tuple[float, float, float]:
+        """返回最近一条 publisher 正常返回的命令。"""
+        with self._command_transaction_lock:
+            return tuple(self.last_command)
+
+    def active_motion_command_snapshot(self) -> tuple[float, float, float]:
+        """返回最后成功提交的非零命令，直到新鲜里程计确认停稳。"""
+        with self._command_transaction_lock:
+            return tuple(self._active_motion_command)
+
+    def observe_motion_odometry(
+        self,
+        stamp: float | None,
+        *,
+        linear_speed: float,
+        angular_speed: float,
+        wall_time: float,
+    ) -> None:
+        """在同一事务内更新 Gate，并维护制动期间的活动运动命令。"""
+        with self._command_transaction_lock:
+            gate = self._command_gate
+            observe = getattr(gate, "observe_odometry", None)
+            if callable(observe):
+                observe(
+                    stamp,
+                    linear_speed=linear_speed,
+                    angular_speed=angular_speed,
+                    wall_time=wall_time,
+                )
+            try:
+                resolved_stamp = float(stamp) if stamp is not None else math.nan
+                resolved_linear = abs(float(linear_speed))
+                resolved_angular = abs(float(angular_speed))
+            except (TypeError, ValueError):
+                self._active_motion_stop_samples = 0
+                return
+            if not all(
+                math.isfinite(value)
+                for value in (resolved_stamp, resolved_linear, resolved_angular)
+            ):
+                self._active_motion_stop_samples = 0
+                return
+            if (
+                self._active_motion_last_odom_stamp is not None
+                and resolved_stamp <= self._active_motion_last_odom_stamp
+            ):
+                return
+            self._active_motion_last_odom_stamp = resolved_stamp
+            config = getattr(gate, "config", None)
+            linear_limit = float(getattr(config, "stop_linear_threshold", 0.05))
+            angular_limit = float(getattr(config, "stop_angular_threshold", 0.05))
+            required = max(1, int(getattr(config, "stop_confirmation_samples", 3)))
+            last_success_is_zero = all(abs(value) <= 1e-4 for value in self.last_command)
+            stopped = (
+                last_success_is_zero
+                and resolved_linear <= linear_limit
+                and resolved_angular <= angular_limit
+            )
+            self._active_motion_stop_samples = (
+                self._active_motion_stop_samples + 1 if stopped else 0
+            )
+            if self._active_motion_stop_samples >= required:
+                self._active_motion_command = (0.0, 0.0, 0.0)
 
     def _publish_path_diagnostics(self) -> None:
         publishers = (self._raw_path_publisher, self._followed_path_publisher)
@@ -646,6 +772,10 @@ class PathFollower:
         self._local_target_publisher.publish(message)
 
     def tracking_debug_snapshot(self) -> dict[str, object]:
+        with self._command_transaction_lock:
+            return self._tracking_debug_snapshot_locked()
+
+    def _tracking_debug_snapshot_locked(self) -> dict[str, object]:
         now = get_time()
         wall_now = time.monotonic()
         recover_remaining = max(0.0, self._recover_until - now)
@@ -690,21 +820,32 @@ class PathFollower:
             "keepalive_publish_count": self.keepalive_publish_count,
             "last_command_wall_time": self._last_command_wall_time,
             "wall_command_age": wall_command_age,
+            "active_motion_command": [
+                round(value, 3) for value in self._active_motion_command
+            ],
+            "active_motion_stop_samples": self._active_motion_stop_samples,
+            "publish_failure_latched": self._publish_failure_latched,
+            "publish_failure_reason": self._publish_failure_reason,
         }
 
     def command_debug_summary(self) -> dict[str, object]:
-        return {
-            "command_count": self.command_count,
-            "nonzero_linear_count": self.nonzero_linear_count,
-            "max_abs_linear_x": round(self.max_abs_linear_x, 3),
-            "max_abs_linear_y": round(self.max_abs_linear_y, 3),
-            "max_abs_angular_z": round(self.max_abs_angular_z, 3),
-            "last_command": [round(value, 3) for value in self.last_command],
-            "stuck_count": self.stuck_count,
-            "recover_count": self.recover_count,
-            "keepalive_publish_count": self.keepalive_publish_count,
-            "tracking": self.tracking_debug_snapshot(),
-        }
+        with self._command_transaction_lock:
+            return {
+                "command_count": self.command_count,
+                "nonzero_linear_count": self.nonzero_linear_count,
+                "max_abs_linear_x": round(self.max_abs_linear_x, 3),
+                "max_abs_linear_y": round(self.max_abs_linear_y, 3),
+                "max_abs_angular_z": round(self.max_abs_angular_z, 3),
+                "last_command": [round(value, 3) for value in self.last_command],
+                "active_motion_command": [
+                    round(value, 3) for value in self._active_motion_command
+                ],
+                "stuck_count": self.stuck_count,
+                "recover_count": self.recover_count,
+                "keepalive_publish_count": self.keepalive_publish_count,
+                "publish_failure_latched": self._publish_failure_latched,
+                "tracking": self._tracking_debug_snapshot_locked(),
+            }
 
 
 def _clamp(value: float, low: float, high: float) -> float:

@@ -271,6 +271,9 @@ class ScanLocalizationNode {
     double shared_map_max_map_commit_difference = 0.05;
     bool diagnostic_frame_details = false;
     std::string depth_cloud_topic = "/real_sense/depth/points";
+    std::string raw_cloud_frame = "laser_livox";
+    std::string imu_frame = "imu_link";
+    std::string depth_cloud_frame = "real_sense_optical_frame";
     std::vector<double> base_to_livox_xyz;
     std::vector<double> base_to_livox_rpy;
     std::vector<double> base_to_depth_xyz;
@@ -362,6 +365,17 @@ class ScanLocalizationNode {
                       diagnostic_frame_details);
     private_nh_.param("depth_cloud_topic", depth_cloud_topic,
                       depth_cloud_topic);
+    private_nh_.param("raw_cloud_frame", raw_cloud_frame, raw_cloud_frame);
+    private_nh_.param("imu_frame", imu_frame, imu_frame);
+    private_nh_.param("depth_cloud_frame", depth_cloud_frame,
+                      depth_cloud_frame);
+    if (raw_cloud_frame.empty() || imu_frame.empty() ||
+        depth_cloud_frame.empty()) {
+      throw std::runtime_error("定位输入 frame_id 契约不能为空");
+    }
+    raw_cloud_frame_ = raw_cloud_frame;
+    imu_frame_ = imu_frame;
+    depth_cloud_frame_ = depth_cloud_frame;
     if (!std::isfinite(min_range) || !std::isfinite(max_range) || min_range < 0.0 ||
         max_range < min_range) {
       throw std::runtime_error("定位点云量程参数无效");
@@ -652,6 +666,12 @@ class ScanLocalizationNode {
     // 只缓存有限、归一化且带有效时间戳的 IMU；livox_imu_local_map 与
     // rgbd_livox 在各点云回调中按时间查最近样本，imu_constrained 还会在此
     // 更新短时平移积分先验。
+    if (message->header.frame_id != imu_frame_) {
+      ROS_ERROR_THROTTLE(
+          2.0, "/trunk_imu frame_id 不符合公开契约：实际=%s，期望=%s",
+          message->header.frame_id.c_str(), imu_frame_.c_str());
+      return;
+    }
     const auto &q = message->orientation;
     const auto &a = message->linear_acceleration;
     const auto &w = message->angular_velocity;
@@ -779,6 +799,13 @@ class ScanLocalizationNode {
     // 正式旧后端继续累计帧间 GICP；共享地图候选只读估计绝对平移，不在深度回调写状态。
     if ((!use_rgbd_livox_ && !use_adaptive_shared_map_) ||
         message->header.stamp.isZero()) {
+      return;
+    }
+    if (message->header.frame_id != depth_cloud_frame_) {
+      ROS_ERROR_THROTTLE(
+          2.0,
+          "/real_sense/depth/points frame_id 不符合公开契约：实际=%s，期望=%s",
+          message->header.frame_id.c_str(), depth_cloud_frame_.c_str());
       return;
     }
     std::lock_guard<std::mutex> depth_lock(depth_processing_mutex_);
@@ -962,6 +989,16 @@ class ScanLocalizationNode {
     // Livox 是世界系初始化和最终输出的主时钟。首个有效帧先估计楼面；之后按
     // 后端执行纯 KISS-ICP、IMU 加速度积分旧后端、Livox-IMU 局部地图，或
     // RGB-D 连续里程 + Livox 校正。
+    if (message->header.stamp.isZero()) {
+      ROS_ERROR_THROTTLE(2.0, "/scan 缺少有效时间戳，拒绝定位帧");
+      return;
+    }
+    if (message->header.frame_id != raw_cloud_frame_) {
+      ROS_ERROR_THROTTLE(
+          2.0, "/scan frame_id 不符合公开契约：实际=%s，期望=%s",
+          message->header.frame_id.c_str(), raw_cloud_frame_.c_str());
+      return;
+    }
     std::vector<Eigen::Vector3d> points;
     points.reserve(message->points.size());
     for (const auto &point : message->points) {
@@ -2081,6 +2118,9 @@ class ScanLocalizationNode {
   std::deque<double> livox_scale_samples_;
   double livox_scale_ = 1.0;
   std::string frame_id_;
+  std::string raw_cloud_frame_;
+  std::string imu_frame_;
+  std::string depth_cloud_frame_;
 };
 
 }  // namespace
