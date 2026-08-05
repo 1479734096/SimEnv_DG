@@ -13,8 +13,104 @@ from danger_search.navigation_tasks import (
     TakeElevator,
 )
 from danger_search.mapper import BLACK, FREE, MultiFloorGridMap
+from danger_search.navigation_context import NavigationTaskContext
 from danger_search.navigator import STUCK
 from danger_search.planner import BUDGET_EXHAUSTED, PlanResult, UNREACHABLE
+
+
+def _task_context(source) -> NavigationTaskContext:
+    """把测试场景的显式依赖冻结为生产同款导航上下文。"""
+    controller = source.controller
+
+    def _recover_with_clearance(reason):
+        recover = getattr(source, "_recover_with_rotation_clearance", None)
+        if callable(recover):
+            return bool(recover(reason))
+        fallback = getattr(controller, "recover", None)
+        if callable(fallback):
+            fallback()
+            return True
+        return False
+
+    def _confirm_floor(target_floor):
+        confirm = getattr(source, "confirm_floor_transition", None)
+        if callable(confirm):
+            confirm(target_floor)
+        else:
+            source.current_floor = int(target_floor)
+
+    return NavigationTaskContext(
+        controller=controller,
+        mapper=getattr(source, "mapper", SimpleNamespace(floor=lambda _floor: object())),
+        building_client=getattr(source, "building_client", object()),
+        current_floor=int(getattr(source, "current_floor", 0)),
+        door_pass_max_linear=getattr(source, "door_pass_max_linear", None),
+        open_door_geometry_refresh_enabled=hasattr(
+            source, "refresh_open_door_geometry"
+        ),
+        elevator_geometry_refresh_enabled=hasattr(
+            source, "refresh_elevator_geometry"
+        ),
+        elevator_geometry_refresh_standoff=float(
+            getattr(source, "elevator_geometry_refresh_standoff", 1.2)
+        ),
+        elevator_opening_confirmation_timeout=float(
+            getattr(source, "elevator_opening_confirmation_timeout", 8.0)
+        ),
+        elevator_stuck_retry_limit=int(
+            getattr(source, "elevator_stuck_retry_limit", 4)
+        ),
+        exit_first_max_linear=getattr(source, "exit_first_max_linear", None),
+        exit_cabin_backoff_enabled=bool(
+            getattr(source, "exit_cabin_backoff_enabled", False)
+        ),
+        clear_opened_door_area_fn=getattr(
+            source, "clear_opened_door_area", lambda _door_id: None
+        ),
+        refresh_open_door_geometry_fn=getattr(
+            source, "refresh_open_door_geometry", lambda _door_id, _pose: DONE
+        ),
+        refresh_elevator_geometry_fn=getattr(
+            source,
+            "refresh_elevator_geometry",
+            lambda _elevator_id, _floor, _door_id, _pose: IDLE,
+        ),
+        record_failure_fn=getattr(source, "_record_failure", lambda _reason: None),
+        log_structured_fn=getattr(source, "_log_structured", lambda _payload: None),
+        begin_floor_transition_fn=getattr(
+            source, "begin_floor_transition", lambda **_kwargs: None
+        ),
+        confirm_floor_transition_fn=_confirm_floor,
+        begin_door_open_confirmation_fn=getattr(
+            source,
+            "begin_elevator_door_open_confirmation",
+            lambda _door_id: None,
+        ),
+        confirm_door_open_fn=getattr(
+            source, "confirm_elevator_door_open", lambda _door_id, _pose: True
+        ),
+        finish_door_open_confirmation_fn=getattr(
+            source,
+            "finish_elevator_door_open_confirmation",
+            lambda _door_id: None,
+        ),
+        elevator_visual_preparation_pending_fn=getattr(
+            source,
+            "elevator_visual_preparation_pending",
+            lambda _door_id: False,
+        ),
+        recover_with_rotation_clearance_fn=_recover_with_clearance,
+        elevator_start_retreat_target_fn=getattr(
+            source,
+            "elevator_start_retreat_target",
+            lambda _pose, _floor: None,
+        ),
+        elevator_approach_trace_candidates_fn=getattr(
+            source,
+            "elevator_approach_trace_candidates",
+            lambda _elevator_id, _floor, **_kwargs: (),
+        ),
+    )
 
 
 class NavigateToPoseTest(unittest.TestCase):
@@ -55,7 +151,7 @@ class NavigateToPoseTest(unittest.TestCase):
             "danger_search.navigation_tasks.astar_plan",
             return_value=PlanResult(status=UNREACHABLE),
         ):
-            status = task.tick(manager, (0.0, 0.0, 0.0))
+            status = task.tick(_task_context(manager), (0.0, 0.0, 0.0))
 
         self.assertEqual(status, FAILED)
         self.assertEqual(paths, [])
@@ -69,7 +165,7 @@ class NavigateToPoseTest(unittest.TestCase):
             "danger_search.navigation_tasks.astar_plan",
             return_value=PlanResult(status=BUDGET_EXHAUSTED),
         ):
-            status = task.tick(manager, (0.0, 0.0, 0.0))
+            status = task.tick(_task_context(manager), (0.0, 0.0, 0.0))
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(paths, [])
@@ -115,8 +211,8 @@ class OpenDoorAndPassTest(unittest.TestCase):
             controller=SimpleNamespace(stop=lambda: None),
         )
 
-        self.assertEqual(task.tick(manager, (0.0, -0.8, math.pi / 2.0)), RUNNING)
-        self.assertEqual(task.tick(manager, (0.0, -0.8, math.pi / 2.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.0, -0.8, math.pi / 2.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.0, -0.8, math.pi / 2.0)), RUNNING)
 
         self.assertEqual(task.phase, "GO_PASS_POINT")
         self.assertEqual(cleared, ["main_entrance"])
@@ -150,13 +246,13 @@ class OpenDoorAndPassTest(unittest.TestCase):
         )
         pose = (0.0, -0.8, math.pi / 2.0)
 
-        self.assertEqual(task.tick(manager, pose), RUNNING)
-        self.assertEqual(task.tick(manager, pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
         self.assertEqual(task.phase, "GO_OPEN_WAIT_POINT")
-        self.assertEqual(task.tick(manager, pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
         self.assertEqual(task.phase, "REFRESH_OPENING")
-        self.assertEqual(task.tick(manager, pose), RUNNING)
-        self.assertEqual(task.tick(manager, pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
 
         self.assertEqual(task.phase, "GO_REFRESHED_WAIT_POINT")
         self.assertEqual(task.wait_point, (0.3, -0.8))
@@ -179,7 +275,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
             _record_failure=lambda reason: failures.append(reason),
         )
 
-        status = task.tick(manager, (0.0, -0.8, math.pi / 2.0))
+        status = task.tick(_task_context(manager), (0.0, -0.8, math.pi / 2.0))
 
         self.assertEqual(status, FAILED)
         self.assertEqual(failures, ["开门服务失败: denied"])
@@ -204,8 +300,8 @@ class OpenDoorAndPassTest(unittest.TestCase):
         )
 
         pose = (0.0, -0.8, math.pi / 2.0)
-        self.assertEqual(task.tick(manager, pose), RUNNING)
-        self.assertEqual(task.tick(manager, pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
 
         self.assertEqual(task.phase, "GO_PASS_POINT")
 
@@ -246,7 +342,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
             "danger_search.navigation_tasks.astar_plan",
             return_value=PlanResult(status=UNREACHABLE),
         ) as astar:
-            status = task.tick(manager, (0.0, -2.3, math.pi / 2.0))
+            status = task.tick(_task_context(manager), (0.0, -2.3, math.pi / 2.0))
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(task.phase, "CALL_OPEN")
@@ -293,8 +389,8 @@ class OpenDoorAndPassTest(unittest.TestCase):
             "danger_search.navigation_tasks.astar_plan",
             return_value=PlanResult(status=UNREACHABLE),
         ), patch("danger_search.navigation_tasks.get_time", side_effect=[10.0, 13.1]):
-            first = task.tick(manager, (0.0, -4.0, math.pi / 2.0))
-            second = task.tick(manager, (0.0, -4.0, math.pi / 2.0))
+            first = task.tick(_task_context(manager), (0.0, -4.0, math.pi / 2.0))
+            second = task.tick(_task_context(manager), (0.0, -4.0, math.pi / 2.0))
 
         self.assertEqual(first, RUNNING)
         self.assertEqual(second, FAILED)
@@ -339,7 +435,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
             "danger_search.navigation_tasks.astar_plan",
             return_value=PlanResult(status=UNREACHABLE),
         ), patch("danger_search.navigation_tasks.get_time", return_value=10.0):
-            status = task.tick(manager, (1.2, -2.3, math.pi / 2.0))
+            status = task.tick(_task_context(manager), (1.2, -2.3, math.pi / 2.0))
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(task.phase, "GO_WAIT_POINT")
@@ -380,7 +476,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
         )
 
         with patch("danger_search.navigation_tasks.astar_plan", return_value=PlanResult(status=UNREACHABLE)):
-            status = task.tick(manager, (0.0, 0.8, math.pi / 2.0))
+            status = task.tick(_task_context(manager), (0.0, 0.8, math.pi / 2.0))
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(recorded_paths, [])
@@ -434,8 +530,8 @@ class OpenDoorAndPassTest(unittest.TestCase):
         pose = (0.2, -1.1, math.atan2(1.9, -0.2))
 
         with patch("danger_search.navigation_tasks.astar_plan") as astar:
-            first = task.tick(manager, pose)
-            second = task.tick(manager, pose)
+            first = task.tick(_task_context(manager), pose)
+            second = task.tick(_task_context(manager), pose)
 
         self.assertEqual(first, RUNNING)
         self.assertEqual(second, RUNNING)
@@ -470,7 +566,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            task.tick(manager, (0.0, -0.6, math.pi / 2.0)),
+            task.tick(_task_context(manager), (0.0, -0.6, math.pi / 2.0)),
             RUNNING,
         )
 
@@ -531,9 +627,9 @@ class OpenDoorAndPassTest(unittest.TestCase):
 
         pose = (0.2, -1.1, math.atan2(1.9, -0.2))
         with patch("danger_search.navigation_tasks.get_time", side_effect=[10.0, 13.1]):
-            align = task.tick(manager, pose)
-            first = task.tick(manager, pose)
-            second = task.tick(manager, pose)
+            align = task.tick(_task_context(manager), pose)
+            first = task.tick(_task_context(manager), pose)
+            second = task.tick(_task_context(manager), pose)
 
         self.assertEqual(align, RUNNING)
         self.assertEqual(first, RUNNING)
@@ -577,7 +673,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
             _record_failure=lambda reason: failures.append(reason),
         )
 
-        status = task.tick(manager, (0.0, -0.8, math.pi / 2.0))
+        status = task.tick(_task_context(manager), (0.0, -0.8, math.pi / 2.0))
 
         self.assertEqual(status, FAILED)
         self.assertEqual(recovered, [])
@@ -604,7 +700,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
             _record_failure=lambda reason: failures.append(reason),
         )
 
-        status = task.tick(manager, (0.0, 0.61, math.pi / 2.0))
+        status = task.tick(_task_context(manager), (0.0, 0.61, math.pi / 2.0))
 
         self.assertEqual(status, FAILED)
         self.assertEqual(failures, ["控制器提前结束过门路径"])
@@ -696,37 +792,37 @@ class TakeElevatorTest(unittest.TestCase):
         with patch.object(task, "_tick_cabin_transit", return_value=STUCK), patch(
             "danger_search.navigation_tasks.get_time", return_value=10.0
         ):
-            self.assertEqual(task.tick(manager, (1.37, 2.60, math.pi)), RUNNING)
+            self.assertEqual(task.tick(_task_context(manager), (1.37, 2.60, math.pi)), RUNNING)
 
         self.assertEqual(task.phase, "EXIT_BACKOFF_SETTLE")
         self.assertEqual(task._retry_count, 1)
         self.assertGreater(task._exit_backoff_target_xy[0], 1.37)
 
         with patch("danger_search.navigation_tasks.get_time", return_value=10.6):
-            task.tick(manager, (1.37, 2.60, math.pi))
+            task.tick(_task_context(manager), (1.37, 2.60, math.pi))
         self.assertEqual(task.phase, "EXIT_BACKOFF_ALIGN")
 
         # 朝向与出口相反时只能原地对准，不能开始倒车。
         with patch("danger_search.navigation_tasks.get_time", return_value=10.7):
-            task.tick(manager, (1.37, 2.60, 0.0))
+            task.tick(_task_context(manager), (1.37, 2.60, 0.0))
         self.assertEqual(task.phase, "EXIT_BACKOFF_ALIGN")
         self.assertTrue(manager.controller.turn_commands)
         self.assertEqual(manager.controller.reverse_reasons, [])
 
         with patch("danger_search.navigation_tasks.get_time", return_value=10.8):
-            task.tick(manager, (1.37, 2.60, math.pi))
+            task.tick(_task_context(manager), (1.37, 2.60, math.pi))
         self.assertEqual(task.phase, "EXIT_BACKOFF_REVERSE")
 
         with patch("danger_search.navigation_tasks.get_time", return_value=10.9):
-            task.tick(manager, (1.37, 2.60, math.pi))
+            task.tick(_task_context(manager), (1.37, 2.60, math.pi))
         self.assertEqual(manager.controller.reverse_reasons, ["exit_cabin_backoff"])
 
         with patch("danger_search.navigation_tasks.get_time", return_value=12.0):
-            task.tick(manager, (1.72, 2.60, math.pi))
+            task.tick(_task_context(manager), (1.72, 2.60, math.pi))
         self.assertEqual(task.phase, "EXIT_BACKOFF_REALIGN")
 
         with patch("danger_search.navigation_tasks.get_time", return_value=12.1):
-            task.tick(manager, (1.72, 2.60, math.pi))
+            task.tick(_task_context(manager), (1.72, 2.60, math.pi))
         self.assertEqual(task.phase, "EXIT_CABIN")
         self.assertIn("exit_backoff_complete", manager.controller.clear_reasons)
 
@@ -743,16 +839,16 @@ class TakeElevatorTest(unittest.TestCase):
         task = TakeElevator(0, 1)
 
         with patch.object(task, "_navigate_to", return_value=True):
-            self.assertEqual(task.tick(manager, (0.85, 2.60, math.pi / 2.0)), RUNNING)
+            self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, math.pi / 2.0)), RUNNING)
 
         self.assertEqual(task.phase, "ALIGN_TO_CURRENT_DOOR")
-        self.assertEqual(task.tick(manager, (0.85, 2.60, math.pi / 2.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, math.pi / 2.0)), RUNNING)
         self.assertTrue(manager.controller.turn_commands)
         self.assertEqual(task.phase, "ALIGN_TO_CURRENT_DOOR")
 
-        self.assertEqual(task.tick(manager, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.phase, "ALIGN_TO_CURRENT_DOOR")
-        self.assertEqual(task.tick(manager, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
 
     def test_elevator_unreachable_planning_fails_after_bounded_retries(self):
@@ -775,7 +871,7 @@ class TakeElevatorTest(unittest.TestCase):
             "danger_search.navigation_tasks.get_time",
             side_effect=(0.0, 0.6, 1.2),
         ):
-            statuses = [task.tick(manager, (4.0, 4.0, 0.0)) for _ in range(3)]
+            statuses = [task.tick(_task_context(manager), (4.0, 4.0, 0.0)) for _ in range(3)]
 
         self.assertEqual(statuses, [RUNNING, RUNNING, FAILED])
         self.assertEqual(planner.call_count, 3)
@@ -802,7 +898,7 @@ class TakeElevatorTest(unittest.TestCase):
             "danger_search.navigation_tasks.get_time",
             side_effect=(0.0, 0.6, 1.2),
         ):
-            statuses = [task.tick(manager, (4.0, 4.0, 0.0)) for _ in range(3)]
+            statuses = [task.tick(_task_context(manager), (4.0, 4.0, 0.0)) for _ in range(3)]
 
         self.assertEqual(statuses, [RUNNING, RUNNING, FAILED])
         self.assertEqual(
@@ -842,11 +938,11 @@ class TakeElevatorTest(unittest.TestCase):
             "danger_search.navigation_tasks.get_time",
             side_effect=(0.0, 0.6, 1.2, 1.3),
         ):
-            self.assertEqual(task.tick(manager, (4.0, 4.0, 0.0)), RUNNING)
-            self.assertEqual(task.tick(manager, (4.0, 4.0, 0.0)), RUNNING)
-            self.assertEqual(task.tick(manager, (4.0, 4.0, 0.0)), RUNNING)
+            self.assertEqual(task.tick(_task_context(manager), (4.0, 4.0, 0.0)), RUNNING)
+            self.assertEqual(task.tick(_task_context(manager), (4.0, 4.0, 0.0)), RUNNING)
+            self.assertEqual(task.tick(_task_context(manager), (4.0, 4.0, 0.0)), RUNNING)
             self.assertEqual(task.phase, "GO_TO_ELEVATOR_TRACE_APPROACH")
-            self.assertEqual(task.tick(manager, (4.0, 4.0, 0.0)), RUNNING)
+            self.assertEqual(task.tick(_task_context(manager), (4.0, 4.0, 0.0)), RUNNING)
 
         self.assertEqual(task.phase, "ALIGN_TO_CURRENT_DOOR")
         self.assertIsNone(task.failure_reason)
@@ -885,22 +981,22 @@ class TakeElevatorTest(unittest.TestCase):
         ):
             for _ in range(3):
                 self.assertEqual(
-                    task.tick(manager, (4.0, 4.0, math.pi / 2.0)), RUNNING
+                    task.tick(_task_context(manager), (4.0, 4.0, math.pi / 2.0)), RUNNING
                 )
             self.assertEqual(task.phase, "ELEVATOR_START_RETREAT")
             self.assertEqual(
-                task.tick(manager, (4.0, 4.0, math.pi / 2.0)), RUNNING
+                task.tick(_task_context(manager), (4.0, 4.0, math.pi / 2.0)), RUNNING
             )
             self.assertEqual(
                 manager.controller.reverse_reasons,
                 ["elevator_start_clearance_retreat"],
             )
             self.assertEqual(
-                task.tick(manager, (4.0, 3.2, math.pi / 2.0)), RUNNING
+                task.tick(_task_context(manager), (4.0, 3.2, math.pi / 2.0)), RUNNING
             )
             self.assertEqual(task.phase, "GO_TO_ELEVATOR_DOOR")
             self.assertEqual(
-                task.tick(manager, (4.0, 3.2, math.pi / 2.0)), RUNNING
+                task.tick(_task_context(manager), (4.0, 3.2, math.pi / 2.0)), RUNNING
             )
 
         self.assertEqual(len(retreat_requests), 1)
@@ -929,7 +1025,7 @@ class TakeElevatorTest(unittest.TestCase):
         task._start_retreat_deadline = 20.0
 
         with patch("danger_search.navigation_tasks.get_time", return_value=10.0):
-            status = task.tick(manager, (4.0, 4.0, math.pi / 2.0))
+            status = task.tick(_task_context(manager), (4.0, 4.0, math.pi / 2.0))
 
         self.assertEqual(status, FAILED)
         self.assertEqual(task.failure_reason, "elevator_start_retreat_failed")
@@ -960,7 +1056,7 @@ class TakeElevatorTest(unittest.TestCase):
             "danger_search.navigation_tasks.get_time",
             side_effect=(0.0, 0.1, 0.2, 0.3, 0.4),
         ):
-            statuses = [task.tick(manager, (4.0, 4.0, 0.0)) for _ in range(5)]
+            statuses = [task.tick(_task_context(manager), (4.0, 4.0, 0.0)) for _ in range(5)]
 
         self.assertEqual(statuses[-1], FAILED)
         self.assertEqual(len(manager.controller.recover_reasons), 4)
@@ -989,7 +1085,7 @@ class TakeElevatorTest(unittest.TestCase):
                 path=[(4.0, 4.0), (0.85, 2.60)], status="reached"
             ),
         ), patch("danger_search.navigation_tasks.get_time", return_value=0.0):
-            status = task.tick(manager, (4.0, 4.0, 0.0))
+            status = task.tick(_task_context(manager), (4.0, 4.0, 0.0))
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(gate_sources, ["elevator_navigation_stuck"])
@@ -1010,13 +1106,13 @@ class TakeElevatorTest(unittest.TestCase):
         task = TakeElevator(0, 1)
         task.phase = "REFRESH_CURRENT_ELEVATOR_GEOMETRY"
 
-        self.assertEqual(task.tick(manager, (0.85, 2.6, 0.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.6, 0.0)), RUNNING)
         self.assertEqual(task.phase, "GO_TO_REFRESHED_ELEVATOR_DOOR")
         self.assertEqual(len(refresh_calls), 1)
         self.assertIn("elevator_geometry_refreshed", manager.controller.clear_reasons)
 
         with patch.object(task, "_navigate_to", return_value=True):
-            self.assertEqual(task.tick(manager, (0.85, 2.6, 0.0)), RUNNING)
+            self.assertEqual(task.tick(_task_context(manager), (0.85, 2.6, 0.0)), RUNNING)
         self.assertEqual(task.phase, "ALIGN_TO_REFRESHED_ELEVATOR_DOOR")
 
     def test_elevator_refresh_timeout_preserves_registered_geometry(self):
@@ -1033,7 +1129,7 @@ class TakeElevatorTest(unittest.TestCase):
         task = TakeElevator(0, 1)
         task.phase = "REFRESH_CURRENT_ELEVATOR_GEOMETRY"
 
-        self.assertEqual(task.tick(manager, (0.85, 2.6, 0.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.6, 0.0)), RUNNING)
 
         self.assertEqual(task.phase, "GO_TO_REFRESHED_ELEVATOR_DOOR")
         self.assertIsNone(task.failure_reason)
@@ -1043,7 +1139,7 @@ class TakeElevatorTest(unittest.TestCase):
         )
 
         with patch.object(task, "_navigate_to", return_value=True):
-            self.assertEqual(task.tick(manager, (0.85, 2.6, 0.0)), RUNNING)
+            self.assertEqual(task.tick(_task_context(manager), (0.85, 2.6, 0.0)), RUNNING)
         self.assertEqual(task.phase, "ALIGN_TO_REFRESHED_ELEVATOR_DOOR")
 
     def test_elevator_refresh_viewpoint_keeps_camera_farther_from_door(self):
@@ -1080,9 +1176,9 @@ class TakeElevatorTest(unittest.TestCase):
 
         manager.controller.tick = tick_controller
 
-        self.assertEqual(task.tick(manager, (2.0, 2.60, math.pi)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (2.0, 2.60, math.pi)), RUNNING)
         task._retry_count = 1
-        self.assertEqual(task.tick(manager, (2.0, 2.60, math.pi)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (2.0, 2.60, math.pi)), RUNNING)
 
         self.assertEqual(observed_caps, [0.25, None])
         self.assertFalse(hasattr(manager.controller, "max_linear"))
@@ -1106,7 +1202,7 @@ class TakeElevatorTest(unittest.TestCase):
         task._cabin_transit_target_xy = (0.85, 2.60)
         manager.controller.path_active = True
 
-        self.assertEqual(task.tick(manager, (2.0, 2.60, math.pi)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (2.0, 2.60, math.pi)), RUNNING)
 
         self.assertEqual(observed_poses, [((2.0, 2.60, math.pi), {"goal_tolerance": 0.15})])
 
@@ -1124,7 +1220,7 @@ class TakeElevatorTest(unittest.TestCase):
         task.phase = "EXIT_CABIN"
 
         with patch.object(task, "_tick_cabin_transit", return_value=STUCK):
-            status = task.tick(manager, (1.37, 2.60, math.pi))
+            status = task.tick(_task_context(manager), (1.37, 2.60, math.pi))
 
         self.assertEqual(status, FAILED)
         self.assertEqual(task.phase, "EXIT_CABIN")
@@ -1176,7 +1272,7 @@ class TakeElevatorTest(unittest.TestCase):
         with patch.object(task, "_tick_cabin_transit", return_value=STUCK), patch(
             "danger_search.navigation_tasks.get_time", return_value=10.0
         ):
-            status = task.tick(manager, (1.37, 2.60, math.pi))
+            status = task.tick(_task_context(manager), (1.37, 2.60, math.pi))
 
         self.assertEqual(status, FAILED)
         self.assertEqual(task.phase, "EXIT_CABIN")
@@ -1201,7 +1297,7 @@ class TakeElevatorTest(unittest.TestCase):
         task._exit_backoff_deadline = 13.0
 
         with patch("danger_search.navigation_tasks.get_time", return_value=13.1):
-            status = task.tick(manager, (1.37, 2.60, math.pi))
+            status = task.tick(_task_context(manager), (1.37, 2.60, math.pi))
 
         self.assertEqual(status, FAILED)
         self.assertEqual(manager.controller.reverse_reasons, [])
@@ -1225,7 +1321,7 @@ class TakeElevatorTest(unittest.TestCase):
             return DONE
 
         with patch.object(task, "_navigate_to_with_status", side_effect=navigate):
-            status = task.tick(manager, (2.32, 2.53, 0.0))
+            status = task.tick(_task_context(manager), (2.32, 2.53, 0.0))
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(task.cabin_transit_stage, "ALIGN")
@@ -1330,7 +1426,7 @@ class TakeElevatorTest(unittest.TestCase):
         stages = []
         for _ in range(6):
             task._tick_cabin_transit(
-                manager,
+                _task_context(manager),
                 pose,
                 mode="exit",
                 position_xy=cabin_center,
@@ -1376,7 +1472,7 @@ class TakeElevatorTest(unittest.TestCase):
         with patch.object(task, "_navigate_to_with_status", return_value=DONE):
             for _ in range(2 * (flip_limit + 1)):
                 status = task._tick_cabin_transit(
-                    manager,
+                    _task_context(manager),
                     pose,
                     mode="exit",
                     position_xy=cabin_center,
@@ -1403,14 +1499,14 @@ class TakeElevatorTest(unittest.TestCase):
         task._cabin_transit_mode = "exit"
         task.cabin_transit_stage = "ALIGN"
 
-        self.assertEqual(task.tick(manager, (2.60, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, 0.0)), RUNNING)
         self.assertTrue(manager.controller.turn_commands)
         self.assertEqual(manager.controller.paths, [])
 
-        self.assertEqual(task.tick(manager, (2.60, 2.60, math.pi)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, math.pi)), RUNNING)
         self.assertEqual(manager.controller.paths, [])
 
-        self.assertEqual(task.tick(manager, (2.60, 2.60, math.pi)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, math.pi)), RUNNING)
         self.assertEqual(task.cabin_transit_stage, "CROSS")
         self.assertEqual(
             manager.controller.paths,
@@ -1432,7 +1528,7 @@ class TakeElevatorTest(unittest.TestCase):
         task._cabin_transit_mode = "enter"
         task.cabin_transit_stage = "ALIGN"
 
-        self.assertEqual(task.tick(manager, (0.85, 2.60, -0.14)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, -0.14)), RUNNING)
 
         self.assertGreaterEqual(
             abs(manager.controller.turn_commands[-1]),
@@ -1457,7 +1553,7 @@ class TakeElevatorTest(unittest.TestCase):
         manager.controller.path_active = True
 
         with patch("danger_search.navigation_tasks.astar_plan") as planner:
-            status = task.tick(manager, (1.12, 2.60, math.pi))
+            status = task.tick(_task_context(manager), (1.12, 2.60, math.pi))
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(task.phase, "EXIT_CABIN")
@@ -1469,7 +1565,7 @@ class TakeElevatorTest(unittest.TestCase):
         )
         planner.assert_not_called()
 
-        status = task.tick(manager, (0.98, 2.60, math.pi))
+        status = task.tick(_task_context(manager), (0.98, 2.60, math.pi))
         self.assertEqual(status, RUNNING)
         self.assertEqual(task.phase, "CLOSE_TARGET_FLOOR_DOOR")
 
@@ -1488,8 +1584,8 @@ class TakeElevatorTest(unittest.TestCase):
         task._cabin_transit_mode = "enter"
         task.cabin_transit_stage = "ALIGN"
 
-        self.assertEqual(task.tick(manager, (0.85, 2.60, 0.0)), RUNNING)
-        self.assertEqual(task.tick(manager, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
 
         self.assertEqual(task.cabin_transit_stage, "CROSS")
         self.assertEqual(
@@ -1523,7 +1619,7 @@ class TakeElevatorTest(unittest.TestCase):
         task.cabin_transit_stage = "ALIGN"
         task._cabin_transit_alignment_count = 1
 
-        self.assertEqual(task.tick(manager, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
 
         self.assertEqual(cleared, ["lift_door_ground"])
         self.assertEqual(task.cabin_transit_stage, "CROSS")
@@ -1553,7 +1649,7 @@ class TakeElevatorTest(unittest.TestCase):
         task._cabin_transit_alignment_count = 1
 
         with patch("danger_search.navigation_tasks.rospy.logwarn_throttle"):
-            self.assertEqual(task.tick(manager, (0.85, 2.60, 0.0)), RUNNING)
+            self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
 
         self.assertEqual(task.cabin_transit_stage, "ALIGN")
         self.assertEqual(manager.controller.paths, [])
@@ -1573,8 +1669,8 @@ class TakeElevatorTest(unittest.TestCase):
         task._cabin_transit_mode = "enter"
         task.cabin_transit_stage = "ALIGN"
 
-        self.assertEqual(task.tick(manager, (0.85, 2.60, 0.0)), RUNNING)
-        self.assertEqual(task.tick(manager, (0.85, 2.60, 0.12)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.12)), RUNNING)
 
         self.assertEqual(task.cabin_transit_stage, "CROSS")
         self.assertEqual(
@@ -1598,7 +1694,7 @@ class TakeElevatorTest(unittest.TestCase):
         task.cabin_transit_stage = "POSITION"
 
         with patch.object(task, "_tick_cabin_transit", return_value=STUCK):
-            self.assertEqual(task.tick(manager, (0.70, 2.60, 0.0)), RUNNING)
+            self.assertEqual(task.tick(_task_context(manager), (0.70, 2.60, 0.0)), RUNNING)
 
         self.assertEqual(
             manager.controller.recover_reasons,
@@ -1607,7 +1703,7 @@ class TakeElevatorTest(unittest.TestCase):
 
         task.cabin_transit_stage = "CROSS"
         with patch.object(task, "_tick_cabin_transit", return_value=STUCK):
-            self.assertEqual(task.tick(manager, (1.50, 2.60, 0.0)), FAILED)
+            self.assertEqual(task.tick(_task_context(manager), (1.50, 2.60, 0.0)), FAILED)
 
         self.assertEqual(
             manager.controller.recover_reasons,
@@ -1628,13 +1724,13 @@ class TakeElevatorTest(unittest.TestCase):
         task.phase = "CLOSE_CURRENT_FLOOR_DOOR"
         task._service_task = _DoneService()
 
-        self.assertEqual(task.tick(manager, (2.60, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.phase, "ALIGN_TO_TARGET_DOOR")
         self.assertTrue(manager.controller.turn_commands)
 
-        self.assertEqual(task.tick(manager, (2.60, 2.60, math.pi)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, math.pi)), RUNNING)
         self.assertEqual(task.phase, "ALIGN_TO_TARGET_DOOR")
-        self.assertEqual(task.tick(manager, (2.60, 2.60, math.pi)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, math.pi)), RUNNING)
         self.assertEqual(task.phase, "CALL_ELEVATOR_TO_TARGET_FLOOR")
         self.assertEqual(manager.controller.paths, [])
 
@@ -1669,7 +1765,7 @@ class TakeElevatorTest(unittest.TestCase):
             "danger_search.navigation_tasks._segment_crosses_blocked_cell",
             return_value=False,
         ):
-            status = task.tick(manager, (2.60, 2.60, math.pi))
+            status = task.tick(_task_context(manager), (2.60, 2.60, math.pi))
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(confirmed_floors, [1])
@@ -1698,7 +1794,7 @@ class TakeElevatorTest(unittest.TestCase):
         task = TakeElevator(0, 1)
         task.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
 
-        self.assertEqual(task.tick(manager, (2.60, 2.60, math.pi)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, math.pi)), RUNNING)
 
         self.assertEqual(
             transition_calls,
@@ -1732,7 +1828,7 @@ class TakeElevatorTest(unittest.TestCase):
         ) as planner, patch(
             "danger_search.navigation_tasks.rospy.logwarn_throttle"
         ):
-            status = task.tick(manager, (2.60, 2.60, math.pi))
+            status = task.tick(_task_context(manager), (2.60, 2.60, math.pi))
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(task.phase, "WAIT_TARGET_DOOR_OPEN")
@@ -1754,7 +1850,7 @@ class TakeElevatorTest(unittest.TestCase):
             _record_failure=lambda reason: failures.append(reason),
         )
 
-        status = task.tick(manager, (0.0, 0.0, math.pi / 2.0))
+        status = task.tick(_task_context(manager), (0.0, 0.0, math.pi / 2.0))
 
         self.assertEqual(status, FAILED)
         self.assertEqual(failures, ["电梯服务失败: jammed"])
@@ -1786,7 +1882,7 @@ class TakeElevatorTest(unittest.TestCase):
             "danger_search.navigation_tasks.get_time",
             return_value=11.0,
         ):
-            status = task.tick(manager, (0.0, 0.0, math.pi / 2.0))
+            status = task.tick(_task_context(manager), (0.0, 0.0, math.pi / 2.0))
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(task.phase, "ENTER_CABIN")
@@ -1815,7 +1911,7 @@ class TakeElevatorTest(unittest.TestCase):
             clear_opened_door_area=lambda door_id: None,
         )
 
-        status = task.tick(manager, (0.0, 0.0, math.pi / 2.0))
+        status = task.tick(_task_context(manager), (0.0, 0.0, math.pi / 2.0))
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(task.phase, "WAIT_CURRENT_DOOR_OPEN")
@@ -1861,8 +1957,8 @@ class TakeElevatorTest(unittest.TestCase):
             "danger_search.navigation_tasks._segment_crosses_blocked_cell",
             return_value=False,
         ):
-            first = task.tick(manager, (0.85, 2.60, 0.0))
-            second = task.tick(manager, (0.85, 2.60, 0.0))
+            first = task.tick(_task_context(manager), (0.85, 2.60, 0.0))
+            second = task.tick(_task_context(manager), (0.85, 2.60, 0.0))
 
         self.assertEqual(first, RUNNING)
         self.assertEqual(second, RUNNING)
@@ -1887,7 +1983,7 @@ class TakeElevatorTest(unittest.TestCase):
             controller=SimpleNamespace(stop=lambda: stop_calls.append(True)),
         )
 
-        status = task.tick(manager, (0.85, 2.60, 0.0))
+        status = task.tick(_task_context(manager), (0.85, 2.60, 0.0))
 
         self.assertEqual(status, RUNNING)
         self.assertEqual(task.phase, "OPEN_CURRENT_FLOOR_DOOR")

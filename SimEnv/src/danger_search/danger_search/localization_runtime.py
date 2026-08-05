@@ -38,6 +38,37 @@ class LocalizationHealthAssessment:
     unavailable_duration: float
 
 
+LOCALIZATION_ALLOW = "ALLOW"
+LOCALIZATION_WAIT_ODOMETRY = "WAIT_ODOMETRY"
+LOCALIZATION_FAIL_ODOMETRY = "FAIL_ODOMETRY"
+LOCALIZATION_WAIT_STANCE = "WAIT_STANCE"
+LOCALIZATION_FAIL_STANCE = "FAIL_STANCE"
+LOCALIZATION_FAIL_STANCE_UNAVAILABLE = "FAIL_STANCE_UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class LocalizationProgressDecision:
+    """顶层状态机应执行的单一定位决策。"""
+
+    action: str
+    assessment: LocalizationHealthAssessment | None
+    stop_reason: str | None
+    failure_reason: str | None
+    reason_code: str | None
+
+    @property
+    def allows_progress(self) -> bool:
+        return self.action == LOCALIZATION_ALLOW
+
+    @property
+    def terminal(self) -> bool:
+        return self.action in {
+            LOCALIZATION_FAIL_ODOMETRY,
+            LOCALIZATION_FAIL_STANCE,
+            LOCALIZATION_FAIL_STANCE_UNAVAILABLE,
+        }
+
+
 class LocalizationRuntime:
     """集中管理一次任务生命周期内的定位运行状态。
 
@@ -168,6 +199,68 @@ class LocalizationRuntime:
             observed_period=observed_period,
             stale_limit=stale_limit,
             unavailable_duration=unavailable_duration,
+        )
+
+    def decide_progress(
+        self,
+        pose_sample: PoseSample | None,
+        *,
+        now: float,
+        stance_health: bool | None,
+        stance_required: bool,
+    ) -> LocalizationProgressDecision:
+        """按固定优先级组合姿态健康和里程计新鲜度。
+
+        显式姿态异常优先于里程计断流，确保失败原因不被派生陈旧状态覆盖；
+        尚未收到姿态状态时，先验证里程计，再在启动宽限内等待锁存消息。
+        """
+        if stance_required and stance_health is False:
+            return LocalizationProgressDecision(
+                LOCALIZATION_FAIL_STANCE,
+                None,
+                "localization_stance_unhealthy",
+                "定位姿态健康异常",
+                "localization_stance_unhealthy",
+            )
+
+        assessment = self.assess_health(pose_sample, now=now)
+        if not assessment.allows_progress:
+            action = (
+                LOCALIZATION_FAIL_ODOMETRY
+                if assessment.failure_started
+                else LOCALIZATION_WAIT_ODOMETRY
+            )
+            return LocalizationProgressDecision(
+                action,
+                assessment,
+                "localization_stale",
+                "定位数据持续不可用" if assessment.failure_started else None,
+                "localization_unavailable" if assessment.failure_started else None,
+            )
+
+        if not stance_required or stance_health is True:
+            return LocalizationProgressDecision(
+                LOCALIZATION_ALLOW,
+                assessment,
+                None,
+                None,
+                None,
+            )
+
+        if assessment.elapsed < self.unavailable_timeout:
+            return LocalizationProgressDecision(
+                LOCALIZATION_WAIT_STANCE,
+                assessment,
+                "localization_stance_health_pending",
+                None,
+                None,
+            )
+        return LocalizationProgressDecision(
+            LOCALIZATION_FAIL_STANCE_UNAVAILABLE,
+            assessment,
+            "localization_stance_health_pending",
+            "定位姿态健康状态持续不可用",
+            "localization_stance_health_unavailable",
         )
 
     def lookup(

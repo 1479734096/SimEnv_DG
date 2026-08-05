@@ -22,13 +22,28 @@
 - `danger_search.frontier`：前沿提取、安全落点、有限候选规划、评分和短期失败黑名单；不发布速度或切换任务状态。
 - `danger_search.navigator`：纯跟踪计算加 ROS 边缘发送器；路径、恢复、停车和保活命令都经过同一个 `_publish` 出口。
 - `danger_search.ground_support_gate`：最终速度出口前的停车包络和支撑状态机；不改地图、不重规划，也不自行发布速度。
+- `danger_search.ground_support_runtime`：支撑线程到主线程的证据队列、Gate 状态镜像和任务层重试账本；不重新判定安全，也不发布速度。
+- `danger_search.ground_support_coordinator`：拥有 GroundSupport Gate、ShadowSupport 与反馈队列的生命周期；任务层只读取协调结果，安全判定仍属于 Gate。
+- `danger_search.perception_runtime`：拥有 SensorBuffer 与点云/RGB-D 独立消费游标；不判断楼层、不写地图。
+- `danger_search.map_update_runtime`：拥有 Mapper、危险源检测器、门板检测器和跟踪器；只在主线程提交地图/检测更新，并返回冻结摘要。
+- `danger_search.floor_transition_runtime`：拥有换层期间唯一楼层作用域守卫；只根据服务确认和新里程计决定是否允许楼层数据写入。
+- `danger_search.door_observation_runtime`：主入口门洞的跨帧确认和近场刷新拒绝分类；不读 ROS、不调用服务。
+- `danger_search.return_home_planner`：冻结地图/轨迹上的返航 A*、候选验证和后台执行器；不持有正式地图引用、不切换任务状态。
+- `danger_search.mission_config`：ROS 参数、公开场景能力和接口白名单的唯一加载边界；输出启动时配置快照。
+- `danger_search.mission_node_runtime`：ROS 节点初始化、订阅、定时器、墙钟 watchdog 和 shutdown 生命周期；不决定任务状态。
+- `danger_search.mission_reporting`：结果文件、运行摘要、状态/地图诊断话题和结构化日志的唯一输出边界。
+- `danger_search.progress_monitor`：前沿选择与位姿进度的诊断状态机；只产生诊断/cooldown，不修改地图或任务状态。
 - `danger_search.red_sphere_detector`：同步 RGB-D 的红色分割、深度反投影和球面拟合；只有上层提供同时间匹配的刚体 `camera_to_world` 才输出逻辑 world 候选。
 - `danger_search.detection_tracker`：危险源候选的多帧关联、质量确认和空间 NMS；同一输入帧对每条轨迹最多贡献一次命中。
 - `danger_search.rgbd_door_detector`：深色门板的平面/尺寸验证和开门视觉变化；只输出匿名几何观测，不解释门 ID、不调用服务。
 - `danger_search.building_control_client`：公开 door/elevator ID、服务权限和运行时传感器几何的唯一结合点；异步服务响应不直接改地图。
 - `danger_search.local_semantic_detector`：从局部世界系点云提取门洞与轿厢结构；正式配置禁止真值邻近回退。
-- `danger_search.navigation_tasks`：普通导航、过门和乘梯的非阻塞子状态机；只通过 Mapper、PathFollower、感知确认和建筑客户端推进。
-- `danger_search.mission_manager`：10 Hz 顶层状态机；按定位健康、感知更新、安全门控、子任务和顶层决策的固定顺序推进，耗时返航规划只轮询后台快照任务。
+- `danger_search.navigation_context`：导航子任务每个 tick 的冻结依赖合同；任务不能反向读取或修改 `MissionManager` 私有状态。
+- `danger_search.navigation_tasks`：普通导航、过门和乘梯的非阻塞子状态机；只通过显式 `NavigationTaskContext` 使用 Mapper、PathFollower、感知确认和建筑客户端。
+- `danger_search.exploration_runtime`：无前沿逃逸、前沿惯性和探索进展的有界账本；不决定换层或返航。
+- `danger_search.elevator_observation_runtime`：电梯门板、刷新和开门确认的跨帧状态；不调用服务、不发布控制。
+- `danger_search.return_home_runtime`：返航异步规划、局部失败段和受控后退反馈；不写任务结果、不切换顶层状态。
+- `danger_search.mission_manager`：10 Hz 顶层状态机；按定位健康、感知更新、安全门控、子任务和顶层决策的固定顺序推进，只编排上述运行时模块，不直接拥有 ROS 感知缓冲、Mapper/Detector、楼层守卫、GroundSupport 组件或子任务内部账本。
 
 ## 离线工具边界
 
@@ -40,7 +55,7 @@
   其真值输入和评测输出不得回流到同一轮生产状态。
 - `tools/offline/check_production_boundary.py` 在提交和最终验收前重复检查上述边界。
 
-迁移期保留旧模块导入路径；模块完成行为等价验证后再移动到内部子包，旧路径只保留兼容导出。
+职责迁移后删除旧字段和测试鸭子接口，不在 `MissionManager` 上保留兼容 setter；测试直接构造运行时所有者或显式上下文。
 
 ## 不变量
 

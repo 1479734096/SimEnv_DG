@@ -3,7 +3,15 @@
 import unittest
 from types import SimpleNamespace
 
-from danger_search.localization_runtime import LocalizationRuntime
+from danger_search.localization_runtime import (
+    LOCALIZATION_ALLOW,
+    LOCALIZATION_FAIL_ODOMETRY,
+    LOCALIZATION_FAIL_STANCE,
+    LOCALIZATION_FAIL_STANCE_UNAVAILABLE,
+    LOCALIZATION_WAIT_ODOMETRY,
+    LOCALIZATION_WAIT_STANCE,
+    LocalizationRuntime,
+)
 from danger_search.pose_provider import (
     POSE_EXPIRED,
     POSE_MATCHED,
@@ -24,6 +32,77 @@ def _sample(stamp: float) -> PoseSample:
 
 
 class LocalizationRuntimeTest(unittest.TestCase):
+    def _runtime(self):
+        return LocalizationRuntime(
+            SimpleNamespace(observed_period=lambda **_kwargs: 0.1),
+            stale_minimum=0.4,
+            unavailable_timeout=3.0,
+            start_time=0.0,
+        )
+
+    def test_progress_decision_preserves_stance_and_odometry_priority(self):
+        runtime = self._runtime()
+        unhealthy = runtime.decide_progress(
+            None,
+            now=0.1,
+            stance_health=False,
+            stance_required=True,
+        )
+        self.assertEqual(unhealthy.action, LOCALIZATION_FAIL_STANCE)
+        self.assertIsNone(unhealthy.assessment)
+
+        waiting_odom = runtime.decide_progress(
+            _sample(0.0),
+            now=0.5,
+            stance_health=None,
+            stance_required=True,
+        )
+        self.assertEqual(waiting_odom.action, LOCALIZATION_WAIT_ODOMETRY)
+
+        waiting_stance = self._runtime().decide_progress(
+            _sample(0.1),
+            now=0.1,
+            stance_health=None,
+            stance_required=True,
+        )
+        self.assertEqual(waiting_stance.action, LOCALIZATION_WAIT_STANCE)
+
+        missing_stance = self._runtime().decide_progress(
+            _sample(3.1),
+            now=3.1,
+            stance_health=None,
+            stance_required=True,
+        )
+        self.assertEqual(
+            missing_stance.action,
+            LOCALIZATION_FAIL_STANCE_UNAVAILABLE,
+        )
+
+        allowed = self._runtime().decide_progress(
+            _sample(0.1),
+            now=0.1,
+            stance_health=True,
+            stance_required=True,
+        )
+        self.assertEqual(allowed.action, LOCALIZATION_ALLOW)
+
+    def test_progress_decision_escalates_continuous_odometry_staleness(self):
+        runtime = self._runtime()
+        first = runtime.decide_progress(
+            _sample(0.0),
+            now=0.5,
+            stance_health=True,
+            stance_required=True,
+        )
+        failed = runtime.decide_progress(
+            _sample(0.0),
+            now=3.6,
+            stance_health=True,
+            stance_required=True,
+        )
+        self.assertEqual(first.action, LOCALIZATION_WAIT_ODOMETRY)
+        self.assertEqual(failed.action, LOCALIZATION_FAIL_ODOMETRY)
+
     def test_health_stale_failure_and_recovery_keep_existing_timing(self):
         runtime = LocalizationRuntime(
             SimpleNamespace(observed_period=lambda **_kwargs: 0.1),

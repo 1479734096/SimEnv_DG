@@ -40,8 +40,8 @@ class OpeningObservation:
 class LocalSemanticDetector:
     """用轻量几何规则检测机器人附近的门洞与轿厢结构。
 
-    本类只做观测解释，不调用门/电梯服务。``MissionManager`` 负责跨帧确认、
-    公开 ID 绑定和任务创建，防止单帧候选直接触发环境交互。
+    本类只做观测解释，不调用门/电梯服务。门洞跨帧确认由独立运行时负责，
+    ``MissionManager`` 只绑定公开 ID 并创建任务，防止单帧候选直接触发环境交互。
     """
 
     def __init__(

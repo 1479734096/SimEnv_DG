@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from danger_search.mission_manager import _ProgressMonitor
+from danger_search.progress_monitor import ProgressMonitor
 
 
 @dataclass
@@ -27,8 +27,8 @@ class ProgressMonitorTests(unittest.TestCase):
         repeat: int = 3,
         min_displacement: float = 0.20,
         cooldown: float = 10.0,
-    ) -> _ProgressMonitor:
-        return _ProgressMonitor(
+    ) -> ProgressMonitor:
+        return ProgressMonitor(
             goal_tolerance=goal_tolerance,
             window=window,
             repeat=repeat,

@@ -19,10 +19,12 @@ tools/
 ├── usetools.md
 ├── sim/
 │   ├── run_elevator_gui_test.sh
+│   ├── run_three_floor_seed_matrix.sh
 │   └── run_localization_seed_matrix.sh
 └── offline/
     ├── README.md
     ├── check_production_boundary.py
+    ├── summarize_three_floor_matrix.py
     ├── summarize_localization_matrix.py
     ├── analyze_mission_timing.py
     ├── analyze_localization_drift_bag.py
@@ -37,9 +39,11 @@ tools/
 | 工具 | 主要用途 | 是否需要离线真值 |
 |---|---|---|
 | `sim/run_elevator_gui_test.sh` | 启动两层/三层 GUI 电梯专项并归档证据 | 默认不需要；可显式录制 |
+| `sim/run_three_floor_seed_matrix.sh` | 串行运行预登记的三层完整闭环 seed 并汇总效果 | 是，仅在每轮任务结束后评分 |
 | `sim/run_localization_seed_matrix.sh` | 串行运行并恢复预登记的 20-seed 定位矩阵 | 是，仅离线裁决 |
 | `offline/README.md` | 说明离线工具与生产闭包的隔离原则 | 否 |
 | `offline/check_production_boundary.py` | 检查生产包没有导入离线/真值工具 | 否 |
+| `offline/summarize_three_floor_matrix.py` | 汇总三层矩阵的经过、效果、终态和问题 | 是，仅读取已归档评分 |
 | `offline/summarize_localization_matrix.py` | 汇总矩阵证据并按冻结门槛裁决 | 是，读取 runner 产物 |
 | `offline/analyze_mission_timing.py` | 统计任务耗时、运动、覆盖、安全事件和失败类型 | 否；定位误差/评分为可选 sidecar |
 | `offline/analyze_localization_drift_bag.py` | 计算生产定位相对真值的漂移 | 是 |
@@ -188,6 +192,43 @@ runner 返回码：
 - `1`：算法失败或专项超时；
 - `2`：参数、端口、启动或环境前置失败；
 - `130`：用户或外部信号中止。
+
+### 3.7 三层完整闭环 seed 矩阵
+
+先确认当前修改已经提交，因为矩阵会冻结完整 40 位 Git HEAD，并拒绝在已跟踪文件有未提交
+改动时运行。seed 必须在运行前一次性列出，建议至少包括一个已知回归 seed 和两个新 seed：
+
+```bash
+THREE_FLOOR_MATRIX_OUTPUT_ROOT=/tmp/three_floor_20260729 \
+  tools/sim/run_three_floor_seed_matrix.sh 8127 6946 1612
+```
+
+矩阵固定使用 `GUI=true`、3 层、`280 s` 单层预算、`60 s` 最短探索、`840 s`
+仿真总预算和 `9000 s` 墙钟上限。每轮内部仍由 `run_elevator_gui_test.sh` 调用
+`auto.sh`，完成站立和 `/cmd_vel` 模式切换后再启动 formal 任务节点。
+
+执行规则：
+
+- 算法成功和算法失败都保留为正式结果，随后自动切换下一 seed；
+- 算法失败不重跑，避免用随机重复掩盖结果；
+- 基础设施失败最多同配置尝试两次，仍失败时暂停矩阵，不污染后续 seed；
+- Ctrl-C 立即暂停；使用完全相同的输出目录、HEAD 和 seed 列表可断点续跑；
+- 运行期间关闭诊断录包和真值话题。每轮任务退出后，脚本才归档本轮
+  `detected_danger.json` 和裁判 `danger_truth.json`，运行官方评分器和时间账本分析器。
+
+证据根目录包含：
+
+| 文件 | 内容 |
+|---|---|
+| `MATRIX_CONFIG.txt` | HEAD、seed 顺序、预算和诊断开关冻结值 |
+| `OPERATOR_NOTES.md` | 人工填写卡门、接触和姿态等画面观察 |
+| `seed_<N>/attempt_<M>/` | 单次完整日志、结果、真值、评分、哈希和时间账本 |
+| `matrix_summary.json` | 机器可读的逐轮指标和总体统计 |
+| `matrix_summary.md` | 运行经过、整体效果和出现问题的中文总表 |
+
+单轮 `attempt_class` 分为 `success`、`algorithm_failure`、
+`infrastructure_failure` 和 `interrupted`。自动摘要只能陈述结构化日志事实；画面上发生但
+日志无法识别的台阶卡住、门框接触等现象应同时写入 `OPERATOR_NOTES.md`。
 
 ## 4. 参赛 Python/离线边界检查
 

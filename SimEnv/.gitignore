@@ -1,0 +1,12 @@
+/build/
+/devel/
+/logs/
+/results/
+/generated_building/
+/src/generated_building/
+**/__pycache__/
+*.py[cod]
+*.bag
+.pytest_cache/
+.catkin_tools/
+/.ros_*/

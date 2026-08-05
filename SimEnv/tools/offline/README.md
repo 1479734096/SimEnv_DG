@@ -19,6 +19,17 @@ LOCALIZATION_MATRIX_OUTPUT_ROOT=/tmp/stage17_adaptive_shared_map_matrix \
   tools/sim/run_localization_seed_matrix.sh
 ```
 
+三层正式行为矩阵使用：
+
+```bash
+THREE_FLOOR_MATRIX_OUTPUT_ROOT=/tmp/three_floor_20260729 \
+  tools/sim/run_three_floor_seed_matrix.sh 8127 6946 1612
+```
+
+该 runner 在每轮生产任务完全退出后才复制同轮真值并调用
+`tools/offline/summarize_three_floor_matrix.py`。汇总结果和真值不得回流到后续运行的生产
+决策；矩阵只使用预登记 seed，不根据评分替换失败 seed。
+
 任务退出并完成离线漂移分析后，可单独重建汇总：
 
 ```bash
