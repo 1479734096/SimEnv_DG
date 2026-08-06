@@ -259,6 +259,7 @@ _CONFIG_GROUP_FIELDS = {
             "frontier_params",
             "floor_timeout",
             "floor_finish_time_ratio",
+            "route_check_ratio",
             "explore_coverage_ratio",
             "frontier_current_region_radius",
             "frontier_switch_score_margin",
@@ -472,6 +473,7 @@ class _MissionConfigBuilder:
         self.return_speed_estimate = float(_param("mission/return_speed_estimate", 0.35))
         self.floor_change_time_estimate = float(_param("mission/floor_change_time_estimate", 40.0))
         self.floor_finish_time_ratio = float(_param("mission/floor_finish_time_ratio", 0.75))
+        self.route_check_ratio = float(_param("mission/route_check_ratio", 0.75))
         self.exploration_progress_window = float(_param("mission/exploration_progress_window", 15.0))
         self.min_exploration_progress_cells = int(_param("mission/min_exploration_progress_cells", 30))
         self.min_remaining_frontiers = int(_param("mission/min_remaining_frontiers", 2))
@@ -661,6 +663,37 @@ class _MissionConfigBuilder:
             "free_clear_angle_step": float(_param("map/free_clear_angle_step", 0.1745)),
             "free_clear_obstacle_margin": float(_param("map/free_clear_obstacle_margin", 0.25)),
             "free_clear_min_points_per_bin": int(_param("map/free_clear_min_points_per_bin", 2)),
+            "evidence_lifecycle_enabled": bool(
+                _param("map/evidence_lifecycle_enabled", True)
+            ),
+            "low_height_max_z": float(_param("map/low_height_max_z", 0.30)),
+            "low_confirm_generations": int(
+                _param("map/low_confirm_generations", 3)
+            ),
+            "low_confirm_window_generations": int(
+                _param("map/low_confirm_window_generations", 20)
+            ),
+            "low_candidate_counter_generations": int(
+                _param("map/low_candidate_counter_generations", 3)
+            ),
+            "low_candidate_counter_positions": int(
+                _param("map/low_candidate_counter_positions", 2)
+            ),
+            "low_confirmed_counter_generations": int(
+                _param("map/low_confirmed_counter_generations", 6)
+            ),
+            "low_confirmed_counter_positions": int(
+                _param("map/low_confirmed_counter_positions", 3)
+            ),
+            "low_near_exempt_radius": float(
+                _param("map/low_near_exempt_radius", 0.0)
+            ),
+            "low_candidate_max_range": float(
+                _param("map/low_candidate_max_range", 0.0)
+            ),
+            "counter_pose_separation": float(
+                _param("map/counter_pose_separation", 0.15)
+            ),
         }
         self.cloud_stride = int(_param("map/cloud_stride", 3))
         self.cloud_max_points = int(_param("map/cloud_max_points", 18000))

@@ -62,6 +62,7 @@ class ReturnHomeRuntime:
     retreat_target: tuple[float, float] | None = None
     retreat_deadline: float = 0.0
     retreat_anchor: tuple[float, float] | None = None
+    planner_constraint_revision: int = 0
 
     def reset_feedback(self) -> None:
         self.stuck_anchor = None
@@ -102,6 +103,7 @@ class ReturnHomeRuntime:
         navigation_trace,
         visited_radius: float,
         veto_lookahead: float,
+        planning_constraints=None,
     ) -> None:
         if self.planner is not None:
             raise RuntimeError("返航规划线程已存在")
@@ -128,10 +130,14 @@ class ReturnHomeRuntime:
                 visited_radius=float(visited_radius),
                 veto_segments=veto_segments,
                 failed_signature=failed_signature,
+                planning_constraints=planning_constraints,
                 veto_lookahead=float(veto_lookahead),
             ),
         )
         self.planner = planner
+        self.planner_constraint_revision = int(
+            getattr(planning_constraints, "revision", 0)
+        )
         planner.start()
 
     def poll_plan(
@@ -139,6 +145,7 @@ class ReturnHomeRuntime:
         *,
         current_floor: int,
         goal_xy: tuple[float, float],
+        current_constraint_revision: int | None = None,
     ) -> ReturnHomePlanPoll:
         planner = self.planner
         if planner is None:
@@ -148,7 +155,12 @@ class ReturnHomeRuntime:
             return ReturnHomePlanPoll("pending")
         self.planner = None
         frozen_goal = (float(goal_xy[0]), float(goal_xy[1]))
-        if planner.floor != int(current_floor) or planner.goal_xy != frozen_goal:
+        if (
+            planner.floor != int(current_floor)
+            or planner.goal_xy != frozen_goal
+            or current_constraint_revision is not None
+            and int(current_constraint_revision) != self.planner_constraint_revision
+        ):
             return ReturnHomePlanPoll("stale")
         plan_status, path = outcome
         if plan_status == "error":
@@ -220,6 +232,7 @@ class ReturnHomeRuntime:
         rotation_min_clearance: float,
         clearance_margin: float,
         maximum_distance: float,
+        planning_constraints=None,
     ) -> ReturnHomeRetreatSelection | None:
         if self.retreat_anchor is not None and math.hypot(
             float(pose[0]) - self.retreat_anchor[0],
@@ -244,7 +257,12 @@ class ReturnHomeRuntime:
                 continue
             if not grid_cell_has_clearance(grid, target_cell, required_clearance):
                 continue
-            plan = astar_plan(grid, (pose[0], pose[1]), target)
+            plan = astar_plan(
+                grid,
+                (pose[0], pose[1]),
+                target,
+                constraints=planning_constraints,
+            )
             if not plan.reached or len(plan.path) != 2:
                 continue
             target_direction = math.atan2(target[1] - pose[1], target[0] - pose[0])

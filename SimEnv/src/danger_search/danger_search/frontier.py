@@ -23,9 +23,11 @@ except ImportError:
 from danger_search.mapper import BLACK, FREE, NEGATIVE, FloorGrid, OCC, UNKNOWN, VISITED
 from danger_search.planner import (
     DEFAULT_MAX_ITERATIONS,
+    PlanningConstraints,
     UNREACHABLE,
     astar_plan,
     path_length,
+    reachable_traversable_component,
 )
 from danger_search.time_utils import get_time
 
@@ -90,6 +92,22 @@ class FrontierSelectionDebug:
     switch_score_margin: float = 0.0
     selection_wall_duration: float = 0.0
     candidates: tuple["FrontierCandidateDebug", ...] = ()
+    formal_reachable_count: int = 0
+    effective_reachable_count: int = 0
+    support_blocked_count: int = 0
+    constraints_revision: int = 0
+
+
+@dataclass(frozen=True)
+class FloorTerminationEvidence:
+    """楼层终止时用于区分正式不可达与临时支撑约束隔离。"""
+
+    constraint_revision: int
+    region_ids: tuple[str, ...]
+    formal_reachable_count: int
+    effective_reachable_count: int
+    support_blocked_count: int
+    fully_blocked: bool
 
 
 @dataclass(frozen=True)
@@ -206,6 +224,7 @@ class FrontierExplorer:
         selection_context: FrontierSelectionContext | None = None,
         *,
         frontiers: list[Frontier] | None = None,
+        planning_constraints: PlanningConstraints | None = None,
     ) -> tuple[Frontier | None, list[tuple[float, float]]]:
         """选择本轮收益最高的可达前沿及其路径。
 
@@ -251,8 +270,53 @@ class FrontierExplorer:
             key=lambda frontier: self._optimistic_score(frontier, robot_pose),
             reverse=True,
         )
-        planned_frontiers = ranked_frontiers[: self.max_planning_candidates]
-        for frontier in ranked_frontiers[self.max_planning_candidates :]:
+        robot_xy = (robot_pose[0], robot_pose[1])
+        formal_component = reachable_traversable_component(grid, robot_xy)
+        effective_component = (
+            formal_component
+            if planning_constraints is None
+            else reachable_traversable_component(
+                grid, robot_xy, constraints=planning_constraints
+            )
+        )
+        membership: dict[Frontier, tuple[bool, bool]] = {}
+        for frontier in ranked_frontiers:
+            candidate_cells = {
+                cell
+                for target in self._candidate_targets_for_frontier(
+                    grid, frontier, robot_xy
+                )
+                for cell in [grid.world_to_grid(*target)]
+                if cell is not None
+            }
+            membership[frontier] = (
+                bool(candidate_cells & formal_component),
+                bool(candidate_cells & effective_component),
+            )
+        formal_reachable_count = sum(value[0] for value in membership.values())
+        effective_reachable_count = sum(value[1] for value in membership.values())
+        support_blocked_count = sum(
+            formal and not effective
+            for formal, effective in membership.values()
+        )
+        effective_frontiers = [
+            frontier for frontier in ranked_frontiers if membership[frontier][1]
+        ]
+        planned_frontiers = effective_frontiers[: self.max_planning_candidates]
+        not_planned = [
+            frontier for frontier in ranked_frontiers if frontier not in planned_frontiers
+        ]
+        for frontier in not_planned:
+            formal_reachable, effective_reachable = membership[frontier]
+            rejection_reason = (
+                "planning_candidate_limit"
+                if effective_reachable
+                else (
+                    "support_constraint_blocked"
+                    if formal_reachable and planning_constraints is not None
+                    else "formal_component_unreachable"
+                )
+            )
             candidate_debug_records.append(
                 FrontierCandidateDebug(
                     position=frontier.centroid,
@@ -264,11 +328,13 @@ class FrontierExplorer:
                     ),
                     path_length=None,
                     final_score=None,
-                    rejection_reason="planning_candidate_limit",
+                    rejection_reason=rejection_reason,
                     door_context_adjustment=0.0,
                     door_context_penalty=0.0,
                     blacklist_status="not_evaluated",
-                    reachability_result="not_evaluated",
+                    reachability_result=(
+                        "not_evaluated" if effective_reachable else "unreachable"
+                    ),
                 )
             )
         for frontier in planned_frontiers:
@@ -286,6 +352,7 @@ class FrontierExplorer:
                 frontier,
                 robot_pose,
                 selection_context=selection_context,
+                planning_constraints=planning_constraints,
             )
             if target_xy is None or not path:
                 candidate_debug_records.append(candidate_debug)
@@ -347,6 +414,7 @@ class FrontierExplorer:
                 robot_pose,
                 selection_context=selection_context,
                 candidate_debug_records=candidate_debug_records,
+                planning_constraints=planning_constraints,
             )
             final_target = fallback_frontier.centroid if fallback_frontier is not None else None
             top_candidates = self._top_candidate_debug(candidate_debug_records, final_target)
@@ -379,6 +447,13 @@ class FrontierExplorer:
                     switch_score_margin=selection_context.switch_score_margin if selection_context is not None else 0.0,
                     selection_wall_duration=time.perf_counter() - selection_started,
                     candidates=top_candidates,
+                    formal_reachable_count=formal_reachable_count,
+                    effective_reachable_count=effective_reachable_count,
+                    support_blocked_count=support_blocked_count,
+                    constraints_revision=(
+                        planning_constraints.revision
+                        if planning_constraints is not None else 0
+                    ),
                 ),
             )
             return fallback_frontier, fallback_path
@@ -432,15 +507,107 @@ class FrontierExplorer:
                 switch_score_margin=selection_context.switch_score_margin if selection_context is not None else 0.0,
                 selection_wall_duration=time.perf_counter() - selection_started,
                 candidates=top_candidates,
+                formal_reachable_count=formal_reachable_count,
+                effective_reachable_count=effective_reachable_count,
+                support_blocked_count=support_blocked_count,
+                constraints_revision=(
+                    planning_constraints.revision
+                    if planning_constraints is not None else 0
+                ),
             ),
         )
         return best_frontier, best_path
+
+    def support_constraint_blocked_evidence(
+        self,
+        grid: FloorGrid,
+        robot_pose: tuple[float, float, float],
+        planning_constraints: PlanningConstraints | None,
+        *,
+        frontiers: list[Frontier] | None = None,
+    ) -> FloorTerminationEvidence | None:
+        """返回同一次终止快照中的支撑约束完全隔离证明。"""
+        evidence = self.floor_termination_evidence(
+            grid,
+            robot_pose,
+            planning_constraints,
+            frontiers=frontiers,
+        )
+        return evidence if evidence.fully_blocked else None
+
+    def floor_termination_evidence(
+        self,
+        grid: FloorGrid,
+        robot_pose: tuple[float, float, float],
+        planning_constraints: PlanningConstraints | None,
+        *,
+        frontiers: list[Frontier] | None = None,
+    ) -> FloorTerminationEvidence:
+        """一次性冻结当前地图的 frontier 与 formal/effective 连通事实。"""
+        regions = (
+            tuple(planning_constraints.support_regions)
+            if planning_constraints is not None else ()
+        )
+        represented = frozenset(
+            cell
+            for region in regions
+            for cell in region.blocked_cells
+        )
+        constraints_are_sourced = bool(
+            planning_constraints is not None
+            and regions
+            and planning_constraints.blocked_cells <= represented
+        )
+        current_frontiers = (
+            self.extract_frontiers(grid) if frontiers is None else list(frontiers)
+        )
+        robot_xy = (float(robot_pose[0]), float(robot_pose[1]))
+        formal_component = reachable_traversable_component(grid, robot_xy)
+        effective_component = reachable_traversable_component(
+            grid, robot_xy, constraints=planning_constraints
+        )
+        formal_reachable_count = 0
+        effective_reachable_count = 0
+        for frontier in current_frontiers:
+            candidate_cells = {
+                cell
+                for target in self._candidate_targets_for_frontier(
+                    grid, frontier, robot_xy
+                )
+                for cell in [grid.world_to_grid(*target)]
+                if cell is not None
+            }
+            formal_reachable = bool(candidate_cells & formal_component)
+            effective_reachable = bool(candidate_cells & effective_component)
+            formal_reachable_count += int(formal_reachable)
+            effective_reachable_count += int(effective_reachable)
+        support_blocked_count = formal_reachable_count - effective_reachable_count
+        return FloorTerminationEvidence(
+            constraint_revision=(
+                planning_constraints.revision
+                if planning_constraints is not None else 0
+            ),
+            region_ids=tuple(
+                sorted(region.region_id for region in regions)
+            ),
+            formal_reachable_count=formal_reachable_count,
+            effective_reachable_count=effective_reachable_count,
+            support_blocked_count=support_blocked_count,
+            fully_blocked=bool(
+                constraints_are_sourced
+                and formal_reachable_count > 0
+                and effective_reachable_count == 0
+                and support_blocked_count == formal_reachable_count
+            ),
+        )
 
     def confirm_budget_exhausted_frontier(
         self,
         grid: FloorGrid,
         robot_pose: tuple[float, float, float],
         selection_context: FrontierSelectionContext | None = None,
+        *,
+        planning_constraints: PlanningConstraints | None = None,
     ) -> tuple[Frontier | None, list[tuple[float, float]]]:
         """对本轮预算耗尽候选做一次确定性确认，找到首个可达目标即返回。"""
         pending = list(getattr(self, "_last_budget_exhausted_frontiers", ()))
@@ -462,6 +629,7 @@ class FrontierExplorer:
                 selection_context=selection_context,
                 planning_max_iterations=None,
                 exhaustive_goal_candidates=True,
+                planning_constraints=planning_constraints,
             )
             if target_xy is None or not path:
                 continue
@@ -628,6 +796,7 @@ class FrontierExplorer:
         robot_pose: tuple[float, float, float],
         selection_context: FrontierSelectionContext | None = None,
         candidate_debug_records: list[FrontierCandidateDebug] | None = None,
+        planning_constraints: PlanningConstraints | None = None,
     ) -> tuple[Frontier | None, list[tuple[float, float]]]:
         """无有效 frontier 时，从 FREE 区域中选择探索价值高、路径可达的目标。
 
@@ -725,7 +894,9 @@ class FrontierExplorer:
                 continue
 
             evaluated_count += 1
-            result = astar_plan(grid, robot_xy, goal)
+            result = astar_plan(
+                grid, robot_xy, goal, constraints=planning_constraints
+            )
             if result.reached:
                 if self._path_crosses_permanent_gate(result.path, selection_context):
                     skipped_count += 1
@@ -894,6 +1065,7 @@ class FrontierExplorer:
         selection_context: FrontierSelectionContext | None = None,
         planning_max_iterations: int | None = DEFAULT_MAX_ITERATIONS,
         exhaustive_goal_candidates: bool = False,
+        planning_constraints: PlanningConstraints | None = None,
     ) -> tuple[
         tuple[float, float] | None,
         list[tuple[float, float]],
@@ -989,6 +1161,7 @@ class FrontierExplorer:
                 robot_xy,
                 target_xy,
                 max_iterations=planning_max_iterations,
+                constraints=planning_constraints,
             )
             if result.reached:
                 if self._path_crosses_permanent_gate(result.path, selection_context):

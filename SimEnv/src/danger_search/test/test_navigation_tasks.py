@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import danger_search.navigation_tasks as navigation_tasks_module
+
 from danger_search.navigation_tasks import (
     DONE,
     FAILED,
@@ -43,7 +45,8 @@ def _task_context(source) -> NavigationTaskContext:
         controller=controller,
         mapper=getattr(source, "mapper", SimpleNamespace(floor=lambda _floor: object())),
         building_client=getattr(source, "building_client", object()),
-        current_floor=int(getattr(source, "current_floor", 0)),
+            current_floor=int(getattr(source, "current_floor", 0)),
+            planning_constraints=None,
         door_pass_max_linear=getattr(source, "door_pass_max_linear", None),
         open_door_geometry_refresh_enabled=hasattr(
             source, "refresh_open_door_geometry"
@@ -105,12 +108,18 @@ def _task_context(source) -> NavigationTaskContext:
             "elevator_start_retreat_target",
             lambda _pose, _floor: None,
         ),
-        elevator_approach_trace_candidates_fn=getattr(
+            elevator_approach_trace_candidates_fn=getattr(
             source,
             "elevator_approach_trace_candidates",
-            lambda _elevator_id, _floor, **_kwargs: (),
-        ),
-    )
+                lambda _elevator_id, _floor, **_kwargs: (),
+            ),
+            plan_path_fn=lambda *args, **kwargs: navigation_tasks_module.astar_plan(
+                *args, **kwargs
+            ),
+            segment_is_traversable_fn=lambda grid, start, end: not navigation_tasks_module._segment_crosses_blocked_cell(
+                grid, start, end
+            ),
+        )
 
 
 class NavigateToPoseTest(unittest.TestCase):
@@ -1345,7 +1354,7 @@ class TakeElevatorTest(unittest.TestCase):
         # 轿厢中心格及到目标等待点的整段路径全部标 FREE，确保 A* 可达且直线跨越无阻塞
         for gx in range(5, 35):
             for gy in range(20, 30):
-                grid.data[gy, gx] = FREE
+                grid.set_base_state(gx, gy, FREE)
 
         cabin_center = (2.960, 2.304)
         target_wait = (0.85, 2.60)
@@ -1610,7 +1619,7 @@ class TakeElevatorTest(unittest.TestCase):
         def clear_door(door_id):
             cleared.append(door_id)
             gx, gy = blocked_cell
-            grid.data[gy, gx] = FREE
+            grid.set_snapshot_cell(gx, gy, FREE)
 
         manager.clear_opened_door_area = clear_door
         task = TakeElevator(0, 1)
@@ -1638,7 +1647,7 @@ class TakeElevatorTest(unittest.TestCase):
         ).floor(0)
         blocked_cell = grid.world_to_grid(1.55, 2.60)
         gx, gy = blocked_cell
-        grid.data[gy, gx] = BLACK
+        grid.mark_black(gx, gy, owner="test:elevator_entry")
         manager = self._exit_manager(grid)
         manager.current_floor = 0
         manager.clear_opened_door_area = lambda door_id: None

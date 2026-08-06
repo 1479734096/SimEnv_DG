@@ -231,6 +231,7 @@ class ExplorationRuntime:
         current_floor: int,
         config: NoFrontierRecoveryConfig,
         record_failure: bool = True,
+        planning_constraints=None,
     ) -> ExplorationRuntimeResult:
         """推进一次无前沿扫描；楼层结束由调用方根据 completed 决定。"""
         escape_state = self.no_frontier_escape_state
@@ -248,6 +249,7 @@ class ExplorationRuntime:
                     controller=controller,
                     current_floor=current_floor,
                     config=config,
+                    planning_constraints=planning_constraints,
                 )
             if escape_state == "scan_once":
                 self.no_frontier_escape_state = "exhausted"
@@ -313,6 +315,7 @@ class ExplorationRuntime:
         controller: object,
         current_floor: int,
         config: NoFrontierRecoveryConfig,
+        planning_constraints=None,
     ) -> ExplorationRuntimeResult:
         """沿本层已走轨迹选择一次有界直线退避。"""
         start = grid.world_to_grid(float(pose[0]), float(pose[1]))
@@ -339,7 +342,12 @@ class ExplorationRuntime:
                 continue
             if not grid_cell_has_clearance(grid, target_cell, required_clearance):
                 continue
-            plan = astar_plan(grid, (pose[0], pose[1]), target)
+            plan = astar_plan(
+                grid,
+                (pose[0], pose[1]),
+                target,
+                constraints=planning_constraints,
+            )
             if not plan.reached or len(plan.path) != 2:
                 continue
             target_direction = math.atan2(target[1] - pose[1], target[0] - pose[0])

@@ -141,6 +141,66 @@ class GroundSupportAssessment:
     support_lookahead_distance: float | None = None
     boundary_observable: bool | None = None
     boundary_reason_counts: tuple[tuple[str, int], ...] = ()
+    floor: int = 0
+    map_epoch: int = 0
+    localization_epoch: int = 0
+    cloud_generation: int = 0
+    support_boundary_cells: tuple[tuple[int, int], ...] = ()
+    grid_origin: tuple[float, float] | None = None
+    grid_resolution: float | None = None
+    drop_clusters: tuple["DropClusterEvidence", ...] = ()
+
+
+@dataclass(frozen=True)
+class DropClusterEvidence:
+    cluster_id: str
+    floor: int
+    frame_id: str
+    map_epoch: int
+    localization_epoch: int
+    stamp: float
+    generation: int
+    grid_origin: tuple[float, float]
+    grid_resolution: float
+    source_cells: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class NegativeClusterAck:
+    floor: int
+    map_epoch: int
+    localization_epoch: int
+    cluster_ids: tuple[str, ...]
+    map_revision: int
+
+
+@dataclass(frozen=True)
+class SupportFailureWitness:
+    """锁存触发 HOLD 的完整失败断面，供规划约束事务消费。"""
+
+    sequence: int
+    floor: int
+    map_epoch: int
+    localization_epoch: int
+    stamp: float
+    generation: int
+    source_cells: tuple[tuple[int, int], ...]
+    hold_context_id: int
+    trigger_command: tuple[float, float, float]
+    grid_origin: tuple[float, float]
+    grid_resolution: float
+    frame_id: str = "odom"
+
+
+@dataclass(frozen=True)
+class SupportConstraintAck:
+    """规划约束安装完成后的强确认，禁止跨 scope 或旧 revision 复位 Gate。"""
+
+    witness_sequence: int
+    floor: int
+    map_epoch: int
+    localization_epoch: int
+    constraint_revision: int
 
 
 class GroundSupportSafetyGate:
@@ -225,9 +285,13 @@ class GroundSupportSafetyGate:
         self._temporary_hold_context_id: int | None = None
         self._unknown_support_hold_enabled = True
         self._latched_drop_point_world: tuple[float, float] | None = None
+        self._latched_drop_clusters: tuple[DropClusterEvidence, ...] = ()
         self._boundary_candidate_centroid: tuple[float, float] | None = None
         self._boundary_confirmation_count = 0
         self._latched_boundary_cells_world: tuple[tuple[float, float], ...] = ()
+        self._pending_failure_witness: SupportFailureWitness | None = None
+        self._failure_witness_sequence = 0
+        self._last_constraint_ack_revision = 0
         self.last_stop_distance: float | None = 0.0
         self.true_drop_stop_count = 0
         self.observation_hold_count = 0
@@ -266,6 +330,8 @@ class GroundSupportSafetyGate:
         if self._assessment is not None and assessment.stamp <= self._assessment.stamp:
             return
         self._assessment = assessment
+        if self.state in _TEMPORARY_HOLDS:
+            self._capture_failure_witness(assessment)
         self._assessment_sequence += 1
         support_context_matches = (
             self.state not in _TEMPORARY_HOLDS
@@ -440,12 +506,20 @@ class GroundSupportSafetyGate:
                 control_time=control_time,
             )
         elif self.state in _TEMPORARY_HOLDS and elapsed >= self.config.observation_hold_timeout:
-            self._enter_state(
-                SUPPORT_PATH_UNAVAILABLE,
-                "ground_support_path_unavailable",
-                wall_time,
-                control_time=control_time,
-            )
+            if self._pending_failure_witness is None:
+                self._enter_state(
+                    SAFETY_BLOCKED,
+                    "support_veto_source_missing",
+                    wall_time,
+                    control_time=control_time,
+                )
+            else:
+                self._enter_state(
+                    SUPPORT_PATH_UNAVAILABLE,
+                    "ground_support_path_unavailable",
+                    wall_time,
+                    control_time=control_time,
+                )
 
     def check_wall_timeout(self, wall_time: float) -> None:
         """仅在仿真时钟或 odom 停止推进时作为生命周期 watchdog。"""
@@ -620,6 +694,7 @@ class GroundSupportSafetyGate:
         if not near_supported_boundary:
             return requested
         self._begin_temporary_hold_context(requested, pose_yaw)
+        self._capture_failure_witness(assessment)
         if not fresh:
             self.stale_data_hold_count += 1
             self._enter_state(
@@ -750,9 +825,31 @@ class GroundSupportSafetyGate:
     def latched_boundary_cells_world(self) -> tuple[tuple[float, float], ...]:
         return self._latched_boundary_cells_world
 
-    def reset_negative_obstacle_after_replan(self) -> bool:
+    @property
+    def failure_witness(self) -> SupportFailureWitness | None:
+        return self._pending_failure_witness
+
+    @property
+    def latched_drop_clusters(self) -> tuple[DropClusterEvidence, ...]:
+        return self._latched_drop_clusters
+
+    def reset_negative_obstacle_after_replan(
+        self,
+        ack: NegativeClusterAck | None = None,
+    ) -> bool:
         """停稳且外部已写入局部禁行区后，解除 DROP 锁存。"""
-        if self.state != SAFETY_BLOCKED or self.reason_code != "negative_obstacle":
+        expected = self._latched_drop_clusters
+        if (
+            self.state != SAFETY_BLOCKED
+            or self.reason_code != "negative_obstacle"
+            or not expected
+            or ack is None
+            or ack.floor != expected[0].floor
+            or ack.map_epoch != expected[0].map_epoch
+            or ack.localization_epoch != expected[0].localization_epoch
+            or ack.cluster_ids != tuple(item.cluster_id for item in expected)
+            or ack.map_revision <= 0
+        ):
             return False
         self.state = CLEAR
         self.reason_code = None
@@ -765,14 +862,23 @@ class GroundSupportSafetyGate:
         self._temporary_hold_pose_yaw = None
         self._temporary_hold_context_id = None
         self._latched_drop_point_world = None
+        self._latched_drop_clusters = ()
         self._reset_boundary_candidate()
         return True
 
-    def reset_path_unavailable(self) -> bool:
+    def reset_path_unavailable(self, ack: SupportConstraintAck | None = None) -> bool:
         """只解除 UNKNOWN 超时导致的当前路径失败，永久安全状态不可复位。"""
         if (
             self.state != SUPPORT_PATH_UNAVAILABLE
             or self.reason_code != "ground_support_path_unavailable"
+            or self._pending_failure_witness is None
+            or ack is None
+            or ack.witness_sequence != self._pending_failure_witness.sequence
+            or ack.floor != self._pending_failure_witness.floor
+            or ack.map_epoch != self._pending_failure_witness.map_epoch
+            or ack.localization_epoch
+            != self._pending_failure_witness.localization_epoch
+            or ack.constraint_revision <= self._last_constraint_ack_revision
         ):
             return False
         self.state = CLEAR
@@ -783,6 +889,8 @@ class GroundSupportSafetyGate:
         self._temporary_hold_command = None
         self._temporary_hold_pose_yaw = None
         self._temporary_hold_context_id = None
+        self._last_constraint_ack_revision = int(ack.constraint_revision)
+        self._pending_failure_witness = None
         self._reset_boundary_candidate()
         return True
 
@@ -796,6 +904,25 @@ class GroundSupportSafetyGate:
             self._hold_context_sequence += 1
             self._temporary_hold_context_id = self._hold_context_sequence
         self._reset_boundary_candidate()
+
+    def invalidate_evidence_scope(self) -> None:
+        """原子 scope 转换时撤销所有依赖旧证据的锁存上下文。"""
+        if not self.enabled:
+            return
+        self.invalidate_assessment()
+        self._pending_failure_witness = None
+        self._temporary_hold_command = None
+        self._temporary_hold_pose_yaw = None
+        self._temporary_hold_context_id = None
+        self._stopped_sample_count = 0
+        if self.state != SAFETY_BLOCKED or self.reason_code != "negative_obstacle":
+            # scope 变化后没有可复用的 HOLD 命令，也没有合法的进入时间。
+            # 回到 CLEAR，让下一条非零命令经缺评估分支重新建立完整的
+            # fail-closed HOLD 上下文；直接伪造 STALE_DATA_HOLD 会永久无法释放。
+            self.state = CLEAR
+            self.reason_code = None
+            self._state_enter_wall_time = None
+            self._state_enter_control_time = None
 
     def _guard_distance(
         self,
@@ -882,8 +1009,47 @@ class GroundSupportSafetyGate:
             self._hold_context_sequence += 1
             self._temporary_hold_context_id = self._hold_context_sequence
             self._fresh_supported_sequence_count = 0
+            self._pending_failure_witness = None
         self._temporary_hold_command = tuple(float(value) for value in command)
         self._temporary_hold_pose_yaw = float(pose_yaw)
+
+    def _capture_failure_witness(
+        self,
+        assessment: GroundSupportAssessment,
+    ) -> None:
+        """同一 HOLD 只冻结首个完整断面；后续空评估不得清除它。"""
+        if self._pending_failure_witness is not None:
+            return
+        cells = tuple(sorted(set(assessment.support_boundary_cells or ())))
+        if (
+            not cells
+            or not self._assessment_matches_temporary_hold(assessment)
+            or int(assessment.cloud_generation) <= 0
+            or int(assessment.map_epoch) <= 0
+            or int(assessment.localization_epoch) <= 0
+            or assessment.grid_origin is None
+            or assessment.grid_resolution is None
+            or not math.isfinite(float(assessment.grid_resolution))
+            or float(assessment.grid_resolution) <= 0.0
+        ):
+            return
+        self._failure_witness_sequence += 1
+        self._pending_failure_witness = SupportFailureWitness(
+            sequence=self._failure_witness_sequence,
+            floor=int(assessment.floor),
+            map_epoch=int(assessment.map_epoch),
+            localization_epoch=int(assessment.localization_epoch),
+            stamp=float(assessment.stamp),
+            generation=int(assessment.cloud_generation),
+            source_cells=cells,
+            hold_context_id=int(assessment.hold_context_id),
+            trigger_command=tuple(float(value) for value in assessment.support_command),
+            grid_origin=(
+                float(assessment.grid_origin[0]),
+                float(assessment.grid_origin[1]),
+            ),
+            grid_resolution=float(assessment.grid_resolution),
+        )
 
     def _assessment_matches_temporary_hold(
         self,
@@ -975,6 +1141,24 @@ class GroundSupportSafetyGate:
         point = assessment.drop_point_world if assessment is not None else None
         if point is not None and all(math.isfinite(float(value)) for value in point):
             self._latched_drop_point_world = (float(point[0]), float(point[1]))
+        clusters = tuple(assessment.drop_clusters) if assessment is not None else ()
+        if not clusters or any(
+            cluster.floor != int(assessment.floor)
+            or cluster.map_epoch != int(assessment.map_epoch)
+            or cluster.localization_epoch != int(assessment.localization_epoch)
+            or abs(cluster.stamp - float(assessment.stamp)) > 1e-9
+            or cluster.generation != int(assessment.cloud_generation)
+            or not cluster.source_cells
+            for cluster in clusters
+        ):
+            self._enter_state(
+                SAFETY_BLOCKED,
+                "drop_source_cluster_missing",
+                wall_time,
+                control_time=control_time,
+            )
+            return
+        self._latched_drop_clusters = clusters
         self._enter_state(
             DROP_STOPPING,
             "negative_obstacle",
@@ -1136,6 +1320,54 @@ class GroundSupportSafetyGate:
                     or not all(math.isfinite(float(value)) for value in point)
                 ):
                     return False
+            for cluster in assessment.drop_clusters:
+                if (
+                    not isinstance(cluster, DropClusterEvidence)
+                    or not cluster.cluster_id
+                    or cluster.frame_id != "odom"
+                    or cluster.floor != int(assessment.floor)
+                    or cluster.map_epoch != int(assessment.map_epoch)
+                    or cluster.localization_epoch
+                    != int(assessment.localization_epoch)
+                    or cluster.generation != int(assessment.cloud_generation)
+                    or not math.isfinite(float(cluster.stamp))
+                    or abs(cluster.stamp - float(assessment.stamp)) > 1e-9
+                    or not cluster.source_cells
+                    or assessment.grid_origin is None
+                    or cluster.grid_origin
+                    != tuple(float(value) for value in assessment.grid_origin)
+                    or assessment.grid_resolution is None
+                    or abs(
+                        float(cluster.grid_resolution)
+                        - float(assessment.grid_resolution)
+                    ) > 1e-9
+                    or not math.isfinite(float(cluster.grid_resolution))
+                    or float(cluster.grid_resolution) <= 0.0
+                    or any(
+                        not isinstance(cell, (tuple, list))
+                        or len(cell) != 2
+                        or any(
+                            isinstance(value, bool)
+                            or not isinstance(value, int)
+                            for value in cell
+                        )
+                        for cell in cluster.source_cells
+                    )
+                ):
+                    return False
+            if assessment.grid_origin is not None and (
+                len(assessment.grid_origin) != 2
+                or not all(
+                    math.isfinite(float(value))
+                    for value in assessment.grid_origin
+                )
+            ):
+                return False
+            if assessment.grid_resolution is not None and (
+                not math.isfinite(float(assessment.grid_resolution))
+                or float(assessment.grid_resolution) <= 0.0
+            ):
+                return False
             return True
         except (AttributeError, TypeError, ValueError):
             return False

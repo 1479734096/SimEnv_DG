@@ -11,6 +11,7 @@ class NavigationTaskContext:
     mapper: object
     building_client: object
     current_floor: int
+    planning_constraints: object | None
     door_pass_max_linear: float | None
     open_door_geometry_refresh_enabled: bool
     elevator_geometry_refresh_enabled: bool
@@ -33,6 +34,8 @@ class NavigationTaskContext:
     recover_with_rotation_clearance_fn: Callable[[str], bool]
     elevator_start_retreat_target_fn: Callable[..., object]
     elevator_approach_trace_candidates_fn: Callable[..., object]
+    plan_path_fn: Callable[..., object]
+    segment_is_traversable_fn: Callable[..., bool]
 
     def clear_opened_door_area(self, door_id: str) -> None:
         self.clear_opened_door_area_fn(door_id)
@@ -75,3 +78,9 @@ class NavigationTaskContext:
 
     def elevator_approach_trace_candidates(self, *args, **kwargs):
         return self.elevator_approach_trace_candidates_fn(*args, **kwargs)
+
+    def plan_path(self, *args, **kwargs):
+        return self.plan_path_fn(*args, **kwargs)
+
+    def segment_is_traversable(self, *args, **kwargs) -> bool:
+        return bool(self.segment_is_traversable_fn(*args, **kwargs))

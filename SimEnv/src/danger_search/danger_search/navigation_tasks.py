@@ -67,7 +67,7 @@ class NavigateToPose(NavigationTask):
 
         if not context.controller.has_path():
             grid = context.mapper.floor(context.current_floor)
-            result = astar_plan(grid, (pose[0], pose[1]), self.target_xy)
+            result = context.plan_path(grid, (pose[0], pose[1]), self.target_xy)
             if result.reached:
                 context.controller.set_path(result.path)
             elif result.unreachable:
@@ -345,6 +345,7 @@ class OpenDoorAndPass(NavigationTask):
                 grid,
                 (pose[0], pose[1]),
                 self._pass_point,
+                constraints=context.planning_constraints,
             ):
                 return self._handle_pass_blocked(context)
 
@@ -417,7 +418,7 @@ class OpenDoorAndPass(NavigationTask):
 
         if not context.controller.has_path():
             grid = context.mapper.floor(context.current_floor)
-            result = astar_plan(
+            result = context.plan_path(
                 grid,
                 (pose[0], pose[1]),
                 target_xy,
@@ -426,7 +427,9 @@ class OpenDoorAndPass(NavigationTask):
             if result.reached:
                 context.controller.set_path(result.path)
             elif result.unreachable:
-                if allow_direct_fallback and not _segment_crosses_blocked_cell(grid, (pose[0], pose[1]), target_xy):
+                if allow_direct_fallback and context.segment_is_traversable(
+                    grid, (pose[0], pose[1]), target_xy
+                ):
                     context.controller.set_path([(pose[0], pose[1]), target_xy])
                 else:
                     self._last_navigation_blocked = True
@@ -562,6 +565,8 @@ def _segment_crosses_blocked_cell(
     grid,
     start_xy: tuple[float, float],
     end_xy: tuple[float, float],
+    *,
+    constraints=None,
 ) -> bool:
     start_cell = grid.world_to_grid(start_xy[0], start_xy[1])
     end_cell = grid.world_to_grid(end_xy[0], end_xy[1])
@@ -577,7 +582,9 @@ def _segment_crosses_blocked_cell(
         if cell is None:
             return True
         gx, gy = cell
-        if int(grid.data[gy, gx]) in (BLACK, NEGATIVE, OCC):
+        if int(grid.data[gy, gx]) in (BLACK, NEGATIVE, OCC) or (
+            constraints is not None and cell in constraints.blocked_cells
+        ):
             return True
     return False
 
@@ -832,6 +839,7 @@ class TakeElevator(NavigationTask):
                 grid,
                 current_wait,
                 cabin_center,
+                constraints=context.planning_constraints,
             ):
                 self._reset_cabin_transit()
                 self.phase = "ENTER_CABIN"
@@ -954,6 +962,7 @@ class TakeElevator(NavigationTask):
                 grid,
                 cabin_center,
                 target_wait,
+                constraints=context.planning_constraints,
             )
             if not straight_segment_blocked:
                 self._reset_cabin_transit()
@@ -1235,7 +1244,12 @@ class TakeElevator(NavigationTask):
                 self._cabin_transit_door_clear_refreshed = True
             grid = context.mapper.floor(context.current_floor)
             commit_start = (pose[0], pose[1])
-            if _segment_crosses_blocked_cell(grid, commit_start, target_xy):
+            if _segment_crosses_blocked_cell(
+                grid,
+                commit_start,
+                target_xy,
+                constraints=context.planning_constraints,
+            ):
                 self._cabin_transit_alignment_count = 0
                 if rospy is not None:
                     rospy.logwarn_throttle(
@@ -1471,7 +1485,12 @@ class TakeElevator(NavigationTask):
             pose[1] + direction[1] * backoff_distance,
         )
         grid = context.mapper.floor(context.current_floor)
-        if _segment_crosses_blocked_cell(grid, (pose[0], pose[1]), target_xy):
+        if _segment_crosses_blocked_cell(
+            grid,
+            (pose[0], pose[1]),
+            target_xy,
+            constraints=context.planning_constraints,
+        ):
             return False
         self._exit_backoff_start_xy = (pose[0], pose[1])
         self._exit_backoff_target_xy = target_xy
@@ -1609,7 +1628,7 @@ class TakeElevator(NavigationTask):
             grid = context.mapper.floor(context.current_floor)
             multiplier = 1 << min(self._navigation_budget_count, 2)
             max_iterations = DEFAULT_MAX_ITERATIONS * multiplier
-            result = astar_plan(
+            result = context.plan_path(
                 grid,
                 (pose[0], pose[1]),
                 target_xy,
@@ -1627,6 +1646,8 @@ class TakeElevator(NavigationTask):
                     result.status,
                     max_iterations,
                     0,
+                    reason_code=result.reason_code,
+                    blocker=result.blocker,
                 )
             elif result.budget_exhausted:
                 self._navigation_budget_count += 1
@@ -1637,6 +1658,8 @@ class TakeElevator(NavigationTask):
                     result.status,
                     max_iterations,
                     self._navigation_budget_count,
+                    reason_code=result.reason_code,
+                    blocker=result.blocker,
                 )
                 context.controller.stop(reason="elevator_navigation_budget_exhausted")
                 if self._navigation_budget_count >= int(
@@ -1662,6 +1685,8 @@ class TakeElevator(NavigationTask):
                     result.status,
                     max_iterations,
                     self._navigation_unreachable_count,
+                    reason_code=result.reason_code,
+                    blocker=result.blocker,
                 )
                 context.controller.stop(reason="elevator_navigation_unreachable")
                 if self._navigation_unreachable_count >= int(
@@ -1919,6 +1944,9 @@ class TakeElevator(NavigationTask):
         result: str,
         max_iterations: int,
         attempt: int,
+        *,
+        reason_code: str | None = None,
+        blocker: dict | None = None,
     ) -> None:
         context.log_structured(
             {
@@ -1926,6 +1954,8 @@ class TakeElevator(NavigationTask):
                 "task": self.name,
                 "phase": self.phase,
                 "result": str(result),
+                "reason_code": reason_code,
+                "blocker": blocker,
                 "attempt": int(attempt),
                 "max_iterations": int(max_iterations),
                 "pose": None

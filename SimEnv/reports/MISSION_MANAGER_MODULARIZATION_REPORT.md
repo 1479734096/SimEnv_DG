@@ -486,3 +486,102 @@ ID；旧 `_try_register_local_elevator`、`_try_register_rgbd_elevator` 和
 子模块反向读取任务状态，形成第二个 `MissionManager`，违反本轮目标。下一阶段入口是固定
 `seed=8127` 的单次 Gazebo 闭环验证；运行失败时应按模块公开合同定位，不恢复已删除接口，也不
 在编排器重新实现功能。
+
+## 23. GroundSupport 生命周期合同收敛
+
+本轮针对长时测试中重复出现的“约束安装后永久存在、换层与健康事件误增 epoch、起点 veto
+按出口重复 A*、临时约束隔离被误写成探索完成”四个根因做替换式修正，不调整安全阈值，也不
+运行 Gazebo。
+
+### 23.1 证据与 epoch
+
+- `ConfirmedSupportBatch` 只逐格确认并撤销 `SupportConstraintRegion`，不再调用 Mapper 的
+  NEGATIVE 写入或清除接口；部分确认不撤销，全部来源格都由晚于最近失败 witness 的帧确认后
+  才原子撤销并递增 constraints revision。
+- `GroundSupportCoordinator` 以单一 `RLock` 串行 scope 提交、约束安装、ACK/reset、pending
+  batch 和 ShadowSupport 失效。普通换层只切 active floor，不递增 map/localization epoch。
+- ShadowSupport 的有状态帧处理也在 scope 临界区内完成，但不持 controller 锁；scope 事务
+  必须等待旧帧处理结束并随后清空旧证据，旧帧不能在失效后重新写回。
+- 每层 map epoch 只允许显式地图重建入口递增；localization epoch 由 `PoseProvider` 的 odom
+  frame identity 变化或明确时间基重置推进，健康布尔变化不再伪造连续性中断。
+- ShadowSupport 的时间高水位改为按楼层保存，scope 失效会清相应证据和高水位。
+- 同一空间 region 出现更新的失败 witness 时，全部逐格确认集随
+  `last_witness_generation` 一起重置；早于新失败的局部确认不能与后续帧拼接撤销约束。
+- Gate 的 scope 失效先清旧评估、witness 和 HOLD 上下文，再回到无评估 `CLEAR`；下一条
+  非零命令通过正常入口建立带控制时间的 fail-closed HOLD，避免伪造无命令、无进入时间的
+  `STALE_DATA_HOLD` 导致永久零速。
+
+### 23.2 规划与楼层完成
+
+- 删除“枚举每个出口并递归完整 A*”路径，改为一次 `(cell, escaped)` 状态化 A*。起点 owner
+  只在单调退出前缀内豁免，其他 region 的重叠格始终阻挡；退出后禁止重入。整个搜索共享一份
+  迭代预算，认证前缀不做 LOS 压缩。
+- Frontier 在同一地图快照上各计算一次 formal/effective 连通域，只有 effective 候选占用有限
+  A* 名额。过程性隔离只记录诊断；只有楼层准备结束时 formal 仍有目标、effective 为零、没有
+  预算未决且阻挡全部来自 support ledger，才记录无效完成证据并禁止最终 success。
+- 楼层终止证书基于当时的 `FloorGrid`、位姿和冻结 constraints 重新计算，不复用较早一次
+  frontier 选择的 debug；地图已变化而 constraints revision 未变化时不会误用陈旧证明。
+- 新增 AST 边界测试，生产中的 A* 调用必须显式传递冻结 `PlanningConstraints`；临时支撑反馈
+  模块不得出现正式 NEGATIVE 地图修改 API。
+
+### 23.3 验证与边界
+
+- GroundSupport、Planner、Frontier、MissionManager、PoseProvider 和 ShadowSupport 定向套件
+  全部通过；完整 Python 包 `656 passed`。
+- `py_compile`、生产边界、离线隔离、唯一 `/cmd_vel` publisher 和两类 diff check 通过。
+- 官方哈希仍只有既有 5 项允许差异：`auto.sh`、`docs/quick-start.md`、`FSM.h`、`FSM.cpp`、
+  `gazebo.xacro`；本轮未扩大。
+- 本轮未运行 Gazebo，不能据静态测试宣称 seed `8127` 长时二层闭环通过。后续须先独立只读
+  复核，再单独授权一次固定 seed 验证。
+
+## 24. 楼层退出证明与来源化 DROP 事务
+
+本轮继续收敛 GroundSupport 到任务编排、规划约束和正式地图之间的所有权边界，不调整 Gate、
+DROP、建图或控制阈值，也不恢复单点 BLACK、匿名 NEGATIVE 或开放式 recovery。
+
+### 24.1 楼层退出与重试
+
+- Frontier 新增冻结 `FloorTerminationEvidence`。它在同一次当前地图提取中计算 formal/effective
+  连通分量、支撑约束 revision、region IDs 和完全隔离结论；楼层退出不再混用较早的
+  `last_selection_debug`。
+- `FloorExitCertificate` 对 invalid 采用粘滞语义：同楼层首次无效证书保留，后续结果不能升级
+  或覆盖。正常 success 仍要求每个实际探索楼层都有有效证书。
+- 支撑失败按空间 region 的 `failure_count` 消费 `maximum_same_phase_replans`：EXPLORE 丢弃
+  当前 frontier，关键任务第三次同 region 通过下一任务 tick 显式返回 `FAILED`，RETURN_HOME
+  进入既有有界候选拒绝链；约束安装与精确 ACK 始终先于任务层分派。
+- MissionManager 只通过 Coordinator 的带锁 Gate transition 和冻结 region 查询入口访问反馈
+  状态，测试不再直接修改内部 feedback 或读取 `_regions`。
+
+### 24.2 来源化 DROP
+
+- ShadowSupport 输出完整连通 DROP source cluster；Gate 只锁存 scope、stamp、generation 和
+  几何完全匹配的簇。源簇缺失时保持 `SAFETY_BLOCKED`，不能退化为单点 fallback。
+- DROP 恢复事务固定为 `controller transaction -> scope lock -> Mapper atomic commit -> clear path
+  -> Gate exact ACK/reset`。只有无关键任务的 `EXPLORE_FLOOR`/`RETURN_HOME` 可以提交；门、
+  电梯等任务内 DROP 保持锁存并走显式终局。
+- `maximum_negative_obstacle_replans` 只统计首次新增簇且 ACK 成功的事务。预算耗尽在 Mapper
+  原子提交内拒绝新增并保持地图零修改；全幂等重放不递增 revision 或预算，但仍允许精确 ACK。
+- Mapper 批次要求统一 floor/frame/双 epoch/origin/resolution，任一异常整批零修改。正支撑按
+  簇跨帧累积且必须晚于 witness generation，完整覆盖全部 source cells 后才撤销 owner；OCC/
+  BLACK 仍保持显示优先级，owner 清空时同步移除隐藏 underlay。
+- 新楼层 DROP 批次先按 Mapper 固定几何和边界完成结构校验，再允许创建 `FloorGrid`；未知楼层的
+  正支撑确认只返回空结果，不会因无效输入惰性创建地图。簇 ID 必须是非空字符串，簇时间戳
+  必须为有限数。
+- 已删除 `FloorGrid.mark_negative()`、`FloorGrid.clear_negative_with_support()`、单点 BLACK DROP
+  返回类型和旧重规划接口；`confirmed_negative_cells` 只保留为只读诊断载荷，生产无消费者。
+- 返航完成但楼层退出证书缺失或无效时，结果原因分别写为
+  `floor_exit_certificate_missing` / `floor_exit_certificate_invalid`；已有定位、DROP 等更高优先级
+  失败原因保持不变，不再出现失败结果仍标记 `return_home_completed`。
+
+### 24.3 验证与剩余边界
+
+- 指定定向套件：`308 passed`，覆盖 Feedback、Gate、Mapper、Frontier 和 MissionManager；
+- 完整 Python 测试包：`673 passed`，仅有系统 `Cryptodome` 使用弃用 `imp` 模块的既有告警；
+- `py_compile`、`git diff --check`、`git diff --cached --check` 通过，生产/测试均无已删除旧接口
+  的调用；
+- `tools/offline/check_production_boundary.py` 退出码为 0；唯一 `/cmd_vel` publisher 静态审计仍为
+  `navigator.py`，定位模块只订阅该话题；
+- 官方文件哈希仍仅有既有 5 项不匹配：`auto.sh`、`docs/quick-start.md`、`FSM.h`、`FSM.cpp`、
+  `gazebo.xacro`，本轮未扩大；
+- 本轮未运行 Gazebo。上述结果证明 Python 与生产边界静态合同回归闭合；固定 `seed=8127`
+  的运行时闭环仍需独立审查后另行授权。

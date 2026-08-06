@@ -17,7 +17,7 @@ class ElevatorNavigationRuntimeTest(unittest.TestCase):
             origin_x=0.0,
             origin_y=0.0,
         ).floor(0)
-        self.grid.data[:, :] = FREE
+        self.grid.fill_base(FREE)
 
     def test_approach_candidates_only_use_traversable_hall_side_trace(self):
         elevator = SimpleNamespace(lobby_poses={0: (0.5, 2.0, 0.0)})
@@ -37,7 +37,7 @@ class ElevatorNavigationRuntimeTest(unittest.TestCase):
     def test_retreat_only_exits_initial_occ_band_along_trace(self):
         start = self.grid.world_to_grid(2.0, 2.0)
         for offset in range(3):
-            self.grid.data[start[1], start[0] - offset] = OCC
+            self.grid.mark_occupied(start[0] - offset, start[1])
 
         target = elevator_start_retreat_target(
             pose=(2.0, 2.0, 0.0),

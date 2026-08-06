@@ -11,10 +11,105 @@ from danger_search.frontier import Frontier
 from danger_search.frontier import FrontierSelectionContext
 from danger_search.frontier import _build_frontier_mask
 from danger_search.mapper import BLACK, FREE, FloorGrid, OCC, UNKNOWN, VISITED
-from danger_search.planner import PlanResult, REACHED, BUDGET_EXHAUSTED, UNREACHABLE
+from danger_search.planner import (
+    PlanResult,
+    PlanningConstraints,
+    SupportVetoRegion,
+    REACHED,
+    BUDGET_EXHAUSTED,
+    UNREACHABLE,
+)
 
 
 class FrontierExplorerTest(unittest.TestCase):
+    def test_formal_reachable_but_support_blocked_is_reported_without_astar_loop(self):
+        grid = FloorGrid(
+            floor_index=0, resolution=1.0, width=7.0, length=3.0,
+            origin_x=0.0, origin_y=0.0,
+        )
+        for gx in range(1, 6):
+            grid.set_base_state(gx, 1, FREE)
+        start = grid.grid_to_world(1, 1)
+        goal = grid.grid_to_world(5, 1)
+        frontier = Frontier(cells=((5, 1),), centroid=goal, information_gain=1.0)
+        region = SupportVetoRegion(
+            "support:1", frozenset({(3, 1)}), frozenset({(3, 0)})
+        )
+        constraints = PlanningConstraints.from_regions((region,), revision=7)
+        explorer = FrontierExplorer(
+            min_cluster_size=1, max_fallback_planning_candidates=1
+        )
+        explorer._candidate_targets_for_frontier = lambda *_args: [goal]
+        explorer._select_free_space_goal = lambda *_args, **_kwargs: (None, [])
+
+        selected, path = explorer.select_frontier(
+            grid, (start[0], start[1], 0.0),
+            frontiers=[frontier], planning_constraints=constraints,
+        )
+
+        self.assertIsNone(selected)
+        self.assertEqual(path, [])
+        evidence = explorer.support_constraint_blocked_evidence(
+            grid,
+            (start[0], start[1], 0.0),
+            constraints,
+            frontiers=[frontier],
+        )
+        self.assertIsNotNone(evidence)
+        assert evidence is not None
+        self.assertEqual(evidence.constraint_revision, 7)
+        self.assertEqual(evidence.region_ids, ("support:1",))
+        self.assertEqual(evidence.formal_reachable_count, 1)
+        self.assertEqual(evidence.effective_reachable_count, 0)
+        self.assertTrue(evidence.fully_blocked)
+
+        grid.mark_occupied(2, 1)
+        self.assertIsNone(
+            explorer.support_constraint_blocked_evidence(
+                grid,
+                (start[0], start[1], 0.0),
+                constraints,
+                frontiers=[frontier],
+            )
+        )
+
+    def test_termination_evidence_is_frozen_from_current_map_not_selection_debug(self):
+        grid = FloorGrid(
+            floor_index=0, resolution=1.0, width=7.0, length=3.0,
+            origin_x=0.0, origin_y=0.0,
+        )
+        for gx in range(1, 6):
+            grid.set_base_state(gx, 1, FREE)
+        start = grid.grid_to_world(1, 1)
+        goal = grid.grid_to_world(5, 1)
+        frontier = Frontier(cells=((5, 1),), centroid=goal, information_gain=1.0)
+        constraints = PlanningConstraints.from_regions(
+            (SupportVetoRegion(
+                "support:current", frozenset({(3, 1)}), frozenset({(3, 0)})
+            ),),
+            revision=9,
+        )
+        explorer = FrontierExplorer(min_cluster_size=1)
+        explorer._candidate_targets_for_frontier = lambda *_args: [goal]
+        explorer.last_selection_debug = SimpleNamespace(
+            formal_reachable_count=99,
+            effective_reachable_count=98,
+            constraints_revision=1,
+        )
+
+        evidence = explorer.floor_termination_evidence(
+            grid,
+            (start[0], start[1], 0.0),
+            constraints,
+            frontiers=[frontier],
+        )
+
+        self.assertEqual(evidence.constraint_revision, 9)
+        self.assertEqual(evidence.region_ids, ("support:current",))
+        self.assertEqual(evidence.formal_reachable_count, 1)
+        self.assertEqual(evidence.effective_reachable_count, 0)
+        self.assertTrue(evidence.fully_blocked)
+
     def test_invalid_configuration_is_rejected(self):
         with self.assertRaises(ValueError):
             FrontierExplorer(min_cluster_size=0)
@@ -53,11 +148,11 @@ class FrontierExplorerTest(unittest.TestCase):
             origin_y=-2.5,
         )
         rng = np.random.default_rng(42)
-        grid.data[:] = rng.choice(
+        grid.load_legacy_data(rng.choice(
             [UNKNOWN, FREE, VISITED, BLACK, OCC],
             size=grid.data.shape,
             p=[0.35, 0.30, 0.15, 0.05, 0.15],
-        )
+        ))
 
         expected = np.zeros_like(grid.data, dtype=bool)
         for gy in range(1, grid.size_y - 1):
@@ -212,7 +307,7 @@ class FrontierExplorerTest(unittest.TestCase):
         self._mark_free_rect(grid, 1, 5, 5, 5)
         self._mark_free_rect(grid, 5, 9, 3, 7)
         grid.mark_occupied(9, 5)
-        grid.data[4, 9] = BLACK
+        grid.mark_black(9, 4, owner="test:frontier_clearance")
 
         explorer = FrontierExplorer(
             min_cluster_size=1,
@@ -327,7 +422,7 @@ class FrontierExplorerTest(unittest.TestCase):
         for gy in range(grid.size_y):
             for gx in range(grid.size_x):
                 grid.mark_free(gx, gy)
-        grid.data[2, 2] = UNKNOWN
+        grid.set_base_state(2, 2, UNKNOWN)
         explorer = FrontierExplorer(min_cluster_size=1)
 
         frontier, path = explorer._select_free_space_goal(grid, (0.0, 0.0, 0.0))
@@ -562,10 +657,21 @@ class FrontierExplorerTest(unittest.TestCase):
             switch_score_margin=20.0,
         )
 
-        def fake_astar(_grid, start, goal, max_iterations=None):
+        def fake_astar(_grid, start, goal, max_iterations=None, **_kwargs):
             return PlanResult(path=[start, goal], status=REACHED)
 
-        with patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
+        all_free = frozenset(
+            (gx, gy)
+            for gy in range(grid.size_y)
+            for gx in range(grid.size_x)
+            if grid.data[gy, gx] in (FREE, VISITED)
+        )
+        with patch(
+            "danger_search.frontier.astar_plan", side_effect=fake_astar
+        ), patch(
+            "danger_search.frontier.reachable_traversable_component",
+            return_value=all_free,
+        ):
             frontier, path = explorer.select_frontier(grid, (0.0, 0.0, 0.0), selection_context=context)
 
         self.assertIsNotNone(frontier)
@@ -597,7 +703,7 @@ class FrontierExplorerTest(unittest.TestCase):
         recorded_failures: list[tuple[float, float]] = []
         explorer.record_failure = lambda g, xy: recorded_failures.append(xy)
 
-        def fake_astar(_grid, start, goal, max_iterations=None):
+        def fake_astar(_grid, start, goal, max_iterations=None, **_kwargs):
             return PlanResult(status=BUDGET_EXHAUSTED)
 
         with patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
@@ -673,7 +779,7 @@ class FrontierExplorerTest(unittest.TestCase):
         recorded_failures: list[tuple[float, float]] = []
         explorer.record_failure = lambda g, xy: recorded_failures.append(xy)
 
-        def fake_astar(_grid, start, goal, max_iterations=None):
+        def fake_astar(_grid, start, goal, max_iterations=None, **_kwargs):
             return PlanResult(status=UNREACHABLE)
 
         with patch("danger_search.frontier.astar_plan", side_effect=fake_astar):
@@ -750,7 +856,7 @@ class FrontierExplorerTest(unittest.TestCase):
             information_gain=10.0,
         )
 
-        def fake_astar(_grid, start, goal, max_iterations=None):
+        def fake_astar(_grid, start, goal, max_iterations=None, **_kwargs):
             # 弯曲路径：0 -> (0.2, 0.18) -> (0.31, 0)，路径长度 > 0.38
             return PlanResult(
                 path=[start, (0.2, 0.18), goal],
@@ -803,7 +909,7 @@ class FrontierExplorerTest(unittest.TestCase):
             information_gain=10.0,
         )
 
-        def fake_astar(_grid, start, goal, max_iterations=None):
+        def fake_astar(_grid, start, goal, max_iterations=None, **_kwargs):
             return PlanResult(path=[start, goal], status=REACHED)
 
         with patch.object(
@@ -906,7 +1012,7 @@ class FrontierExplorerTest(unittest.TestCase):
             information_gain=10.0,
         )
 
-        def fake_astar(_grid, start, goal, max_iterations=None):
+        def fake_astar(_grid, start, goal, max_iterations=None, **_kwargs):
             return PlanResult(path=[start, goal], status=REACHED)
 
         with patch.object(
@@ -950,7 +1056,7 @@ class FrontierExplorerTest(unittest.TestCase):
             information_gain=10.0,
         )
 
-        def fake_astar(_grid, start, goal, max_iterations=None):
+        def fake_astar(_grid, start, goal, max_iterations=None, **_kwargs):
             return PlanResult(path=[start, goal], status=REACHED)
 
         with patch.object(
@@ -984,7 +1090,7 @@ class FrontierExplorerTest(unittest.TestCase):
         target = (0.35, 0.0)
         frontier = Frontier(cells=((20, 20),), centroid=target, information_gain=10.0)
 
-        def fake_astar(_grid, start, goal, max_iterations=None):
+        def fake_astar(_grid, start, goal, max_iterations=None, **_kwargs):
             return PlanResult(path=[start, goal], status=REACHED)
 
         with patch.object(explorer, "_candidate_targets_for_frontier", return_value=[target]), \
@@ -1006,7 +1112,7 @@ class FrontierExplorerTest(unittest.TestCase):
         target = (0.36, 0.0)
         frontier = Frontier(cells=((20, 20),), centroid=target, information_gain=10.0)
 
-        def fake_astar(_grid, start, goal, max_iterations=None):
+        def fake_astar(_grid, start, goal, max_iterations=None, **_kwargs):
             return PlanResult(path=[start, goal], status=REACHED)
 
         with patch.object(explorer, "_candidate_targets_for_frontier", return_value=[target]), \
@@ -1029,7 +1135,7 @@ class FrontierExplorerTest(unittest.TestCase):
         frontier_a = Frontier(cells=((10, 10),), centroid=(0.20, 0.0), information_gain=5.0)
         frontier_b = Frontier(cells=((60, 60),), centroid=(3.0, 3.0), information_gain=8.0)
 
-        def fake_astar(_grid, start, goal, max_iterations=None):
+        def fake_astar(_grid, start, goal, max_iterations=None, **_kwargs):
             return PlanResult(path=[start, goal], status=REACHED)
 
         with patch.object(explorer, "extract_frontiers", return_value=[frontier_a, frontier_b]), \
@@ -1066,7 +1172,7 @@ class FrontierExplorerTest(unittest.TestCase):
         frontier = Frontier(cells=((20, 20),), centroid=(0.20, 0.0), information_gain=10.0)
 
         astar_calls = []
-        def fake_astar(_grid, start, goal, max_iterations=None):
+        def fake_astar(_grid, start, goal, max_iterations=None, **_kwargs):
             astar_calls.append(goal)
             return PlanResult(path=[start, goal], status=REACHED)
 
@@ -1117,7 +1223,7 @@ class FrontierExplorerTest(unittest.TestCase):
         recorded_failures = []
         explorer.record_failure = lambda _grid, goal: recorded_failures.append(goal)
 
-        def fake_astar(_grid, start, goal, max_iterations=None):
+        def fake_astar(_grid, start, goal, max_iterations=None, **_kwargs):
             astar_goals.append(goal)
             return PlanResult(path=[start, goal], status=REACHED)
 

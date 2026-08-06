@@ -1,3 +1,5 @@
+import ast
+from pathlib import Path
 import unittest
 from types import SimpleNamespace
 
@@ -22,6 +24,48 @@ from danger_search.perception_runtime import (
 from danger_search.perception_mapping_runtime import PerceptionMappingRuntime
 from danger_search.pose_provider import POSE_MATCHED, POSE_PENDING
 from danger_search.return_home_runtime import ReturnHomeRuntime
+
+
+class PlanningConstraintBoundaryTest(unittest.TestCase):
+    def test_all_production_astar_callers_supply_frozen_constraints(self):
+        package = Path(__file__).resolve().parents[1] / "danger_search"
+        callers = (
+            "mission_manager.py",
+            "return_home_runtime.py",
+            "exploration_runtime.py",
+            "door_navigation_runtime.py",
+            "frontier.py",
+            "return_home_planner.py",
+        )
+        missing = []
+        for name in callers:
+            path = package / name
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                if not isinstance(node.func, ast.Name) or node.func.id != "astar_plan":
+                    continue
+                if not any(keyword.arg == "constraints" for keyword in node.keywords):
+                    missing.append(f"{name}:{node.lineno}")
+        self.assertEqual(missing, [])
+
+    def test_ground_support_feedback_has_no_formal_map_mutation_api(self):
+        package = Path(__file__).resolve().parents[1] / "danger_search"
+        sources = "\n".join(
+            (package / name).read_text(encoding="utf-8")
+            for name in (
+                "ground_support_runtime.py",
+                "ground_support_coordinator.py",
+            )
+        )
+        self.assertNotIn("clear_negative_cells_with_support", sources)
+        self.assertNotIn("mark_negative_cells", sources)
+        self.assertNotIn("apply_map_updates", sources)
+
+        mapper_source = (package / "mapper.py").read_text(encoding="utf-8")
+        self.assertNotIn("def mark_negative(", mapper_source)
+        self.assertNotIn("def clear_negative_with_support(", mapper_source)
 
 
 class _Stamp:
@@ -240,6 +284,9 @@ class MapUpdateRuntimeTest(unittest.TestCase):
         )
         result = runtime.update_cloud(
             floor_index=0,
+            cloud_generation=1,
+            map_epoch=1,
+            localization_epoch=1,
             robot_xyz=(0.0, 0.0, 0.3),
             robot_pose=(0.0, 0.0, 0.0),
             points=[(0.4, 0.0, 0.4), (0.8, 0.7, 0.4)],
@@ -287,6 +334,8 @@ class PerceptionMappingRuntimeTest(unittest.TestCase):
         committed = runtime.commit_cloud(
             preparation,
             floor_index=0,
+            map_epoch=1,
+            localization_epoch=1,
             cloud_max_points=100,
             cloud_stride=1,
             opened_door_exclusion=None,
@@ -308,6 +357,8 @@ class PerceptionMappingRuntimeTest(unittest.TestCase):
             runtime.commit_cloud(
                 CloudPreparation(INPUT_INVALID, None, None, object()),
                 floor_index=0,
+                map_epoch=1,
+                localization_epoch=1,
                 cloud_max_points=100,
                 cloud_stride=1,
                 opened_door_exclusion=None,
@@ -380,6 +431,7 @@ class MissionStateOwnerTest(unittest.TestCase):
             mapper=object(),
             building_client=object(),
             current_floor=0,
+            planning_constraints=None,
             door_pass_max_linear=None,
             open_door_geometry_refresh_enabled=True,
             elevator_geometry_refresh_enabled=True,
@@ -402,6 +454,8 @@ class MissionStateOwnerTest(unittest.TestCase):
             recover_with_rotation_clearance_fn=lambda _reason: True,
             elevator_start_retreat_target_fn=lambda *_args: None,
             elevator_approach_trace_candidates_fn=lambda *_args, **_kwargs: (),
+            plan_path_fn=lambda *_args, **_kwargs: None,
+            segment_is_traversable_fn=lambda *_args, **_kwargs: True,
         )
         self.assertEqual(context.refresh_open_door_geometry("door", (0, 0, 0)), "running")
         self.assertEqual(

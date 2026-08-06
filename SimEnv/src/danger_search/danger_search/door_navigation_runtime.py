@@ -87,6 +87,7 @@ class DoorNavigationRuntime:
         building_client,
         pass_offset: float,
         now: float,
+        planning_constraints=None,
     ) -> str | None:
         doors = self.unopened_doors(
             floor_index=floor_index,
@@ -107,7 +108,9 @@ class DoorNavigationRuntime:
                 )
             except ValueError:
                 continue
-            result = astar_plan(grid, robot_xy, wait_point)
+            result = astar_plan(
+                grid, robot_xy, wait_point, constraints=planning_constraints
+            )
             if result.reached:
                 length = path_length(result.path)
                 if length < best_length:

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import time
 
 import numpy as np
@@ -52,7 +52,14 @@ from danger_search.ground_support_runtime import (
 )
 from .time_utils import get_time
 from danger_search.navigator import DONE, IDLE, RUNNING, STUCK, PathFollower
-from danger_search.planner import BUDGET_EXHAUSTED, astar_path, astar_plan, path_length
+from danger_search.planner import (
+    BUDGET_EXHAUSTED,
+    DEFAULT_MAX_ITERATIONS,
+    astar_path,
+    astar_plan,
+    path_length,
+    segment_is_traversable,
+)
 from danger_search.mapper import (
     BLACK,
     FREE,
@@ -152,13 +159,27 @@ def _return_reason_indicates_exploration_complete(reason: str | None) -> bool:
     return reason in EXPLORATION_COMPLETE_RETURN_REASONS
 
 
-class MissionManager:
-    """Timer 驱动的顶层编排器，拥有一次任务的全部可变运行状态。
+@dataclass(frozen=True)
+class FloorExitCertificate:
+    """楼层离开时冻结的规划事实；正常成功必须覆盖全部已探索楼层。"""
 
-    组件所有权集中在这里：传感器和定位提供事实，Mapper/Detector 生成环境
-    表示，Frontier/Planner 选择目标，PathFollower 是唯一速度发送入口。
-    ``MissionManager`` 只在定时器回调中推进业务状态，服务等待由任务对象内部
-    的异步调用表示，从而避免卡住传感器回调和安全停车逻辑。
+    floor: int
+    map_epoch: int
+    localization_epoch: int
+    constraint_revision: int
+    reason_code: str
+    formal_reachable_count: int
+    effective_reachable_count: int
+    region_ids: tuple[str, ...]
+    valid: bool
+
+
+class MissionManager:
+    """Timer 驱动的顶层任务编排器。
+
+    本类只拥有任务状态、预算和终局语义；感知、地图、安全证据与规划约束均由
+    专用组件持有，并以冻结快照或 directive 交付。PathFollower 仍是唯一速度
+    发送入口，异步服务与规划结果只在主 tick 中应用。
     """
 
     def __init__(
@@ -201,6 +222,9 @@ class MissionManager:
         self._return_home_main_entrance_crossed = False
         self._return_home = ReturnHomeRuntime()
         self._mission_success_eligible = True
+        self._invalid_floor_completion_evidence: list[dict[str, object]] = []
+        self._floor_exit_certificates: dict[int, FloorExitCertificate] = {}
+        self._explored_floor_ids: set[int] = set()
         self._normal_completion = False
         self._terminal_outcome = "running"
         self._terminal_reason: str | None = None
@@ -211,6 +235,7 @@ class MissionManager:
         self._result_write_call_site: str | None = None
         self._last_shutdown_diagnostic: dict[str, object] | None = None
         self._return_home_success = False
+        self._forced_task_failure_reason: str | None = None
         self._elevator_success: bool | None = None
         self._timeout_triggered = False
         self._failure_reasons: list[str] = []
@@ -322,24 +347,12 @@ class MissionManager:
         return self._ground_support.grid
 
     @property
-    def _ground_support_runtime(self):
-        return self._ground_support.feedback
-
-    @property
     def _ground_support_map_epoch(self) -> int:
         return self._ground_support.map_epoch
-
-    @_ground_support_map_epoch.setter
-    def _ground_support_map_epoch(self, value: int) -> None:
-        self._ground_support.map_epoch = int(value)
 
     @property
     def _ground_support_localization_epoch(self) -> int:
         return self._ground_support.localization_epoch
-
-    @_ground_support_localization_epoch.setter
-    def _ground_support_localization_epoch(self, value: int) -> None:
-        self._ground_support.localization_epoch = int(value)
 
     @property
     def _floor_transition_guard(self):
@@ -371,6 +384,7 @@ class MissionManager:
             mapper=self.mapper,
             building_client=self.building_client,
             current_floor=int(self.current_floor),
+            planning_constraints=self._planning_constraints(),
             door_pass_max_linear=getattr(self, "door_pass_max_linear", None),
             open_door_geometry_refresh_enabled=True,
             elevator_geometry_refresh_enabled=True,
@@ -399,6 +413,34 @@ class MissionManager:
             recover_with_rotation_clearance_fn=self._recover_with_rotation_clearance,
             elevator_start_retreat_target_fn=self.elevator_start_retreat_target,
             elevator_approach_trace_candidates_fn=self.elevator_approach_trace_candidates,
+            plan_path_fn=self._plan_path,
+            segment_is_traversable_fn=self._segment_is_traversable,
+        )
+
+    def _planning_constraints(self):
+        return self._ground_support.planning_constraints(self.current_floor)
+
+    def _plan_path(
+        self,
+        grid,
+        start_xy,
+        goal_xy,
+        max_iterations=DEFAULT_MAX_ITERATIONS,
+    ):
+        return astar_plan(
+            grid,
+            start_xy,
+            goal_xy,
+            max_iterations=max_iterations,
+            constraints=self._planning_constraints(),
+        )
+
+    def _segment_is_traversable(self, grid, start_xy, end_xy) -> bool:
+        return segment_is_traversable(
+            grid,
+            start_xy,
+            end_xy,
+            constraints=self._planning_constraints(),
         )
 
     def building_services_required(self) -> bool:
@@ -509,16 +551,8 @@ class MissionManager:
         stamp_value = float(stamp)
         if not math.isfinite(stamp_value):
             return
-        previous = self._localization_health
         self._localization_health = bool(value)
         self._localization_health_stamp = stamp_value
-        if previous is not None and previous != self._localization_health:
-            self._ground_support_localization_epoch += 1
-            gate = self._ground_support_gate
-            invalidate = getattr(gate, "invalidate_assessment", None)
-            if callable(invalidate):
-                with _controller_command_transaction(self.controller):
-                    invalidate()
         if not self._localization_health:
             MissionReportingRuntime.logwarn_throttle(
                 2.0,
@@ -764,6 +798,12 @@ class MissionManager:
         pose_provider = getattr(self, "pose_provider", None)
         latest_pose = getattr(pose_provider, "latest", None)
         pose_sample = latest_pose() if callable(latest_pose) else None
+        continuity_epoch = getattr(pose_provider, "continuity_epoch", None)
+        if continuity_epoch is not None:
+            with _controller_command_transaction(self.controller):
+                self._ground_support.synchronize_localization_epoch(
+                    int(continuity_epoch)
+                )
         if not self._apply_localization_progress_decision(pose_sample):
             return
         pose = pose_sample.xy_yaw
@@ -776,23 +816,20 @@ class MissionManager:
         self._sync_ground_support_task_context(pose)
         self._ground_support.observe_odometry(self.controller, pose_sample)
         self._update_mapping_and_detection(snapshot, pose, xyz, pose_sample)
-        map_update = self._ground_support.apply_map_updates(self.mapper)
-        if map_update.changed:
+        constraint_update = self._ground_support.apply_confirmed_support(self.mapper)
+        if constraint_update.revoked_region_ids:
             self._log_structured(
                 {
-                    "event": "ground_support_map_update",
+                    "event": "ground_support_constraint_revoked",
                     "elapsed": round(float(self._elapsed()), 3),
-                    "negative_added": map_update.negative_added,
-                    "negative_cleared_by_support": (
-                        map_update.negative_cleared_by_support
-                    ),
+                    "region_ids": list(constraint_update.revoked_region_ids),
                 }
             )
         if self._handle_ground_support_control(pose):
             return
 
         if self.current_task is not None:
-            status = self.current_task.tick(self.navigation_task_context(), pose)
+            status = self._tick_current_task_status(pose)
             if status in (DONE, FAILED):
                 completed_task_name = getattr(self.current_task, "name", type(self.current_task).__name__)
                 completed_task_phase = getattr(self.current_task, "phase", None)
@@ -909,6 +946,8 @@ class MissionManager:
             pose,
             controller=self.controller,
             max_linear=self.main_entrance_clearance_max_linear,
+            grid=self.mapper.floor(self.current_floor),
+            segment_is_traversable=self._segment_is_traversable,
         )
         if clearance_result.failed:
             self._apply_initial_entry_clearance_failure(clearance_result.target)
@@ -982,14 +1021,8 @@ class MissionManager:
         )
         if guard is None:
             return
-        self._ground_support_map_epoch = (
-            int(getattr(self, "_ground_support_map_epoch", 0)) + 1
-        )
-        support_gate = getattr(self, "_ground_support_gate", None)
-        invalidate_support = getattr(support_gate, "invalidate_assessment", None)
-        if callable(invalidate_support):
-            with _controller_command_transaction(self.controller):
-                invalidate_support()
+        with _controller_command_transaction(self.controller):
+            self._ground_support.invalidate_active_assessment()
         self._log_structured(
             {
                 "event": "floor_transition_ambiguous_enter",
@@ -1021,12 +1054,8 @@ class MissionManager:
         )
         self.current_floor = target_floor
         self.floor_start_time = get_time()
-        self._ground_support_map_epoch = (
-            int(getattr(self, "_ground_support_map_epoch", 0)) + 1
-        )
-        self._ground_support_localization_epoch = (
-            int(getattr(self, "_ground_support_localization_epoch", 0)) + 1
-        )
+        with _controller_command_transaction(self.controller):
+            self._ground_support.activate_floor(target_floor)
         self._log_structured(
             {
                 "event": "floor_transition_sensor_confirmed",
@@ -1071,11 +1100,8 @@ class MissionManager:
         )
         guard = self._floor_transition_runtime.snapshot
         if decision.entered and guard is not None:
-            support_gate = getattr(self, "_ground_support_gate", None)
-            invalidate_support = getattr(support_gate, "invalidate_assessment", None)
-            if callable(invalidate_support):
-                with _controller_command_transaction(self.controller):
-                    invalidate_support()
+            with _controller_command_transaction(self.controller):
+                self._ground_support.invalidate_active_assessment()
             self._log_structured(
                 {
                     "event": "floor_transition_ambiguous_enter",
@@ -1312,16 +1338,15 @@ class MissionManager:
                 cloud_commit = self._perception_mapping.commit_cloud(
                     cloud_preparation,
                     floor_index=self.current_floor,
+                    map_epoch=self._ground_support.map_epoch_for_floor(
+                        self.current_floor
+                    ),
+                    localization_epoch=self._ground_support.localization_epoch,
                     cloud_max_points=self.cloud_max_points,
                     cloud_stride=self.cloud_stride,
                     opened_door_exclusion=self._active_opened_door_obstacle_exclusion(),
                 )
                 cloud_result = cloud_commit.map_result
-                if getattr(self, "_ground_support_gate", None) is not None:
-                    self._ground_support.reapply_black_marks(
-                        self.mapper,
-                        self.current_floor,
-                    )
                 if estimated_floor != self.current_floor:
                     current_task = getattr(self, "current_task", None)
                     mismatch_key = (
@@ -1571,7 +1596,7 @@ class MissionManager:
         )
         if transition_ambiguous:
             with _controller_command_transaction(self.controller):
-                gate.invalidate_assessment()
+                self._ground_support.invalidate_active_assessment()
             return
         points = self._perception_runtime.read_cloud_xyz(
             cloud_input,
@@ -1587,6 +1612,7 @@ class MissionManager:
             pose_sample=pose_sample,
             points=points,
             cloud_stamp=cloud_stamp,
+            cloud_generation=cloud_generation,
         )
 
 
@@ -1597,7 +1623,6 @@ class MissionManager:
         gate = getattr(self, "_ground_support_gate", None)
         if gate is None:
             return False
-        runtime = self._ground_support_runtime
         with _controller_command_transaction(self.controller):
             check_control_timeout = getattr(gate, "check_control_timeout", None)
             if callable(check_control_timeout):
@@ -1610,7 +1635,7 @@ class MissionManager:
             gate_snapshot = gate.snapshot()
             if state != GROUND_SUPPORT_CLEAR:
                 self.controller.stop(reason=reason)
-        transition = runtime.observe_gate_state(state)
+        transition = self._ground_support.observe_gate_transition(state)
         if transition.changed:
             self._log_structured(
                 {
@@ -1634,30 +1659,28 @@ class MissionManager:
             return True
 
         if action == GROUND_SUPPORT_ACTION_NEGATIVE_OBSTACLE:
-            replan = self._ground_support.resume_negative_obstacle(
+            persisted = self._ground_support.persist_latched_drop_clusters(
                 controller=self.controller,
                 mapper=self.mapper,
                 floor_index=self.current_floor,
                 mission_state=self.state,
                 task_active=self.current_task is not None,
                 ordinary_states=frozenset({EXPLORE_FLOOR, RETURN_HOME}),
-                map_resolution=float(self.map_params["resolution"]),
             )
-            if replan is not None:
+            if persisted is not None:
                 self.current_frontier = None
                 self._exploration.last_frontier_target = None
                 self._exploration.last_frontier_score = None
                 self._exploration.last_frontier_used_fallback = False
                 self._log_structured(
                     {
-                        "event": "negative_obstacle_local_replan",
+                        "event": "negative_clusters_persisted",
                         "elapsed": round(float(self._elapsed()), 3),
-                        "floor": replan.floor,
+                        "floor": persisted.floor,
                         "mission_state": self.state,
-                        "drop_point_world": list(replan.point_world),
-                        "black_radius": replan.black_radius,
-                        "attempt": replan.attempt,
-                        "maximum_attempts": replan.maximum_attempts,
+                        "cluster_ids": list(persisted.cluster_ids),
+                        "source_cell_count": persisted.source_cell_count,
+                        "map_revision": persisted.map_revision,
                         "ordinary_recover_called": False,
                     }
                 )
@@ -1680,99 +1703,72 @@ class MissionManager:
             interrupted_task = self.current_task
             task_phase = getattr(interrupted_task, "phase", None)
             interrupted_frontier_target = self._exploration.last_frontier_target
-            if (
-                reason == "ground_support_path_unavailable"
-                and interrupted_task is None
-                and self.state in {EXPLORE_FLOOR, RETURN_HOME}
-            ):
-                boundary_world = tuple(
-                    getattr(gate, "latched_boundary_cells_world", ()) or ()
-                )
-                boundary_cells = {
-                    cell
-                    for point in boundary_world
-                    if len(point) >= 2
-                    for cell in [
-                        self.mapper.floor(self.current_floor).world_to_grid(
-                            float(point[0]), float(point[1])
-                        )
-                    ]
-                    if cell is not None
-                }
-                if boundary_cells:
-                    added = self.mapper.mark_negative_cells(
-                        self.current_floor, boundary_cells
-                    )
-                    self.current_frontier = None
-                    self._exploration.last_frontier_target = None
-                    self._log_structured(
-                        {
-                            "event": "ground_support_boundary_persisted",
-                            "elapsed": round(float(self._elapsed()), 3),
-                            "floor": self.current_floor,
-                            "cell_count": len(boundary_cells),
-                            "new_negative_count": added,
-                        }
-                    )
             if interrupted_task is not None:
-                retry_key = ("task", id(interrupted_task), task_phase)
+                context_key = ("task", getattr(interrupted_task, "name", ""), task_phase)
             elif interrupted_frontier_target is not None:
-                retry_key = (
+                context_key = (
                     "frontier",
                     round(float(interrupted_frontier_target[0]), 3),
                     round(float(interrupted_frontier_target[1]), 3),
                 )
             else:
-                retry_key = ("state", self.state)
-            retry_count = runtime.record_path_retry(retry_key)
-
-            self.controller.clear_path(reason=reason)
-            maximum_replans = max(
-                0,
-                int(
-                    getattr(self, "ground_support_params", {}).get(
-                        "maximum_same_phase_replans",
-                        2,
-                    )
-                ),
+                context_key = ("state", self.state)
+            directive = self._ground_support.install_path_constraint(
+                context_key=context_key,
+                controller=self.controller,
             )
-            log_structured = getattr(self, "_log_structured", None)
-            if callable(log_structured):
-                log_structured(
-                    {
-                        "event": "ground_support_path_replan",
-                        "reason_code": reason,
-                        "task": getattr(interrupted_task, "name", None),
-                        "task_phase": task_phase,
-                        "active_door": self.active_door,
-                        "attempt": retry_count,
-                        "maximum_same_phase_replans": maximum_replans,
-                        "parent_task_preserved": interrupted_task is not None,
-                    }
-                )
-            if retry_count > maximum_replans:
-                exhausted_reason = "ground_support_path_replan_exhausted"
-                self._record_failure(exhausted_reason)
+            if directive.action != "constraint_installed":
+                self._record_failure(directive.reason_code)
                 self._mission_success_eligible = False
                 if self.state not in (WRITE_RESULT, FINISH, MISSION_FAILED):
                     self._transition_state(
                         WRITE_RESULT,
-                        reason_code=exhausted_reason,
+                        reason_code=directive.reason_code,
                         call_site=(
                             "MissionManager._handle_ground_support_control:"
-                            "path_replan_exhausted"
+                            "constraint_install_failed"
                         ),
-                        diagnostic_context={
-                            "task": getattr(interrupted_task, "name", None),
-                            "task_phase": task_phase,
-                            "active_door": self.active_door,
-                            "attempt": retry_count,
-                        },
                     )
                 return True
-            with _controller_command_transaction(self.controller):
-                gate.reset_path_unavailable()
-                runtime.synchronize_gate_state(gate.state)
+            self.controller.clear_path(reason=reason)
+            maximum_replans = max(
+                0,
+                int(self.ground_support_params.get("maximum_same_phase_replans", 2)),
+            )
+            region_exhausted = int(directive.failure_count) > maximum_replans
+            if interrupted_task is None and self.state == EXPLORE_FLOOR:
+                self.current_frontier = None
+                self._exploration.last_frontier_target = None
+                self._exploration.last_frontier_score = None
+                self._exploration.last_frontier_used_fallback = False
+            elif interrupted_task is not None and region_exhausted:
+                self._forced_task_failure_reason = (
+                    "ground_support_constraint_exhausted"
+                )
+            elif (
+                interrupted_task is None
+                and self.state == RETURN_HOME
+                and region_exhausted
+            ):
+                self._return_home.candidate_reject_count += 1
+                if self._return_home.candidate_reject_count >= int(
+                    getattr(self, "return_home_max_candidate_rejects", 3)
+                ):
+                    self._fail_return_home_stuck(
+                        reason_code="return_home_stuck_exhausted"
+                    )
+            self._log_structured(
+                {
+                    "event": "ground_support_constraint_installed",
+                    "reason_code": reason,
+                    "region_id": directive.region_id,
+                    "failure_count": directive.failure_count,
+                    "task": getattr(interrupted_task, "name", None),
+                    "task_phase": task_phase,
+                    "context_key": list(context_key),
+                    "parent_task_preserved": interrupted_task is not None,
+                }
+            )
             return True
         return True
 
@@ -1849,7 +1845,9 @@ class MissionManager:
         if home_pose is None:
             return float(getattr(self, "max_runtime", 840.0))
         grid = self.mapper.floor(self.current_floor)
-        result = astar_plan(grid, (pose[0], pose[1]), (home_pose[0], home_pose[1]))
+        result = self._plan_path(
+            grid, (pose[0], pose[1]), (home_pose[0], home_pose[1])
+        )
         if result.reached and result.path:
             distance = path_length(result.path)
         else:
@@ -1873,6 +1871,167 @@ class MissionManager:
             lobby_poses = getattr(elevator, "lobby_poses", {})
             if target_floor in lobby_poses and self.current_floor in lobby_poses:
                 return True
+        return False
+
+    def _elevator_route_ready_check(
+        self,
+        pose: tuple[float, float, float],
+    ) -> tuple[bool, str | None, object | None]:
+        """换层前路线就绪预检：电梯等待点在当前已知地图上 A* 是否可达。
+
+        只使用当前合法 FloorGrid 与已注册电梯几何，不读取 layout/world；
+        A* 沿用正式 constraints，UNKNOWN 不可通行（fail-closed）。
+        返回 (ready, reason, blocker)。
+        """
+        if self.current_floor + 1 >= self.max_floor:
+            return True, None, None
+        building_client = getattr(self, "building_client", None)
+        if building_client is None:
+            return False, "no_usable_elevator", None
+        elevators = getattr(building_client, "elevators", {})
+        target_floor = self.current_floor + 1
+        elevator_id = None
+        for elevator_id_candidate, elevator in elevators.items():
+            lobby_poses = getattr(elevator, "lobby_poses", {})
+            if (
+                target_floor in lobby_poses
+                and self.current_floor in lobby_poses
+            ):
+                elevator_id = elevator_id_candidate
+                break
+        if elevator_id is None:
+            return False, "no_usable_elevator", None
+        try:
+            wait_point, _ = building_client.get_elevator_points(
+                elevator_id, self.current_floor
+            )
+        except (ValueError, TypeError):
+            return False, "elevator_points_unavailable", None
+        grid = self.mapper.floor(self.current_floor)
+        result = astar_plan(
+            grid,
+            (float(pose[0]), float(pose[1])),
+            (float(wait_point[0]), float(wait_point[1])),
+            constraints=self._planning_constraints(),
+        )
+        start_xy = (float(pose[0]), float(pose[1]))
+        goal_xy = (float(wait_point[0]), float(wait_point[1]))
+        if result.reached:
+            # 防止 A* 目标吸附假可达：目标不可通行时 A* 会把目标吸附到
+            # 附近最近可通行格（起点也参与吸附），path 终点会远离真实目标。
+            # 只有路径终点真正贴近电梯等待点才算就绪。
+            if result.path:
+                end = result.path[-1]
+                if (
+                    math.hypot(end[0] - goal_xy[0], end[1] - goal_xy[1])
+                    <= getattr(self, "elevator_route_goal_tolerance", 0.5)
+                ):
+                    return True, None, None
+            # 吸附假可达：目标区域实际不可达，进入 UNKNOWN/硬障碍分类。
+            if self._optimistic_unknown_route_reachable(grid, start_xy, goal_xy):
+                return False, "unknown_blocked", None
+            return False, "goal_region_blocked", None
+        if result.reason_code == "open_set_exhausted":
+            # 区分 UNKNOWN 阻断与硬障碍围堵：把 UNKNOWN 当可穿后若乐观可达，
+            # 则阻断源于未探索区域（延后探索可解）；否则是真实硬障碍（fail-closed）。
+            if self._optimistic_unknown_route_reachable(grid, start_xy, goal_xy):
+                return False, "unknown_blocked", result.blocker
+        return False, result.reason_code, result.blocker
+
+    def _optimistic_unknown_route_reachable(
+        self,
+        grid,
+        start_xy: tuple[float, float],
+        goal_xy: tuple[float, float],
+    ) -> bool:
+        """乐观可达性：副本中将 UNKNOWN 视为可通行（不改正式地图），
+        仅用于把 open_set_exhausted 分类为 UNKNOWN 阻断或真实硬障碍。
+        障碍核心/膨胀与 BLACK/NEGATIVE 语义在副本中保持，仍不可穿。
+        """
+        optimistic = grid.copy()
+        for gy in range(optimistic.size_y):
+            for gx in range(optimistic.size_x):
+                if int(optimistic.base[gy, gx]) == UNKNOWN:
+                    optimistic.set_base_state(gx, gy, FREE)
+        result = astar_plan(
+            optimistic,
+            start_xy,
+            goal_xy,
+            constraints=None,
+        )
+        return result.reached
+
+    def _floor_change_route_ready(
+        self,
+        floor_elapsed: float,
+        pose: tuple[float, float, float],
+        *,
+        decision_reason: str,
+    ) -> bool:
+        """换层前路线就绪门：FINISH_FLOOR 的统一前置不变量。
+
+        - 未到检查点（floor_elapsed < floor_timeout×route_check_ratio）直接放行；
+        - 电梯等待点 A* 可达 → 放行换层；
+        - UNKNOWN 阻断（open_set_exhausted）→ 延后换层继续探索；预算裁剪
+          （effective_guidance_time < 15s）后显式失败 elevator_route_not_ready，
+          不盲目进入 TakeElevator；
+        - HIGH_HARD/支撑约束/起点逃逸等其他不可达 → fail-closed 显式失败，
+          记录 blocker，不把楼层标记为完成。
+        """
+        check_point = self.floor_timeout * self.route_check_ratio
+        if floor_elapsed < check_point:
+            return True
+        ready, reason, blocker = self._elevator_route_ready_check(pose)
+        if ready:
+            return True
+        if reason != "unknown_blocked":
+            self._record_failure(
+                "elevator_route_not_ready_%s" % (reason or "blocked")
+            )
+            self._transition_state(
+                WRITE_RESULT,
+                reason_code="elevator_route_not_ready",
+                call_site="MissionManager._floor_change_route_ready",
+                diagnostic_context={
+                    "decision_reason": decision_reason,
+                    "route_reason": reason,
+                    "blocker": (
+                        dict(blocker) if isinstance(blocker, dict) else None
+                    ),
+                    "floor_elapsed": round(float(floor_elapsed), 2),
+                },
+            )
+            return False
+        remaining = self.max_runtime - self._elapsed()
+        change_time = self._estimate_floor_change_time(
+            self.current_floor + 1, pose
+        )
+        return_time = self._estimate_return_time(pose)
+        effective_guidance = (
+            remaining - change_time - return_time - self.return_safety_buffer
+        )
+        if math.isfinite(effective_guidance) and effective_guidance < 15.0:
+            self._record_failure("elevator_route_not_ready_budget")
+            self._transition_state(
+                WRITE_RESULT,
+                reason_code="elevator_route_not_ready",
+                call_site="MissionManager._floor_change_route_ready",
+                diagnostic_context={
+                    "decision_reason": decision_reason,
+                    "route_reason": reason,
+                    "effective_guidance_time": round(
+                        max(0.0, effective_guidance), 2
+                    ),
+                },
+            )
+            return False
+        MissionReportingRuntime.loginfo(
+            "换层前路线未就绪（UNKNOWN 阻断），延后换层继续探索："
+            "floor=%d reason=%s effective_guidance=%.1f",
+            self.current_floor,
+            reason,
+            max(0.0, effective_guidance) if math.isfinite(effective_guidance) else -1.0,
+        )
         return False
 
     def _estimate_floor_change_time(self, target_floor: int, pose: tuple[float, float, float]) -> float:
@@ -1908,6 +2067,7 @@ class MissionManager:
         return (grid.floor_index, robot_cell, frontier_cells)
 
     def _tick_explore(self, pose: tuple[float, float, float]) -> None:
+        self._explored_floor_ids.add(int(self.current_floor))
         grid = self.mapper.floor(self.current_floor)
         now = get_time()
         progress_monitor = getattr(self, "_progress_monitor", None)
@@ -2043,6 +2203,7 @@ class MissionManager:
                     self._log_structured(diagnostic)
 
                     if action == "RETURN_HOME":
+                        self._record_floor_exit_certificate(reason_code)
                         self._transition_state(
                             RETURN_HOME,
                             reason_code=reason_code,
@@ -2050,6 +2211,12 @@ class MissionManager:
                         )
                         return
                     elif action == "FINISH_FLOOR":
+                        if not self._floor_change_route_ready(
+                            floor_elapsed,
+                            pose,
+                            decision_reason=reason_code,
+                        ):
+                            return
                         self._finish_current_floor(
                             reason_code=reason_code,
                             call_site="MissionManager._tick_explore:budget_decision",
@@ -2132,6 +2299,7 @@ class MissionManager:
                     pose,
                     selection_context=selection_context,
                     frontiers=frontiers,
+                    planning_constraints=self._planning_constraints(),
                 )
 
             # ProgressMonitor 仅作诊断：记录选择历史并检测退化循环，
@@ -2178,6 +2346,7 @@ class MissionManager:
                     building_client=self.building_client,
                     pass_offset=self.door_pass_offset,
                     now=get_time(),
+                    planning_constraints=self._planning_constraints(),
                 )
                 if door_id is not None:
                     self.controller.clear_path()
@@ -2239,6 +2408,7 @@ class MissionManager:
                     record_failure=(
                         not all_inside_tolerance and not planning_unresolved
                     ),
+                    planning_constraints=self._planning_constraints(),
                 )
                 self._apply_exploration_runtime_result(scan_result)
                 if scan_result.completed:
@@ -2253,6 +2423,7 @@ class MissionManager:
                                 grid,
                                 pose,
                                 selection_context=selection_context,
+                                planning_constraints=self._planning_constraints(),
                             )
                             if confirmed_frontier is not None and confirmed_path:
                                 self._exploration.reset_no_frontier_escape()
@@ -2667,7 +2838,12 @@ class MissionManager:
             cell_value = int(grid.data[target_cell[1], target_cell[0]])
             if cell_value in (BLACK, NEGATIVE, OCC):
                 continue
-            if segment_crosses_blocked_cell(grid, (pose[0], pose[1]), target):
+            if segment_crosses_blocked_cell(
+                grid,
+                (pose[0], pose[1]),
+                target,
+                constraints=self._planning_constraints(),
+            ):
                 continue
             self.current_frontier = None
             self._exploration.last_frontier_target = None
@@ -2699,6 +2875,7 @@ class MissionManager:
             cloud_points=self._map_runtime.latest_cloud_points,
             floor_height=self.mapper.floor_height,
             config=self._entry_config,
+            segment_is_traversable=self._segment_is_traversable,
         )
         if result.failure is not None:
             self._record_failure(result.failure)
@@ -2902,6 +3079,7 @@ class MissionManager:
         reason_code: str = "floor_finished",
         call_site: str = "MissionManager._finish_current_floor",
     ) -> None:
+        self._record_floor_exit_certificate(reason_code)
         no_frontier_count = self._exploration.no_reachable_frontier_confirmations
         self.controller.clear_path()
         self._exploration.no_frontier_scan_until = 0.0
@@ -2951,6 +3129,101 @@ class MissionManager:
                 "can_change_floor": can_change_floor,
             },
         )
+
+    def _record_floor_exit_certificate(self, reason_code: str) -> FloorExitCertificate:
+        """所有正常 EXPLORE_FLOOR 出口共用的冻结证书入口。"""
+        self._explored_floor_ids.add(int(self.current_floor))
+        constraints = self._planning_constraints()
+        pose = self._last_pose or self.home_pose
+        freeze = getattr(self.explorer, "floor_termination_evidence", None)
+        evidence = (
+            freeze(
+                self.mapper.floor(self.current_floor),
+                pose,
+                constraints,
+            )
+            if callable(freeze) and pose is not None else None
+        )
+        blocked = self._lock_support_constraint_blocked_completion(evidence)
+        certificate = FloorExitCertificate(
+            floor=int(self.current_floor),
+            map_epoch=int(self._ground_support.map_epoch_for_floor(self.current_floor)),
+            localization_epoch=int(self._ground_support.localization_epoch),
+            constraint_revision=int(
+                getattr(evidence, "constraint_revision", 0)
+            ),
+            reason_code=str(reason_code),
+            formal_reachable_count=int(
+                getattr(evidence, "formal_reachable_count", 0)
+            ),
+            effective_reachable_count=int(
+                getattr(evidence, "effective_reachable_count", 0)
+            ),
+            region_ids=tuple(getattr(evidence, "region_ids", ())),
+            valid=evidence is not None and not blocked,
+        )
+        previous = self._floor_exit_certificates.get(certificate.floor)
+        if previous is not None and not previous.valid:
+            return previous
+        self._floor_exit_certificates[certificate.floor] = certificate
+        self._log_structured(
+            {
+                "event": "floor_exit_certificate",
+                **certificate.__dict__,
+                "region_ids": list(certificate.region_ids),
+            }
+        )
+        return certificate
+
+    def _lock_support_constraint_blocked_completion(self, evidence=None) -> bool:
+        """仅在楼层终止边界锁定仍未解除的临时约束隔离。"""
+        if evidence is None:
+            constraints = self._planning_constraints()
+            freeze = getattr(self.explorer, "floor_termination_evidence", None)
+            pose = self._last_pose or self.home_pose
+            if not callable(freeze) or pose is None:
+                return False
+            evidence = freeze(
+                self.mapper.floor(self.current_floor), pose, constraints
+            )
+        if not bool(getattr(evidence, "fully_blocked", False)):
+            return False
+        key = (int(self.current_floor), int(evidence.constraint_revision))
+        if any(
+            (item.get("floor"), item.get("constraint_revision")) == key
+            for item in self._invalid_floor_completion_evidence
+        ):
+            return True
+        payload = {
+            "floor": key[0],
+            "reason_code": "support_constraint_blocked",
+            "constraint_revision": key[1],
+            "region_ids": list(evidence.region_ids),
+            "formal_reachable_count": evidence.formal_reachable_count,
+            "support_blocked_count": evidence.support_blocked_count,
+        }
+        self._invalid_floor_completion_evidence.append(payload)
+        self._mission_success_eligible = False
+        self._record_failure("support_constraint_blocked")
+        self._log_structured(
+            {"event": "floor_completion_invalid", **payload}
+        )
+        return True
+
+    def _tick_current_task_status(
+        self,
+        pose: tuple[float, float, float],
+    ) -> str:
+        """消费一次强制任务失败，否则正常 tick 当前任务。"""
+        forced_failure = self._forced_task_failure_reason
+        if forced_failure is None:
+            return self.current_task.tick(self.navigation_task_context(), pose)
+        self._forced_task_failure_reason = None
+        try:
+            self.current_task.failure_reason = forced_failure
+        except (AttributeError, TypeError):
+            pass
+        return FAILED
 
     def _log_floor_budget_exhausted(self, floor_elapsed: float) -> None:
         """记录楼层配额到期后仍继续探索的原因。"""
@@ -3100,6 +3373,19 @@ class MissionManager:
                 self.home_pose,
                 tuple(self._entry.trace),
             )
+            constraints = self._planning_constraints()
+            if reverse_trace is not None and constraints is not None:
+                grid = self.mapper.floor(self.current_floor)
+                if any(
+                    not segment_is_traversable(
+                        grid,
+                        start,
+                        end,
+                        constraints=constraints,
+                    )
+                    for start, end in zip(reverse_trace, reverse_trace[1:])
+                ):
+                    reverse_trace = None
             if reverse_trace is not None:
                 self._return_home.entry_trace_attempted = True
                 self.controller.set_path(reverse_trace)
@@ -3125,12 +3411,16 @@ class MissionManager:
                     ),
                     visited_radius=self.mapper.visited_radius,
                     veto_lookahead=self.return_home_veto_lookahead,
+                    planning_constraints=self._planning_constraints(),
                 )
                 self.controller.stop(reason="return_home_plan_pending")
                 return
             plan_poll = self._return_home.poll_plan(
                 current_floor=self.current_floor,
                 goal_xy=navigation_goal,
+                current_constraint_revision=int(
+                    getattr(self._planning_constraints(), "revision", 0)
+                ),
             )
             if plan_poll.status == "pending":
                 self.controller.stop(reason="return_home_plan_pending")
@@ -3243,6 +3533,7 @@ class MissionManager:
             rotation_min_clearance=self.no_frontier_rotation_min_clearance,
             clearance_margin=self.no_frontier_retreat_clearance_margin,
             maximum_distance=self.no_frontier_retreat_max_distance,
+            planning_constraints=self._planning_constraints(),
         )
         if selection is None:
             self._log_structured(
@@ -3404,16 +3695,45 @@ class MissionManager:
         reason_code: str | None = None,
         call_site: str = "MissionManager._write_result",
     ) -> None:
-        resolved_reason = reason_code or "result_write_requested"
+        requested_reason = reason_code or "result_write_requested"
         self._state_at_result_write = getattr(self, "state", None)
-        self._result_write_reason = resolved_reason
         self._result_write_call_site = call_site
+        explored_floors = set(getattr(self, "_explored_floor_ids", ()))
+        certificates = getattr(self, "_floor_exit_certificates", {})
+        certificates_missing = bool(
+            not explored_floors or not explored_floors <= set(certificates)
+        )
+        certificates_invalid = bool(
+            not certificates_missing
+            and any(not certificates[floor].valid for floor in explored_floors)
+        )
+        certificates_complete = bool(
+            not certificates_missing and not certificates_invalid
+        )
+        resolved_reason = requested_reason
+        if requested_reason == "return_home_completed" and not certificates_complete:
+            higher_priority_failure = next(
+                (
+                    failure
+                    for failure in getattr(self, "_failure_reasons", ())
+                    if failure and failure != "support_constraint_blocked"
+                ),
+                None,
+            )
+            if higher_priority_failure is not None:
+                resolved_reason = higher_priority_failure
+            elif certificates_missing:
+                resolved_reason = "floor_exit_certificate_missing"
+            else:
+                resolved_reason = "floor_exit_certificate_invalid"
+        self._result_write_reason = resolved_reason
         self._normal_completion = bool(
             resolved_reason == "return_home_completed"
             and getattr(self, "_mission_success_eligible", True)
             and getattr(self, "_return_home_started", False)
             and getattr(self, "_return_home_completed", False)
             and getattr(self, "_return_home_success", False)
+            and certificates_complete
         )
         # 时间预算不足导致的返航闭环成功，不能标记为“探索完成”。
         self._exploration_completed = bool(
@@ -3719,6 +4039,9 @@ class MissionManager:
             "mission_success_eligible": bool(
                 getattr(self, "_mission_success_eligible", True)
             ),
+            "invalid_floor_completion_evidence": list(
+                getattr(self, "_invalid_floor_completion_evidence", ())
+            ),
             "terminal_outcome": getattr(self, "_terminal_outcome", "running"),
         }
 
@@ -3847,6 +4170,8 @@ def segment_crosses_blocked_cell(
     grid,
     start_xy: tuple[float, float],
     end_xy: tuple[float, float],
+    *,
+    constraints=None,
 ) -> bool:
     start_cell = grid.world_to_grid(start_xy[0], start_xy[1])
     end_cell = grid.world_to_grid(end_xy[0], end_xy[1])
@@ -3862,6 +4187,8 @@ def segment_crosses_blocked_cell(
         if cell is None:
             return True
         gx, gy = cell
-        if int(grid.data[gy, gx]) in (BLACK, NEGATIVE, OCC):
+        if int(grid.data[gy, gx]) in (BLACK, NEGATIVE, OCC) or (
+            constraints is not None and cell in constraints.blocked_cells
+        ):
             return True
     return False

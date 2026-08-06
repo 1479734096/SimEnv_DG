@@ -17,6 +17,15 @@ from typing import Iterable
 
 import numpy as np
 
+from danger_search.map_evidence import (
+    BLOCKING_OBSTACLE_KINDS,
+    HIGH_HARD,
+    LEGACY_HARD,
+    LOW_CANDIDATE,
+    LOW_CONFIRMED,
+    ObstacleEvidenceLedger,
+)
+
 
 UNKNOWN = -1
 FREE = 0
@@ -24,6 +33,28 @@ VISITED = 30
 BLACK = 80
 NEGATIVE = 90
 OCC = 100
+
+
+@dataclass(frozen=True)
+class NegativeClusterRecord:
+    cluster_id: str
+    floor: int
+    frame_id: str
+    map_epoch: int
+    localization_epoch: int
+    stamp: float
+    generation: int
+    grid_origin: tuple[float, float]
+    grid_resolution: float
+    source_cells: frozenset[tuple[int, int]]
+
+
+@dataclass(frozen=True)
+class NegativeClusterCommit:
+    committed: bool
+    reason_code: str
+    cluster_ids: tuple[str, ...] = ()
+    revision: int = 0
 
 
 @dataclass
@@ -47,6 +78,11 @@ class MapperDebugSnapshot:
     known_bbox_fill_ratio: float
     traversable_known_ratio: float
     visited_traversable_ratio: float
+    low_candidate_core_count: int = 0
+    low_confirmed_core_count: int = 0
+    hard_core_count: int = 0
+    low_core_removed_count: int = 0
+    low_core_removed_total: int = 0
 
 
 @dataclass
@@ -60,6 +96,61 @@ class _MapperFrameStats:
     dynamic_door_cleared_count: int = 0
     suspicious_clearing_prevented_count: int = 0
     nearest_obstacle_distance: float = math.inf
+    low_core_removed_count: int = 0
+
+
+def _valid_negative_cell(cell, grid: "FloorGrid") -> bool:
+    if not _valid_negative_cell_structure(cell):
+        return False
+    gx, gy = cell
+    return bool(0 <= gx < grid.size_x and 0 <= gy < grid.size_y)
+
+
+def _valid_negative_cell_structure(cell) -> bool:
+    return bool(
+        isinstance(cell, (tuple, list))
+        and len(cell) == 2
+        and all(
+            not isinstance(value, bool) and isinstance(value, int)
+            for value in cell
+        )
+    )
+
+
+def _negative_record_structure_valid(record) -> bool:
+    try:
+        return bool(
+            isinstance(record, NegativeClusterRecord)
+            and isinstance(record.cluster_id, str)
+            and bool(record.cluster_id)
+            and record.frame_id == "odom"
+            and not isinstance(record.floor, bool)
+            and isinstance(record.floor, int)
+            and record.floor >= 0
+            and not isinstance(record.map_epoch, bool)
+            and isinstance(record.map_epoch, int)
+            and record.map_epoch > 0
+            and not isinstance(record.localization_epoch, bool)
+            and isinstance(record.localization_epoch, int)
+            and record.localization_epoch > 0
+            and not isinstance(record.generation, bool)
+            and isinstance(record.generation, int)
+            and record.generation > 0
+            and math.isfinite(float(record.stamp))
+            and bool(record.source_cells)
+            and all(
+                _valid_negative_cell_structure(cell)
+                for cell in record.source_cells
+            )
+            and math.isfinite(float(record.grid_resolution))
+            and record.grid_resolution > 0.0
+            and len(record.grid_origin) == 2
+            and all(
+                math.isfinite(float(value)) for value in record.grid_origin
+            )
+        )
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False
 
 
 @dataclass
@@ -101,10 +192,204 @@ class FloorGrid:
             raise ValueError("栅格分辨率和尺寸必须为正有限数，原点必须为有限数")
         self.size_x = int(math.ceil(self.width / self.resolution))
         self.size_y = int(math.ceil(self.length / self.resolution))
-        self.data = np.full((self.size_y, self.size_x), UNKNOWN, dtype=np.int16)
+        self.base = np.full((self.size_y, self.size_x), UNKNOWN, dtype=np.int16)
+        self._derived = np.full((self.size_y, self.size_x), UNKNOWN, dtype=np.int16)
+        self.obstacle_evidence = ObstacleEvidenceLedger(
+            floor_index=self.floor_index,
+            size_x=self.size_x,
+            size_y=self.size_y,
+            resolution=self.resolution,
+            origin_x=self.origin_x,
+            origin_y=self.origin_y,
+        )
+        self.evidence_scope = (self.floor_index, 1, 1)
+        self.black_owners: dict[tuple[int, int], set[str]] = {}
         # NEGATIVE 可能暂时被 OCC/BLACK 覆盖；单独保存来源，动态门清除 OCC 时
         # 才能恢复负障，而直接楼面证据也只能移除这一来源。
         self.negative_cells: set[tuple[int, int]] = set()
+        self.negative_cluster_records: dict[str, NegativeClusterRecord] = {}
+        self.negative_cell_owners: dict[tuple[int, int], set[str]] = {}
+        self.negative_first_state: dict[tuple[int, int], int] = {}
+        self.negative_cluster_confirmations: dict[
+            str, frozenset[tuple[int, int]]
+        ] = {}
+
+    @property
+    def data(self) -> np.ndarray:
+        view = self._derived.view()
+        view.flags.writeable = False
+        return view
+
+    @property
+    def occ_cores(self):
+        return self.obstacle_evidence.cores
+
+    @property
+    def inflation_owners(self):
+        return self.obstacle_evidence.inflation_owners
+
+    def _in_bounds(self, gx: int, gy: int) -> bool:
+        return 0 <= int(gx) < self.size_x and 0 <= int(gy) < self.size_y
+
+    def _refresh_cell(self, gx: int, gy: int) -> None:
+        cell = (int(gx), int(gy))
+        if not self._in_bounds(*cell):
+            return
+        if self.obstacle_evidence.blocking_at(cell):
+            state = OCC
+        elif self.black_owners.get(cell):
+            state = BLACK
+        elif self.negative_cell_owners.get(cell):
+            state = NEGATIVE
+        else:
+            state = int(self.base[cell[1], cell[0]])
+        self._derived[cell[1], cell[0]] = state
+
+    def _refresh_cells(self, cells: Iterable[tuple[int, int]]) -> None:
+        for gx, gy in cells:
+            self._refresh_cell(gx, gy)
+
+    def set_base_state(self, gx: int, gy: int, state: int) -> None:
+        if int(state) not in (UNKNOWN, FREE, VISITED):
+            raise ValueError("基础层只允许 UNKNOWN、FREE 或 VISITED")
+        if self._in_bounds(gx, gy):
+            self.base[int(gy), int(gx)] = int(state)
+            self._refresh_cell(gx, gy)
+
+    def fill_base(self, state: int) -> None:
+        if int(state) not in (UNKNOWN, FREE, VISITED):
+            raise ValueError("基础层只允许 UNKNOWN、FREE 或 VISITED")
+        self.base[:, :] = int(state)
+        for gy in range(self.size_y):
+            for gx in range(self.size_x):
+                self._refresh_cell(gx, gy)
+
+    def load_legacy_data(self, values) -> None:
+        data = np.asarray(values, dtype=np.int16)
+        if data.shape != (self.size_y, self.size_x):
+            raise ValueError("旧栅格快照尺寸不匹配")
+        self.base[:, :] = UNKNOWN
+        self.obstacle_evidence = ObstacleEvidenceLedger(
+            floor_index=self.floor_index,
+            size_x=self.size_x,
+            size_y=self.size_y,
+            resolution=self.resolution,
+            origin_x=self.origin_x,
+            origin_y=self.origin_y,
+        )
+        self.black_owners.clear()
+        self.negative_cells.clear()
+        self.negative_cell_owners.clear()
+        for gy in range(self.size_y):
+            for gx in range(self.size_x):
+                state = int(data[gy, gx])
+                if state in (UNKNOWN, FREE, VISITED):
+                    self.base[gy, gx] = state
+                elif state == OCC:
+                    wx, wy = self.grid_to_world(gx, gy)
+                    self.record_obstacle_observation(
+                        wx,
+                        wy,
+                        0.0,
+                        kind=LEGACY_HARD,
+                        cloud_generation=0,
+                        robot_xy=(wx, wy),
+                        map_epoch=1,
+                        localization_epoch=1,
+                        low_confirm_generations=1,
+                        low_confirm_window_generations=1,
+                        pose_separation=0.0,
+                    )
+                elif state == BLACK:
+                    self.black_owners[(gx, gy)] = {"legacy_snapshot"}
+                elif state == NEGATIVE:
+                    self.negative_cells.add((gx, gy))
+                    self.negative_cell_owners[(gx, gy)] = {"legacy_snapshot"}
+        self._derived[:, :] = UNKNOWN
+        self._refresh_cells(
+            (gx, gy)
+            for gy in range(self.size_y)
+            for gx in range(self.size_x)
+        )
+
+    def copy(self) -> "FloorGrid":
+        result = FloorGrid(
+            self.floor_index,
+            self.resolution,
+            self.width,
+            self.length,
+            self.origin_x,
+            self.origin_y,
+        )
+        result.base = np.array(self.base, copy=True)
+        result._derived = np.array(self._derived, copy=True)
+        result.obstacle_evidence = self.obstacle_evidence.copy()
+        result.evidence_scope = tuple(self.evidence_scope)
+        result.black_owners = {
+            cell: set(owners) for cell, owners in self.black_owners.items()
+        }
+        result.negative_cells = set(self.negative_cells)
+        result.negative_cluster_records = dict(self.negative_cluster_records)
+        result.negative_cell_owners = {
+            cell: set(owners) for cell, owners in self.negative_cell_owners.items()
+        }
+        result.negative_first_state = dict(self.negative_first_state)
+        result.negative_cluster_confirmations = dict(
+            self.negative_cluster_confirmations
+        )
+        return result
+
+    def set_snapshot_cell(
+        self,
+        gx: int,
+        gy: int,
+        state: int,
+        *,
+        owner: str = "snapshot",
+    ) -> None:
+        if not self._in_bounds(gx, gy):
+            return
+        cell = (int(gx), int(gy))
+        if state == BLACK:
+            self.black_owners.setdefault(cell, set()).add(str(owner))
+        elif state in (UNKNOWN, FREE, VISITED):
+            self.base[gy, gx] = int(state)
+            self.black_owners.pop(cell, None)
+            if state in (FREE, VISITED):
+                for obstacle_owner in tuple(
+                    self.inflation_owners.get(cell, ())
+                ):
+                    self.remove_obstacle_core(obstacle_owner)
+        else:
+            raise ValueError("规划快照只允许基础状态或 BLACK")
+        self._refresh_cell(*cell)
+
+    def activate_evidence_scope(
+        self, *, map_epoch: int, localization_epoch: int
+    ) -> None:
+        requested = (
+            self.floor_index,
+            int(map_epoch),
+            int(localization_epoch),
+        )
+        if requested == self.evidence_scope:
+            return
+        affected = set(self.inflation_owners) | set(self.negative_cell_owners)
+        self.obstacle_evidence = ObstacleEvidenceLedger(
+            floor_index=self.floor_index,
+            size_x=self.size_x,
+            size_y=self.size_y,
+            resolution=self.resolution,
+            origin_x=self.origin_x,
+            origin_y=self.origin_y,
+        )
+        self.negative_cells.clear()
+        self.negative_cluster_records.clear()
+        self.negative_cell_owners.clear()
+        self.negative_first_state.clear()
+        self.negative_cluster_confirmations.clear()
+        self.evidence_scope = requested
+        self._refresh_cells(affected)
 
     def world_to_grid(self, x: float, y: float) -> tuple[int, int] | None:
         if not math.isfinite(float(x)) or not math.isfinite(float(y)):
@@ -128,52 +413,82 @@ class FloorGrid:
 
     def mark_free(self, gx: int, gy: int) -> None:
         """仅把 UNKNOWN 变为 FREE，绝不覆盖已知障碍或任务禁区。"""
-        if 0 <= gx < self.size_x and 0 <= gy < self.size_y and self.data[gy, gx] == UNKNOWN:
-            self.data[gy, gx] = FREE
+        if self._in_bounds(gx, gy) and int(self.base[gy, gx]) == UNKNOWN:
+            self.set_base_state(gx, gy, FREE)
 
     def mark_occupied(self, gx: int, gy: int) -> None:
-        if 0 <= gx < self.size_x and 0 <= gy < self.size_y:
-            self.data[gy, gx] = OCC
-
-    def mark_negative(self, gx: int, gy: int) -> bool:
-        """登记动态负障；OCC/BLACK 保持更高显示优先级。"""
-        if not (0 <= gx < self.size_x and 0 <= gy < self.size_y):
-            return False
-        cell = (int(gx), int(gy))
-        was_new = cell not in self.negative_cells
-        self.negative_cells.add(cell)
-        if int(self.data[gy, gx]) not in (OCC, BLACK):
-            self.data[gy, gx] = NEGATIVE
-        return was_new
-
-    def clear_negative_with_support(self, gx: int, gy: int) -> bool:
-        """直接楼面证据只移除动态负障，不清 OCC 或任务 BLACK。"""
-        cell = (int(gx), int(gy))
-        if cell not in self.negative_cells:
-            return False
-        self.negative_cells.remove(cell)
-        if 0 <= gx < self.size_x and 0 <= gy < self.size_y:
-            if int(self.data[gy, gx]) == NEGATIVE:
-                self.data[gy, gx] = FREE
-        return True
+        if not self._in_bounds(gx, gy):
+            return
+        wx, wy = self.grid_to_world(gx, gy)
+        self.record_obstacle_observation(
+            wx,
+            wy,
+            0.0,
+            kind=LEGACY_HARD,
+            cloud_generation=0,
+            robot_xy=(wx, wy),
+            map_epoch=1,
+            localization_epoch=1,
+            low_confirm_generations=1,
+            low_confirm_window_generations=1,
+            pose_separation=0.0,
+        )
 
     def mark_occupied_radius(self, x: float, y: float, radius: float) -> None:
         """把障碍命中按机器人安全余量膨胀为圆形 OCC 区域。"""
-        center = self.world_to_grid(x, y)
-        if center is None:
+        self.record_obstacle_observation(
+            x,
+            y,
+            radius,
+            kind=LEGACY_HARD,
+            cloud_generation=0,
+            robot_xy=(x, y),
+            map_epoch=1,
+            localization_epoch=1,
+            low_confirm_generations=1,
+            low_confirm_window_generations=1,
+            pose_separation=0.0,
+        )
+
+    def record_obstacle_observation(self, x, y, radius, **kwargs) -> None:
+        changed = self.obstacle_evidence.record_observation(
+            x, y, radius, **kwargs
+        )
+        self._refresh_cells(changed)
+
+    def remove_obstacle_core(self, cell: tuple[int, int]) -> bool:
+        existed = tuple(cell) in self.occ_cores
+        changed = self.obstacle_evidence.remove_core(tuple(cell))
+        self._refresh_cells(changed)
+        return existed
+
+    def record_counter_ray(self, start, end, **kwargs) -> int:
+        before = len(self.occ_cores)
+        changed = self.obstacle_evidence.record_counter_ray(
+            start, end, **kwargs
+        )
+        self._refresh_cells(changed)
+        return max(0, before - len(self.occ_cores))
+
+    def mark_black(self, gx: int, gy: int, *, owner: str) -> None:
+        if self._in_bounds(gx, gy):
+            self.black_owners.setdefault((gx, gy), set()).add(str(owner))
+            self._refresh_cell(gx, gy)
+
+    def clear_black(
+        self, gx: int, gy: int, *, owner: str | None = None
+    ) -> None:
+        cell = (int(gx), int(gy))
+        owners = self.black_owners.get(cell)
+        if owners is None:
             return
-        if radius <= 0.0:
-            self.mark_occupied(*center)
-            return
-        cx, cy = center
-        cells = int(math.ceil(radius / self.resolution))
-        for gy in range(cy - cells, cy + cells + 1):
-            for gx in range(cx - cells, cx + cells + 1):
-                if not (0 <= gx < self.size_x and 0 <= gy < self.size_y):
-                    continue
-                wx, wy = self.grid_to_world(gx, gy)
-                if math.hypot(wx - x, wy - y) <= radius:
-                    self.data[gy, gx] = OCC
+        if owner is None:
+            self.black_owners.pop(cell, None)
+        else:
+            owners.discard(str(owner))
+            if not owners:
+                self.black_owners.pop(cell, None)
+        self._refresh_cell(*cell)
 
     def mark_visited_radius(self, x: float, y: float, radius: float) -> None:
         """记录机身实际覆盖区域；实体 OCC 与安全 BLACK 始终拥有更高优先级。"""
@@ -187,11 +502,8 @@ class FloorGrid:
                 if not (0 <= gx < self.size_x and 0 <= gy < self.size_y):
                     continue
                 wx, wy = self.grid_to_world(gx, gy)
-                if (
-                    math.hypot(wx - x, wy - y) <= radius
-                    and self.data[gy, gx] not in (OCC, BLACK, NEGATIVE)
-                ):
-                    self.data[gy, gx] = VISITED
+                if math.hypot(wx - x, wy - y) <= radius:
+                    self.set_base_state(gx, gy, VISITED)
 
     def coverage_ratio(self) -> float:
         # 不使用真值：以当前观测到的地图包围盒为分母，衡量内部未知空洞是否已填充。
@@ -266,6 +578,17 @@ class MultiFloorGridMap:
         free_clear_obstacle_margin: float = 0.25,
         free_clear_min_points_per_bin: int = 2,
         negative_minimum_drop: float = 0.30,
+        evidence_lifecycle_enabled: bool = True,
+        low_height_max_z: float = 0.30,
+        low_confirm_generations: int = 3,
+        low_confirm_window_generations: int = 20,
+        low_candidate_counter_generations: int = 3,
+        low_candidate_counter_positions: int = 2,
+        low_confirmed_counter_generations: int = 6,
+        low_confirmed_counter_positions: int = 3,
+        counter_pose_separation: float = 0.15,
+        low_near_exempt_radius: float = 0.0,
+        low_candidate_max_range: float = 0.0,
     ):
         self.resolution = float(resolution)
         self.width = float(width)
@@ -285,6 +608,27 @@ class MultiFloorGridMap:
         self.free_clear_obstacle_margin = float(free_clear_obstacle_margin)
         self.free_clear_min_points_per_bin = max(1, int(free_clear_min_points_per_bin))
         self.negative_minimum_drop = float(negative_minimum_drop)
+        self.evidence_lifecycle_enabled = bool(evidence_lifecycle_enabled)
+        self.low_height_max_z = float(low_height_max_z)
+        self.low_confirm_generations = int(low_confirm_generations)
+        self.low_confirm_window_generations = int(low_confirm_window_generations)
+        self.low_candidate_counter_generations = int(
+            low_candidate_counter_generations
+        )
+        self.low_candidate_counter_positions = int(
+            low_candidate_counter_positions
+        )
+        self.low_confirmed_counter_generations = int(
+            low_confirmed_counter_generations
+        )
+        self.low_confirmed_counter_positions = int(
+            low_confirmed_counter_positions
+        )
+        self.counter_pose_separation = float(counter_pose_separation)
+        self.low_near_exempt_radius = max(0.0, float(low_near_exempt_radius))
+        self.low_candidate_max_range = max(0.0, float(low_candidate_max_range))
+        self._negative_cluster_revision = 0
+        self._low_core_removed_total = 0
         finite_parameters = (
             self.resolution,
             self.width,
@@ -302,6 +646,10 @@ class MultiFloorGridMap:
             self.free_clear_angle_step,
             self.free_clear_obstacle_margin,
             self.negative_minimum_drop,
+            self.low_height_max_z,
+            self.counter_pose_separation,
+            self.low_near_exempt_radius,
+            self.low_candidate_max_range,
         )
         if not all(math.isfinite(value) for value in finite_parameters):
             raise ValueError("建图参数必须为有限数")
@@ -317,6 +665,17 @@ class MultiFloorGridMap:
             or self.free_clear_max_range < 0.0
             or self.free_clear_obstacle_margin < 0.0
             or self.negative_minimum_drop <= 0.0
+            or self.low_height_max_z < self.obstacle_min_z
+            or self.low_height_max_z > self.obstacle_max_z
+            or self.low_confirm_generations <= 0
+            or self.low_confirm_window_generations < self.low_confirm_generations
+            or self.low_candidate_counter_generations <= 0
+            or self.low_candidate_counter_positions <= 0
+            or self.low_confirmed_counter_generations
+            < self.low_candidate_counter_generations
+            or self.low_confirmed_counter_positions
+            < self.low_candidate_counter_positions
+            or self.counter_pose_separation < 0.0
         ):
             raise ValueError("建图尺寸、楼高、障碍范围或距离参数无效")
         self.point_free_clear_max_range = max(0.0, self.point_free_clear_max_range)
@@ -351,6 +710,9 @@ class MultiFloorGridMap:
         floor_index: int,
         robot_xyz: tuple[float, float, float],
         points: Iterable[tuple[float, float, float]],
+        cloud_generation: int = 0,
+        map_epoch: int = 1,
+        localization_epoch: int = 1,
     ) -> None:
         """融合一帧已变换到 world 的点云。
 
@@ -359,6 +721,10 @@ class MultiFloorGridMap:
         诊断统计。无障碍远点的自由射线受 ``point_free_clear_max_range`` 限制。
         """
         grid = self.floor(floor_index)
+        grid.activate_evidence_scope(
+            map_epoch=int(map_epoch),
+            localization_epoch=int(localization_epoch),
+        )
         stats = _MapperFrameStats(
             floor_index=floor_index,
             occupied_to_free_count=self._pending_occupied_to_free_count,
@@ -409,10 +775,59 @@ class MultiFloorGridMap:
             )
             observations.append((px, py, pz, distance, is_obstacle_point, target_cell))
 
+        obstacle_hit_cells = frozenset(
+            target_cell
+            for _px, _py, _pz, _distance, is_obstacle_point, target_cell
+            in observations
+            if is_obstacle_point
+        )
         # 先写入同帧全部障碍，再清自由空间，避免点顺序导致早到的 miss 穿过晚到的墙命中。
         for px, py, _pz, _distance, is_obstacle_point, _target_cell in observations:
             if is_obstacle_point:
-                grid.mark_occupied_radius(px, py, self.obstacle_inflation_radius)
+                if not self.evidence_lifecycle_enabled or int(cloud_generation) <= 0:
+                    grid.mark_occupied_radius(
+                        px, py, self.obstacle_inflation_radius
+                    )
+                else:
+                    nominal_z_rel = float(_pz) - floor_base_z
+                    if nominal_z_rel < self.low_height_max_z:
+                        # 低回波候选记账的距离语境：
+                        # - 近距（< low_near_exempt_radius）：来源是自腿/紧贴物体等物理
+                        #   稳定的伪影（bag 取证：机身前上方 Mid360 每帧上千自腿低回波点
+                        #   命中站位格，3 代次+2 位姿秒确认成 LOW_CONFIRMED，直接导致
+                        #   start_cell_obstacle_core）；由 0.5m stop envelope 执行层物理兜底，
+                        #   不记账不会造成穿越。视线遮挡语义保留（该点仍在
+                        #   obstacle_hit_cells 中截断自由射线）。
+                        # - 远距（> low_candidate_max_range）：点稀疏、高度混叠，多帧
+                        #   "稳定命中"不可靠，只信高回波（HIGH_HARD 不受限）。
+                        if (
+                            self.low_near_exempt_radius > 0.0
+                            and _distance < self.low_near_exempt_radius
+                        ):
+                            continue
+                        if (
+                            self.low_candidate_max_range > 0.0
+                            and _distance > self.low_candidate_max_range
+                        ):
+                            continue
+                        kind = LOW_CANDIDATE
+                    else:
+                        kind = HIGH_HARD
+                    grid.record_obstacle_observation(
+                        px,
+                        py,
+                        self.obstacle_inflation_radius,
+                        kind=kind,
+                        cloud_generation=int(cloud_generation),
+                        robot_xy=(robot_xyz[0], robot_xyz[1]),
+                        map_epoch=int(map_epoch),
+                        localization_epoch=int(localization_epoch),
+                        low_confirm_generations=self.low_confirm_generations,
+                        low_confirm_window_generations=(
+                            self.low_confirm_window_generations
+                        ),
+                        pose_separation=self.counter_pose_separation,
+                    )
 
         for px, py, _pz, distance, is_obstacle_point, target_cell in observations:
             ray_target = target_cell
@@ -429,6 +844,27 @@ class MultiFloorGridMap:
                     continue
                 ray_target = capped_cell
                 stats.suspicious_clearing_prevented_count += 1
+            if self.evidence_lifecycle_enabled and not is_obstacle_point:
+                removed = grid.record_counter_ray(
+                    robot_cell,
+                    ray_target,
+                    hit_cells=obstacle_hit_cells,
+                    cloud_generation=int(cloud_generation),
+                    robot_xy=(robot_xyz[0], robot_xyz[1]),
+                    map_epoch=int(map_epoch),
+                    localization_epoch=int(localization_epoch),
+                    candidate_generations=(
+                        self.low_candidate_counter_generations
+                    ),
+                    candidate_positions=self.low_candidate_counter_positions,
+                    confirmed_generations=(
+                        self.low_confirmed_counter_generations
+                    ),
+                    confirmed_positions=self.low_confirmed_counter_positions,
+                    pose_separation=self.counter_pose_separation,
+                )
+                stats.low_core_removed_count += removed
+                self._low_core_removed_total += removed
             clear_length, stopped_at_blocked = self._raycast_free(
                 grid,
                 robot_cell,
@@ -464,41 +900,180 @@ class MultiFloorGridMap:
             known_bbox_fill_ratio=grid.known_bbox_fill_ratio(),
             traversable_known_ratio=grid.traversable_known_ratio(),
             visited_traversable_ratio=grid.visited_traversable_ratio(),
+            low_candidate_core_count=sum(
+                core.kind == LOW_CANDIDATE for core in grid.occ_cores.values()
+            ),
+            low_confirmed_core_count=sum(
+                core.kind == LOW_CONFIRMED for core in grid.occ_cores.values()
+            ),
+            hard_core_count=sum(
+                core.kind in {HIGH_HARD, LEGACY_HARD}
+                for core in grid.occ_cores.values()
+            ),
+            low_core_removed_count=int(stats.low_core_removed_count),
+            low_core_removed_total=int(self._low_core_removed_total),
         )
 
-    def mark_black(self, floor_index: int, x: float, y: float, radius: float) -> None:
-        """标记任务层禁止规划区域，但不覆盖已经确认的实体 OCC。"""
-        grid = self.floor(floor_index)
-        center = grid.world_to_grid(x, y)
-        if center is None:
-            return
-        cx, cy = center
-        cells = int(math.ceil(radius / grid.resolution))
-        for gy in range(cy - cells, cy + cells + 1):
-            for gx in range(cx - cells, cx + cells + 1):
-                if 0 <= gx < grid.size_x and 0 <= gy < grid.size_y and grid.data[gy, gx] != OCC:
-                    grid.data[gy, gx] = BLACK
-
-    def mark_negative_cells(
+    def persist_negative_clusters_atomic(
         self,
-        floor_index: int,
-        cells: Iterable[tuple[int, int]],
-    ) -> int:
-        """把已完成抗噪确认的支撑交点写入动态负障层。"""
-        grid = self.floor(floor_index)
-        return sum(grid.mark_negative(int(gx), int(gy)) for gx, gy in cells)
-
-    def clear_negative_cells_with_support(
-        self,
-        floor_index: int,
-        cells: Iterable[tuple[int, int]],
-    ) -> int:
-        """用连续直接楼面证据移除对应动态负障来源。"""
-        grid = self.floor(floor_index)
-        return sum(
-            grid.clear_negative_with_support(int(gx), int(gy))
-            for gx, gy in cells
+        records: Iterable[NegativeClusterRecord],
+        *,
+        allow_new: bool = True,
+    ) -> NegativeClusterCommit:
+        """整批校验后提交 DROP owner；任一记录异常时零修改。"""
+        frozen = tuple(records)
+        if not frozen:
+            return NegativeClusterCommit(False, "drop_source_cluster_missing")
+        if any(not _negative_record_structure_valid(record) for record in frozen):
+            return NegativeClusterCommit(False, "drop_cluster_scope_invalid")
+        batch_scope = (
+            frozen[0].floor,
+            frozen[0].frame_id,
+            frozen[0].map_epoch,
+            frozen[0].localization_epoch,
+            frozen[0].grid_origin,
+            frozen[0].grid_resolution,
         )
+        ids = tuple(record.cluster_id for record in frozen)
+        if len(set(ids)) != len(ids):
+            return NegativeClusterCommit(False, "drop_cluster_id_conflict")
+        for record in frozen:
+            if (
+                (
+                    record.floor,
+                    record.frame_id,
+                    record.map_epoch,
+                    record.localization_epoch,
+                    record.grid_origin,
+                    record.grid_resolution,
+                ) != batch_scope
+            ):
+                return NegativeClusterCommit(False, "drop_cluster_scope_invalid")
+        floor = frozen[0].floor
+        expected_size_x = int(math.ceil(self.width / self.resolution))
+        expected_size_y = int(math.ceil(self.length / self.resolution))
+        if (
+            abs(frozen[0].grid_resolution - self.resolution) > 1e-9
+            or frozen[0].grid_origin != (self.origin_x, self.origin_y)
+            or any(
+                not (
+                    0 <= cell[0] < expected_size_x
+                    and 0 <= cell[1] < expected_size_y
+                )
+                for record in frozen
+                for cell in record.source_cells
+            )
+        ):
+            return NegativeClusterCommit(False, "drop_cluster_scope_invalid")
+        grid = self.floor(floor)
+        for record in frozen:
+            if (
+                abs(record.grid_resolution - grid.resolution) > 1e-9
+                or record.grid_origin != (grid.origin_x, grid.origin_y)
+                or any(
+                    not _valid_negative_cell(cell, grid)
+                    for cell in record.source_cells
+                )
+            ):
+                return NegativeClusterCommit(False, "drop_cluster_scope_invalid")
+            existing = grid.negative_cluster_records.get(record.cluster_id)
+            if existing is not None and existing != record:
+                return NegativeClusterCommit(False, "drop_cluster_id_conflict")
+        additions = tuple(
+            record for record in frozen
+            if record.cluster_id not in grid.negative_cluster_records
+        )
+        if not additions:
+            return NegativeClusterCommit(
+                True, "already_committed", ids, self._negative_cluster_revision
+            )
+        if not allow_new:
+            return NegativeClusterCommit(
+                False,
+                "negative_obstacle_replan_exhausted",
+                ids,
+                self._negative_cluster_revision,
+            )
+        for record in additions:
+            grid.negative_cluster_records[record.cluster_id] = record
+            grid.negative_cluster_confirmations[record.cluster_id] = frozenset()
+            for cell in record.source_cells:
+                owners = grid.negative_cell_owners.setdefault(cell, set())
+                owners.add(record.cluster_id)
+                grid.negative_cells.add(cell)
+                grid._refresh_cell(*cell)
+        self._negative_cluster_revision += 1
+        return NegativeClusterCommit(
+            True, "committed", ids, self._negative_cluster_revision
+        )
+
+    def clear_negative_clusters_with_support(
+        self,
+        *,
+        floor: int,
+        cells: Iterable[tuple[int, int]],
+        map_epoch: int,
+        localization_epoch: int,
+        generation: int,
+        grid_origin: tuple[float, float],
+        grid_resolution: float,
+    ) -> tuple[str, ...]:
+        """逐帧累积更新正支撑；完整覆盖来源簇后才原子撤销。"""
+        if (
+            isinstance(floor, bool)
+            or not isinstance(floor, int)
+            or floor < 0
+        ):
+            return ()
+        grid = self._floors.get(floor)
+        if grid is None:
+            return ()
+        if (
+            tuple(float(value) for value in grid_origin)
+            != (grid.origin_x, grid.origin_y)
+            or abs(float(grid_resolution) - grid.resolution) > 1e-9
+        ):
+            return ()
+        confirmed = frozenset((int(gx), int(gy)) for gx, gy in cells)
+        removable = []
+        for record in tuple(grid.negative_cluster_records.values()):
+            if (
+                record.map_epoch != int(map_epoch)
+                or record.localization_epoch != int(localization_epoch)
+                or record.grid_origin != tuple(grid_origin)
+                or abs(record.grid_resolution - float(grid_resolution)) > 1e-9
+                or int(generation) <= record.generation
+            ):
+                continue
+            matched = confirmed & record.source_cells
+            if not matched:
+                continue
+            accumulated = (
+                grid.negative_cluster_confirmations.get(
+                    record.cluster_id, frozenset()
+                ) | matched
+            )
+            if record.source_cells <= accumulated:
+                removable.append(record)
+            else:
+                grid.negative_cluster_confirmations[record.cluster_id] = frozenset(
+                    accumulated
+                )
+        for record in removable:
+            grid.negative_cluster_records.pop(record.cluster_id, None)
+            grid.negative_cluster_confirmations.pop(record.cluster_id, None)
+            for cell in record.source_cells:
+                owners = grid.negative_cell_owners.get(cell, set())
+                owners.discard(record.cluster_id)
+                if owners:
+                    continue
+                grid.negative_cell_owners.pop(cell, None)
+                grid.negative_cells.discard(cell)
+                grid.negative_first_state.pop(cell, None)
+                grid._refresh_cell(*cell)
+        if removable:
+            self._negative_cluster_revision += 1
+        return tuple(sorted(record.cluster_id for record in removable))
 
     def clear_dynamic_door_strip(
         self,
@@ -529,12 +1104,10 @@ class MultiFloorGridMap:
         tangent_y = normal_x
         search_radius = math.hypot(half_width, half_depth)
         cells = int(math.ceil(search_radius / grid.resolution))
-        cleared_count = 0
+        strip_cells: set[tuple[int, int]] = set()
         for gy in range(cy - cells, cy + cells + 1):
             for gx in range(cx - cells, cx + cells + 1):
                 if not (0 <= gx < grid.size_x and 0 <= gy < grid.size_y):
-                    continue
-                if int(grid.data[gy, gx]) != OCC:
                     continue
                 wx, wy = grid.grid_to_world(gx, gy)
                 dx = wx - x
@@ -542,10 +1115,32 @@ class MultiFloorGridMap:
                 along_normal = dx * normal_x + dy * normal_y
                 along_tangent = dx * tangent_x + dy * tangent_y
                 if abs(along_normal) <= half_depth and abs(along_tangent) <= half_width:
-                    grid.data[gy, gx] = (
-                        NEGATIVE if (gx, gy) in grid.negative_cells else FREE
-                    )
-                    cleared_count += 1
+                    strip_cells.add((gx, gy))
+        occupied_before_cells = {
+            (gx, gy)
+            for gx, gy in strip_cells
+            if int(grid.data[gy, gx]) == OCC
+        }
+        # 只移除核心本身落在门板条带内的 owner。按派生 OCC 格匿名擦除会把
+        # 门侧墙体的膨胀所有权一并清掉，破坏来源账本。
+        removable_cores = []
+        for core_cell in tuple(grid.occ_cores):
+            wx, wy = grid.grid_to_world(*core_cell)
+            dx = wx - x
+            dy = wy - y
+            along_normal = dx * normal_x + dy * normal_y
+            along_tangent = dx * tangent_x + dy * tangent_y
+            if abs(along_normal) <= half_depth and abs(along_tangent) <= half_width:
+                removable_cores.append(core_cell)
+        for core_cell in removable_cores:
+            grid.remove_obstacle_core(core_cell)
+        for gx, gy in occupied_before_cells:
+            if int(grid.data[gy, gx]) not in (OCC, BLACK, NEGATIVE):
+                grid.set_base_state(gx, gy, FREE)
+        occupied_after = sum(
+            int(grid.data[gy, gx]) == OCC for gx, gy in strip_cells
+        )
+        cleared_count = max(0, len(occupied_before_cells) - occupied_after)
         self._pending_occupied_to_free_count += cleared_count
         self._pending_dynamic_door_cleared_count += cleared_count
 

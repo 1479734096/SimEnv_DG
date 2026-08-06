@@ -17,6 +17,9 @@ from danger_search.ground_support_gate import (
     GroundSupportAssessment,
     GroundSupportGateConfig,
     GroundSupportSafetyGate,
+    DropClusterEvidence,
+    NegativeClusterAck,
+    SupportConstraintAck,
 )
 
 
@@ -63,8 +66,25 @@ def _assessment(**overrides) -> GroundSupportAssessment:
         "hold_context_id": 0,
         "support_command": None,
         "support_lookahead_distance": None,
+        "grid_origin": (-14.0, -6.0),
+        "grid_resolution": 0.1,
     }
     values.update(overrides)
+    if values.get("drop_confirmed") and "drop_clusters" not in overrides:
+        values["drop_clusters"] = (
+            DropClusterEvidence(
+                cluster_id="drop:test",
+                floor=int(values.get("floor", 0)),
+                frame_id="odom",
+                map_epoch=int(values.get("map_epoch", 0)),
+                localization_epoch=int(values.get("localization_epoch", 0)),
+                stamp=float(values["stamp"]),
+                generation=int(values.get("cloud_generation", 0)),
+                grid_origin=tuple(values["grid_origin"]),
+                grid_resolution=float(values["grid_resolution"]),
+                source_cells=((1, 1),),
+            ),
+        )
     if "received_control_time" not in overrides:
         values["received_control_time"] = values["received_wall_time"]
     return GroundSupportAssessment(**values)
@@ -186,6 +206,26 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
         self.assertEqual(command, (0.0, 0.0, 0.0))
         self.assertEqual(gate.state, STALE_DATA_HOLD)
         self.assertEqual(gate.reason_code, "ground_support_missing")
+
+    def test_scope_invalidation_rebuilds_a_timed_hold_on_next_command(self):
+        gate = GroundSupportSafetyGate(_config())
+        gate.update_assessment(_assessment())
+
+        gate.invalidate_evidence_scope()
+
+        self.assertEqual(gate.state, CLEAR)
+        self.assertIsNone(gate.failure_witness)
+        command = gate.filter_command(
+            (0.2, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=101.0,
+            control_time=11.0,
+        )
+        self.assertEqual(command, (0.0, 0.0, 0.0))
+        self.assertEqual(gate.state, STALE_DATA_HOLD)
+        self.assertEqual(gate.reason_code, "ground_support_missing")
+        self.assertEqual(gate._temporary_hold_command, (0.2, 0.0, 0.0))
+        self.assertEqual(gate._state_enter_control_time, 11.0)
 
     def test_non_finite_assessment_invalidates_previous_evidence(self):
         gate = GroundSupportSafetyGate(_config())
@@ -850,10 +890,59 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
 
         self.assertEqual(gate.state, SAFETY_BLOCKED)
         self.assertEqual(gate.latched_drop_point_world, (4.2, 5.3))
-        self.assertTrue(gate.reset_negative_obstacle_after_replan())
+        cluster = gate.latched_drop_clusters[0]
+        ack = NegativeClusterAck(
+            floor=cluster.floor,
+            map_epoch=cluster.map_epoch,
+            localization_epoch=cluster.localization_epoch,
+            cluster_ids=(cluster.cluster_id,),
+            map_revision=1,
+        )
+        self.assertTrue(gate.reset_negative_obstacle_after_replan(ack))
         self.assertEqual(gate.state, CLEAR)
         self.assertIsNone(gate.latched_drop_point_world)
-        self.assertFalse(gate.reset_negative_obstacle_after_replan())
+        self.assertFalse(gate.reset_negative_obstacle_after_replan(ack))
+
+    def test_drop_cluster_geometry_and_cells_are_validated_before_latching(self):
+        base = _assessment(
+            drop_confirmed=True,
+            drop_intersects_sweep=True,
+            floor=0,
+            map_epoch=1,
+            localization_epoch=1,
+            cloud_generation=1,
+        )
+        malformed = (
+            DropClusterEvidence(
+                **{**base.drop_clusters[0].__dict__,
+                   "grid_origin": (99.0, 99.0)}
+            ),
+            DropClusterEvidence(
+                **{**base.drop_clusters[0].__dict__,
+                   "grid_resolution": 0.2}
+            ),
+            DropClusterEvidence(
+                **{**base.drop_clusters[0].__dict__,
+                   "source_cells": ((1.2, 1),)}
+            ),
+            DropClusterEvidence(
+                **{**base.drop_clusters[0].__dict__,
+                   "source_cells": ((True, 1),)}
+            ),
+            DropClusterEvidence(
+                **{**base.drop_clusters[0].__dict__, "stamp": math.nan}
+            ),
+        )
+        for cluster in malformed:
+            with self.subTest(cluster=cluster):
+                gate = GroundSupportSafetyGate(_config())
+                gate.update_assessment(
+                    GroundSupportAssessment(
+                        **{**base.__dict__, "drop_clusters": (cluster,)}
+                    )
+                )
+                self.assertIsNone(gate._assessment)
+                self.assertEqual(gate.latched_drop_clusters, ())
 
     def test_safety_stop_timeout_uses_sim_time(self):
         gate = GroundSupportSafetyGate(_config())
@@ -905,8 +994,8 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
         )
         gate.check_control_timeout(12.01, wall_time=100.6)
 
-        self.assertEqual(gate.state, SUPPORT_PATH_UNAVAILABLE)
-        self.assertEqual(gate.reason_code, "ground_support_path_unavailable")
+        self.assertEqual(gate.state, SAFETY_BLOCKED)
+        self.assertEqual(gate.reason_code, "support_veto_source_missing")
 
     def test_wall_progress_alone_does_not_expire_observation_hold(self):
         gate = GroundSupportSafetyGate(_config(observation_hold_timeout=2.0))
@@ -991,6 +1080,71 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
 
         self.assertEqual(gate.latched_boundary_cells_world, ())
         self.assertEqual(gate.snapshot()["boundary_confirmation_count"], 1)
+
+
+def test_hold_freezes_complete_failure_witness_until_matching_ack():
+    gate = GroundSupportSafetyGate(_config(observation_hold_timeout=2.0))
+    gate.update_assessment(
+        _assessment(
+            supported_distance=0.10,
+            floor=1,
+            map_epoch=2,
+            localization_epoch=3,
+            cloud_generation=7,
+            support_boundary_cells=((8, 9), (8, 10)),
+        )
+    )
+    gate.filter_command(
+        (0.20, 0.0, 0.0),
+        pose_yaw=0.0,
+        wall_time=100.0,
+        control_time=10.0,
+    )
+    command, context_id = gate.support_sweep_context_snapshot((0.0, 0.0, 0.0))
+    gate.update_assessment(
+        _assessment(
+            stamp=10.1,
+            received_wall_time=100.1,
+            supported_distance=0.10,
+            floor=1,
+            map_epoch=2,
+            localization_epoch=3,
+            cloud_generation=8,
+            support_boundary_cells=((8, 9), (8, 10)),
+            hold_context_id=context_id,
+            support_command=command,
+            support_lookahead_distance=0.2,
+        )
+    )
+    witness = gate.failure_witness
+    assert witness is not None
+    assert witness.source_cells == ((8, 9), (8, 10))
+
+    gate.update_assessment(
+        _assessment(
+            stamp=10.2,
+            received_wall_time=100.2,
+            data_age=0.20,
+            supported_distance=0.10,
+            support_boundary_detected=False,
+            support_boundary_cells=(),
+        )
+    )
+    gate.check_control_timeout(12.01, wall_time=100.2)
+
+    assert gate.state == SUPPORT_PATH_UNAVAILABLE
+    assert gate.failure_witness == witness
+    wrong_ack = SupportConstraintAck(
+        witness.sequence + 1, witness.floor, witness.map_epoch,
+        witness.localization_epoch, 1,
+    )
+    ack = SupportConstraintAck(
+        witness.sequence, witness.floor, witness.map_epoch,
+        witness.localization_epoch, 1,
+    )
+    assert not gate.reset_path_unavailable(wrong_ack)
+    assert gate.reset_path_unavailable(ack)
+    assert gate.state == CLEAR
 
 
 if __name__ == "__main__":

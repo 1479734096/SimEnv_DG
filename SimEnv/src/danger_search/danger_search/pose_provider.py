@@ -103,6 +103,13 @@ class PoseProvider:
         self._lock = Lock()
         self._samples: deque[PoseSample] = deque(maxlen=max(2, int(max_samples)))
         self._subscriber = None
+        self._frame_identity: tuple[str, str] | None = None
+        self._continuity_epoch = 1
+
+    @property
+    def continuity_epoch(self) -> int:
+        with self._lock:
+            return self._continuity_epoch
 
     def start(self) -> None:
         """建立内部里程计订阅；构造对象本身不会产生 ROS 副作用。"""
@@ -221,12 +228,30 @@ class PoseProvider:
             linear_xyz=(float(twist.linear.x), float(twist.linear.y), float(twist.linear.z)),
             angular_xyz=(float(twist.angular.x), float(twist.angular.y), float(twist.angular.z)),
         )
+        frame_identity = (
+            str(getattr(getattr(message, "header", None), "frame_id", "")),
+            str(getattr(message, "child_frame_id", "")),
+        )
         with self._lock:
             if not _is_valid_sample(sample):
                 return
+            if self._frame_identity is None:
+                self._frame_identity = frame_identity
+            elif frame_identity != self._frame_identity:
+                self._continuity_epoch += 1
+                self._frame_identity = frame_identity
+                self._samples.clear()
             # 查询逻辑依赖历史按时间递增；异常乱序帧不能破坏这一不变量。
             if self._samples and sample.stamp <= self._samples[-1].stamp:
-                return
+                latest_stamp = self._samples[-1].stamp
+                timebase_reset = (
+                    latest_stamp - sample.stamp > 1.0
+                    and sample.stamp < 0.5 * latest_stamp
+                )
+                if not timebase_reset:
+                    return
+                self._continuity_epoch += 1
+                self._samples.clear()
             self._samples.append(sample)
 
 

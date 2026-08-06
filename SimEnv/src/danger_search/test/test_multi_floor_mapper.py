@@ -6,7 +6,9 @@ from danger_search.planner import astar_path
 from danger_search.mapper import (
     BLACK,
     FREE,
+    FloorGrid,
     NEGATIVE,
+    NegativeClusterRecord,
     MultiFloorGridMap,
     OCC,
     UNKNOWN,
@@ -15,6 +17,20 @@ from danger_search.mapper import (
 
 
 class MultiFloorMapperTest(unittest.TestCase):
+    @staticmethod
+    def _negative_record(mapper, cell, *, cluster_id="drop:1", generation=1):
+        return NegativeClusterRecord(
+            cluster_id=cluster_id,
+            floor=0,
+            frame_id="odom",
+            map_epoch=1,
+            localization_epoch=1,
+            stamp=float(generation),
+            generation=generation,
+            grid_origin=(mapper.origin_x, mapper.origin_y),
+            grid_resolution=mapper.resolution,
+            source_cells=frozenset({cell}),
+        )
     @staticmethod
     def _point_from_polar(distance: float, angle: float, z: float = 0.6) -> Tuple[float, float, float]:
         return (distance * math.cos(angle), distance * math.sin(angle), z)
@@ -44,6 +60,120 @@ class MultiFloorMapperTest(unittest.TestCase):
         self.assertFalse(grid.is_traversable(*center))
         self.assertFalse(grid.is_traversable(*neighbor))
 
+    def test_low_candidate_does_not_block_visited_until_distinct_pose_confirmation(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+            visited_radius=0.0,
+            obstacle_inflation_radius=0.15,
+            free_clear_enabled=False,
+            evidence_lifecycle_enabled=True,
+            low_confirm_generations=3,
+            low_confirm_window_generations=10,
+            counter_pose_separation=0.15,
+        )
+        grid = mapper.floor(0)
+        core = grid.world_to_grid(0.5, 0.0)
+        assert core is not None
+        grid.set_base_state(*core, VISITED)
+
+        for generation, robot_x in ((1, -0.4), (2, -0.4), (3, -0.4)):
+            mapper.update_from_cloud(
+                floor_index=0,
+                robot_xyz=(robot_x, 0.0, 0.4),
+                points=[(0.5, 0.0, 0.18)],
+                cloud_generation=generation,
+                map_epoch=1,
+                localization_epoch=1,
+            )
+        self.assertEqual(grid.occ_cores[core].kind, "LOW_CANDIDATE")
+        self.assertEqual(int(grid.data[core[1], core[0]]), VISITED)
+
+        for generation, robot_x in ((4, -0.2), (5, 0.0)):
+            mapper.update_from_cloud(
+                floor_index=0,
+                robot_xyz=(robot_x, 0.0, 0.4),
+                points=[(0.5, 0.0, 0.18)],
+                cloud_generation=generation,
+                map_epoch=1,
+                localization_epoch=1,
+            )
+        self.assertEqual(grid.occ_cores[core].kind, "LOW_CONFIRMED")
+        self.assertEqual(int(grid.data[core[1], core[0]]), OCC)
+
+    def test_strict_counterevidence_removes_low_core_and_restores_base(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+            visited_radius=0.0,
+            obstacle_inflation_radius=0.0,
+            free_clear_enabled=False,
+            evidence_lifecycle_enabled=True,
+            low_confirm_generations=3,
+            low_confirm_window_generations=10,
+            low_candidate_counter_generations=3,
+            low_candidate_counter_positions=2,
+            counter_pose_separation=0.15,
+        )
+        grid = mapper.floor(0)
+        core = grid.world_to_grid(0.5, 0.0)
+        assert core is not None
+        grid.set_base_state(*core, VISITED)
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(-0.4, 0.0, 0.4),
+            points=[(0.5, 0.0, 0.18)],
+            cloud_generation=1,
+            map_epoch=1,
+            localization_epoch=1,
+        )
+        for generation, robot_x in ((2, -0.3), (3, -0.1), (4, 0.1)):
+            mapper.update_from_cloud(
+                floor_index=0,
+                robot_xyz=(robot_x, 0.0, 0.4),
+                points=[(1.0, 0.0, 0.0)],
+                cloud_generation=generation,
+                map_epoch=1,
+                localization_epoch=1,
+            )
+        self.assertNotIn(core, grid.occ_cores)
+        self.assertEqual(int(grid.data[core[1], core[0]]), VISITED)
+
+    def test_overlapping_inflation_survives_one_core_removal(self):
+        grid = FloorGrid(0, 0.1, 4.0, 4.0, -2.0, -2.0)
+        first = grid.world_to_grid(0.0, 0.0)
+        second = grid.world_to_grid(0.1, 0.0)
+        assert first is not None and second is not None
+        for generation, owner in enumerate((first, second), start=1):
+            grid.record_obstacle_observation(
+                *grid.grid_to_world(*owner),
+                0.2,
+                kind="HIGH_HARD",
+                cloud_generation=generation,
+                robot_xy=(-0.5, 0.0),
+                map_epoch=1,
+                localization_epoch=1,
+                low_confirm_generations=3,
+                low_confirm_window_generations=10,
+                pose_separation=0.15,
+            )
+        overlap = next(
+            iter(
+                grid.occ_cores[first].inflated_cells
+                & grid.occ_cores[second].inflated_cells
+            )
+        )
+        self.assertEqual(grid.inflation_owners[overlap], {first, second})
+        self.assertTrue(grid.remove_obstacle_core(first))
+        self.assertEqual(grid.inflation_owners[overlap], {second})
+        self.assertEqual(int(grid.data[overlap[1], overlap[0]]), OCC)
+
     def test_visited_mark_does_not_erase_black_safety_cell(self):
         mapper = MultiFloorGridMap(
             resolution=0.1,
@@ -56,7 +186,7 @@ class MultiFloorMapperTest(unittest.TestCase):
         cell = grid.world_to_grid(0.0, 0.0)
         self.assertIsNotNone(cell)
         center = grid.grid_to_world(*cell)
-        grid.data[cell[1], cell[0]] = BLACK
+        grid.mark_black(*cell, owner="test:safety")
 
         grid.mark_visited_radius(center[0], center[1], 0.05)
 
@@ -125,9 +255,9 @@ class MultiFloorMapperTest(unittest.TestCase):
             origin_y=0.0,
         )
         grid = mapper.floor(0)
-        grid.data[1, 1] = FREE
-        grid.data[1, 2] = VISITED
-        grid.data[3, 4] = OCC
+        grid.set_base_state(1, 1, FREE)
+        grid.set_base_state(2, 1, VISITED)
+        grid.mark_occupied(4, 3)
 
         self.assertAlmostEqual(grid.known_area(), 0.75)
         self.assertAlmostEqual(grid.visited_area(), 0.25)
@@ -395,7 +525,7 @@ class MultiFloorMapperTest(unittest.TestCase):
         self.assertIsNotNone(black_cell)
         grid.mark_occupied(*inside_cell)
         grid.mark_occupied(*outside_cell)
-        grid.data[black_cell[1], black_cell[0]] = BLACK
+        grid.mark_black(*black_cell, owner="test:door_safety")
 
         mapper.clear_dynamic_door_strip(0, 0.0, 0.0, 0.0, width=1.0, depth=0.8)
 
@@ -476,8 +606,12 @@ class MultiFloorMapperTest(unittest.TestCase):
         )
         grid = mapper.floor(0)
         cell = grid.world_to_grid(0.5, 0.0)
+        grid.mark_free(*cell)
 
-        self.assertEqual(mapper.mark_negative_cells(0, [cell]), 1)
+        commit = mapper.persist_negative_clusters_atomic(
+            (self._negative_record(mapper, cell),)
+        )
+        self.assertTrue(commit.committed)
         self.assertEqual(grid.data[cell[1], cell[0]], NEGATIVE)
         self.assertFalse(grid.is_traversable(*cell))
         mapper.update_from_cloud(
@@ -486,8 +620,223 @@ class MultiFloorMapperTest(unittest.TestCase):
             points=[(1.0, 0.0, 0.0)],
         )
         self.assertEqual(grid.data[cell[1], cell[0]], NEGATIVE)
-        self.assertEqual(mapper.clear_negative_cells_with_support(0, [cell]), 1)
+        self.assertEqual(
+            mapper.clear_negative_clusters_with_support(
+                floor=0, cells=[cell], map_epoch=1,
+                localization_epoch=1, generation=2,
+                grid_origin=(mapper.origin_x, mapper.origin_y),
+                grid_resolution=mapper.resolution,
+            ),
+            ("drop:1",),
+        )
         self.assertEqual(grid.data[cell[1], cell[0]], FREE)
+
+    def test_negative_cluster_batch_rejects_mixed_scope_without_partial_commit(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1, width=4.0, length=4.0,
+            origin_x=-2.0, origin_y=-2.0,
+        )
+        cells = (mapper.floor(0).world_to_grid(0.2, 0.0),
+                 mapper.floor(0).world_to_grid(0.4, 0.0))
+        first = self._negative_record(mapper, cells[0], cluster_id="drop:a")
+        second = NegativeClusterRecord(
+            **{**first.__dict__, "cluster_id": "drop:b", "map_epoch": 2,
+               "source_cells": frozenset({cells[1]})}
+        )
+
+        commit = mapper.persist_negative_clusters_atomic((first, second))
+
+        self.assertFalse(commit.committed)
+        self.assertEqual(commit.reason_code, "drop_cluster_scope_invalid")
+        self.assertEqual(mapper.floor(0).negative_cluster_records, {})
+        self.assertFalse(mapper.floor(0).negative_cell_owners)
+
+    def test_negative_cluster_rejects_non_integer_cells_and_nonfinite_geometry(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1, width=4.0, length=4.0,
+            origin_x=-2.0, origin_y=-2.0,
+        )
+        base = self._negative_record(mapper, (20, 20))
+        malformed_cell = NegativeClusterRecord(
+            **{**base.__dict__, "source_cells": frozenset({(20.5, 20)})}
+        )
+        malformed_geometry = NegativeClusterRecord(
+            **{**base.__dict__, "cluster_id": "drop:nan",
+               "grid_resolution": math.nan}
+        )
+        malformed_floor = NegativeClusterRecord(
+            **{**base.__dict__, "cluster_id": "drop:floor", "floor": True}
+        )
+        malformed_cluster_id = NegativeClusterRecord(
+            **{**base.__dict__, "cluster_id": 7}
+        )
+        floors_before = dict(mapper._floors)
+
+        self.assertFalse(
+            mapper.persist_negative_clusters_atomic((malformed_cell,)).committed
+        )
+        self.assertFalse(
+            mapper.persist_negative_clusters_atomic((malformed_geometry,)).committed
+        )
+        self.assertFalse(
+            mapper.persist_negative_clusters_atomic((malformed_floor,)).committed
+        )
+        self.assertFalse(
+            mapper.persist_negative_clusters_atomic(
+                (malformed_cluster_id,)
+            ).committed
+        )
+        self.assertEqual(mapper._floors, floors_before)
+        self.assertEqual(mapper.floor(0).negative_cluster_records, {})
+
+    def test_new_floor_bad_geometry_or_bounds_does_not_create_floor(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1, width=4.0, length=4.0,
+            origin_x=-2.0, origin_y=-2.0,
+        )
+        bad_geometry = NegativeClusterRecord(
+            cluster_id="drop:bad-geometry", floor=7, frame_id="odom",
+            map_epoch=1, localization_epoch=1, stamp=1.0, generation=1,
+            grid_origin=(99.0, 99.0), grid_resolution=0.1,
+            source_cells=frozenset({(1, 1)}),
+        )
+        out_of_bounds = NegativeClusterRecord(
+            cluster_id="drop:out-of-bounds", floor=8, frame_id="odom",
+            map_epoch=1, localization_epoch=1, stamp=1.0, generation=1,
+            grid_origin=(-2.0, -2.0), grid_resolution=0.1,
+            source_cells=frozenset({(999, 1)}),
+        )
+
+        self.assertFalse(
+            mapper.persist_negative_clusters_atomic((bad_geometry,)).committed
+        )
+        self.assertFalse(
+            mapper.persist_negative_clusters_atomic((out_of_bounds,)).committed
+        )
+        self.assertEqual(mapper._floors, {})
+
+    def test_confirmation_for_unknown_floor_does_not_create_floor(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1, width=4.0, length=4.0,
+            origin_x=-2.0, origin_y=-2.0,
+        )
+
+        removed = mapper.clear_negative_clusters_with_support(
+            floor=9, cells=[(1, 1)], map_epoch=1,
+            localization_epoch=1, generation=2,
+            grid_origin=(-2.0, -2.0), grid_resolution=0.1,
+        )
+
+        self.assertEqual(removed, ())
+        self.assertEqual(mapper._floors, {})
+
+    def test_idempotent_cluster_batch_does_not_advance_revision(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1, width=4.0, length=4.0,
+            origin_x=-2.0, origin_y=-2.0,
+        )
+        cell = mapper.floor(0).world_to_grid(0.2, 0.0)
+        record = self._negative_record(mapper, cell)
+        first = mapper.persist_negative_clusters_atomic((record,))
+        replay = mapper.persist_negative_clusters_atomic((record,))
+
+        self.assertTrue(first.committed)
+        self.assertTrue(replay.committed)
+        self.assertEqual(replay.reason_code, "already_committed")
+        self.assertEqual(replay.revision, first.revision)
+
+    def test_negative_cluster_support_accumulates_across_newer_batches(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1, width=4.0, length=4.0,
+            origin_x=-2.0, origin_y=-2.0,
+        )
+        grid = mapper.floor(0)
+        first_cell = grid.world_to_grid(0.2, 0.0)
+        cells = frozenset({first_cell, (first_cell[0] + 1, first_cell[1])})
+        record = NegativeClusterRecord(
+            **{**self._negative_record(mapper, next(iter(cells))).__dict__,
+               "source_cells": cells, "generation": 10}
+        )
+        mapper.persist_negative_clusters_atomic((record,))
+
+        self.assertEqual(
+            mapper.clear_negative_clusters_with_support(
+                floor=0, cells=[next(iter(cells))], map_epoch=1,
+                localization_epoch=1, generation=11,
+                grid_origin=(mapper.origin_x, mapper.origin_y),
+                grid_resolution=mapper.resolution,
+            ),
+            (),
+        )
+        remaining = cells - {next(iter(cells))}
+        self.assertEqual(
+            mapper.clear_negative_clusters_with_support(
+                floor=0, cells=remaining, map_epoch=1,
+                localization_epoch=1, generation=12,
+                grid_origin=(mapper.origin_x, mapper.origin_y),
+                grid_resolution=mapper.resolution,
+            ),
+            ("drop:1",),
+        )
+
+    def test_negative_underlay_is_removed_when_occ_hides_revoked_cluster(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1, width=4.0, length=4.0,
+            origin_x=-2.0, origin_y=-2.0,
+        )
+        grid = mapper.floor(0)
+        cell = grid.world_to_grid(0.2, 0.0)
+        mapper.persist_negative_clusters_atomic((self._negative_record(mapper, cell),))
+        grid.mark_occupied(*cell)
+
+        mapper.clear_negative_clusters_with_support(
+            floor=0, cells=[cell], map_epoch=1,
+            localization_epoch=1, generation=2,
+            grid_origin=(mapper.origin_x, mapper.origin_y),
+            grid_resolution=mapper.resolution,
+        )
+
+        self.assertEqual(grid.data[cell[1], cell[0]], OCC)
+        self.assertNotIn(cell, grid.negative_first_state)
+
+    def test_stale_or_wrong_geometry_support_does_not_accumulate(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1, width=4.0, length=4.0,
+            origin_x=-2.0, origin_y=-2.0,
+        )
+        grid = mapper.floor(0)
+        first = grid.world_to_grid(0.2, 0.0)
+        second = (first[0] + 1, first[1])
+        record = NegativeClusterRecord(
+            **{
+                **self._negative_record(mapper, first).__dict__,
+                "generation": 10,
+                "source_cells": frozenset({first, second}),
+            }
+        )
+        mapper.persist_negative_clusters_atomic((record,))
+
+        self.assertEqual(mapper.clear_negative_clusters_with_support(
+            floor=0, cells=[first], map_epoch=1, localization_epoch=1,
+            generation=10, grid_origin=(mapper.origin_x, mapper.origin_y),
+            grid_resolution=mapper.resolution,
+        ), ())
+        self.assertEqual(mapper.clear_negative_clusters_with_support(
+            floor=0, cells=[first], map_epoch=1, localization_epoch=1,
+            generation=11, grid_origin=(99.0, 99.0),
+            grid_resolution=mapper.resolution,
+        ), ())
+        self.assertEqual(mapper.clear_negative_clusters_with_support(
+            floor=0, cells=[second], map_epoch=1, localization_epoch=1,
+            generation=11, grid_origin=(mapper.origin_x, mapper.origin_y),
+            grid_resolution=mapper.resolution,
+        ), ())
+        self.assertIn("drop:1", grid.negative_cluster_records)
+        self.assertEqual(mapper.clear_negative_clusters_with_support(
+            floor=0, cells=[first], map_epoch=1, localization_epoch=1,
+            generation=12, grid_origin=(mapper.origin_x, mapper.origin_y),
+            grid_resolution=mapper.resolution,
+        ), ("drop:1",))
 
     def test_direct_support_never_clears_black_or_occupied_priority(self):
         mapper = MultiFloorGridMap(
@@ -500,11 +849,19 @@ class MultiFloorMapperTest(unittest.TestCase):
         grid = mapper.floor(0)
         black = grid.world_to_grid(0.2, 0.0)
         occupied = grid.world_to_grid(0.4, 0.0)
-        mapper.mark_negative_cells(0, [black, occupied])
-        grid.data[black[1], black[0]] = BLACK
-        grid.data[occupied[1], occupied[0]] = OCC
+        mapper.persist_negative_clusters_atomic((
+            self._negative_record(mapper, black, cluster_id="drop:black"),
+            self._negative_record(mapper, occupied, cluster_id="drop:occ"),
+        ))
+        grid.mark_black(*black, owner="test:direct_support")
+        grid.mark_occupied(*occupied)
 
-        mapper.clear_negative_cells_with_support(0, [black, occupied])
+        mapper.clear_negative_clusters_with_support(
+            floor=0, cells=[black, occupied], map_epoch=1,
+            localization_epoch=1, generation=2,
+            grid_origin=(mapper.origin_x, mapper.origin_y),
+            grid_resolution=mapper.resolution,
+        )
 
         self.assertEqual(grid.data[black[1], black[0]], BLACK)
         self.assertEqual(grid.data[occupied[1], occupied[0]], OCC)
@@ -519,7 +876,9 @@ class MultiFloorMapperTest(unittest.TestCase):
         )
         grid = mapper.floor(0)
         cell = grid.world_to_grid(0.2, 0.0)
-        mapper.mark_negative_cells(0, [cell])
+        mapper.persist_negative_clusters_atomic((
+            self._negative_record(mapper, cell),
+        ))
         grid.mark_occupied(*cell)
 
         mapper.clear_dynamic_door_strip(
@@ -527,6 +886,32 @@ class MultiFloorMapperTest(unittest.TestCase):
         )
 
         self.assertEqual(grid.data[cell[1], cell[0]], NEGATIVE)
+
+    def test_epoch_change_discards_old_obstacle_and_drop_evidence(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+        )
+        grid = mapper.floor(0)
+        grid.fill_base(FREE)
+        obstacle = grid.world_to_grid(0.2, 0.0)
+        negative = grid.world_to_grid(-0.2, 0.0)
+        grid.mark_occupied(*obstacle)
+        mapper.persist_negative_clusters_atomic((
+            self._negative_record(
+                mapper, negative, cluster_id="drop:old"
+            ),
+        ))
+
+        grid.activate_evidence_scope(map_epoch=2, localization_epoch=1)
+
+        self.assertEqual(grid.data[obstacle[1], obstacle[0]], FREE)
+        self.assertEqual(grid.data[negative[1], negative[0]], FREE)
+        self.assertEqual(grid.occ_cores, {})
+        self.assertEqual(grid.negative_cluster_records, {})
 
 
 if __name__ == "__main__":

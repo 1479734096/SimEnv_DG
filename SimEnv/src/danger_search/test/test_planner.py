@@ -4,8 +4,13 @@ from __future__ import annotations
 import math
 import unittest
 
-from danger_search.mapper import FloorGrid
+import numpy as np
+
+from danger_search.map_evidence import HIGH_HARD, LOW_CANDIDATE, LOW_CONFIRMED
+from danger_search.mapper import FREE, FloorGrid
 from danger_search.planner import (
+    PlanningConstraints,
+    SupportVetoRegion,
     BUDGET_EXHAUSTED,
     REACHED,
     UNREACHABLE,
@@ -14,6 +19,197 @@ from danger_search.planner import (
     path_length,
     simplify_path_line_of_sight,
 )
+
+
+def test_planning_constraints_apply_to_start_goal_search_and_los_without_map_write():
+    grid = FloorGrid(
+        floor_index=0,
+        resolution=1.0,
+        width=7.0,
+        length=5.0,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    grid.fill_base(FREE)
+    original = grid.data.copy()
+    blocked = frozenset({(3, 1), (3, 2), (3, 3)})
+    constraints = PlanningConstraints(blocked_cells=blocked)
+
+    result = astar_plan(
+        grid,
+        grid.grid_to_world(1, 2),
+        grid.grid_to_world(5, 2),
+        constraints=constraints,
+    )
+
+    assert result.reached
+    assert all(grid.world_to_grid(*point) not in blocked for point in result.path)
+    assert np.array_equal(grid.data, original)
+
+
+def test_start_veto_requires_complete_monotonic_exit_prefix():
+    grid = FloorGrid(
+        floor_index=0,
+        resolution=1.0,
+        width=8.0,
+        length=5.0,
+        origin_x=0.0,
+        origin_y=0.0,
+    )
+    grid.fill_base(FREE)
+    blocked = frozenset({(1, 2), (2, 2), (3, 2)})
+    region = SupportVetoRegion("r1", blocked, frozenset({(0, 2)}))
+    constraints = PlanningConstraints.from_regions((region,), revision=1)
+
+    result = astar_plan(
+        grid,
+        grid.grid_to_world(1, 2),
+        grid.grid_to_world(6, 2),
+        constraints=constraints,
+    )
+
+    assert result.reached
+    cells = [grid.world_to_grid(*point) for point in result.path]
+    assert cells[:4] == [(1, 2), (2, 2), (3, 2), (4, 2)]
+    assert all(cell not in blocked for cell in cells[4:])
+
+
+def test_start_veto_cannot_exempt_cell_owned_by_foreign_region():
+    grid = FloorGrid(
+        floor_index=0, resolution=1.0, width=7.0, length=3.0,
+        origin_x=0.0, origin_y=0.0,
+    )
+    grid.fill_base(FREE)
+    owner = SupportVetoRegion(
+        "owner", frozenset({(1, 1), (2, 1)}), frozenset({(0, 1)})
+    )
+    foreign = SupportVetoRegion(
+        "foreign", frozenset({(2, 1), (3, 1)}), frozenset({(3, 0)})
+    )
+    result = astar_plan(
+        grid, grid.grid_to_world(1, 1), grid.grid_to_world(5, 1),
+        constraints=PlanningConstraints.from_regions((owner, foreign), revision=1),
+        max_iterations=None,
+    )
+    assert result.unreachable
+    assert result.reason_code == "support_veto_escape_unreachable"
+
+
+def _record_hard_core(grid, cell, *, radius=1.1, map_epoch=1):
+    wx, wy = grid.grid_to_world(*cell)
+    grid.record_obstacle_observation(
+        wx,
+        wy,
+        radius,
+        kind=HIGH_HARD,
+        cloud_generation=1,
+        robot_xy=(wx, wy),
+        map_epoch=map_epoch,
+        localization_epoch=1,
+        low_confirm_generations=3,
+        low_confirm_window_generations=20,
+        pose_separation=0.15,
+    )
+
+
+def test_inflated_occ_start_uses_same_monotonic_escape_search():
+    grid = FloorGrid(
+        floor_index=0, resolution=1.0, width=8.0, length=5.0,
+        origin_x=0.0, origin_y=0.0,
+    )
+    grid.fill_base(FREE)
+    _record_hard_core(grid, (1, 2))
+    start = grid.grid_to_world(2, 2)
+    result = astar_plan(grid, start, grid.grid_to_world(6, 2))
+
+    assert result.reached
+    assert [grid.world_to_grid(*point) for point in result.path][:2] == [
+        (2, 2), (3, 2)
+    ]
+    assert result.blocker["obstacle_owner_cells"] == ((1, 2),)
+
+
+def _record_low_confirmed_core(grid, cell, *, radius=1.1):
+    """构造多帧低回波确认的 LOW_CONFIRMED 核心（3 代次 + 分离位姿）。"""
+    wx, wy = grid.grid_to_world(*cell)
+    for gen in (1, 2, 3):
+        grid.record_obstacle_observation(
+            wx,
+            wy,
+            radius,
+            kind=LOW_CANDIDATE,
+            cloud_generation=gen,
+            robot_xy=(wx + gen * 0.2, wy),
+            map_epoch=1,
+            localization_epoch=1,
+            low_confirm_generations=3,
+            low_confirm_window_generations=20,
+            pose_separation=0.15,
+        )
+    assert grid.occ_cores[cell].kind == LOW_CONFIRMED
+
+
+def test_obstacle_core_start_is_never_exempted():
+    # HIGH_HARD（可靠实体障碍，如贴墙）起点本体保持 fail-closed，不豁免。
+    grid = FloorGrid(
+        floor_index=0, resolution=1.0, width=8.0, length=5.0,
+        origin_x=0.0, origin_y=0.0,
+    )
+    grid.fill_base(FREE)
+    _record_hard_core(grid, (2, 2))
+    result = astar_plan(
+        grid, grid.grid_to_world(2, 2), grid.grid_to_world(6, 2)
+    )
+
+    assert result.unreachable
+    assert result.reason_code == "start_cell_obstacle_core"
+
+
+def test_low_confirmed_start_core_self_exempted_when_base_traversable():
+    # LOW_CONFIRMED（多帧低回波确认，seed=8127 链 B 自腿伪影）起点本体自证豁免：
+    # 机器人 pose 落在此格=物理可通行，放开起点格及其 base 可通行膨胀邻域后可达。
+    grid = FloorGrid(
+        floor_index=0, resolution=1.0, width=8.0, length=5.0,
+        origin_x=0.0, origin_y=0.0,
+    )
+    grid.fill_base(FREE)
+    _record_low_confirmed_core(grid, (2, 2))
+    result = astar_plan(
+        grid, grid.grid_to_world(2, 2), grid.grid_to_world(6, 2)
+    )
+
+    assert result.reached
+    assert result.blocker.get("start_core_self") is True
+
+
+def test_low_confirmed_start_core_still_blocked_when_base_untraversable():
+    # base 层非 FREE/VISITED（从未探测的 UNKNOWN）时自证不成立，仍不可达。
+    grid = FloorGrid(
+        floor_index=0, resolution=1.0, width=8.0, length=5.0,
+        origin_x=0.0, origin_y=0.0,
+    )
+    _record_low_confirmed_core(grid, (2, 2))
+    result = astar_plan(
+        grid, grid.grid_to_world(2, 2), grid.grid_to_world(6, 2)
+    )
+
+    assert result.unreachable
+
+
+def test_inflated_start_rejects_cross_epoch_owner():
+    grid = FloorGrid(
+        floor_index=0, resolution=1.0, width=8.0, length=5.0,
+        origin_x=0.0, origin_y=0.0,
+    )
+    grid.fill_base(FREE)
+    _record_hard_core(grid, (1, 2))
+    grid.evidence_scope = (0, 2, 1)
+    result = astar_plan(
+        grid, grid.grid_to_world(2, 2), grid.grid_to_world(6, 2)
+    )
+
+    assert result.unreachable
+    assert result.reason_code == "start_obstacle_owner_scope_mismatch"
 
 
 class PlannerTest(unittest.TestCase):

@@ -57,6 +57,8 @@ class PerceptionMappingRuntime:
         preparation: CloudPreparation,
         *,
         floor_index: int,
+        map_epoch: int,
+        localization_epoch: int,
         cloud_max_points: int,
         cloud_stride: int,
         opened_door_exclusion,
@@ -75,6 +77,9 @@ class PerceptionMappingRuntime:
         self.map_runtime.last_cloud_stamp = cloud_input.stamp
         result = self.map_runtime.update_cloud(
             floor_index=int(floor_index),
+            cloud_generation=int(cloud_input.generation),
+            map_epoch=int(map_epoch),
+            localization_epoch=int(localization_epoch),
             robot_xyz=self.floor_coordinates.logical_xyz(
                 sample.xyz,
                 int(floor_index),

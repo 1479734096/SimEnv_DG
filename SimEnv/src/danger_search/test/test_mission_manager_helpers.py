@@ -26,6 +26,8 @@ from danger_search.ground_support_gate import (
     GroundSupportAssessment,
     GroundSupportGateConfig,
     GroundSupportSafetyGate,
+    DropClusterEvidence,
+    SupportFailureWitness,
 )
 from danger_search.ground_support_runtime import GroundSupportFeedbackRuntime
 from danger_search.ground_support_coordinator import GroundSupportCoordinator
@@ -34,6 +36,7 @@ from danger_search.floor_transition_runtime import (
     FloorCoordinateModel,
     FloorTransitionRuntime,
 )
+from danger_search.frontier import FloorTerminationEvidence
 from danger_search.elevator_observation_runtime import ElevatorObservationRuntime
 from danger_search.exploration_runtime import (
     ExplorationBudgetInput,
@@ -65,7 +68,15 @@ from danger_search.mission_config import (
 )
 from danger_search.mission_node_runtime import wait_for_localization_ready
 from danger_search.mission_reporting import MissionReportingRuntime
-from danger_search.mapper import BLACK, FREE, NEGATIVE, OCC, VISITED, MultiFloorGridMap
+from danger_search.mapper import (
+    BLACK,
+    FREE,
+    NEGATIVE,
+    OCC,
+    VISITED,
+    MultiFloorGridMap,
+    NegativeClusterRecord,
+)
 import danger_search.mission_manager as mission_manager_module
 import danger_search.initial_entry_runtime as initial_entry_runtime_module
 import danger_search.return_home_planner as return_home_planner_module
@@ -73,6 +84,7 @@ from danger_search.mission_manager import (
     CHANGE_FLOOR,
     EXPLORE_FLOOR,
     FINISH,
+    FloorExitCertificate,
     MISSION_FAILED,
     RETURN_HOME,
     WRITE_RESULT,
@@ -259,6 +271,9 @@ class _TestMapRuntime:
         self,
         *,
         floor_index,
+        cloud_generation,
+        map_epoch,
+        localization_epoch,
         robot_xyz,
         robot_pose,
         points,
@@ -268,6 +283,9 @@ class _TestMapRuntime:
             floor_index=floor_index,
             robot_xyz=robot_xyz,
             points=points,
+            cloud_generation=cloud_generation,
+            map_epoch=map_epoch,
+            localization_epoch=localization_epoch,
         )
         return CloudMapResult(
             tuple(points),
@@ -311,20 +329,32 @@ class _TestMapRuntime:
 
 class _TestGroundSupportCoordinator:
     def __init__(self):
+        from threading import RLock
+
         self.params = {}
+        self._scope_lock = RLock()
         self.gate = None
         self.grid = None
         self.feedback = GroundSupportFeedbackRuntime()
-        self.map_epoch = 0
-        self.localization_epoch = 0
+        self._active_floor = 0
+        self._map_epochs = {0: 1, 1: 1}
+        self.map_epoch = 1
+        self.localization_epoch = 1
         self.last_cloud_generation = 0
         self.last_cloud_stamp = None
+        self._negative_obstacle_commit_count = 0
 
-    def apply_map_updates(self, mapper):
-        return self.feedback.apply_map_updates(mapper)
+    def apply_confirmed_support(self, mapper=None):
+        return GroundSupportCoordinator.apply_confirmed_support(self, mapper)
 
-    def queue_map_updates(self, result, *, default_floor):
-        self.feedback.queue_map_updates(result, default_floor=default_floor)
+    def queue_confirmed_support(self, result, *, default_floor, cloud_stamp, cloud_generation):
+        return GroundSupportCoordinator.queue_confirmed_support(
+            self,
+            result,
+            default_floor=default_floor,
+            cloud_stamp=cloud_stamp,
+            cloud_generation=cloud_generation,
+        )
 
     def observe_odometry(self, controller, pose_sample):
         return GroundSupportCoordinator.observe_odometry(
@@ -333,21 +363,182 @@ class _TestGroundSupportCoordinator:
             pose_sample,
         )
 
+    def planning_constraints(self, floor):
+        return self.feedback.planning_constraints(
+            floor=int(floor),
+            map_epoch=int(self.map_epoch),
+            localization_epoch=int(self.localization_epoch),
+        )
+
+    def constraint_regions(self, floor):
+        return self.feedback.constraint_regions(
+            floor=int(floor),
+            map_epoch=int(self.map_epoch),
+            localization_epoch=int(self.localization_epoch),
+        )
+
+    def map_epoch_for_floor(self, floor):
+        return int(self.map_epoch)
+
+    def observe_gate_transition(self, state):
+        return self.feedback.observe_gate_state(state)
+
+    def set_gate_state_for_test(self, state):
+        self.feedback.synchronize_gate_state(state)
+
+    def invalidate_active_assessment(self):
+        gate = self.gate
+        invalidate = getattr(gate, "invalidate_evidence_scope", None)
+        if not callable(invalidate):
+            invalidate = getattr(gate, "invalidate_assessment", None)
+        if callable(invalidate):
+            invalidate()
+
+    def activate_floor(self, floor):
+        self._active_floor = int(floor)
+        self._map_epochs.setdefault(self._active_floor, 1)
+        self.map_epoch = self._map_epochs[self._active_floor]
+        self.invalidate_active_assessment()
+
+    def advance_map_epoch(self):
+        return GroundSupportCoordinator.advance_map_epoch(self)
+
+    def advance_localization_epoch(self):
+        return GroundSupportCoordinator.advance_localization_epoch(self)
+
+    def install_path_constraint(self, *, context_key, controller=None):
+        return GroundSupportCoordinator.install_path_constraint(
+            self, context_key=context_key, controller=controller
+        )
+
+    def _install_path_constraint_locked(self, *, context_key):
+        return GroundSupportCoordinator._install_path_constraint_locked(
+            self, context_key=context_key
+        )
+
     def assess_frame(self, **kwargs):
         return GroundSupportCoordinator.assess_frame(self, **kwargs)
 
-    def resume_negative_obstacle(self, **kwargs):
-        return GroundSupportCoordinator.resume_negative_obstacle(self, **kwargs)
-
-    def reapply_black_marks(self, mapper, floor_index):
-        return GroundSupportCoordinator.reapply_black_marks(
-            self,
-            mapper,
-            floor_index,
+    def persist_latched_drop_clusters(self, **kwargs):
+        return GroundSupportCoordinator.persist_latched_drop_clusters(
+            self, **kwargs
         )
 
 
+def _set_support_failure_witness(
+    manager,
+    gate,
+    *,
+    sequence: int,
+    cells,
+) -> None:
+    manager._ground_support.params = {"sweep_half_width": 0.2}
+    manager._ground_support.grid = SimpleNamespace(
+        config=SimpleNamespace(resolution=0.1, origin_x=-14.0, origin_y=-6.0)
+    )
+    gate._pending_failure_witness = SupportFailureWitness(
+        sequence=sequence,
+        floor=int(manager.current_floor),
+        map_epoch=int(manager._ground_support.map_epoch),
+        localization_epoch=int(manager._ground_support.localization_epoch),
+        stamp=float(sequence),
+        generation=sequence,
+        source_cells=cells,
+        hold_context_id=sequence,
+        trigger_command=(0.2, 0.0, 0.0),
+        grid_origin=(-14.0, -6.0),
+        grid_resolution=0.1,
+    )
+
 class MissionManagerHelperTest(unittest.TestCase):
+    def test_ground_support_scope_transition_invalidates_all_old_evidence_atomically(self):
+        manager = _make_test_manager()
+        manager.ground_support_params["production_gate_enabled"] = True
+        coordinator = GroundSupportCoordinator(
+            params=manager.ground_support_params,
+            map_params=manager.map_params,
+            cloud_max_points=manager.cloud_max_points,
+            path_goal_tolerance=0.35,
+        )
+        gate = coordinator.gate
+        grid = coordinator.grid
+        self.assertIsNotNone(gate)
+        self.assertIsNotNone(grid)
+        assert gate is not None and grid is not None
+        witness = SupportFailureWitness(
+            sequence=1, floor=0, map_epoch=1, localization_epoch=1,
+            stamp=1.0, generation=1, source_cells=((1, 1),),
+            hold_context_id=1, trigger_command=(0.1, 0.0, 0.0),
+            grid_origin=(grid.config.origin_x, grid.config.origin_y),
+            grid_resolution=grid.config.resolution,
+        )
+        coordinator.feedback.install_constraint(
+            witness, blocked_cells={(1, 1)}
+        )
+        coordinator.feedback.queue_confirmed_support(
+            {"floor": 0, "confirmed_supported_cells": [[1, 1]]},
+            default_floor=0, map_epoch=1, localization_epoch=1,
+            grid_origin=(grid.config.origin_x, grid.config.origin_y),
+            grid_resolution=grid.config.resolution,
+            cloud_stamp=2.0, cloud_generation=2,
+        )
+        gate._assessment = object()
+        gate._pending_failure_witness = witness
+        grid._cells[0][(1, 1)] = object()
+
+        coordinator.advance_map_epoch(0)
+
+        self.assertIsNone(gate._assessment)
+        self.assertIsNone(gate.failure_witness)
+        self.assertEqual(grid._cells.get(0), None)
+        self.assertIsNone(coordinator.planning_constraints(0))
+        self.assertEqual(coordinator.feedback._pending_supported, [])
+
+    def test_floor_switch_does_not_advance_map_or_localization_epoch(self):
+        manager = _make_test_manager()
+        coordinator = manager._ground_support
+        original_localization = coordinator.localization_epoch
+        coordinator.activate_floor(1)
+        self.assertEqual(coordinator.map_epoch, 1)
+        coordinator.activate_floor(0)
+        self.assertEqual(coordinator.map_epoch, 1)
+        self.assertEqual(coordinator.localization_epoch, original_localization)
+
+    def test_support_constraint_blocked_locks_success_only_at_floor_termination(self):
+        manager = _make_test_manager()
+        manager.current_floor = 0
+        manager._last_pose = (0.0, 0.0, 0.0)
+        manager._map_runtime.mapper = SimpleNamespace(
+            floor=lambda _floor: object()
+        )
+        manager._mission_success_eligible = True
+        constraints = SimpleNamespace(revision=9)
+        manager._planning_constraints = lambda: constraints
+        manager.explorer = SimpleNamespace(
+            floor_termination_evidence=lambda _grid, _pose, current, **_kwargs: (
+                FloorTerminationEvidence(
+                    constraint_revision=9,
+                    region_ids=("support:9",),
+                    formal_reachable_count=2,
+                    effective_reachable_count=0,
+                    support_blocked_count=2,
+                    fully_blocked=True,
+                )
+                if current is constraints else None
+            )
+        )
+        failures = []
+        logs = []
+        manager._record_failure = failures.append
+        manager._log_structured = logs.append
+
+        self.assertTrue(manager._mission_success_eligible)
+        self.assertTrue(manager._lock_support_constraint_blocked_completion())
+        self.assertFalse(manager._mission_success_eligible)
+        self.assertEqual(failures, ["support_constraint_blocked"])
+        self.assertTrue(manager._lock_support_constraint_blocked_completion())
+        self.assertEqual(failures, ["support_constraint_blocked"])
+
     @staticmethod
     def _finish_return_home_plan(manager, pose):
         planner = manager._return_home.planner
@@ -434,7 +625,6 @@ class MissionManagerHelperTest(unittest.TestCase):
 
     def test_failed_elevator_task_records_false_summary_state(self):
         manager = _make_test_manager()
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
         manager._map_runtime.mapper = SimpleNamespace()
         manager.state = CHANGE_FLOOR
         manager.max_runtime = 100.0
@@ -1068,7 +1258,6 @@ class MissionManagerHelperTest(unittest.TestCase):
                 evaluated_commands.append(command) or False
             ),
         )
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
         pose_sample = mission_manager_module.PoseSample(
             stamp=10.002,
             xyz=(0.0, 0.0, 0.39),
@@ -1149,8 +1338,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             check_wall_timeout=lambda _now: None,
             snapshot=lambda: {"state": SAFETY_BLOCKED},
         )
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
-        manager._ground_support_runtime.synchronize_gate_state(SAFETY_BLOCKED)
+        manager._ground_support.set_gate_state_for_test(SAFETY_BLOCKED)
         manager.ground_support_params = {"negative_obstacle_replan_enabled": False}
         manager._ground_support.params = manager.ground_support_params
         manager.state = EXPLORE_FLOOR
@@ -1171,7 +1359,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertFalse(manager._mission_success_eligible)
         self.assertNotIn("recover", [item[0] for item in controller_calls])
 
-    def test_negative_obstacle_can_mark_local_black_and_replan_without_recover(self):
+    def test_negative_obstacle_persists_source_cluster_without_recover(self):
         failures = []
         transitions = []
         logs = []
@@ -1198,6 +1386,26 @@ class MissionManagerHelperTest(unittest.TestCase):
                 drop_direction_world=(1.0, 0.0),
                 received_control_time=100.0,
                 drop_point_world=(1.0, 0.0),
+                floor=0,
+                map_epoch=1,
+                localization_epoch=1,
+                cloud_generation=1,
+                grid_origin=(-2.0, -2.0),
+                grid_resolution=0.1,
+                drop_clusters=(
+                    DropClusterEvidence(
+                        cluster_id="drop:test:1",
+                        floor=0,
+                        frame_id="odom",
+                        map_epoch=1,
+                        localization_epoch=1,
+                        stamp=10.0,
+                        generation=1,
+                        grid_origin=(-2.0, -2.0),
+                        grid_resolution=0.1,
+                        source_cells=((30, 20),),
+                    ),
+                ),
             )
         )
         filtered = gate.filter_command(
@@ -1229,8 +1437,7 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         manager = _make_test_manager()
         manager._ground_support.gate = gate
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
-        manager._ground_support_runtime.synchronize_gate_state(SAFETY_BLOCKED)
+        manager._ground_support.set_gate_state_for_test(SAFETY_BLOCKED)
         manager.ground_support_params = {
             "negative_obstacle_replan_enabled": True,
             "maximum_negative_obstacle_replans": 2,
@@ -1244,6 +1451,13 @@ class MissionManagerHelperTest(unittest.TestCase):
             length=4.0,
             origin_x=-2.0,
             origin_y=-2.0,
+        )
+        manager._ground_support.grid = SimpleNamespace(
+            config=SimpleNamespace(
+                resolution=0.1,
+                origin_x=-2.0,
+                origin_y=-2.0,
+            )
         )
         manager.current_floor = 0
         manager.state = EXPLORE_FLOOR
@@ -1266,25 +1480,22 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         drop_cell = manager.mapper.floor(0).world_to_grid(1.0, 0.0)
         self.assertTrue(handled)
-        self.assertEqual(manager.mapper.floor(0).data[drop_cell[1], drop_cell[0]], BLACK)
+        self.assertEqual(manager.mapper.floor(0).data[drop_cell[1], drop_cell[0]], NEGATIVE)
         manager.mapper.update_from_cloud(
             floor_index=0,
             robot_xyz=(1.0, 0.0, 0.6),
             points=[],
         )
-        # 第 3 层 MAP-001 修复后，普通建图更新不得擦除安全 BLACK。
-        self.assertEqual(manager.mapper.floor(0).data[drop_cell[1], drop_cell[0]], BLACK)
-        manager._ground_support.reapply_black_marks(manager.mapper, 0)
-        self.assertEqual(manager.mapper.floor(0).data[drop_cell[1], drop_cell[0]], BLACK)
+        self.assertEqual(manager.mapper.floor(0).data[drop_cell[1], drop_cell[0]], NEGATIVE)
         self.assertEqual(gate.state, GROUND_SUPPORT_CLEAR)
         self.assertIsNone(manager.current_frontier)
         self.assertIsNone(manager._exploration.last_frontier_target)
         self.assertEqual(failures, [])
         self.assertEqual(transitions, [])
         self.assertFalse(any(call[0] == "recover" for call in controller_calls))
-        self.assertEqual(logs[-1]["event"], "negative_obstacle_local_replan")
+        self.assertEqual(logs[-1]["event"], "negative_clusters_persisted")
 
-    def test_fourth_negative_obstacle_replan_fails_explicitly(self):
+    def test_negative_obstacle_without_source_cluster_fails_explicitly(self):
         failures = []
         transitions = []
         gate = SimpleNamespace(
@@ -1296,9 +1507,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         manager = _make_test_manager()
         manager._ground_support.gate = gate
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
-        manager._ground_support_runtime.synchronize_gate_state(SAFETY_BLOCKED)
-        manager._ground_support_runtime.negative_replan_count = 3
+        manager._ground_support.set_gate_state_for_test(SAFETY_BLOCKED)
         manager.ground_support_params = {
             "negative_obstacle_replan_enabled": True,
             "maximum_negative_obstacle_replans": 3,
@@ -1333,7 +1542,144 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertFalse(manager._mission_success_eligible)
         self.assertEqual(transitions[0][0], WRITE_RESULT)
         self.assertEqual(transitions[0][1]["reason_code"], "negative_obstacle")
-        self.assertEqual(manager._ground_support_runtime.negative_replan_count, 3)
+
+    def test_drop_during_critical_task_never_modifies_map_or_resets_gate(self):
+        manager = _make_test_manager()
+        manager.current_floor = 0
+        manager.state = EXPLORE_FLOOR
+        manager.current_task = OpenDoorAndPass("main_entrance")
+        manager._map_runtime.mapper = MultiFloorGridMap(
+            resolution=0.1, width=4.0, length=4.0,
+            origin_x=-2.0, origin_y=-2.0,
+        )
+        cluster = DropClusterEvidence(
+            cluster_id="drop:critical", floor=0, frame_id="odom",
+            map_epoch=1, localization_epoch=1, stamp=1.0, generation=1,
+            grid_origin=(-2.0, -2.0), grid_resolution=0.1,
+            source_cells=((20, 20),),
+        )
+        resets = []
+        manager._ground_support.gate = SimpleNamespace(
+            state=SAFETY_BLOCKED, reason_code="negative_obstacle",
+            latched_drop_clusters=(cluster,),
+            check_control_timeout=lambda *_a, **_k: None,
+            snapshot=lambda: {"state": SAFETY_BLOCKED},
+            reset_negative_obstacle_after_replan=lambda ack: resets.append(ack) or True,
+        )
+        manager._ground_support.set_gate_state_for_test(SAFETY_BLOCKED)
+        failures = []
+        transitions = []
+        manager.controller = SimpleNamespace(
+            reset_progress_timer=lambda _pose: None,
+            stop=lambda **_kwargs: None,
+            clear_path=lambda **_kwargs: None,
+        )
+        manager._record_failure = failures.append
+        manager._transition_state = lambda state, **kwargs: transitions.append((state, kwargs))
+
+        manager._handle_ground_support_control((0.0, 0.0, 0.0))
+
+        self.assertEqual(manager.mapper.floor(0).negative_cluster_records, {})
+        self.assertEqual(resets, [])
+        self.assertEqual(failures, ["negative_obstacle"])
+        self.assertEqual(transitions[0][0], WRITE_RESULT)
+
+    def test_drop_budget_counts_only_new_commits_and_allows_idempotent_ack(self):
+        manager = _make_test_manager()
+        coordinator = manager._ground_support
+        coordinator.params = {
+            "negative_obstacle_replan_enabled": True,
+            "maximum_negative_obstacle_replans": 1,
+        }
+        mapper = MultiFloorGridMap(
+            resolution=0.1, width=4.0, length=4.0,
+            origin_x=-2.0, origin_y=-2.0,
+        )
+        clears = []
+        resets = []
+        controller = SimpleNamespace(
+            clear_path=lambda **kwargs: clears.append(kwargs)
+        )
+        gate = SimpleNamespace(state=SAFETY_BLOCKED)
+
+        def reset(ack):
+            resets.append(ack)
+            gate.state = GROUND_SUPPORT_CLEAR
+            return True
+
+        gate.reset_negative_obstacle_after_replan = reset
+        coordinator.gate = gate
+
+        def cluster(cluster_id, cell):
+            return DropClusterEvidence(
+                cluster_id=cluster_id, floor=0, frame_id="odom",
+                map_epoch=1, localization_epoch=1, stamp=1.0,
+                generation=1, grid_origin=(-2.0, -2.0),
+                grid_resolution=0.1, source_cells=(cell,),
+            )
+
+        first = cluster("drop:first", (20, 20))
+        gate.latched_drop_clusters = (first,)
+        committed = coordinator.persist_latched_drop_clusters(
+            controller=controller, mapper=mapper, floor_index=0,
+            mission_state=EXPLORE_FLOOR, task_active=False,
+            ordinary_states=frozenset({EXPLORE_FLOOR, RETURN_HOME}),
+        )
+        gate.state = SAFETY_BLOCKED
+        gate.latched_drop_clusters = (cluster("drop:second", (21, 20)),)
+        exhausted = coordinator.persist_latched_drop_clusters(
+            controller=controller, mapper=mapper, floor_index=0,
+            mission_state=EXPLORE_FLOOR, task_active=False,
+            ordinary_states=frozenset({EXPLORE_FLOOR, RETURN_HOME}),
+        )
+        gate.state = SAFETY_BLOCKED
+        gate.latched_drop_clusters = (first,)
+        replay = coordinator.persist_latched_drop_clusters(
+            controller=controller, mapper=mapper, floor_index=0,
+            mission_state=EXPLORE_FLOOR, task_active=False,
+            ordinary_states=frozenset({EXPLORE_FLOOR, RETURN_HOME}),
+        )
+
+        self.assertIsNotNone(committed)
+        self.assertIsNone(exhausted)
+        self.assertIsNotNone(replay)
+        self.assertEqual(set(mapper.floor(0).negative_cluster_records), {"drop:first"})
+        self.assertEqual(len(resets), 2)
+        self.assertEqual(len(clears), 2)
+
+    def test_drop_from_stale_floor_scope_cannot_commit_or_ack(self):
+        manager = _make_test_manager()
+        coordinator = manager._ground_support
+        coordinator.params = {
+            "negative_obstacle_replan_enabled": True,
+            "maximum_negative_obstacle_replans": 2,
+        }
+        coordinator.activate_floor(1)
+        mapper = MultiFloorGridMap(
+            resolution=0.1, width=4.0, length=4.0,
+            origin_x=-2.0, origin_y=-2.0,
+        )
+        resets = []
+        coordinator.gate = SimpleNamespace(
+            latched_drop_clusters=(DropClusterEvidence(
+                cluster_id="drop:old", floor=0, frame_id="odom",
+                map_epoch=1, localization_epoch=1, stamp=1.0,
+                generation=1, grid_origin=(-2.0, -2.0),
+                grid_resolution=0.1, source_cells=((20, 20),),
+            ),),
+            reset_negative_obstacle_after_replan=lambda ack: resets.append(ack) or True,
+        )
+
+        result = coordinator.persist_latched_drop_clusters(
+            controller=SimpleNamespace(clear_path=lambda **_kwargs: None),
+            mapper=mapper, floor_index=0, mission_state=EXPLORE_FLOOR,
+            task_active=False,
+            ordinary_states=frozenset({EXPLORE_FLOOR, RETURN_HOME}),
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(mapper.floor(0).negative_cluster_records, {})
+        self.assertEqual(resets, [])
 
     def test_persistent_localization_speed_anomaly_is_not_replanned(self):
         failures = []
@@ -1348,8 +1694,7 @@ class MissionManagerHelperTest(unittest.TestCase):
                 "reason_code": "localization_speed_abnormal",
             },
         )
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
-        manager._ground_support_runtime.synchronize_gate_state(
+        manager._ground_support.set_gate_state_for_test(
             SUPPORT_PATH_UNAVAILABLE
         )
         manager.state = EXPLORE_FLOOR
@@ -1420,28 +1765,58 @@ class MissionManagerHelperTest(unittest.TestCase):
             origin_x=-2.0,
             origin_y=-2.0,
         )
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
+        manager._ground_support.grid = SimpleNamespace(
+            config=SimpleNamespace(
+                resolution=0.1,
+                origin_x=-2.0,
+                origin_y=-2.0,
+            )
+        )
+        manager._ground_support.activate_floor(1)
         manager._elapsed = lambda: 1.0
         manager._log_structured = logs.append
         cell = manager.mapper.floor(1).world_to_grid(0.5, 0.0)
 
-        manager._ground_support_runtime.queue_map_updates(
+        manager._ground_support.queue_confirmed_support(
             {"floor": 1, "confirmed_negative_cells": [list(cell)]},
             default_floor=manager.current_floor,
+            cloud_stamp=1.0,
+            cloud_generation=1,
         )
         self.assertNotEqual(
             manager.mapper.floor(1).data[cell[1], cell[0]], NEGATIVE
         )
-        update = manager._ground_support_runtime.apply_map_updates(manager.mapper)
-        self.assertEqual(manager.mapper.floor(1).data[cell[1], cell[0]], NEGATIVE)
+        update = manager._ground_support.apply_confirmed_support(manager.mapper)
+        self.assertNotEqual(manager.mapper.floor(1).data[cell[1], cell[0]], NEGATIVE)
+        self.assertFalse(update.changed)
 
-        manager._ground_support_runtime.queue_map_updates(
+        committed = manager.mapper.persist_negative_clusters_atomic(
+            (
+                NegativeClusterRecord(
+                    cluster_id="drop:1:1:1:1:0",
+                    floor=1,
+                    frame_id="odom",
+                    map_epoch=1,
+                    localization_epoch=1,
+                    stamp=1.0,
+                    generation=1,
+                    grid_origin=(-2.0, -2.0),
+                    grid_resolution=0.1,
+                    source_cells=frozenset({cell}),
+                ),
+            )
+        )
+        self.assertTrue(committed.committed)
+        self.assertEqual(manager.mapper.floor(1).data[cell[1], cell[0]], NEGATIVE)
+        manager._ground_support.queue_confirmed_support(
             {"floor": 1, "confirmed_supported_cells": [list(cell)]},
             default_floor=manager.current_floor,
+            cloud_stamp=2.0,
+            cloud_generation=2,
         )
-        update = manager._ground_support_runtime.apply_map_updates(manager.mapper)
+        update = manager._ground_support.apply_confirmed_support(manager.mapper)
         self.assertNotEqual(manager.mapper.floor(1).data[cell[1], cell[0]], NEGATIVE)
-        self.assertEqual(update.negative_cleared_by_support, 1)
+        self.assertTrue(update.changed)
 
     def test_stable_unknown_boundary_is_persisted_before_path_replan(self):
         logs = []
@@ -1454,15 +1829,9 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         gate.state = SUPPORT_PATH_UNAVAILABLE
         gate.reason_code = "ground_support_path_unavailable"
-        gate._latched_boundary_cells_world = (
-            (0.50, -0.10),
-            (0.50, 0.00),
-            (0.50, 0.10),
-        )
         manager = _make_test_manager()
         manager._ground_support.gate = gate
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
-        manager._ground_support_runtime.synchronize_gate_state(
+        manager._ground_support.set_gate_state_for_test(
             SUPPORT_PATH_UNAVAILABLE
         )
         manager.ground_support_params = {"maximum_same_phase_replans": 2}
@@ -1488,26 +1857,31 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager._elapsed = lambda: 2.0
         manager._record_failure = lambda reason: None
         manager._log_structured = logs.append
+        source_cells = tuple(
+            manager.mapper.floor(1).world_to_grid(*point)
+            for point in ((0.50, -0.10), (0.50, 0.00), (0.50, 0.10))
+        )
+        _set_support_failure_witness(
+            manager, gate, sequence=1, cells=source_cells
+        )
 
         manager._handle_ground_support_control((0.0, 0.0, 0.0))
 
         grid = manager.mapper.floor(1)
         for point in ((0.50, -0.10), (0.50, 0.00), (0.50, 0.10)):
             cell = grid.world_to_grid(*point)
-            self.assertEqual(grid.data[cell[1], cell[0]], NEGATIVE)
+            self.assertNotEqual(grid.data[cell[1], cell[0]], NEGATIVE)
         self.assertIsNone(manager.current_frontier)
+        constraints = manager._ground_support.planning_constraints(1)
+        self.assertIsNotNone(constraints)
+        self.assertTrue(set(source_cells).issubset(constraints.blocked_cells))
         self.assertTrue(
-            any(item["event"] == "ground_support_boundary_persisted" for item in logs)
-        )
-        self.assertEqual(
-            manager._ground_support_runtime.path_retry_key,
-            ("frontier", 1.0, 0.0),
+            any(item["event"] == "ground_support_constraint_installed" for item in logs)
         )
 
     def test_distinct_confirmed_boundaries_do_not_share_frontier_retry_budget(self):
         manager = _make_test_manager()
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
-        manager._ground_support_runtime.synchronize_gate_state(
+        manager._ground_support.set_gate_state_for_test(
             SUPPORT_PATH_UNAVAILABLE
         )
         manager.ground_support_params = {"maximum_same_phase_replans": 2}
@@ -1537,7 +1911,10 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager._elapsed = lambda: 2.0
         manager._log_structured = lambda payload: None
 
-        for target, boundary_x in (((1.0, 0.0), 0.5), ((-1.0, 0.0), -0.5)):
+        for sequence, (target, source_cell) in enumerate(
+            (((1.0, 0.0), (10, 10)), ((-1.0, 0.0), (30, 30))),
+            start=1,
+        ):
             gate = GroundSupportSafetyGate(
                 GroundSupportGateConfig(
                     enabled=True,
@@ -1547,25 +1924,30 @@ class MissionManagerHelperTest(unittest.TestCase):
             )
             gate.state = SUPPORT_PATH_UNAVAILABLE
             gate.reason_code = "ground_support_path_unavailable"
-            gate._latched_boundary_cells_world = ((boundary_x, 0.0),)
             manager._ground_support.gate = gate
-            manager._ground_support_runtime.synchronize_gate_state(
+            manager._ground_support.set_gate_state_for_test(
                 SUPPORT_PATH_UNAVAILABLE
             )
             manager.current_frontier = SimpleNamespace(centroid=target)
             manager._exploration.last_frontier_target = target
             manager._exploration.last_frontier_score = 1.0
+            _set_support_failure_witness(
+                manager, gate, sequence=sequence, cells=(source_cell,)
+            )
 
             manager._handle_ground_support_control((0.0, 0.0, 0.0))
 
-            self.assertEqual(manager._ground_support_runtime.path_retry_count, 1)
-            self.assertEqual(
-                manager._ground_support_runtime.path_retry_key,
-                ("frontier", round(target[0], 3), round(target[1], 3)),
-            )
-
         self.assertEqual(failures, [])
         self.assertEqual(transitions, [])
+        constraints = manager._ground_support.planning_constraints(1)
+        self.assertEqual(len(constraints.support_regions), 2)
+        self.assertEqual(
+            sorted(
+                region.failure_count
+                for region in manager._ground_support.constraint_regions(1)
+            ),
+            [1, 1],
+        )
 
     def test_unknown_timeout_fails_only_current_path_without_discarding_frontier(self):
         cleared = []
@@ -1581,8 +1963,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         gate.reason_code = "ground_support_path_unavailable"
         manager = _make_test_manager()
         manager._ground_support.gate = gate
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
-        manager._ground_support_runtime.synchronize_gate_state(
+        manager._ground_support.set_gate_state_for_test(
             SUPPORT_PATH_UNAVAILABLE
         )
         manager.state = EXPLORE_FLOOR
@@ -1600,14 +1981,17 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         manager._record_failure = lambda reason: failures.append(reason)
         manager._log_structured = lambda payload: None
+        _set_support_failure_witness(
+            manager, gate, sequence=1, cells=((10, 10),)
+        )
 
         handled = manager._handle_ground_support_control((0.0, 0.0, 0.0))
 
         self.assertTrue(handled)
         self.assertEqual(cleared, [{"reason": "ground_support_path_unavailable"}])
         self.assertEqual(failures, [])
-        self.assertIsNotNone(manager.current_frontier)
-        self.assertEqual(manager._exploration.last_frontier_target, (3.0, 4.0))
+        self.assertIsNone(manager.current_frontier)
+        self.assertIsNone(manager._exploration.last_frontier_target)
         self.assertEqual(gate.state, GROUND_SUPPORT_CLEAR)
 
     def test_unknown_timeout_preserves_open_door_parent_and_phase(self):
@@ -1628,8 +2012,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         task._commit_point = (2.0, 0.0)
         manager = _make_test_manager()
         manager._ground_support.gate = gate
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
-        manager._ground_support_runtime.synchronize_gate_state(
+        manager._ground_support.set_gate_state_for_test(
             SUPPORT_PATH_UNAVAILABLE
         )
         manager.ground_support_params = {"maximum_same_phase_replans": 2}
@@ -1644,6 +2027,9 @@ class MissionManagerHelperTest(unittest.TestCase):
             clear_path=lambda **kwargs: cleared.append(kwargs),
         )
         manager._log_structured = lambda payload: None
+        _set_support_failure_witness(
+            manager, gate, sequence=1, cells=((10, 10),)
+        )
 
         handled = manager._handle_ground_support_control((0.0, 0.0, 0.0))
 
@@ -1661,8 +2047,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         task = OpenDoorAndPass("main_entrance")
         task.phase = "GO_PASS_POINT"
         manager = _make_test_manager()
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
-        manager._ground_support_runtime.synchronize_gate_state(
+        manager._ground_support.set_gate_state_for_test(
             SUPPORT_PATH_UNAVAILABLE
         )
         manager.ground_support_params = {"maximum_same_phase_replans": 2}
@@ -1682,7 +2067,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager._transition_state = lambda state, **kwargs: transitions.append((state, kwargs))
         manager._log_structured = lambda payload: None
 
-        for _attempt in range(3):
+        for sequence in range(1, 4):
             gate = GroundSupportSafetyGate(
                 GroundSupportGateConfig(
                     enabled=True,
@@ -1693,16 +2078,102 @@ class MissionManagerHelperTest(unittest.TestCase):
             gate.state = SUPPORT_PATH_UNAVAILABLE
             gate.reason_code = "ground_support_path_unavailable"
             manager._ground_support.gate = gate
-            manager._ground_support_runtime.synchronize_gate_state(
+            manager._ground_support.set_gate_state_for_test(
                 SUPPORT_PATH_UNAVAILABLE
+            )
+            _set_support_failure_witness(
+                manager, gate, sequence=sequence, cells=((10, 10),)
             )
             manager._handle_ground_support_control((0.0, 0.0, 0.0))
 
         self.assertIs(manager.current_task, task)
         self.assertEqual(task.phase, "GO_PASS_POINT")
         self.assertEqual(recover_calls, [])
-        self.assertEqual(failures, ["ground_support_path_replan_exhausted"])
-        self.assertEqual(transitions[-1][0], WRITE_RESULT)
+        self.assertEqual(failures, [])
+        self.assertEqual(transitions, [])
+        region = manager._ground_support.constraint_regions(0)[0]
+        self.assertEqual(region.failure_count, 3)
+        self.assertEqual(
+            manager._tick_current_task_status((0.0, 0.0, 0.0)), FAILED
+        )
+        self.assertEqual(task.failure_reason, "ground_support_constraint_exhausted")
+        self.assertEqual(recover_calls, [])
+
+    def test_return_home_support_region_exhaustion_uses_bounded_reject_budget(self):
+        manager = _make_test_manager()
+        manager.state = RETURN_HOME
+        manager.current_floor = 0
+        manager.current_task = None
+        manager.return_home_max_candidate_rejects = 1
+        manager.ground_support_params = {"maximum_same_phase_replans": 2}
+        manager.controller = SimpleNamespace(
+            reset_progress_timer=lambda _pose: None,
+            stop=lambda **_kwargs: None,
+            clear_path=lambda **_kwargs: None,
+        )
+        manager._log_structured = lambda _payload: None
+        failures = []
+        manager._fail_return_home_stuck = lambda **kwargs: failures.append(kwargs["reason_code"])
+        for sequence in range(1, 4):
+            gate = GroundSupportSafetyGate(GroundSupportGateConfig(
+                enabled=True, validated_max_speed=0.6,
+                stop_distance_table=((0.6, 0.1),),
+            ))
+            gate.state = SUPPORT_PATH_UNAVAILABLE
+            gate.reason_code = "ground_support_path_unavailable"
+            manager._ground_support.gate = gate
+            manager._ground_support.set_gate_state_for_test(SUPPORT_PATH_UNAVAILABLE)
+            _set_support_failure_witness(
+                manager, gate, sequence=sequence, cells=((10, 10),)
+            )
+            manager._handle_ground_support_control((0.0, 0.0, 0.0))
+
+        self.assertEqual(manager._return_home.candidate_reject_count, 1)
+        self.assertEqual(failures, ["return_home_stuck_exhausted"])
+
+    def test_invalid_floor_exit_certificate_is_sticky_and_ignores_stale_debug(self):
+        manager = _make_test_manager()
+        manager.current_floor = 0
+        manager._last_pose = (0.0, 0.0, 0.0)
+        manager._map_runtime.mapper = MultiFloorGridMap(
+            resolution=1.0, width=3.0, length=3.0,
+            origin_x=0.0, origin_y=0.0,
+        )
+        evidence = SimpleNamespace(
+            constraint_revision=7,
+            region_ids=("support:7",),
+            formal_reachable_count=2,
+            effective_reachable_count=0,
+            support_blocked_count=2,
+            fully_blocked=True,
+        )
+        manager.explorer = SimpleNamespace(
+            last_selection_debug=SimpleNamespace(
+                formal_reachable_count=99,
+                effective_reachable_count=98,
+            ),
+            floor_termination_evidence=lambda *_a, **_k: evidence,
+        )
+        manager._planning_constraints = lambda: SimpleNamespace(
+            revision=7, support_regions=()
+        )
+        manager._record_floor_exit_certificate("first")
+        evidence.fully_blocked = False
+        manager._record_floor_exit_certificate("second")
+
+        certificate = manager._floor_exit_certificates[0]
+        self.assertFalse(certificate.valid)
+        self.assertEqual(certificate.reason_code, "first")
+        self.assertEqual(certificate.formal_reachable_count, 2)
+        self.assertEqual(certificate.effective_reachable_count, 0)
+
+    def test_drop_cluster_cell_conversion_rejects_non_integer_without_exception(self):
+        evidence = ground_support_coordinator_module._drop_cluster_evidence(
+            [[[1.2, 2]]], floor=0, map_epoch=1, localization_epoch=1,
+            stamp=1.0, generation=1, grid_origin=(0.0, 0.0),
+            grid_resolution=0.1,
+        )
+        self.assertEqual(evidence, ())
 
     def test_floor_transition_invalidates_old_floor_support_assessment(self):
         manager, _, _, reads, map_updates, _ = self._make_floor_transition_manager()
@@ -2776,7 +3247,19 @@ class MissionManagerHelperTest(unittest.TestCase):
             origin_x=-2.0,
             origin_y=-2.0,
         )
-        manager.explorer = SimpleNamespace(last_selection_debug=None)
+        manager.explorer = SimpleNamespace(
+            last_selection_debug=None,
+            floor_termination_evidence=lambda *_args, **_kwargs: (
+                FloorTerminationEvidence(
+                    constraint_revision=0,
+                    region_ids=(),
+                    formal_reachable_count=0,
+                    effective_reachable_count=0,
+                    support_blocked_count=0,
+                    fully_blocked=False,
+                )
+            ),
+        )
         manager.controller = SimpleNamespace(
             clear_path=lambda reason=None: cleared.append(reason),
         )
@@ -2957,7 +3440,19 @@ class MissionManagerHelperTest(unittest.TestCase):
             origin_x=-2.0,
             origin_y=-2.0,
         )
-        manager.explorer = SimpleNamespace(last_selection_debug=None)
+        manager.explorer = SimpleNamespace(
+            last_selection_debug=None,
+            floor_termination_evidence=lambda *_args, **_kwargs: (
+                FloorTerminationEvidence(
+                    constraint_revision=0,
+                    region_ids=(),
+                    formal_reachable_count=0,
+                    effective_reachable_count=0,
+                    support_blocked_count=0,
+                    fully_blocked=False,
+                )
+            ),
+        )
         manager.controller = SimpleNamespace(
             clear_path=lambda *args, **kwargs: None,
             stop=lambda *args, **kwargs: None,
@@ -3018,6 +3513,20 @@ class MissionManagerHelperTest(unittest.TestCase):
                 manager._reporting = SimpleNamespace(
                     write_result=lambda **_kwargs: Path("result.json")
                 )
+                manager._explored_floor_ids = {0}
+                manager._floor_exit_certificates = {
+                    0: FloorExitCertificate(
+                        floor=0,
+                        map_epoch=1,
+                        localization_epoch=1,
+                        constraint_revision=0,
+                        reason_code=return_reason,
+                        formal_reachable_count=0,
+                        effective_reachable_count=0,
+                        region_ids=(),
+                        valid=True,
+                    )
+                }
 
                 with patch.object(
                     mission_manager_module,
@@ -3032,6 +3541,47 @@ class MissionManagerHelperTest(unittest.TestCase):
 
                 self.assertTrue(manager._normal_completion)
                 self.assertFalse(manager._exploration_completed)
+
+    def test_return_home_result_reports_missing_or_invalid_floor_certificate(self):
+        for mode, failure_reasons, expected_reason in (
+            ("missing", (), "floor_exit_certificate_missing"),
+            ("invalid", (), "floor_exit_certificate_invalid"),
+            ("invalid", ("localization_unavailable",), "localization_unavailable"),
+        ):
+            with self.subTest(mode=mode, failure_reasons=failure_reasons):
+                manager = _make_test_manager()
+                manager.state = WRITE_RESULT
+                manager._return_home_started = True
+                manager._return_home_completed = True
+                manager._return_home_success = True
+                manager._mission_success_eligible = True
+                manager._explored_floor_ids = {0}
+                manager._floor_exit_certificates = {}
+                manager._failure_reasons = list(failure_reasons)
+                if mode == "invalid":
+                    manager._floor_exit_certificates[0] = FloorExitCertificate(
+                        floor=0, map_epoch=1, localization_epoch=1,
+                        constraint_revision=3, reason_code="support_blocked",
+                        formal_reachable_count=2,
+                        effective_reachable_count=0,
+                        region_ids=("support:3",), valid=False,
+                    )
+                manager.controller = SimpleNamespace(
+                    stop=lambda *args, **kwargs: None
+                )
+                manager._map_runtime.tracker = SimpleNamespace(
+                    confirmed_positions=lambda now: [], tracks=[]
+                )
+                manager._reporting = SimpleNamespace(
+                    write_result=lambda **_kwargs: Path("result.json")
+                )
+
+                manager._write_result(reason_code="return_home_completed")
+
+                self.assertEqual(manager._terminal_outcome, "failed")
+                self.assertEqual(manager._terminal_reason, expected_reason)
+                self.assertEqual(manager._result_write_reason, expected_reason)
+                self.assertTrue(manager._return_home_completed)
 
     def test_floor_change_back_to_home_preserves_original_return_reason(self):
         """返航途中完成换层不能覆盖最初的预算或探索完成原因。"""
@@ -4153,7 +4703,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         ).floor(0)
         for point in ((0.2, 2.3), (0.6, 2.3), (1.2, 2.3), (2.8, 2.3)):
             gx, gy = grid.world_to_grid(*point)
-            grid.data[gy, gx] = VISITED
+            grid.set_base_state(gx, gy, VISITED)
         manager._map_runtime.mapper = SimpleNamespace(floor=lambda _floor: grid)
         manager.elevator_visual_max_distance = 4.0
         manager._floor_navigation_traces = {
@@ -4190,10 +4740,10 @@ class MissionManagerHelperTest(unittest.TestCase):
             origin_x=0.0,
             origin_y=0.0,
         ).floor(1)
-        grid.data[:, :] = FREE
+        grid.fill_base(FREE)
         start = grid.world_to_grid(2.0, 2.0)
         for offset in range(3):
-            grid.data[start[1], start[0] - offset] = OCC
+            grid.mark_occupied(start[0] - offset, start[1])
         manager._map_runtime.mapper = SimpleNamespace(floor=lambda _floor: grid)
         manager._floor_navigation_traces = {
             1: [(1.0, 2.0), (1.8, 2.0), (2.0, 2.0)]
@@ -4215,7 +4765,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             origin_x=0.0,
             origin_y=0.0,
         ).floor(1)
-        grid.data[:, :] = FREE
+        grid.fill_base(FREE)
         manager._map_runtime.mapper = SimpleNamespace(floor=lambda _floor: grid)
         manager._floor_navigation_traces = {1: [(1.0, 2.0), (2.0, 2.0)]}
         manager.no_frontier_rotation_min_clearance = 0.40
@@ -4223,13 +4773,14 @@ class MissionManagerHelperTest(unittest.TestCase):
         start = grid.world_to_grid(2.0, 2.0)
         reentry = grid.world_to_grid(1.5, 2.0)
 
-        grid.data[start[1], start[0]] = BLACK
+        grid.mark_black(*start, owner="test:elevator_retreat")
         self.assertIsNone(
             manager.elevator_start_retreat_target((2.0, 2.0, 0.0), 1)
         )
 
-        grid.data[start[1], start[0]] = OCC
-        grid.data[reentry[1], reentry[0]] = OCC
+        grid.clear_black(*start, owner="test:elevator_retreat")
+        grid.mark_occupied(*start)
+        grid.mark_occupied(*reentry)
         self.assertIsNone(
             manager.elevator_start_retreat_target((2.0, 2.0, 0.0), 1)
         )
@@ -4576,7 +5127,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         barrier_cell = grid.world_to_grid(0.0, 0.0)
         self.assertIsNotNone(barrier_cell)
         barrier_x = barrier_cell[0]
-        grid.data[:, barrier_x] = OCC
+        for gy in range(grid.size_y):
+            grid.mark_occupied(barrier_x, gy)
         manager.controller = SimpleNamespace(
             has_path=lambda: False,
             set_path=lambda path: paths.append(path),
@@ -4680,7 +5232,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         for point in trace:
             grid.mark_visited_radius(point[0], point[1], 0.30)
         barrier_x = grid.world_to_grid(0.0, 0.0)[0]
-        grid.data[:, barrier_x] = OCC
+        for gy in range(grid.size_y):
+            grid.mark_occupied(barrier_x, gy)
         pose = (-3.0, 0.0, 0.0)
         goal = (3.0, 0.0)
 
@@ -4712,7 +5265,9 @@ class MissionManagerHelperTest(unittest.TestCase):
             failed_signature=return_segment_signature((-2.5, 0.0)),
             veto_lookahead=0.8,
         )
-        self.assertEqual(vetoed_status, "candidate_rejected_unreachable")
+        # 统一起点逃逸搜索可在首段 veto 后生成替代候选；该候选仍必须由
+        # 正式地图屏障复验拒绝，原因应保留为更具体的 blocked。
+        self.assertEqual(vetoed_status, "candidate_rejected_blocked")
         self.assertEqual(vetoed_path, [])
 
     def test_return_home_stuck_feedback_is_bounded_and_fails_closed(self):
@@ -5585,7 +6140,6 @@ class MissionManagerHelperTest(unittest.TestCase):
     def test_stuck_far_from_frontier_blacklists_region_without_blackmark(self):
         """远处卡住时只临时排除目标区域，不把远处目标写成地图障碍。"""
         recorded_failures: list[tuple[float, float]] = []
-        black_marks: list[tuple] = []
         manager = _make_test_manager()
         manager.current_floor = 0
         manager.manual_mode = False
@@ -5657,8 +6211,6 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.frontier_switch_score_margin = 2.0
         manager._door_navigation.frontier_debug = None
         manager._map_runtime.latest_cloud_points = []
-        manager.mapper.mark_black = lambda floor, x, y, r: black_marks.append((x, y, r))
-
         with patch.object(mission_manager_module, "MissionReportingRuntime", SimpleNamespace(
             loginfo=lambda *a, **k: None, logwarn=lambda *a, **k: None,
         )), patch.object(mission_manager_module, "get_time", return_value=10.0):
@@ -5666,7 +6218,7 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         self.assertEqual(len(recorded_failures), 1)
         self.assertEqual(recorded_failures[0], (10.0, 0.0))
-        self.assertEqual(black_marks, [])
+        self.assertFalse(np.any(grid.data == BLACK))
 
     def test_stuck_near_frontier_only_blacklists_region_without_trapping_robot(self):
         """终点附近卡住也只排除 frontier，不能把当前位置写成永久禁区。"""
@@ -5750,14 +6302,6 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager._map_runtime.nearest_radial_obstacle_distance = 0.30
         manager._exploration.no_frontier_rotation_blocked_logged = False
         manager._log_structured = events.append
-        original_mark_black = manager.mapper.mark_black
-
-        def record_mark_black(floor, x, y, radius):
-            black_marks.append((x, y, radius))
-            original_mark_black(floor, x, y, radius)
-
-        manager.mapper.mark_black = record_mark_black
-
         with patch.object(mission_manager_module, "MissionReportingRuntime", SimpleNamespace(
             loginfo=lambda *a, **k: None, logwarn=lambda *a, **k: None,
         )), patch.object(mission_manager_module, "get_time", return_value=10.0):
@@ -5765,7 +6309,7 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         self.assertEqual(len(recorded_failures), 1)
         self.assertEqual(recorded_failures[0], (0.4, 0.0))
-        self.assertEqual(black_marks, [])
+        self.assertFalse(np.any(grid.data == BLACK))
         self.assertTrue(grid.is_traversable(*grid.world_to_grid(0.0, 0.0)))
         self.assertTrue(astar_plan(grid, (0.0, 0.0), (2.0, 0.0)).reached)
         self.assertEqual(recover_calls, [])
@@ -5776,7 +6320,6 @@ class MissionManagerHelperTest(unittest.TestCase):
     def test_main_entrance_failure_keeps_entrance_unset(self):
         """主入口过门失败后，main_entrance_xy/pass_vector 必须保持未设置。"""
         manager = _make_test_manager()
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
         manager.state = EXPLORE_FLOOR
         manager.start_time = 0.0
         manager.max_runtime = 1000.0
@@ -5862,7 +6405,6 @@ class MissionManagerHelperTest(unittest.TestCase):
     def test_main_entrance_success_sets_entrance_context(self):
         """主入口过门成功后，main_entrance_xy/pass_vector 应写入过门方向。"""
         manager = _make_test_manager()
-        manager._ground_support.feedback = GroundSupportFeedbackRuntime()
         manager.state = EXPLORE_FLOOR
         manager.start_time = 0.0
         manager.max_runtime = 1000.0

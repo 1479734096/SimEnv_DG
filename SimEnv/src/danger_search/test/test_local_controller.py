@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from danger_search.ground_support_gate import (
     DROP_STOPPING,
+    DropClusterEvidence,
     GroundSupportAssessment,
     GroundSupportGateConfig,
     GroundSupportSafetyGate,
@@ -675,6 +676,26 @@ class LocalControllerTest(unittest.TestCase):
                 drop_intersects_sweep=True,
                 drop_distance=0.4,
                 drop_direction_world=(1.0, 0.0),
+                floor=0,
+                map_epoch=1,
+                localization_epoch=1,
+                cloud_generation=1,
+                grid_origin=(-2.0, -2.0),
+                grid_resolution=0.1,
+                drop_clusters=(
+                    DropClusterEvidence(
+                        cluster_id="drop:local-controller",
+                        floor=0,
+                        frame_id="odom",
+                        map_epoch=1,
+                        localization_epoch=1,
+                        stamp=1.0,
+                        generation=1,
+                        grid_origin=(-2.0, -2.0),
+                        grid_resolution=0.1,
+                        source_cells=((20, 20),),
+                    ),
+                ),
             )
         )
         follower = PathFollower(cmd_vel_topic="/cmd_vel", command_keepalive_period=0.1)

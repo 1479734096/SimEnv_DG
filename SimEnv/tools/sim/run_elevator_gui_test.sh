@@ -14,6 +14,7 @@ ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-33.0}"
 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME="${ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME:-$ELEVATOR_TEST_FLOOR_TIMEOUT}"
 ELEVATOR_TEST_MAX_RUNTIME="${ELEVATOR_TEST_MAX_RUNTIME:-180.0}"
 ELEVATOR_TEST_WALL_TIMEOUT="${ELEVATOR_TEST_WALL_TIMEOUT:-1800}"
+ELEVATOR_SIM_STALL_WALL="${ELEVATOR_SIM_STALL_WALL:-300}"
 ELEVATOR_GO_TO_DOOR_STALL_WALL="${ELEVATOR_GO_TO_DOOR_STALL_WALL:-120}"
 ELEVATOR_TEST_KEEP_RUNNING="${ELEVATOR_TEST_KEEP_RUNNING:-0}"
 ELEVATOR_TEST_FULL_CYCLE="${ELEVATOR_TEST_FULL_CYCLE:-0}"
@@ -248,7 +249,8 @@ for value in "$ELEVATOR_TEST_FLOOR_TIMEOUT" "$ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TI
     exit 2
   fi
 done
-for value in "$ELEVATOR_TEST_WALL_TIMEOUT" "$ELEVATOR_GO_TO_DOOR_STALL_WALL"; do
+for value in "$ELEVATOR_TEST_WALL_TIMEOUT" "$ELEVATOR_GO_TO_DOOR_STALL_WALL" \
+             "$ELEVATOR_SIM_STALL_WALL"; do
   if ! is_positive_integer "$value"; then
     printf '墙钟超时必须是正整数秒：%s\n' "$value" >&2
     exit 2
@@ -447,6 +449,8 @@ change_floor_reported=0
 go_to_door_stall_started=0
 upward_complete=0
 rgbd_recording_started=0
+last_elapsed=""
+sim_stall_started=0
 
 while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
   if [[ "$ELEVATOR_TEST_RECORD_RGBD" == "1" ]] && \
@@ -546,6 +550,28 @@ while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
      grep -Fq "换层任务失败" "$MISSION_LOG"; then
     fail "任务在完成所需电梯闭环前进入失败结果"
     exit $?
+  fi
+
+  # sim 停滞检测：任务未终态但 wall 时间内 mission_runtime 的 elapsed 不再推进 =
+  # Gazebo/时钟冻结（基础设施失败）。上次实测 gzserver 崩溃后 runner 只等
+  # terminal_outcome 空转 37 分钟，这里按墙钟有界收尾。
+  if ! grep -Fq '"event": "mission_result_write"' "$MISSION_LOG"; then
+    latest_elapsed="$(grep -F '"event": "mission_runtime"' "$MISSION_LOG" 2>/dev/null | \
+      tail -1 | grep -oE '"elapsed": [0-9.]+' | grep -oE '[0-9.]+' | head -1 || true)"
+    if [[ -n "$latest_elapsed" ]]; then
+      if [[ "$latest_elapsed" == "$last_elapsed" ]]; then
+        if (( sim_stall_started == 0 )); then
+          sim_stall_started=$SECONDS
+        elif (( SECONDS - sim_stall_started >= ELEVATOR_SIM_STALL_WALL )); then
+          fail "sim 时钟停滞（elapsed 停止推进 %s 秒），Gazebo 疑似崩溃，按基础设施失败收尾" \
+            "$(( SECONDS - sim_stall_started ))"
+          exit $?
+        fi
+      else
+        sim_stall_started=0
+      fi
+      last_elapsed=$latest_elapsed
+    fi
   fi
 
   latest_runtime="$(grep -F '"event": "mission_runtime"' "$MISSION_LOG" 2>/dev/null | tail -1 || true)"

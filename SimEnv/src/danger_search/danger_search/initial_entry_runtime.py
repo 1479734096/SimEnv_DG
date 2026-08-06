@@ -101,6 +101,8 @@ class InitialEntryRuntime:
         *,
         controller,
         max_linear: float,
+        grid=None,
+        segment_is_traversable=None,
     ) -> InitialEntryClearanceResult:
         target = self.clearance_target
         if target is None:
@@ -124,6 +126,16 @@ class InitialEntryRuntime:
             self._clear_clearance()
             return InitialEntryClearanceResult(True, target=target)
         if not controller.has_path():
+            if (
+                grid is not None
+                and callable(segment_is_traversable)
+                and not segment_is_traversable(
+                    grid, (pose[0], pose[1]), target
+                )
+            ):
+                controller.clear_path(reason="main_entrance_clearance_blocked")
+                self._clear_clearance()
+                return InitialEntryClearanceResult(True, failed=True, target=target)
             controller.set_path([(pose[0], pose[1]), target])
             if not self.clearance_path_started:
                 MissionReportingRuntime.loginfo(
@@ -165,6 +177,7 @@ class InitialEntryRuntime:
         cloud_points,
         floor_height: float,
         config: InitialEntryConfig,
+        segment_is_traversable=None,
     ) -> InitialEntryTickResult:
         """推进完整主入口进入策略，不读写顶层任务状态。"""
         if self.completed or self.failed:
@@ -249,6 +262,11 @@ class InitialEntryRuntime:
             if target is None:
                 controller.stop(reason="initial_entry_waiting_for_free_corridor")
                 return InitialEntryTickResult(True)
+            if callable(segment_is_traversable) and not segment_is_traversable(
+                grid, (pose[0], pose[1]), target
+            ):
+                controller.stop(reason="initial_entry_planning_constraint")
+                return InitialEntryTickResult(True)
             self.target = target
             controller.set_path([(pose[0], pose[1]), target])
             MissionReportingRuntime.loginfo(
@@ -274,6 +292,11 @@ class InitialEntryRuntime:
                     failure="主入口前向进入失败",
                 )
             self.retry_count += 1
+            if callable(segment_is_traversable) and not segment_is_traversable(
+                grid, (pose[0], pose[1]), target
+            ):
+                controller.stop(reason="initial_entry_planning_constraint")
+                return InitialEntryTickResult(True)
             controller.set_path([(pose[0], pose[1]), target])
         status = controller.tick(pose)
         if status == STUCK:

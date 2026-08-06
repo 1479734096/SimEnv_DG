@@ -125,6 +125,10 @@ mission:
   min_remaining_frontiers: 2
   # 换层前要求剩余总时间的比例（相对于 max_runtime）
   min_floor_change_remaining_ratio: 0.25
+  # 换层前路线就绪检查点：floor_elapsed 达到 floor_timeout×此比例后，
+  # 每次 FINISH_FLOOR 决策前先验证电梯等待点 A* 可达；UNKNOWN 阻断时
+  # 延后换层继续探索（A* 仍不穿 UNKNOWN），预算不足或硬障碍时显式失败。
+  route_check_ratio: 0.75
 
 map:
   # 每层独立 2.5D 栅格；NEGATIVE 只表达传感器确认的动态负障，不编码房间语义。
@@ -139,7 +143,9 @@ map:
   obstacle_inflation_radius: 0.25
   raycast_max_range: 15.0
   # 只有明确障碍命中可清到远端；地面/天花等非障碍回波只清近场。
-  point_free_clear_max_range: 3
+  # P1 试点：3.0 截断导致路径两侧 >3m 的走廊口/房间口保持 UNKNOWN（seed=8127
+  # 换层卡死根因之一）；8.0/12.0 为标定档位，最终取换层打通且周期不劣化的最小值。
+  point_free_clear_max_range: 8
   visited_radius: 0.5
   # 可视扇区自由空间清空：默认偏保守，优先避免穿过已知障碍或凭空穿墙。
   free_clear_enabled: true
@@ -147,6 +153,23 @@ map:
   free_clear_angle_step: 0.1745
   free_clear_obstacle_margin: 0.25
   free_clear_min_points_per_bin: 2
+  # 低高度回波先进入非阻挡候选账本；不同点云代次和观测位姿共同确认后才阻挡。
+  evidence_lifecycle_enabled: true
+  low_height_max_z: 0.30
+  low_confirm_generations: 3
+  low_confirm_window_generations: 20
+  low_candidate_counter_generations: 3
+  low_candidate_counter_positions: 2
+  low_confirmed_counter_generations: 6
+  low_confirmed_counter_positions: 3
+  counter_pose_separation: 0.15
+  # 低回波候选记账的距离语境（seed=8127 链 B 取证）：
+  # - <0.5m：自腿/紧贴伪影（Mid360 前上方安装，自腿回波秒确认成脚下核心），不记账，
+  #   由 0.5m stop envelope 执行层兜底；视线遮挡语义保留（射线仍在命中点截断）
+  # - >5m：点稀疏不可靠，只信高回波；HIGH_HARD 不受限
+  # 0=关闭对应过滤（回退原行为）
+  low_near_exempt_radius: 0.5
+  low_candidate_max_range: 5.0
   cloud_stride: 4
   cloud_max_points: 24000
 
@@ -246,7 +269,11 @@ ground_support:
   assessment_period: 0.02
   # 由停车余量反推的 DROP 证据硬上限；0.25s 陈旧证据明确无效。
   drop_evidence_max_age: 0.05
-  decision_period: 0.10
+  # 评估新鲜度决策窗：评估周期 0.1s，决策窗 0.10 与评估-控制相位差同级，
+  # 低 RTF 下频繁误判"评估不新鲜"→ STALE_DATA_HOLD → 超时且无 witness →
+  # support_veto_source_missing 任务失败（三次复现）。放宽到 0.25 留相位
+  # 余量；DROP 安全由 drop_evidence_max_age 与 _fresh_drop_blocks 独立把关。
+  decision_period: 0.25
   rl_receive_delay: 0.009
   required_margin: 0.02
   # 在停车包络外再保留一个机身步幅余量；连续观测到同一边界后才持久化。

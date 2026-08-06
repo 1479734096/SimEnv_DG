@@ -243,6 +243,31 @@ def _largest_cluster(cells: Iterable[tuple[int, int]]) -> int:
     return largest
 
 
+def _connected_clusters(
+    cells: Iterable[tuple[int, int]],
+) -> tuple[tuple[tuple[int, int], ...], ...]:
+    remaining = set(cells)
+    clusters: list[tuple[tuple[int, int], ...]] = []
+    while remaining:
+        seed = remaining.pop()
+        component = {seed}
+        pending = [seed]
+        while pending:
+            gx, gy = pending.pop()
+            neighbors = {
+                (gx + dx, gy + dy)
+                for dx in (-1, 0, 1)
+                for dy in (-1, 0, 1)
+                if dx or dy
+            }
+            discovered = remaining & neighbors
+            remaining.difference_update(discovered)
+            component.update(discovered)
+            pending.extend(discovered)
+        clusters.append(tuple(sorted(component)))
+    return tuple(sorted(clusters, key=lambda item: item[0]))
+
+
 def _cells_in_clusters_at_least(
     cells: Iterable[tuple[int, int]],
     minimum_size: int,
@@ -611,7 +636,7 @@ class ShadowSupportGrid:
         )
         self._ever_visible: dict[int, set[tuple[int, int]]] = defaultdict(set)
         self._changed: dict[int, set[tuple[int, int]]] = defaultdict(set)
-        self._last_cloud_stamp: float | None = None
+        self._last_cloud_stamps: dict[int, float] = {}
         self._last_emit_stamp: float | None = None
         self._last_alert_active = False
         self.updated_frame_count = 0
@@ -619,6 +644,24 @@ class ShadowSupportGrid:
         self.duplicate_cloud_count = 0
         self.total_input_points = 0
         self.total_sampled_points = 0
+
+    def invalidate_evidence(self, floor: int | None = None) -> None:
+        """scope 事务中撤销旧证据；不跨 map/localization epoch 复用。"""
+        if floor is None:
+            self._cells.clear()
+            self._lower_streaks.clear()
+            self._ever_visible.clear()
+            self._changed.clear()
+            self._last_cloud_stamps.clear()
+        else:
+            floor_index = int(floor)
+            self._cells.pop(floor_index, None)
+            self._lower_streaks.pop(floor_index, None)
+            self._ever_visible.pop(floor_index, None)
+            self._changed.pop(floor_index, None)
+            self._last_cloud_stamps.pop(floor_index, None)
+        self._last_emit_stamp = None
+        self._last_alert_active = False
 
     def cell_state(self, floor: int, cell: tuple[int, int]) -> str:
         evidence = self._cells.get(int(floor), {}).get(tuple(cell))
@@ -1150,6 +1193,11 @@ class ShadowSupportGrid:
         drop_confirmed = (
             _largest_cluster(fresh_drop_cells) >= self.config.minimum_alert_cells
         )
+        confirmed_drop_clusters = tuple(
+            cluster
+            for cluster in _connected_clusters(fresh_drop_cells)
+            if len(cluster) >= self.config.minimum_alert_cells
+        )
         nearest_drop = None
         drop_distance = None
         if fresh_drop_cells:
@@ -1193,6 +1241,10 @@ class ShadowSupportGrid:
             "observation_adequate": observation_adequate,
             "drop_confirmed": drop_confirmed,
             "drop_intersects_sweep": bool(fresh_drop_cells),
+            "drop_clusters": [
+                [[int(gx), int(gy)] for gx, gy in cluster]
+                for cluster in confirmed_drop_clusters
+            ],
             "drop_distance": drop_distance,
             "drop_direction_world": (
                 (nearest_drop - np.asarray(robot_xy, dtype=float).reshape(2)).tolist()
@@ -1201,7 +1253,13 @@ class ShadowSupportGrid:
             ),
             "fresh_drop_cell_count": len(fresh_drop_cells),
             "boundary_cell_count": len(boundary_cells),
+            "support_boundary_cells": [
+                [int(cell[0]), int(cell[1])]
+                for cell in sorted(first_boundary_cells)
+            ],
             "support_boundary_cells_world": boundary_cells_world,
+            "grid_origin": [self.config.origin_x, self.config.origin_y],
+            "grid_resolution": self.config.resolution,
             "boundary_observable": boundary_observable,
             "boundary_reason_counts": dict(boundary_reason_counts),
             "minimum_left_foot_band_coverage": minimum_left_coverage,
@@ -1265,7 +1323,8 @@ class ShadowSupportGrid:
         shadow 诊断还是转换为 ``GroundSupportAssessment`` 交给生产安全门。
         """
         stamp = float(stamp)
-        if self._last_cloud_stamp is not None and stamp <= self._last_cloud_stamp:
+        last_cloud_stamp = self._last_cloud_stamps.get(int(floor))
+        if last_cloud_stamp is not None and stamp <= last_cloud_stamp:
             self.duplicate_cloud_count += 1
             return {
                 "schema": "ground_support_shadow_frame_v1",
@@ -1275,7 +1334,7 @@ class ShadowSupportGrid:
                 "shadow_only": True,
                 "behavior_effect": False,
             }
-        self._last_cloud_stamp = stamp
+        self._last_cloud_stamps[int(floor)] = stamp
         if ambiguous:
             self.skipped_ambiguous_count += 1
             return {

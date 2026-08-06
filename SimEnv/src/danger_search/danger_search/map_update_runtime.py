@@ -72,6 +72,9 @@ class MapUpdateRuntime:
         self,
         *,
         floor_index: int,
+        cloud_generation: int,
+        map_epoch: int,
+        localization_epoch: int,
         robot_xyz: tuple[float, float, float],
         robot_pose: tuple[float, float, float],
         points,
@@ -84,6 +87,9 @@ class MapUpdateRuntime:
             floor_index=int(floor_index),
             robot_xyz=robot_xyz,
             points=frozen_points,
+            cloud_generation=int(cloud_generation),
+            map_epoch=int(map_epoch),
+            localization_epoch=int(localization_epoch),
         )
         forward = nearest_forward_obstacle_observation(
             frozen_points,

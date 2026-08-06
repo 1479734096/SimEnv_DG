@@ -8,10 +8,8 @@ from __future__ import annotations
 import math
 from threading import Lock, Thread
 
-import numpy as np
-
 from danger_search.mapper import BLACK, NEGATIVE, OCC, VISITED, FloorGrid
-from danger_search.planner import astar_plan
+from danger_search.planner import astar_plan, segment_is_traversable
 
 
 class AsyncReturnPlanner:
@@ -63,6 +61,7 @@ def compute_return_home_plan(
     veto_segments: tuple[tuple[float, float, float, float], ...] = (),
     failed_signature: tuple[int, int] | None = None,
     veto_lookahead: float = 0.8,
+    planning_constraints=None,
 ) -> tuple[str, list[tuple[float, float]]]:
     """在地图快照上完成 A*、历史轨迹和安全直线三级判定。"""
     start_xy = (float(pose[0]), float(pose[1]))
@@ -74,7 +73,13 @@ def compute_return_home_plan(
             goal_xy=goal_xy,
             lookahead=veto_lookahead,
         )
-    result = astar_plan(grid, start_xy, goal_xy, max_iterations=None)
+    result = astar_plan(
+        grid,
+        start_xy,
+        goal_xy,
+        max_iterations=None,
+        constraints=planning_constraints,
+    )
     if result.reached:
         return validate_return_home_candidate(
             result.path,
@@ -89,6 +94,7 @@ def compute_return_home_plan(
         goal_xy,
         trace_points=trace_snapshot,
         visited_radius=visited_radius,
+        planning_constraints=planning_constraints,
     )
     if trace_path:
         return validate_return_home_candidate(
@@ -96,7 +102,9 @@ def compute_return_home_plan(
             original_grid=original_grid,
             failed_signature=failed_signature,
         )
-    if not _segment_crosses_blocked_cell(grid, start_xy, goal_xy):
+    if segment_is_traversable(
+        grid, start_xy, goal_xy, constraints=planning_constraints
+    ):
         return validate_return_home_candidate(
             [start_xy, goal_xy],
             original_grid=original_grid,
@@ -143,19 +151,28 @@ def apply_return_home_vetoes(
     for ax, ay, bx, by in segments:
         dx, dy = bx - ax, by - ay
         length = math.hypot(dx, dy)
-        end_distance = min(float(lookahead), length)
-        if end_distance <= 0.15:
+        if length <= 1e-6:
             continue
+        # A* 的认证起点逃逸前缀可能只有一个栅格。若只否决该短 waypoint，
+        # 0.15m 起步豁免会让相同方向原样重生；沿已失败方向延伸到既有有界
+        # lookahead，才能表达“首段方向已不可执行”而不污染正式地图。
+        end_distance = max(0.15, float(lookahead))
+        start_distance = min(0.15, max(grid.resolution * 0.5, 1e-6))
         samples = max(
             1,
             int(
                 math.ceil(
-                    (end_distance - 0.15) / max(grid.resolution * 0.5, 1e-6)
+                    (end_distance - start_distance)
+                    / max(grid.resolution * 0.5, 1e-6)
                 )
             ),
         )
+        start_cell = grid.world_to_grid(ax, ay)
         for index in range(samples + 1):
-            distance = 0.15 + (end_distance - 0.15) * index / samples
+            distance = (
+                start_distance
+                + (end_distance - start_distance) * index / samples
+            )
             x = ax + dx * distance / length
             y = ay + dy * distance / length
             if math.hypot(x - goal_xy[0], y - goal_xy[1]) <= 0.30:
@@ -163,9 +180,11 @@ def apply_return_home_vetoes(
             cell = grid.world_to_grid(x, y)
             if cell is None:
                 continue
+            if cell == start_cell:
+                continue
             gx, gy = cell
             if int(grid.data[gy, gx]) != OCC:
-                grid.data[gy, gx] = BLACK
+                grid.mark_black(gx, gy, owner="return_home_veto")
 
 
 def path_crosses_blocked_beyond(
@@ -202,17 +221,7 @@ def path_crosses_blocked_beyond(
 
 def copy_floor_grid(grid: FloorGrid) -> FloorGrid:
     """复制返航所需的栅格状态，后台线程不得持有正式地图引用。"""
-    snapshot = FloorGrid(
-        floor_index=grid.floor_index,
-        resolution=grid.resolution,
-        width=grid.width,
-        length=grid.length,
-        origin_x=grid.origin_x,
-        origin_y=grid.origin_y,
-    )
-    snapshot.data = np.array(grid.data, copy=True)
-    snapshot.negative_cells = set(grid.negative_cells)
-    return snapshot
+    return grid.copy()
 
 
 def return_path_from_navigation_trace(
@@ -222,6 +231,7 @@ def return_path_from_navigation_trace(
     *,
     trace_points: tuple[tuple[float, float], ...],
     visited_radius: float,
+    planning_constraints=None,
 ) -> list[tuple[float, float]] | None:
     """在地图副本中恢复实际走过的走廊，不污染正式 FREE/OCC 语义。"""
     trace = list(trace_points)
@@ -270,7 +280,13 @@ def return_path_from_navigation_trace(
         goal_xy,
         corridor_radius,
     )
-    result = astar_plan(trace_grid, current_xy, goal_xy, max_iterations=None)
+    result = astar_plan(
+        trace_grid,
+        current_xy,
+        goal_xy,
+        max_iterations=None,
+        constraints=planning_constraints,
+    )
     return result.path if result.reached else None
 
 
@@ -322,7 +338,7 @@ def _mark_return_trace_segment(
                 if math.hypot(wx - sample_x, wy - sample_y) > radius:
                     continue
                 if int(grid.data[gy, gx]) not in (BLACK, NEGATIVE):
-                    grid.data[gy, gx] = VISITED
+                    grid.set_snapshot_cell(gx, gy, VISITED)
 
 
 def _segment_crosses_blocked_cell(

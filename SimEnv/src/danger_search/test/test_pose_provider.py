@@ -11,10 +11,16 @@ def _vector(x=0.0, y=0.0, z=0.0):
     return SimpleNamespace(x=x, y=y, z=z)
 
 
-def _odometry(stamp, *, x=1.0, quaternion=(0.0, 0.0, 0.0, 1.0)):
+def _odometry(
+    stamp, *, x=1.0, quaternion=(0.0, 0.0, 0.0, 1.0),
+    frame_id="odom", child_frame_id="base",
+):
     qx, qy, qz, qw = quaternion
     return SimpleNamespace(
-        header=SimpleNamespace(stamp=SimpleNamespace(to_sec=lambda: stamp)),
+        header=SimpleNamespace(
+            stamp=SimpleNamespace(to_sec=lambda: stamp), frame_id=frame_id
+        ),
+        child_frame_id=child_frame_id,
         pose=SimpleNamespace(
             pose=SimpleNamespace(
                 position=_vector(x=x, y=2.0, z=0.39),
@@ -62,6 +68,17 @@ class PoseProviderTest(unittest.TestCase):
             provider.lookup(math.nan)
         with self.assertRaises(ValueError):
             provider.lookup(1.0, max_delta=math.inf)
+
+    def test_frame_identity_and_timebase_reset_advance_continuity_epoch(self):
+        provider = PoseProvider("/danger_search/localization/odom", max_samples=8)
+        provider._on_odometry(_odometry(10.0))
+        self.assertEqual(provider.continuity_epoch, 1)
+        provider._on_odometry(_odometry(11.0, frame_id="map"))
+        self.assertEqual(provider.continuity_epoch, 2)
+        self.assertEqual([item.stamp for item in provider._samples], [11.0])
+        provider._on_odometry(_odometry(1.0, frame_id="map"))
+        self.assertEqual(provider.continuity_epoch, 3)
+        self.assertEqual([item.stamp for item in provider._samples], [1.0])
 
 
 if __name__ == "__main__":
