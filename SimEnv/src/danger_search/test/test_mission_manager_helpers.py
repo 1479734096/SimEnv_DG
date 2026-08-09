@@ -713,6 +713,61 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertEqual(failures, ["换层任务失败"])
         self.assertEqual(transitions[0][0], RETURN_HOME)
 
+    def test_max_runtime_does_not_abort_active_return_home_closure(self):
+        """620 秒只结束探索预算，已启动的返航收尾必须允许继续。"""
+        manager = _make_test_manager()
+        manager.state = RETURN_HOME
+        manager.max_runtime = 620.0
+        manager._return_home_started = True
+        manager._timeout_triggered = False
+        manager._mission_success_eligible = True
+        manager.current_task = SimpleNamespace(
+            name="OpenDoorAndPass(main_entrance)",
+            phase="GO_PASS_POINT",
+        )
+        manager._publish_status = lambda: None
+        manager._elapsed = lambda: 621.2
+        manager._perception_runtime.sensor_buffer = SimpleNamespace(
+            snapshot=lambda: SimpleNamespace()
+        )
+        manager.pose_provider = SimpleNamespace(
+            latest=lambda: mission_manager_module.PoseSample(
+                stamp=621.2,
+                xyz=(0.0, -0.7, 0.3),
+                quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                linear_xyz=(0.0, 0.0, 0.0),
+                angular_xyz=(0.0, 0.0, 0.0),
+            )
+        )
+        manager._apply_localization_progress_decision = lambda _sample: True
+        manager._update_pose_progress = lambda _pose: None
+        manager._record_initial_entry_trace_pose = lambda _pose: None
+        manager._record_floor_navigation_trace_pose = lambda _pose: None
+        manager._sync_ground_support_task_context = lambda _pose: None
+        manager._ground_support.observe_odometry = lambda *_args: None
+        manager._update_mapping_and_detection = lambda *_args: None
+        manager._handle_ground_support_control = lambda _pose: False
+        task_ticks = []
+        manager._tick_current_task_status = lambda pose: (
+            task_ticks.append(pose) or RUNNING
+        )
+        transitions = []
+        manager._transition_state = lambda state, **kwargs: transitions.append(
+            (state, kwargs.get("reason_code"))
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "MissionReportingRuntime",
+            SimpleNamespace(logwarn=lambda *_args, **_kwargs: None),
+        ):
+            manager.tick()
+
+        self.assertEqual(task_ticks, [(0.0, -0.7, 0.0)])
+        self.assertEqual(transitions, [])
+        self.assertFalse(manager._timeout_triggered)
+        self.assertTrue(manager._mission_success_eligible)
+
     def test_starting_floor_change_marks_attempt_as_not_yet_successful(self):
         manager = _make_test_manager()
         manager._elevator_success = None

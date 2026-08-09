@@ -180,6 +180,14 @@ class InterfaceDocumentationTest(unittest.TestCase):
         self.assertEqual(controller["turn_release_rate"], 0.20)
         self.assertEqual(controller["turn_release_samples"], 3)
 
+    def test_formal_floor_change_estimate_covers_seed8127_return_measurement(self):
+        config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
+
+        self.assertGreaterEqual(
+            config["mission"]["floor_change_time_estimate"],
+            70.0,
+        )
+
     def test_reference_marks_truth_topics_as_referee_only(self):
         content = REFERENCE_PATH.read_text(encoding="utf-8")
         self.assertIn("`/ground_truth/base_w`", content)

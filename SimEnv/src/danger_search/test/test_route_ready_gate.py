@@ -5,6 +5,7 @@
 - 电梯等待点 A* 可达：放行换层；
 - UNKNOWN 阻断（乐观可达）：延后换层继续探索（预算足够时不写失败）；
 - UNKNOWN 阻断且预算裁剪 <15s：显式失败 elevator_route_not_ready；
+- 障碍膨胀区暂时无法逃逸：预算充足时继续脱离，预算不足时显式失败；
 - 硬障碍围堵（乐观也不可达）：fail-closed 显式失败并记录 blocker。
 """
 from __future__ import annotations
@@ -128,6 +129,46 @@ class RouteReadyGateTest(unittest.TestCase):
         result = manager._floor_change_route_ready(
             250.0, (1.0, 1.0, 0.0), decision_reason="floor_timeout_change_floor"
         )
+        self.assertFalse(result)
+        self.assertEqual(manager._transitions[-1][0], WRITE_RESULT)
+        self.assertEqual(manager._transitions[-1][1], "elevator_route_not_ready")
+
+    def test_gate_defers_transient_obstacle_inflation_escape_when_budget_ok(self):
+        manager = _make_manager(_free_grid())
+        blocker = {
+            "active_cell_count": 28,
+            "obstacle_owner_cells": ((16, 20), (16, 21)),
+            "start_core_self": False,
+            "support_region_ids": (),
+        }
+        manager._elevator_route_ready_check = lambda pose: (
+            False,
+            "obstacle_inflation_escape_unreachable",
+            blocker,
+        )
+
+        result = manager._floor_change_route_ready(
+            250.0, (1.0, 1.0, 0.0), decision_reason="floor_timeout_change_floor"
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(manager._transitions, [])
+        self.assertEqual(manager._failure_reasons, [])
+
+    def test_gate_fails_transient_obstacle_inflation_escape_when_budget_exhausted(self):
+        manager = _make_manager(
+            _free_grid(), max_runtime=320.0, elapsed=300.0
+        )
+        manager._elevator_route_ready_check = lambda pose: (
+            False,
+            "obstacle_inflation_escape_unreachable",
+            {"active_cell_count": 28},
+        )
+
+        result = manager._floor_change_route_ready(
+            250.0, (1.0, 1.0, 0.0), decision_reason="floor_timeout_change_floor"
+        )
+
         self.assertFalse(result)
         self.assertEqual(manager._transitions[-1][0], WRITE_RESULT)
         self.assertEqual(manager._transitions[-1][1], "elevator_route_not_ready")

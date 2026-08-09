@@ -472,7 +472,7 @@ class _MissionConfigBuilder:
         # 方案 C：全局时间预算参数
         self.return_safety_buffer = float(_param("mission/return_safety_buffer", 30.0))
         self.return_speed_estimate = float(_param("mission/return_speed_estimate", 0.35))
-        self.floor_change_time_estimate = float(_param("mission/floor_change_time_estimate", 40.0))
+        self.floor_change_time_estimate = float(_param("mission/floor_change_time_estimate", 70.0))
         self.floor_finish_time_ratio = float(_param("mission/floor_finish_time_ratio", 0.75))
         self.route_check_ratio = float(_param("mission/route_check_ratio", 0.75))
         self.exploration_progress_window = float(_param("mission/exploration_progress_window", 15.0))

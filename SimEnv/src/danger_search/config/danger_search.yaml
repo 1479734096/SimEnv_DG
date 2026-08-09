@@ -115,8 +115,8 @@ mission:
   return_safety_buffer: 30.0
   # 返航保守速度估计（m/s），用于估算返航时间
   return_speed_estimate: 0.4
-  # 换层基础时间估计（秒），包含电梯等待和移动
-  floor_change_time_estimate: 30.0
+  # 换层基础时间估计（秒）；seed=8127 正式返程实测 1→0 为 69.5 秒。
+  floor_change_time_estimate: 70.0
   # 楼层结束软边界比例：floor_timeout * ratio 后可结合收益考虑结束
   floor_finish_time_ratio: 0.80
   # 探索收益评估窗口（秒）

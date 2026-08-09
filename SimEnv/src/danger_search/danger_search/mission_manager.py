@@ -818,7 +818,13 @@ class MissionManager:
             outcome = "finished" if self.state == FINISH else "failed"
             self._request_shutdown(f"danger_search mission {outcome}")
             return
-        if self._elapsed() >= self.max_runtime:
+        # max_runtime 是探索预算。预算耗尽后仍必须让已经启动的返航闭环完成，
+        # 否则会在电梯、主门或写结果的最后一步把安全收尾误判成任务失败。
+        return_closure_active = bool(
+            self._return_home_started
+            and self.state in {RETURN_HOME, CHANGE_FLOOR, WRITE_RESULT}
+        )
+        if self._elapsed() >= self.max_runtime and not return_closure_active:
             MissionReportingRuntime.logwarn("接近时间预算，写出当前检测结果")
             self._timeout_triggered = True
             self._record_failure("探索超时")
@@ -2027,9 +2033,9 @@ class MissionManager:
 
         - 未到检查点（floor_elapsed < floor_timeout×route_check_ratio）直接放行；
         - 电梯等待点 A* 可达 → 放行换层；
-        - UNKNOWN 阻断（open_set_exhausted）→ 延后换层继续探索；预算裁剪
-          （effective_guidance_time < 15s）后显式失败 elevator_route_not_ready，
-          不盲目进入 TakeElevator；
+        - UNKNOWN 阻断或当前位置暂时无法从障碍膨胀区逃逸 → 延后换层继续脱离；
+          预算裁剪（effective_guidance_time < 15s）后显式失败
+          elevator_route_not_ready，不盲目进入 TakeElevator；
         - HIGH_HARD/支撑约束/起点逃逸等其他不可达 → fail-closed 显式失败，
           记录 blocker，不把楼层标记为完成。
         """
@@ -2039,7 +2045,11 @@ class MissionManager:
         ready, reason, blocker = self._elevator_route_ready_check(pose)
         if ready:
             return True
-        if reason != "unknown_blocked":
+        deferred_route_reasons = {
+            "unknown_blocked",
+            "obstacle_inflation_escape_unreachable",
+        }
+        if reason not in deferred_route_reasons:
             self._record_failure(
                 "elevator_route_not_ready_%s" % (reason or "blocked")
             )
@@ -2077,15 +2087,19 @@ class MissionManager:
                     "effective_guidance_time": round(
                         max(0.0, effective_guidance), 2
                     ),
+                    "blocker": (
+                        dict(blocker) if isinstance(blocker, dict) else None
+                    ),
                 },
             )
             return False
         MissionReportingRuntime.loginfo(
-            "换层前路线未就绪（UNKNOWN 阻断），延后换层继续探索："
-            "floor=%d reason=%s effective_guidance=%.1f",
+            "换层前路线未就绪，延后换层继续脱离："
+            "floor=%d reason=%s effective_guidance=%.1f blocker=%s",
             self.current_floor,
             reason,
             max(0.0, effective_guidance) if math.isfinite(effective_guidance) else -1.0,
+            dict(blocker) if isinstance(blocker, dict) else None,
         )
         return False
 
