@@ -295,6 +295,7 @@ class GroundSupportSafetyGate:
         self.last_stop_distance: float | None = 0.0
         self.true_drop_stop_count = 0
         self.observation_hold_count = 0
+        self.observation_hold_release_without_witness_count = 0
         self.stale_data_hold_count = 0
         self.speed_out_of_envelope_count = 0
         self.automatic_resume_count = 0
@@ -507,12 +508,12 @@ class GroundSupportSafetyGate:
             )
         elif self.state in _TEMPORARY_HOLDS and elapsed >= self.config.observation_hold_timeout:
             if self._pending_failure_witness is None:
-                self._enter_state(
-                    SAFETY_BLOCKED,
-                    "support_veto_source_missing",
-                    wall_time,
-                    control_time=control_time,
-                )
+                # 观察期结束仍未捕获任何支撑失败边界（boundary/drop 证据均缺失）：
+                # 数据陈旧/观测不充分不是"支撑失败证据"，直接解除临时 hold 继续，
+                # 不能 SAFETY_BLOCKED 使任务失败。明确 DROP 由 _fresh_drop_blocks
+                # 独立锁存停车（true_drop_stop），不经过本分支。
+                self._leave_temporary_hold(wall_time, control_time)
+                self.observation_hold_release_without_witness_count += 1
             else:
                 self._enter_state(
                     SUPPORT_PATH_UNAVAILABLE,

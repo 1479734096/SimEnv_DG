@@ -109,6 +109,7 @@ from danger_search.elevator_navigation_runtime import (
 )
 from danger_search.exploration_runtime import (
     ExplorationBudgetInput,
+    FrontierArrivalGainRuntime,
     ExplorationRuntimeResult,
     ExplorationRuntime,
     NoFrontierRecoveryConfig,
@@ -137,6 +138,12 @@ from danger_search.mission_config import (
     load_mission_config,
     validate_summary_output_path as _validate_summary_output_path,
 )
+
+# 条件导入rospy用于日志输出
+try:
+    import rospy
+except ImportError:
+    rospy = None
 
 
 INIT = "INIT"
@@ -201,7 +208,11 @@ class MissionManager:
         self._service_task = None
         self._change_phase: str | None = None
         self._exploration = ExplorationRuntime()
+        self._frontier_arrival_gain = FrontierArrivalGainRuntime()
         self._last_status_publish = 0.0
+        # rospy.Timer 使用仿真时间；墙钟线程用该值判断 timer 是否长期未进入。
+        self._last_tick_wall_time: float | None = None
+        self._tick_wall_forced_shutdown_reason: str | None = None
         # 主入口探测是一段独立的小状态机：先由合法传感器寻找安全直行目标，
         # 必要时注册入口门并异步开门，轨迹同时留给最终返航反向复用。
         self._entry = InitialEntryRuntime()
@@ -387,7 +398,7 @@ class MissionManager:
             planning_constraints=self._planning_constraints(),
             door_pass_max_linear=getattr(self, "door_pass_max_linear", None),
             open_door_geometry_refresh_enabled=True,
-            elevator_geometry_refresh_enabled=True,
+            elevator_geometry_refresh_enabled=False,  # 临时禁用以避免膨胀岛困住
             elevator_geometry_refresh_standoff=float(
                 getattr(self, "elevator_geometry_refresh_standoff", 1.2)
             ),
@@ -525,6 +536,7 @@ class MissionManager:
         result: ElevatorVisualScanResult,
     ) -> None:
         if result.clear_exploration_target:
+            self._frontier_arrival_gain.cancel()
             self.current_frontier = None
             self._exploration.last_frontier_target = None
             self._exploration.last_frontier_score = None
@@ -539,6 +551,7 @@ class MissionManager:
         self.manual_goal = (float(x), float(y))
         self.current_task = NavigateToPose(self.manual_goal)
         self.controller.clear_path()
+        self._frontier_arrival_gain.cancel()
         self.current_frontier = None
         MissionReportingRuntime.loginfo(
             "收到新的手动导航目标点: (%.2f, %.2f)，已切换到手动目标模式！",
@@ -575,6 +588,41 @@ class MissionManager:
                 self.controller.stop(reason=reason)
         return timed_out, reason
 
+    def check_tick_wall_timeout(
+        self,
+        monotonic_now: float,
+    ) -> tuple[bool, str]:
+        """检查主任务 tick 是否长期未被 ROS 定时器调用。
+
+        该判据只观察 tick 入口的墙钟时间，不读取支撑门状态，避免把仿真器
+        停止与地面不安全混为一谈。首次 tick 前不武装，配置非正值显式关闭。
+        """
+        timeout = float(getattr(self, "tick_wall_stall_timeout", 0.0))
+        if timeout <= 0.0:
+            return False, "mission_tick_wall_stall_disabled"
+        last_tick = getattr(self, "_last_tick_wall_time", None)
+        if last_tick is None:
+            return False, "mission_tick_wall_stall_not_armed"
+        now = float(monotonic_now)
+        if not math.isfinite(now) or now < float(last_tick):
+            return False, "mission_tick_wall_stall_clock_invalid"
+        if getattr(self, "state", None) in (FINISH, MISSION_FAILED):
+            return False, "mission_tick_wall_stall_terminal"
+        return (
+            now - float(last_tick) >= timeout,
+            "mission_tick_wall_stalled",
+        )
+
+    def handle_tick_wall_timeout(self, reason: str) -> None:
+        """将 tick 墙钟停滞转换为一次明确的基础设施失败。"""
+        if self._tick_wall_forced_shutdown_reason is not None:
+            return
+        self._tick_wall_forced_shutdown_reason = str(reason)
+        self._mission_success_eligible = False
+        self._record_failure(str(reason))
+        self.controller.stop(reason=str(reason))
+        self._shutdown_requested = True
+
     def handle_ground_support_wall_timeout(self, reason: str) -> None:
         self._ground_support_forced_shutdown_reason = str(reason)
         self._mission_success_eligible = False
@@ -596,7 +644,8 @@ class MissionManager:
     def handle_shutdown(self) -> None:
         """处理节点关闭业务语义；ROS 资源由 MissionNodeRuntime 管理。"""
         write_reason = (
-            getattr(self, "_ground_support_forced_shutdown_reason", None)
+            getattr(self, "_tick_wall_forced_shutdown_reason", None)
+            or getattr(self, "_ground_support_forced_shutdown_reason", None)
             or "mission_requested_shutdown"
             if bool(getattr(self, "_shutdown_requested", False))
             else "external_ros_shutdown"
@@ -762,6 +811,7 @@ class MissionManager:
         当前子任务—顶层状态”的顺序执行。前面的环节一旦要求等待或停车就立即
         返回，后续规划不会基于陈旧数据继续推进。
         """
+        self._last_tick_wall_time = time.monotonic()
         self._publish_status()
         if self.state in (FINISH, MISSION_FAILED):
             self.controller.stop()
@@ -958,6 +1008,11 @@ class MissionManager:
             if pose is None or xyz is None:
                 return
             self.home_pose = pose
+            if rospy is not None:
+                rospy.loginfo(
+                    "[MissionManager] ✅ home_pose已记录: [%.2f, %.2f, %.2f]",
+                    pose[0], pose[1], pose[2]
+                )
             self.current_floor = self._floor_coordinates.estimate_floor(
                 xyz,
                 current_floor=self.current_floor,
@@ -1951,7 +2006,7 @@ class MissionManager:
         optimistic = grid.copy()
         for gy in range(optimistic.size_y):
             for gx in range(optimistic.size_x):
-                if int(optimistic.base[gy, gx]) == UNKNOWN:
+                if int(optimistic.observation_layer[gy, gx]) == UNKNOWN:
                     optimistic.set_base_state(gx, gy, FREE)
         result = astar_plan(
             optimistic,
@@ -2250,6 +2305,7 @@ class MissionManager:
             assert candidate is not None
             self.controller.clear_path()
             self._exploration.reset_no_frontier_escape()
+            self._frontier_arrival_gain.cancel()
             self.current_frontier = None
             self._exploration.last_frontier_target = None
             self._exploration.last_frontier_score = None
@@ -2350,6 +2406,7 @@ class MissionManager:
                 )
                 if door_id is not None:
                     self.controller.clear_path()
+                    self._frontier_arrival_gain.cancel()
                     self.current_frontier = None
                     self._exploration.last_frontier_target = None
                     self._exploration.last_frontier_score = None
@@ -2428,7 +2485,11 @@ class MissionManager:
                             if confirmed_frontier is not None and confirmed_path:
                                 self._exploration.reset_no_frontier_escape()
                                 self.current_frontier = confirmed_frontier
-                                self.controller.set_path(confirmed_path)
+                                self.controller.set_path(confirmed_path, reason="frontier_confirmed_path")
+                                self._begin_frontier_arrival_gain(
+                                    grid,
+                                    confirmed_frontier,
+                                )
                                 self._exploration.no_reachable_frontier_confirmations = 0
                                 self._exploration.probe_attempt = 0
                                 MissionReportingRuntime.loginfo(
@@ -2471,15 +2532,17 @@ class MissionManager:
             self._log_frontier_switch(frontier, path, pose)
             self._exploration.reset_no_frontier_escape()
             self.current_frontier = frontier
-            self.controller.set_path(path)
+            self.controller.set_path(path, reason="frontier_selected_path")
+            self._begin_frontier_arrival_gain(grid, frontier)
             self._exploration.no_frontier_scan_until = 0.0
             self._exploration.no_reachable_frontier_confirmations = 0
             self._exploration.probe_attempt = 0
             MissionReportingRuntime.loginfo("选择前沿：floor=%d score=%.2f target=(%.2f, %.2f)",
                           self.current_floor, frontier.score, frontier.centroid[0], frontier.centroid[1])
 
-        status = self.controller.tick(pose)
+        status = self.controller.poll_status()
         if status == STUCK:
+            self._frontier_arrival_gain.cancel()
             if self.current_frontier is not None:
                 # STUCK 已经过进度超时确认，临时排除目标附近候选；只改规划黑名单，
                 # 不把远处拐角写成永久地图障碍。
@@ -2489,8 +2552,41 @@ class MissionManager:
             self._exploration.last_frontier_target = None
             self._exploration.last_frontier_score = None
             self._exploration.last_frontier_used_fallback = False
-        elif status in (DONE, IDLE):
+        elif status == DONE:
+            if self.current_frontier is not None:
+                arrival = self._frontier_arrival_gain.arrive(
+                    floor=self.current_floor,
+                    map_epoch=self._frontier_gain_map_epoch(),
+                    known_cells=int(np.count_nonzero(grid.data != UNKNOWN)),
+                )
+                if arrival is not None:
+                    self._log_structured(arrival.diagnostic())
+                    if arrival.cooldown_center is not None:
+                        self.explorer.blacklist_region(
+                            grid,
+                            arrival.cooldown_center,
+                            radius=1.0,
+                        )
             self.current_frontier = None
+        elif status == IDLE:
+            self._frontier_arrival_gain.cancel()
+            self.current_frontier = None
+
+    def _frontier_gain_map_epoch(self) -> int:
+        epoch_for_floor = getattr(self._ground_support, "map_epoch_for_floor", None)
+        if callable(epoch_for_floor):
+            return int(epoch_for_floor(self.current_floor))
+        return int(getattr(self._ground_support, "map_epoch", 1))
+
+    def _begin_frontier_arrival_gain(self, grid, frontier: Frontier) -> None:
+        self._frontier_arrival_gain.begin(
+            floor=self.current_floor,
+            map_epoch=self._frontier_gain_map_epoch(),
+            target=frontier.centroid,
+            known_cells=int(np.count_nonzero(grid.data != UNKNOWN)),
+            expected_gain=frontier.expected_unknown_gain,
+            is_real_frontier=frontier.information_gain > 0.0,
+        )
 
     def _frontier_selection_context(
         self,
@@ -2845,11 +2941,12 @@ class MissionManager:
                 constraints=self._planning_constraints(),
             ):
                 continue
+            self._frontier_arrival_gain.cancel()
             self.current_frontier = None
             self._exploration.last_frontier_target = None
             self._exploration.last_frontier_score = None
             self._exploration.last_frontier_used_fallback = False
-            self.controller.set_path([(pose[0], pose[1]), target])
+            self.controller.set_path([(pose[0], pose[1]), target], reason="probe_unknown_space_path")
             MissionReportingRuntime.loginfo("无前沿，执行短距离探测目标：target=(%.2f, %.2f)", target[0], target[1])
             return True
         return False
@@ -2880,6 +2977,7 @@ class MissionManager:
         if result.failure is not None:
             self._record_failure(result.failure)
         if result.clear_exploration_target:
+            self._frontier_arrival_gain.cancel()
             self.current_frontier = None
             self._exploration.last_frontier_target = None
             self._exploration.last_frontier_score = None
@@ -3079,6 +3177,7 @@ class MissionManager:
         reason_code: str = "floor_finished",
         call_site: str = "MissionManager._finish_current_floor",
     ) -> None:
+        self._frontier_arrival_gain.cancel()
         self._record_floor_exit_certificate(reason_code)
         no_frontier_count = self._exploration.no_reachable_frontier_confirmations
         self.controller.clear_path()
@@ -3257,6 +3356,8 @@ class MissionManager:
 
     def _tick_return_home(self, pose: tuple[float, float, float]) -> None:
         if self.home_pose is None:
+            if rospy is not None:
+                rospy.logerr("[MissionManager] ⚠️ RETURN_HOME失败: home_pose未初始化")
             self._record_failure("缺少返航起点")
             self._transition_state(
                 WRITE_RESULT,
@@ -3264,6 +3365,17 @@ class MissionManager:
                 call_site="MissionManager._tick_return_home",
             )
             return
+
+        # 返航开始时记录home_pose（仅首次）
+        if not getattr(self, "_return_home_started_logged", False):
+            if rospy is not None:
+                rospy.loginfo(
+                    "[MissionManager] 开始返航: 当前位置=[%.2f, %.2f], 目标home_pose=[%.2f, %.2f, %.2f], 距离=%.2fm",
+                    pose[0], pose[1],
+                    self.home_pose[0], self.home_pose[1], self.home_pose[2],
+                    math.hypot(self.home_pose[0] - pose[0], self.home_pose[1] - pose[1])
+                )
+            self._return_home_started_logged = True
         if self.current_floor != 0 and self.max_floor > 1:
             self._begin_floor_change(
                 0,
@@ -3388,7 +3500,7 @@ class MissionManager:
                     reverse_trace = None
             if reverse_trace is not None:
                 self._return_home.entry_trace_attempted = True
-                self.controller.set_path(reverse_trace)
+                self.controller.set_path(reverse_trace, reason="return_home_entry_trace_path")
                 MissionReportingRuntime.loginfo(
                     "主入口外复用本轮已实际通过的入场轨迹返航：waypoints=%d",
                     len(reverse_trace),
@@ -3432,7 +3544,7 @@ class MissionManager:
             planned_path = list(plan_poll.path)
             if plan_status == "reached":
                 self._return_home.candidate_reject_count = 0
-                self.controller.set_path(planned_path)
+                self.controller.set_path(planned_path, reason="return_home_planned_path")
             elif str(plan_status).startswith("candidate_rejected"):
                 self._return_home.candidate_reject_count += 1
                 reject_count = self._return_home.candidate_reject_count
@@ -3477,7 +3589,7 @@ class MissionManager:
         segment_snapshot = getattr(self.controller, "current_segment", None)
         if callable(segment_snapshot):
             current_segment = segment_snapshot()
-        status = self.controller.tick(pose)
+        status = self.controller.poll_status()
         if status == STUCK:
             self._handle_return_home_stuck(pose, current_segment)
 
@@ -3801,8 +3913,20 @@ class MissionManager:
                 if active_goal is not None
                 else None
             ),
-            "path_length": round(self.controller._last_goal_distance, 2) if self.controller.has_path() else 0.0,
-            "is_stuck": self.controller._recover_until > now,
+            # 改用公开快照而非伸手取控制器私有量：
+            # _last_goal_distance 是死字段（全仓库只被赋 math.inf，从无第二个写入
+            # 点），原式在 has_path() 为真时恒得 Infinity，经 json.dumps 默认
+            # allow_nan 写出裸 Infinity —— /mission_status 话题上是非法 JSON。
+            # route_progress 才是真实剩余航程（_remaining_path_distance 每周期
+            # 更新），且已由 _finite_or_none 兜住非有限值。
+            "path_length": (
+                controller_debug["route_progress"]
+                if controller_debug["route_progress"] is not None
+                else 0.0
+            ),
+            # recover_remaining = max(0.0, _recover_until - now)，与原来的
+            # _recover_until > now 精确等价，无需再读私有量。
+            "is_stuck": controller_debug["recover_remaining"] > 0.0,
             "controller": controller_debug,
         }
         self._reporting.publish_status(

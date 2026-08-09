@@ -44,6 +44,9 @@ class LocalSemanticDetector:
     ``MissionManager`` 只绑定公开 ID 并创建任务，防止单帧候选直接触发环境交互。
     """
 
+    # 左右门框分别量化到该横向格，二者之差的最大欠估误差也是一个格宽。
+    opening_width_resolution = 0.05
+
     def __init__(
         self,
         *,
@@ -136,7 +139,7 @@ class LocalSemanticDetector:
         observations: list[OpeningObservation] = []
         for distance in candidate_distances:
             plane = [sample for sample in samples if abs(sample[0] - distance) <= half_depth]
-            lateral_bin_width = 0.05
+            lateral_bin_width = self.opening_width_resolution
             lateral_bins: dict[int, list[tuple[float, float, float]]] = {}
             for sample in plane:
                 bucket = int(round(sample[1] / lateral_bin_width))

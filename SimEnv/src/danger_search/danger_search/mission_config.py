@@ -158,6 +158,7 @@ _CONFIG_GROUP_FIELDS = {
             "startup_delay",
             "max_runtime",
             "max_floor",
+            "tick_wall_stall_timeout",
             "manual_goal_enabled",
             "last_floor_uses_global_budget",
         }
@@ -626,6 +627,11 @@ class _MissionConfigBuilder:
             _param("mission/permanent_forbidden_decay_scale", 3.0)
         )
         self.status_publish_period = float(_param("mission/status_publish_period", 1.0))
+        self.tick_wall_stall_timeout = float(
+            _param("mission/tick_wall_stall_timeout", 60.0)
+        )
+        if not math.isfinite(self.tick_wall_stall_timeout):
+            raise ValueError("mission/tick_wall_stall_timeout 必须为有限数")
         self.exit_cabin_backoff_enabled = bool(
             _param("mission/exit_cabin_backoff_enabled", False)
         )
@@ -869,6 +875,9 @@ class _MissionConfigBuilder:
             "frontier_obstacle_clearance": float(_param("frontier/frontier_obstacle_clearance", 0.25)),
             "frontier_unknown_standoff": float(_param("frontier/frontier_unknown_standoff", 0.20)),
             "frontier_min_information_gain": float(_param("frontier/frontier_min_information_gain", 1.0)),
+            "expected_gain_radius": float(
+                _param("frontier/expected_gain_radius", 3.0)
+            ),
             "door_front_half_plane_penalty": float(_param("frontier/door_front_half_plane_penalty", 6.0)),
             "door_front_half_plane_radius": float(_param("frontier/door_front_half_plane_radius", 1.5)),
             "door_preferred_direction_bonus": float(_param("frontier/door_preferred_direction_bonus", 1.5)),
@@ -902,6 +911,29 @@ class _MissionConfigBuilder:
             "recover_angular_speed": float(_param("controller/recover_angular_speed", 0.55)),
             "command_keepalive_period": float(
                 _param("controller/command_keepalive_period", 0.1)
+            ),
+            "pose_max_age": float(_param("controller/pose_max_age", 0.30)),
+            "yaw_rate_damping": float(_param("controller/yaw_rate_damping", 0.45)),
+            "turn_in_place_heading": float(
+                _param("controller/turn_in_place_heading", 0.70)
+            ),
+            "turn_in_place_rate": float(
+                _param("controller/turn_in_place_rate", 0.45)
+            ),
+            "turn_release_heading": float(
+                _param("controller/turn_release_heading", 0.20)
+            ),
+            "turn_release_rate": float(
+                _param("controller/turn_release_rate", 0.20)
+            ),
+            "turn_release_samples": int(
+                _param("controller/turn_release_samples", 3)
+            ),
+            "route_progress_timeout": float(
+                _param("controller/route_progress_timeout", 8.0)
+            ),
+            "route_progress_improvement": float(
+                _param("controller/route_progress_improvement", 0.10)
             ),
             "obstacle_stop_distance": float(_param("controller/obstacle_stop_distance", 0.50)),
             "obstacle_slow_distance": float(_param("controller/obstacle_slow_distance", 1.00)),

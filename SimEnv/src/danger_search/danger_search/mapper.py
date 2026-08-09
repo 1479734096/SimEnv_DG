@@ -106,6 +106,61 @@ def _valid_negative_cell(cell, grid: "FloorGrid") -> bool:
     return bool(0 <= gx < grid.size_x and 0 <= gy < grid.size_y)
 
 
+def compute_door_strip_cells(
+    x: float,
+    y: float,
+    yaw: float,
+    width: float,
+    depth: float,
+    grid: "FloorGrid",
+) -> set[tuple[int, int]]:
+    """计算门板矩形条带覆盖的栅格格子。
+
+    Args:
+        x, y: 门中心世界坐标
+        yaw: 门法向角度（rad）
+        width: 门宽（沿切向）
+        depth: 门深（沿法向）
+        grid: 目标栅格
+
+    Returns:
+        门板条带覆盖的格子集合 {(gx, gy), ...}
+    """
+    center = grid.world_to_grid(x, y)
+    if center is None:
+        return set()
+
+    cx, cy = center
+    half_width = max(0.0, float(width)) * 0.5
+    half_depth = max(0.0, float(depth)) * 0.5
+
+    if half_width <= 0.0 or half_depth <= 0.0:
+        return set()
+
+    normal_x = math.cos(yaw)
+    normal_y = math.sin(yaw)
+    tangent_x = -normal_y
+    tangent_y = normal_x
+
+    search_radius = math.hypot(half_width, half_depth)
+    cells = int(math.ceil(search_radius / grid.resolution))
+
+    strip_cells: set[tuple[int, int]] = set()
+    for gy in range(cy - cells, cy + cells + 1):
+        for gx in range(cx - cells, cx + cells + 1):
+            if not (0 <= gx < grid.size_x and 0 <= gy < grid.size_y):
+                continue
+            wx, wy = grid.grid_to_world(gx, gy)
+            dx = wx - x
+            dy = wy - y
+            along_normal = dx * normal_x + dy * normal_y
+            along_tangent = dx * tangent_x + dy * tangent_y
+            if abs(along_normal) <= half_depth and abs(along_tangent) <= half_width:
+                strip_cells.add((gx, gy))
+
+    return strip_cells
+
+
 def _valid_negative_cell_structure(cell) -> bool:
     return bool(
         isinstance(cell, (tuple, list))
@@ -160,6 +215,15 @@ class FloorGrid:
     数组按 ``data[gy, gx]`` 存储；world 坐标落在格子中心时通过
     ``grid_to_world`` 返回。所有可通行判断统一只接受 FREE/VISITED，UNKNOWN、
     BLACK 和 OCC 均 fail-closed。
+
+    架构说明：
+    - observation_layer (原 base): 观测基础层，由传感器直接驱动
+      * UNKNOWN: 未观测
+      * FREE: 传感器确认可通行
+      * VISITED: 机器人已到达
+    - planning_layer (原 _derived): 规划约束层，叠加多个约束源
+      * 继承 observation_layer 的 FREE/VISITED
+      * 叠加 OCC (正障碍)、BLACK (任务禁区)、NEGATIVE (负障碍)
     """
     floor_index: int
     resolution: float
@@ -192,8 +256,15 @@ class FloorGrid:
             raise ValueError("栅格分辨率和尺寸必须为正有限数，原点必须为有限数")
         self.size_x = int(math.ceil(self.width / self.resolution))
         self.size_y = int(math.ceil(self.length / self.resolution))
+
+        # 观测基础层：由传感器直接驱动 (UNKNOWN/FREE/VISITED)
         self.base = np.full((self.size_y, self.size_x), UNKNOWN, dtype=np.int16)
+        self.observation_layer = self.base  # 语义别名
+
+        # 规划约束层：叠加约束后的规划视图 (+ OCC/BLACK/NEGATIVE)
         self._derived = np.full((self.size_y, self.size_x), UNKNOWN, dtype=np.int16)
+        self.planning_layer = self._derived  # 语义别名
+
         self.obstacle_evidence = ObstacleEvidenceLedger(
             floor_index=self.floor_index,
             size_x=self.size_x,
@@ -204,6 +275,7 @@ class FloorGrid:
         )
         self.evidence_scope = (self.floor_index, 1, 1)
         self.black_owners: dict[tuple[int, int], set[str]] = {}
+
         # NEGATIVE 可能暂时被 OCC/BLACK 覆盖；单独保存来源，动态门清除 OCC 时
         # 才能恢复负障，而直接楼面证据也只能移除这一来源。
         self.negative_cells: set[tuple[int, int]] = set()
@@ -214,9 +286,13 @@ class FloorGrid:
             str, frozenset[tuple[int, int]]
         ] = {}
 
+        # 批量刷新优化：标记脏格子，延迟刷新
+        self._dirty_cells: set[tuple[int, int]] = set()
+
     @property
     def data(self) -> np.ndarray:
-        view = self._derived.view()
+        """返回规划约束层的只读视图（向后兼容接口）。"""
+        view = self.planning_layer.view()
         view.flags.writeable = False
         return view
 
@@ -231,6 +307,18 @@ class FloorGrid:
     def _in_bounds(self, gx: int, gy: int) -> bool:
         return 0 <= int(gx) < self.size_x and 0 <= int(gy) < self.size_y
 
+    def _mark_dirty(self, gx: int, gy: int) -> None:
+        """标记格子为脏，延迟刷新以减少重复计算。"""
+        cell = (int(gx), int(gy))
+        if self._in_bounds(*cell):
+            self._dirty_cells.add(cell)
+
+    def _flush_dirty_cells(self) -> None:
+        """批量刷新所有标记为脏的格子。"""
+        for cell in self._dirty_cells:
+            self._refresh_cell(*cell)
+        self._dirty_cells.clear()
+
     def _refresh_cell(self, gx: int, gy: int) -> None:
         cell = (int(gx), int(gy))
         if not self._in_bounds(*cell):
@@ -242,8 +330,8 @@ class FloorGrid:
         elif self.negative_cell_owners.get(cell):
             state = NEGATIVE
         else:
-            state = int(self.base[cell[1], cell[0]])
-        self._derived[cell[1], cell[0]] = state
+            state = int(self.observation_layer[cell[1], cell[0]])
+        self.planning_layer[cell[1], cell[0]] = state
 
     def _refresh_cells(self, cells: Iterable[tuple[int, int]]) -> None:
         for gx, gy in cells:
@@ -253,13 +341,13 @@ class FloorGrid:
         if int(state) not in (UNKNOWN, FREE, VISITED):
             raise ValueError("基础层只允许 UNKNOWN、FREE 或 VISITED")
         if self._in_bounds(gx, gy):
-            self.base[int(gy), int(gx)] = int(state)
+            self.observation_layer[int(gy), int(gx)] = int(state)
             self._refresh_cell(gx, gy)
 
     def fill_base(self, state: int) -> None:
         if int(state) not in (UNKNOWN, FREE, VISITED):
             raise ValueError("基础层只允许 UNKNOWN、FREE 或 VISITED")
-        self.base[:, :] = int(state)
+        self.observation_layer[:, :] = int(state)
         for gy in range(self.size_y):
             for gx in range(self.size_x):
                 self._refresh_cell(gx, gy)
@@ -268,7 +356,7 @@ class FloorGrid:
         data = np.asarray(values, dtype=np.int16)
         if data.shape != (self.size_y, self.size_x):
             raise ValueError("旧栅格快照尺寸不匹配")
-        self.base[:, :] = UNKNOWN
+        self.observation_layer[:, :] = UNKNOWN
         self.obstacle_evidence = ObstacleEvidenceLedger(
             floor_index=self.floor_index,
             size_x=self.size_x,
@@ -284,7 +372,7 @@ class FloorGrid:
             for gx in range(self.size_x):
                 state = int(data[gy, gx])
                 if state in (UNKNOWN, FREE, VISITED):
-                    self.base[gy, gx] = state
+                    self.observation_layer[gy, gx] = state
                 elif state == OCC:
                     wx, wy = self.grid_to_world(gx, gy)
                     self.record_obstacle_observation(
@@ -305,7 +393,7 @@ class FloorGrid:
                 elif state == NEGATIVE:
                     self.negative_cells.add((gx, gy))
                     self.negative_cell_owners[(gx, gy)] = {"legacy_snapshot"}
-        self._derived[:, :] = UNKNOWN
+        self.planning_layer[:, :] = UNKNOWN
         self._refresh_cells(
             (gx, gy)
             for gy in range(self.size_y)
@@ -321,8 +409,12 @@ class FloorGrid:
             self.origin_x,
             self.origin_y,
         )
-        result.base = np.array(self.base, copy=True)
-        result._derived = np.array(self._derived, copy=True)
+        # 直接复制底层数组，然后重建别名
+        result.base[:] = self.observation_layer
+        result.observation_layer = result.base
+        result._derived[:] = self.planning_layer
+        result.planning_layer = result._derived
+
         result.obstacle_evidence = self.obstacle_evidence.copy()
         result.evidence_scope = tuple(self.evidence_scope)
         result.black_owners = {
@@ -353,7 +445,7 @@ class FloorGrid:
         if state == BLACK:
             self.black_owners.setdefault(cell, set()).add(str(owner))
         elif state in (UNKNOWN, FREE, VISITED):
-            self.base[gy, gx] = int(state)
+            self.observation_layer[gy, gx] = int(state)
             self.black_owners.pop(cell, None)
             if state in (FREE, VISITED):
                 for obstacle_owner in tuple(
@@ -411,9 +503,50 @@ class FloorGrid:
             return False
         return int(self.data[gy, gx]) in (FREE, VISITED)
 
+    def is_planning_traversable(self, gx: int, gy: int) -> bool:
+        """规划层可通行性（考虑所有约束：障碍、黑区、负障碍）。
+
+        等价于 is_traversable，但语义更明确。
+        """
+        if not self._in_bounds(gx, gy):
+            return False
+        value = self.planning_layer[gy, gx]
+        return value in (FREE, VISITED)
+
+    def is_observation_free(self, gx: int, gy: int) -> bool:
+        """观测层可通行性（仅传感器观测，不考虑任务约束）。
+
+        用于判断传感器是否认为此处可通行，忽略 BLACK/NEGATIVE 等任务层约束。
+        """
+        if not self._in_bounds(gx, gy):
+            return False
+        value = self.observation_layer[gy, gx]
+        return value in (FREE, VISITED)
+
+    def get_constraint_kind(self, gx: int, gy: int):
+        """返回阻挡此格子的约束类型。
+
+        Returns:
+            "obstacle" - 正障碍（传感器检测到的实体障碍）
+            "black" - 黑区（任务层禁区）
+            "negative" - 负障碍（楼面支撑约束）
+            None - 无约束阻挡
+        """
+        cell = (int(gx), int(gy))
+        if not self._in_bounds(*cell):
+            return None
+
+        if self.obstacle_evidence.blocking_at(cell):
+            return "obstacle"
+        if self.black_owners.get(cell):
+            return "black"
+        if self.negative_cell_owners.get(cell):
+            return "negative"
+        return None
+
     def mark_free(self, gx: int, gy: int) -> None:
         """仅把 UNKNOWN 变为 FREE，绝不覆盖已知障碍或任务禁区。"""
-        if self._in_bounds(gx, gy) and int(self.base[gy, gx]) == UNKNOWN:
+        if self._in_bounds(gx, gy) and int(self.observation_layer[gy, gx]) == UNKNOWN:
             self.set_base_state(gx, gy, FREE)
 
     def mark_occupied(self, gx: int, gy: int) -> None:
@@ -449,6 +582,51 @@ class FloorGrid:
             low_confirm_window_generations=1,
             pose_separation=0.0,
         )
+
+    def clear_region(self, cells: Iterable[tuple[int, int]]) -> int:
+        """清除指定格子中的正障碍，恢复为观测层状态或负障碍。
+
+        只移除核心本身落在指定区域内的障碍；若格子仍有负障碍来源则恢复为
+        NEGATIVE，否则恢复为观测层状态（通常是 FREE）。BLACK 是任务/安全
+        禁区，不会被清除。
+
+        Args:
+            cells: 要清理的格子集合 (gx, gy)
+
+        Returns:
+            实际清除的 OCC 格子数量
+        """
+        cells_set = set(cells)
+
+        # 记录清理前的 OCC 状态
+        occupied_before = {
+            cell for cell in cells_set
+            if self._in_bounds(*cell) and int(self.planning_layer[cell[1], cell[0]]) == OCC
+        }
+
+        # 只移除核心本身落在区域内的障碍
+        removable_cores = [
+            core_cell for core_cell in tuple(self.obstacle_evidence.cores)
+            if core_cell in cells_set
+        ]
+
+        for core_cell in removable_cores:
+            self.remove_obstacle_core(core_cell)
+
+        # 恢复清理后非阻挡格子为观测层状态
+        for gx, gy in occupied_before:
+            current_state = int(self.planning_layer[gy, gx])
+            if current_state not in (OCC, BLACK, NEGATIVE):
+                self.set_base_state(gx, gy, FREE)
+
+        # 计算实际清除数量
+        occupied_after = sum(
+            int(self.planning_layer[cell[1], cell[0]]) == OCC
+            for cell in cells_set
+            if self._in_bounds(*cell)
+        )
+
+        return max(0, len(occupied_before) - occupied_after)
 
     def record_obstacle_observation(self, x, y, radius, **kwargs) -> None:
         changed = self.obstacle_evidence.record_observation(
@@ -1088,59 +1266,13 @@ class MultiFloorGridMap:
 
         仅矩形门板条带中的 OCC 会恢复；BLACK 是任务/安全禁区，不能由开门
         动作清除。若格子仍有动态负障来源则恢复为 NEGATIVE，而不是 FREE。
+
+        注：此方法是便利包装，内部使用 compute_door_strip_cells + clear_region。
         """
         grid = self.floor(floor_index)
-        center = grid.world_to_grid(x, y)
-        if center is None:
-            return
-        cx, cy = center
-        half_width = max(0.0, float(width)) * 0.5
-        half_depth = max(0.0, float(depth)) * 0.5
-        if half_width <= 0.0 or half_depth <= 0.0:
-            return
-        normal_x = math.cos(yaw)
-        normal_y = math.sin(yaw)
-        tangent_x = -normal_y
-        tangent_y = normal_x
-        search_radius = math.hypot(half_width, half_depth)
-        cells = int(math.ceil(search_radius / grid.resolution))
-        strip_cells: set[tuple[int, int]] = set()
-        for gy in range(cy - cells, cy + cells + 1):
-            for gx in range(cx - cells, cx + cells + 1):
-                if not (0 <= gx < grid.size_x and 0 <= gy < grid.size_y):
-                    continue
-                wx, wy = grid.grid_to_world(gx, gy)
-                dx = wx - x
-                dy = wy - y
-                along_normal = dx * normal_x + dy * normal_y
-                along_tangent = dx * tangent_x + dy * tangent_y
-                if abs(along_normal) <= half_depth and abs(along_tangent) <= half_width:
-                    strip_cells.add((gx, gy))
-        occupied_before_cells = {
-            (gx, gy)
-            for gx, gy in strip_cells
-            if int(grid.data[gy, gx]) == OCC
-        }
-        # 只移除核心本身落在门板条带内的 owner。按派生 OCC 格匿名擦除会把
-        # 门侧墙体的膨胀所有权一并清掉，破坏来源账本。
-        removable_cores = []
-        for core_cell in tuple(grid.occ_cores):
-            wx, wy = grid.grid_to_world(*core_cell)
-            dx = wx - x
-            dy = wy - y
-            along_normal = dx * normal_x + dy * normal_y
-            along_tangent = dx * tangent_x + dy * tangent_y
-            if abs(along_normal) <= half_depth and abs(along_tangent) <= half_width:
-                removable_cores.append(core_cell)
-        for core_cell in removable_cores:
-            grid.remove_obstacle_core(core_cell)
-        for gx, gy in occupied_before_cells:
-            if int(grid.data[gy, gx]) not in (OCC, BLACK, NEGATIVE):
-                grid.set_base_state(gx, gy, FREE)
-        occupied_after = sum(
-            int(grid.data[gy, gx]) == OCC for gx, gy in strip_cells
-        )
-        cleared_count = max(0, len(occupied_before_cells) - occupied_after)
+        strip_cells = compute_door_strip_cells(x, y, yaw, width, depth, grid)
+        cleared_count = grid.clear_region(strip_cells)
+
         self._pending_occupied_to_free_count += cleared_count
         self._pending_dynamic_door_cleared_count += cleared_count
 

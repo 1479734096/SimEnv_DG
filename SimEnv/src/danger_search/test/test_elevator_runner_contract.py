@@ -65,6 +65,15 @@ class ElevatorRunnerContractTest(unittest.TestCase):
         self.assertIn('terminate_group "$KEEPER_PID" KILL', source)
         self.assertIn('wait "$KEEPER_PID" 2>/dev/null || true', source)
 
+    def test_runner_tracks_ros_nodes_separately_from_roslaunch_wrapper(self):
+        source = RUNNER.read_text(encoding="utf-8")
+
+        self.assertIn("MISSION_NODE_PIDS", source)
+        self.assertIn("record_mission_node_pids", source)
+        self.assertIn("任务节点仍存活", source)
+        self.assertIn('terminate_node_list "$MISSION_NODE_PIDS" INT', source)
+        self.assertIn('terminate_node_list "$MISSION_NODE_PIDS" KILL', source)
+
     def test_landmark_diagnostic_requires_isolated_truth_recording(self):
         environment = dict(os.environ)
         environment["ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS"] = "1"

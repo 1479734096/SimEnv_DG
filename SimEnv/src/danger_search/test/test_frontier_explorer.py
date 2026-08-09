@@ -10,7 +10,7 @@ from danger_search.frontier import FrontierExplorer
 from danger_search.frontier import Frontier
 from danger_search.frontier import FrontierSelectionContext
 from danger_search.frontier import _build_frontier_mask
-from danger_search.mapper import BLACK, FREE, FloorGrid, OCC, UNKNOWN, VISITED
+from danger_search.mapper import BLACK, FREE, NEGATIVE, FloorGrid, OCC, UNKNOWN, VISITED
 from danger_search.planner import (
     PlanResult,
     PlanningConstraints,
@@ -242,7 +242,10 @@ class FrontierExplorerTest(unittest.TestCase):
         required_fields = {
             "position",
             "cluster_size",
+            "frontier_boundary_cells",
             "information_gain",
+            "expected_unknown_gain",
+            "optimistic_score",
             "euclidean_distance",
             "path_length",
             "final_score",
@@ -251,6 +254,7 @@ class FrontierExplorerTest(unittest.TestCase):
             "door_context_penalty",
             "blacklist_status",
             "reachability_result",
+            "elimination_stage",
         }
         self.assertTrue(required_fields.issubset(payload["candidates"][0]))
         self.assertTrue(payload["candidates"][0]["selected"])
@@ -360,6 +364,396 @@ class FrontierExplorerTest(unittest.TestCase):
 
         self.assertGreater(score_with_safe_target, score_with_old_centroid)
 
+    def test_expected_unknown_gain_counts_four_connected_unknown_inside_three_meter_circle(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=8.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        grid.fill_base(FREE)
+        for cell in ((3, 2), (4, 2), (5, 2), (4, 1)):
+            grid.set_base_state(*cell, UNKNOWN)
+        frontier = Frontier(
+            cells=((2, 2),),
+            centroid=grid.grid_to_world(2, 2),
+            information_gain=1.0,
+        )
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            expected_gain_radius=3.0,
+        )
+
+        gain = explorer._expected_unknown_gain(
+            grid,
+            frontier,
+            grid.grid_to_world(1, 2),
+        )
+
+        # 距离圆心 2m 和 3m 的 UNKNOWN 计入；4m 及由它连接的分支不计入。
+        self.assertEqual(gain, 2.0)
+
+    def test_expected_unknown_gain_clips_at_map_boundary_without_double_counting(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=4.0,
+            length=4.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        grid.fill_base(FREE)
+        for cell in ((1, 1), (1, 2), (2, 1), (2, 2)):
+            grid.set_base_state(*cell, UNKNOWN)
+        frontier = Frontier(
+            cells=((0, 1), (0, 2)),
+            centroid=grid.grid_to_world(0, 1),
+            information_gain=2.0,
+        )
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            expected_gain_radius=3.0,
+        )
+
+        gain = explorer._expected_unknown_gain(
+            grid,
+            frontier,
+            grid.grid_to_world(0, 1),
+        )
+
+        self.assertEqual(gain, 4.0)
+
+    def test_expected_unknown_gain_never_traverses_known_or_blocking_states(self):
+        for blocking_state in (OCC, BLACK, NEGATIVE, FREE, VISITED):
+            with self.subTest(blocking_state=blocking_state):
+                grid = FloorGrid(
+                    floor_index=0,
+                    resolution=1.0,
+                    width=7.0,
+                    length=3.0,
+                    origin_x=0.0,
+                    origin_y=0.0,
+                )
+                snapshot = np.full((grid.size_y, grid.size_x), FREE, dtype=np.int16)
+                snapshot[1, 3] = UNKNOWN
+                snapshot[1, 4] = blocking_state
+                snapshot[1, 5] = UNKNOWN
+                grid.load_legacy_data(snapshot)
+                frontier = Frontier(
+                    cells=((2, 1),),
+                    centroid=grid.grid_to_world(2, 1),
+                    information_gain=1.0,
+                )
+                explorer = FrontierExplorer(
+                    min_cluster_size=1,
+                    expected_gain_radius=5.0,
+                )
+
+                gain = explorer._expected_unknown_gain(
+                    grid,
+                    frontier,
+                    grid.grid_to_world(1, 1),
+                )
+
+                self.assertEqual(gain, 1.0)
+
+    def test_far_large_unknown_corridor_beats_near_small_unknown_pocket(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=20.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        grid.fill_base(FREE)
+        robot_pose = (1.5, 2.5, 0.0)
+        near_target = (2.5, 2.5)
+        far_target = (13.5, 2.5)
+        near = Frontier(cells=((2, 2),), centroid=near_target, information_gain=12.0)
+        far = Frontier(cells=((13, 2),), centroid=far_target, information_gain=2.0)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            information_gain_weight=1.0,
+            path_cost_weight=1.0,
+            yaw_cost_weight=0.0,
+            revisit_penalty_weight=0.0,
+        )
+
+        def candidates(_grid, frontier, _robot_xy):
+            return [frontier.centroid]
+
+        def expected_gain(_grid, frontier, _target):
+            return 4.0 if frontier is near else 400.0
+
+        def fake_astar(_grid, start, goal, **_kwargs):
+            return PlanResult(path=[start, goal], status=REACHED)
+
+        with patch.object(
+            explorer, "_candidate_targets_for_frontier", side_effect=candidates
+        ), patch.object(
+            explorer, "_expected_unknown_gain", side_effect=expected_gain
+        ), patch(
+            "danger_search.frontier.astar_plan", side_effect=fake_astar
+        ):
+            selected, path = explorer.select_frontier(
+                grid,
+                robot_pose,
+                frontiers=[near, far],
+            )
+
+        self.assertIsNotNone(selected)
+        self.assertTrue(path)
+        self.assertEqual(selected.centroid, far_target)
+        self.assertEqual(selected.expected_unknown_gain, 400.0)
+
+    def test_long_boundary_with_small_unknown_domain_loses_to_narrow_large_domain(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=12.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        grid.fill_base(FREE)
+        robot_pose = (1.5, 2.5, 0.0)
+        long_boundary = Frontier(
+            cells=tuple((3, gy) for gy in range(5)),
+            centroid=(3.5, 2.5),
+            information_gain=50.0,
+        )
+        narrow_entrance = Frontier(
+            cells=((4, 2),),
+            centroid=(4.5, 2.5),
+            information_gain=1.0,
+        )
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            information_gain_weight=1.0,
+            path_cost_weight=1.0,
+            yaw_cost_weight=0.0,
+            revisit_penalty_weight=0.0,
+        )
+
+        def expected_gain(_grid, frontier, _target):
+            return 4.0 if frontier is long_boundary else 100.0
+
+        with patch.object(
+            explorer,
+            "_candidate_targets_for_frontier",
+            side_effect=lambda _grid, frontier, _robot: [frontier.centroid],
+        ), patch.object(
+            explorer, "_expected_unknown_gain", side_effect=expected_gain
+        ), patch(
+            "danger_search.frontier.astar_plan",
+            side_effect=lambda _grid, start, goal, **_kwargs: PlanResult(
+                path=[start, goal], status=REACHED
+            ),
+        ):
+            selected, _path = explorer.select_frontier(
+                grid,
+                robot_pose,
+                frontiers=[long_boundary, narrow_entrance],
+            )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.centroid, narrow_entrance.centroid)
+
+    def test_far_high_gain_candidate_enters_top_eight_planning_budget(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=20.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        grid.fill_base(FREE)
+        robot_pose = (0.5, 2.5, 0.0)
+        near_frontiers = [
+            Frontier(
+                cells=((gx, 2),),
+                centroid=grid.grid_to_world(gx, 2),
+                information_gain=20.0,
+            )
+            for gx in range(1, 10)
+        ]
+        far_target = grid.grid_to_world(12, 2)
+        far_frontier = Frontier(
+            cells=((12, 2),),
+            centroid=far_target,
+            information_gain=1.0,
+        )
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            information_gain_weight=1.0,
+            path_cost_weight=1.0,
+            yaw_cost_weight=0.0,
+            revisit_penalty_weight=0.0,
+            max_planning_candidates=8,
+        )
+        planned_goals: list[tuple[float, float]] = []
+
+        def expected_gain(_grid, frontier, _target):
+            return 625.0 if frontier is far_frontier else 1.0
+
+        def fake_astar(_grid, start, goal, **_kwargs):
+            planned_goals.append(goal)
+            return PlanResult(path=[start, goal], status=REACHED)
+
+        with patch.object(
+            explorer,
+            "_candidate_targets_for_frontier",
+            side_effect=lambda _grid, frontier, _robot: [frontier.centroid],
+        ), patch.object(
+            explorer, "_expected_unknown_gain", side_effect=expected_gain
+        ), patch(
+            "danger_search.frontier.astar_plan", side_effect=fake_astar
+        ):
+            explorer.select_frontier(
+                grid,
+                robot_pose,
+                frontiers=near_frontiers + [far_frontier],
+            )
+
+        self.assertIn(far_target, planned_goals)
+        debug = explorer.last_selection_debug
+        assert debug is not None
+        far_debug = next(
+            candidate
+            for candidate in debug.candidates
+            if candidate.position == far_target
+        )
+        self.assertNotEqual(far_debug.rejection_reason, "planning_candidate_limit")
+
+    def test_optimistic_and_final_scores_share_expected_unknown_gain(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=8.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        grid.fill_base(FREE)
+        robot_pose = (1.5, 2.5, 0.0)
+        target = (3.5, 2.5)
+        frontier = Frontier(cells=((3, 2),), centroid=target, information_gain=99.0)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            information_gain_weight=1.0,
+            path_cost_weight=1.0,
+            yaw_cost_weight=0.0,
+            revisit_penalty_weight=0.0,
+        )
+
+        with patch.object(
+            explorer, "_candidate_targets_for_frontier", return_value=[target]
+        ), patch.object(
+            explorer, "_expected_unknown_gain", return_value=49.0
+        ) as gain_mock, patch(
+            "danger_search.frontier.astar_plan",
+            return_value=PlanResult(
+                path=[robot_pose[:2], (1.5, 3.5), target],
+                status=REACHED,
+            ),
+        ):
+            selected, _path = explorer.select_frontier(
+                grid,
+                robot_pose,
+                frontiers=[frontier],
+            )
+
+        self.assertIsNotNone(selected)
+        debug = explorer.last_selection_debug
+        assert debug is not None
+        candidate = next(item for item in debug.candidates if item.selected)
+        self.assertEqual(candidate.expected_unknown_gain, 49.0)
+        self.assertEqual(selected.expected_unknown_gain, 49.0)
+        self.assertAlmostEqual(candidate.optimistic_score, 5.0)
+        self.assertAlmostEqual(candidate.final_score, 7.0 - candidate.path_length)
+        gain_mock.assert_called_once_with(grid, frontier, target)
+
+    def test_expected_gain_is_cached_for_at_most_two_valid_landings(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=10.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        grid.fill_base(FREE)
+        robot_pose = (0.5, 2.5, 0.0)
+        targets = [(2.5, 2.5), (3.5, 2.5), (4.5, 2.5)]
+        frontier = Frontier(
+            cells=((4, 2),),
+            centroid=targets[-1],
+            information_gain=3.0,
+        )
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            max_goal_candidates_per_frontier=2,
+        )
+        planned_goals: list[tuple[float, float]] = []
+
+        def fake_astar(_grid, start, goal, **_kwargs):
+            planned_goals.append(goal)
+            return PlanResult(path=[start, goal], status=REACHED)
+
+        with patch.object(
+            explorer,
+            "_candidate_targets_for_frontier",
+            return_value=targets,
+        ), patch.object(
+            explorer,
+            "_expected_unknown_gain",
+            side_effect=(9.0, 16.0),
+        ) as gain_mock, patch(
+            "danger_search.frontier.astar_plan",
+            side_effect=fake_astar,
+        ):
+            selected, _path = explorer.select_frontier(
+                grid,
+                robot_pose,
+                frontiers=[frontier],
+            )
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(gain_mock.call_count, 2)
+        self.assertEqual(planned_goals, targets[:2])
+
+    def test_extraction_thresholds_keep_using_frontier_boundary_count(self):
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        grid.mark_free(2, 2)
+
+        cluster_filtered = FrontierExplorer(min_cluster_size=2)
+        self.assertEqual(cluster_filtered.extract_frontiers(grid), [])
+        self.assertEqual(
+            cluster_filtered._last_extraction_rejections[0].rejection_reason,
+            "cluster_below_min_size",
+        )
+
+        gain_filtered = FrontierExplorer(
+            min_cluster_size=1,
+            frontier_min_information_gain=2.0,
+        )
+        self.assertEqual(gain_filtered.extract_frontiers(grid), [])
+        self.assertEqual(
+            gain_filtered._last_extraction_rejections[0].rejection_reason,
+            "information_gain_below_minimum",
+        )
+
     def test_large_far_cluster_does_not_overwhelm_nearer_reachable_frontier(self):
         """巨大聚类的信息增益应边际递减，不能仅凭格子数压过更近目标。"""
         explorer = FrontierExplorer(
@@ -405,6 +799,48 @@ class FrontierExplorerTest(unittest.TestCase):
         self.assertIsNotNone(frontier)
         self.assertTrue(path)
         self.assertGreater(math.hypot(frontier.centroid[0], frontier.centroid[1]), 0.35)
+
+    def test_all_real_frontiers_cooled_still_uses_free_space_fallback(self):
+        """真实前沿全部冷却时不能直接失败，仍应走既有自由空间出口。"""
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=1.0,
+            width=7.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        for gy in range(1, 4):
+            for gx in range(1, 6):
+                grid.mark_free(gx, gy)
+        start = grid.grid_to_world(1, 2)
+        target = grid.grid_to_world(5, 2)
+        real_frontier = Frontier(
+            cells=((5, 2),),
+            centroid=target,
+            information_gain=20.0,
+        )
+        explorer = FrontierExplorer(min_cluster_size=1)
+        explorer._candidate_targets_for_frontier = lambda *_args: [target]
+        explorer.blacklist_region(grid, target, radius=1.0)
+
+        selected, path = explorer.select_frontier(
+            grid,
+            (start[0], start[1], 0.0),
+            frontiers=[real_frontier],
+        )
+
+        self.assertIsNotNone(selected)
+        self.assertTrue(path)
+        self.assertEqual(selected.information_gain, 0.0)
+        self.assertTrue(explorer.last_selection_debug.used_fallback)
+        self.assertIn(
+            "all_targets_blacklisted",
+            {
+                candidate.rejection_reason
+                for candidate in explorer.last_selection_debug.candidates
+            },
+        )
 
     def test_fallback_prefers_unknown_adjacent_over_far_open_space(self):
         """无有效 frontier 进入 free-space fallback 时，应优先选择靠近未知区域的自由格子，
@@ -671,6 +1107,12 @@ class FrontierExplorerTest(unittest.TestCase):
         ), patch(
             "danger_search.frontier.reachable_traversable_component",
             return_value=all_free,
+        ), patch.object(
+            explorer,
+            "_expected_unknown_gain",
+            side_effect=lambda _grid, _frontier, target: (
+                16.0 if target[0] > 0.0 else 1.0
+            ),
         ):
             frontier, path = explorer.select_frontier(grid, (0.0, 0.0, 0.0), selection_context=context)
 

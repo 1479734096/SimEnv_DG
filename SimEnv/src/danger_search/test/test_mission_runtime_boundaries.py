@@ -27,6 +27,51 @@ from danger_search.return_home_runtime import ReturnHomeRuntime
 
 
 class PlanningConstraintBoundaryTest(unittest.TestCase):
+    def test_runtime_wall_thread_is_unconditional_and_checks_tick_liveness_first(self):
+        path = Path(__file__).resolve().parents[1] / "danger_search" / "mission_node_runtime.py"
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(path))
+        start_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "start"
+        )
+        gate_if = next(
+            node
+            for node in start_method.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and any(
+                isinstance(part, ast.Attribute)
+                and part.attr == "ground_support_gate"
+                for part in ast.walk(node.test)
+            )
+        )
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "Thread"
+                for node in ast.walk(gate_if)
+            )
+        )
+        wall_method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_ground_support_wall_watch"
+        )
+        tick_index = source.index("check_tick_wall_timeout")
+        support_index = source.index("check_ground_support_wall_timeout")
+        self.assertLess(tick_index, support_index)
+        wall_calls = {
+            node.func.attr
+            for node in ast.walk(wall_method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+        self.assertIn("check_tick_wall_timeout", wall_calls)
+
     def test_all_production_astar_callers_supply_frozen_constraints(self):
         package = Path(__file__).resolve().parents[1] / "danger_search"
         callers = (

@@ -87,6 +87,46 @@ inline bool IsTranslationProposalValid(
          proposal.map_generation == current_map_generation;
 }
 
+struct LivoxOnlyGuardDecision {
+  bool allow_proposal = false;
+  bool abstained = false;
+  double planar_delta = std::numeric_limits<double>::quiet_NaN();
+  std::uint32_t consecutive_vetoes = 0;
+};
+
+inline LivoxOnlyGuardDecision EvaluateLivoxOnlyGuard(
+    const TranslationProposal &proposal,
+    const Eigen::Vector3d &reference_translation, double maximum_delta,
+    std::uint32_t previous_consecutive_vetoes,
+    std::uint32_t maximum_consecutive_vetoes) {
+  if (!std::isfinite(maximum_delta) || maximum_delta <= 0.0 ||
+      maximum_consecutive_vetoes == 0) {
+    throw std::invalid_argument("Livox-only 守卫参数无效");
+  }
+
+  LivoxOnlyGuardDecision decision;
+  if (!proposal.accepted || !proposal.translation.allFinite() ||
+      !reference_translation.allFinite()) {
+    return decision;
+  }
+
+  decision.planar_delta =
+      (proposal.translation - reference_translation).head<2>().norm();
+  if (decision.planar_delta <= maximum_delta) {
+    decision.allow_proposal = true;
+    return decision;
+  }
+
+  if (previous_consecutive_vetoes >= maximum_consecutive_vetoes - 1) {
+    decision.allow_proposal = true;
+    decision.abstained = true;
+    return decision;
+  }
+
+  decision.consecutive_vetoes = previous_consecutive_vetoes + 1;
+  return decision;
+}
+
 inline AdaptiveTranslationDecision DecideAdaptiveTranslation(
     const TranslationProposal &rgbd, const TranslationProposal &livox,
     std::uint64_t current_map_generation,

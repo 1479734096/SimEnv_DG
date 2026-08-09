@@ -28,8 +28,10 @@ LOG_DIR="${ELEVATOR_TEST_LOG_DIR:-/tmp/danger_search_elevator_test_$(date +%Y%m%
 
 AUTO_PID=""
 MISSION_PID=""
+MISSION_NODE_PIDS=""
 KEEPER_PID=""
 MASTER_PID=""
+GAZEBO_PID=""
 BAG_PID=""
 RGBD_BAG_PID=""
 RUNTIME_DIR=""
@@ -98,6 +100,35 @@ terminate_group() {
   fi
 }
 
+terminate_node_list() {
+  local pid_list="${1:-}"
+  local signal="${2:-TERM}"
+  local pid
+  for pid in $pid_list; do
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "-$signal" "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+record_mission_node_pids() {
+  local node
+  local pid
+  local discovered=()
+  for node in /scan_localization /danger_search; do
+    pid="$(rosnode info "$node" 2>/dev/null | \
+      awk '$1 == "Pid:" && $2 ~ /^[0-9]+$/ { print $2; exit }' || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      discovered+=("$pid")
+    fi
+  done
+  if (( ${#discovered[@]} == 0 )); then
+    return 1
+  fi
+  MISSION_NODE_PIDS="${discovered[*]}"
+  return 0
+}
+
 write_summary() {
   {
     printf 'result=%s\n' "$RESULT"
@@ -131,6 +162,7 @@ write_summary() {
 cleanup() {
   local exit_code=$?
   trap - EXIT
+  terminate_node_list "$MISSION_NODE_PIDS" INT
   terminate_group "$MISSION_PID" INT
   terminate_group "$RGBD_BAG_PID" INT
   terminate_group "$BAG_PID" INT
@@ -171,6 +203,7 @@ cleanup() {
       --json "$LOG_DIR/landmark_drift.json" \
       > "$LOG_DIR/landmark_drift.log" 2>&1 || true
   fi
+  terminate_node_list "$MISSION_NODE_PIDS" TERM
   terminate_group "$MISSION_PID" TERM
   terminate_group "$AUTO_PID" TERM
   if [[ "$AUTO_PID" =~ ^[0-9]+$ ]]; then
@@ -180,6 +213,8 @@ cleanup() {
       fi
       sleep 1
     done
+    terminate_node_list "$MISSION_NODE_PIDS" KILL
+    terminate_group "$MISSION_PID" KILL
     terminate_group "$AUTO_PID" KILL
     wait "$AUTO_PID" 2>/dev/null || true
   fi
@@ -194,8 +229,17 @@ cleanup() {
     terminate_group "$KEEPER_PID" KILL
     wait "$KEEPER_PID" 2>/dev/null || true
   fi
+  terminate_node_list "$GAZEBO_PID" INT
   if [[ "$MASTER_PID" =~ ^[0-9]+$ ]] && kill -0 "$MASTER_PID" 2>/dev/null; then
     kill -TERM "$MASTER_PID" 2>/dev/null || true
+    for _attempt in 1 2 3 4 5; do
+      if ! kill -0 "$MASTER_PID" 2>/dev/null; then
+        break
+      fi
+      sleep 1
+    done
+    terminate_node_list "$GAZEBO_PID" KILL
+    kill -KILL "$MASTER_PID" 2>/dev/null || true
   fi
   if [[ -n "$RUNTIME_DIR" && -d "$RUNTIME_DIR" ]]; then
     rm -rf -- "$RUNTIME_DIR"
@@ -292,7 +336,7 @@ if [[ ! -f "$BASE_CONFIG" || ! -f "$DEVEL_SETUP" ]]; then
   printf '缺少基础配置或已构建工作空间：%s\n' "$WORKSPACE_ROOT" >&2
   exit 2
 fi
-for command_name in awk find grep mkfifo roslaunch setsid sed ss tail; do
+for command_name in awk find grep mkfifo roslaunch rosnode setsid sed ss tail; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     printf '缺少命令：%s\n' "$command_name" >&2
     exit 2
@@ -355,6 +399,12 @@ if [[ -n "$(ss -ltn 2>/dev/null | awk '$4 ~ /:11311$/ {print; exit}')" ]]; then
   fail "ROS master 端口 11311 已被占用，拒绝干扰现有仿真" 2
   exit $?
 fi
+existing_mission_nodes="$(rosnode list 2>/dev/null | \
+  grep -E '^/(danger_search|scan_localization)$' || true)"
+if [[ -n "$existing_mission_nodes" ]]; then
+  fail "检测到已有任务节点（$existing_mission_nodes），拒绝污染现有仿真" 2
+  exit $?
+fi
 
 log "证据目录：$LOG_DIR"
 log "启动 seed=$SEED、floor_count=$ELEVATOR_TEST_FLOOR_COUNT、floor_timeout=$ELEVATOR_TEST_FLOOR_TIMEOUT 的 GUI 环境"
@@ -387,6 +437,8 @@ if [[ ! "$MASTER_PID" =~ ^[0-9]+$ ]]; then
   fail "无法记录本轮 rosmaster PID，拒绝继续以免留下残余进程" 2
   exit $?
 fi
+GAZEBO_PID="$(rosnode info /gazebo 2>/dev/null | \
+  awk '$1 == "Pid:" && $2 ~ /^[0-9]+$/ { print $2; exit }' || true)"
 
 printf '2' > "$FIFO"
 if ! wait_for_log "$AUTO_LOG" "Switched from passive to fixed stand" 90 "$AUTO_PID"; then
@@ -416,6 +468,9 @@ if [[ "$ELEVATOR_TEST_RECORD_DRIFT" == "1" ]]; then
     /cmd_vel
     /trunk_imu
     /a1_gazebo/joint_states
+    /danger_search/path_raw
+    /danger_search/path_followed
+    /danger_search/local_target
     /rosout
   )
   if [[ "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" == "1" ]]; then
@@ -451,6 +506,7 @@ upward_complete=0
 rgbd_recording_started=0
 last_elapsed=""
 sim_stall_started=0
+mission_wrapper_exit_reported=0
 
 while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
   if [[ "$ELEVATOR_TEST_RECORD_RGBD" == "1" ]] && \
@@ -482,9 +538,16 @@ while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
     log "$DETAIL"
     exit 0
   fi
-  if ! kill -0 "$MISSION_PID" 2>/dev/null; then
-    fail "任务进程在专项成功前退出"
-    exit $?
+  if ! record_mission_node_pids; then
+    if ! grep -Fq '"event": "mission_result_write"' "$MISSION_LOG" 2>/dev/null && \
+       ! grep -Fq "换层任务失败" "$MISSION_LOG" && \
+       ! kill -0 "$MISSION_PID" 2>/dev/null; then
+      fail "任务节点已退出（roslaunch 包装进程也已退出）"
+      exit $?
+    fi
+  elif ! kill -0 "$MISSION_PID" 2>/dev/null && (( mission_wrapper_exit_reported == 0 )); then
+    mission_wrapper_exit_reported=1
+    log "roslaunch 包装进程已退出，但任务节点仍存活，继续按任务节点状态判断"
   fi
 
   if (( registration_reported == 0 )) && \

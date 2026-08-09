@@ -1,0 +1,6736 @@
+{
+ "scenarios": [
+  {
+   "emitted": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "ground_support_gate:safety_blocked",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "ground_support_gate:safety_blocked",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "ground_support_gate:ground_support_gate",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "ground_support_gate:ground_support_gate",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "ground_support_gate:broken",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "ground_support_gate:broken",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "ground_support_gate:shorty",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "ground_support_gate:shorty",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "ground_support_gate:nanny",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "ground_support_gate:nanny",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "ground_support_gate:badtype",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "ground_support_gate:badtype",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.2,
+    0.0,
+    0.05
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.2,
+    0.0,
+    0.05
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "nonzero",
+   "requested": [
+    0.4,
+    0.0,
+    0.1
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "zero_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "caller_reason",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "zero_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "caller_reason",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "zero_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "caller_reason",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "zero_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "caller_reason",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "zero_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "caller_reason",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "zero_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "caller_reason",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "zero_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "caller_reason",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "zero",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "nonfinite",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "inf",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "typeerr",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_command_gate_output",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "invalid_requested_command",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "noneval",
+   "requested": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "zero_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "caller_reason",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "zero_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "caller_reason",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:safety_blocked",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:safety_blocked",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:ground_support_gate",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:ground_support_gate",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:broken",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:broken",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:shorty",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:shorty",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:nanny",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:nanny",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:badtype",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:badtype",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "zero_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "caller_reason",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "zero_command",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "caller_reason",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    5e-05,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:halved",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    5e-05,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:halved",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "eps_at",
+   "requested": [
+    0.0001,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:safety_blocked",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:safety_blocked",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:ground_support_gate",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:ground_support_gate",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:broken",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:broken",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:shorty",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:shorty",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:nanny",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:nanny",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:badtype",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:badtype",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    5.5e-05,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:halved",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    5.5e-05,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "ground_support_gate:halved",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "eps_above",
+   "requested": [
+    0.00011,
+    0.0,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "gate": "none",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "none",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "pass",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "ground_support_gate:safety_blocked",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "ground_support_gate:safety_blocked",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_rc",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "ground_support_gate:ground_support_gate",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "ground_support_gate:ground_support_gate",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "zero_norc",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "ground_support_gate:broken",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "ground_support_gate:broken",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "raise",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "ground_support_gate:shorty",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "ground_support_gate:shorty",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "short",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "ground_support_gate:nanny",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "ground_support_gate:nanny",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nan",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "ground_support_gate:badtype",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "ground_support_gate:badtype",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "badtype",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "nofilter",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "noncallable",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.15,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": null
+  },
+  {
+   "emitted": [
+    0.0,
+    0.15,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": false,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": null,
+   "zero_reason": "caller_reason"
+  },
+  {
+   "emitted": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "gate": "halve",
+   "latched": true,
+   "request": "lateral_only",
+   "requested": [
+    0.0,
+    0.3,
+    0.0
+   ],
+   "resolved": "command_publish_failure_latched",
+   "zero_reason": "caller_reason"
+  }
+ ]
+}

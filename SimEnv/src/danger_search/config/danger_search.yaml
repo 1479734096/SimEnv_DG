@@ -106,6 +106,8 @@ mission:
   permanent_forbidden_penalty: 3.0
   permanent_forbidden_decay_scale: 1.5
   status_publish_period: 0.5
+  # 主任务 tick 的墙钟活性上限；<= 0 时关闭，仅用于检测 ROS /clock 冻结。
+  tick_wall_stall_timeout: 60.0
   # Gazebo 已证伪跨骑卡死后的倒车恢复；默认关闭，仅保留显式诊断入口。
   exit_cabin_backoff_enabled: false
   # 方案 C：全局时间预算参数
@@ -182,13 +184,15 @@ frontier:
   stuck_blacklist_radius: 1.0
   no_progress_timeout: 6.0
   information_gain_weight: 1.0
-  path_cost_weight: 3.0
+  path_cost_weight: 1.0
   yaw_cost_weight: 0.3
   revisit_penalty_weight: 2.0
   # frontier 目标优先落在更安全的 free cell，不贴障碍和 unknown 边缘。
   frontier_obstacle_clearance: 0.25
   frontier_unknown_standoff: 0.20
   frontier_min_information_gain: 1.0
+  # 安全落点附近的局部连通未知潜力；仅用于候选排序和最终评分。
+  expected_gain_radius: 3.0
   # 过门后的临时回头抑制：只在门附近有限半径内生效，远处仅小幅降分。
   door_front_half_plane_penalty: 3.0
   door_front_half_plane_radius: 1.5
@@ -215,7 +219,7 @@ controller:
   goal_tolerance: 0.25
   waypoint_tolerance: 0.25
   corner_tolerance: 0.15
-  pure_pursuit_lookahead: 0.6
+  pure_pursuit_lookahead: 1.0
   reverse_speed: -0.15
   recover_duration: 0.5
   recover_turn_duration: 1.0
@@ -223,9 +227,15 @@ controller:
   # 独立 Timer 重发最近的安全命令，周期必须小于 junior_ctrl 的 0.5 秒超时。
   command_keepalive_period: 0.1
   # A1 机身前缘需要留出停车余量；近于 stop 时只转向，slow 范围内连续减速。
-  obstacle_stop_distance: 0.50
-  obstacle_slow_distance: 1.00
+  obstacle_stop_distance: 0.40
+  obstacle_slow_distance: 0.70
   progress_distance: 0.25
+  # 中等航向误差继续使用现有 yaw/曲率混合走弧线；大角度或高速旋转仍原地转向。
+  turn_in_place_heading: 0.70
+  turn_in_place_rate: 0.45
+  turn_release_heading: 0.20
+  turn_release_rate: 0.20
+  turn_release_samples: 3
 
 # 局部地面支撑安全门。正式配置必须开启；只消费未来足迹走廊，不改占据地图。
 ground_support:

@@ -1,0 +1,65 @@
+任务 1: 定位控制律代码
+
+## 核心发现
+
+### PATH 模式控制律位置
+**函数**: compute_tracking_command()
+**文件**: src/danger_search/danger_search/navigator.py
+**行号**: 1517-1566+
+
+**控制律公式** (1541-1544行):
+```python
+angular = 1.7 * yaw_error
+if measured_yaw_rate is not None and math.isfinite(measured_yaw_rate):
+    angular -= float(yaw_rate_damping) * measured_yaw_rate
+angular = _clamp(angular, -float(max_angular), float(max_angular))
+```
+
+### 死区补偿检查结果
+**PATH 模式**: ❌ 没有死区补偿
+- 仅有比例控制 + 阻尼 + 饱和限幅
+- 没有检查 angular 是否低于执行死区
+- 没有最小可执行角速度的兜底逻辑
+
+### ALIGN 模式对比
+**位置**: navigator.py:900-916
+**死区补偿**: ✅ 有完整的死区补偿逻辑
+
+**关键代码** (904-911行):
+```python
+if abs(align_error) >= self._align_deadband_error and (
+    not yaw_rate_valid or abs(yaw_rate) < 0.05
+):
+    # A1 纯转向在小角速度下存在执行死区：误差超限且实测转速接近
+    # 零时，用最小可执行转速兜底，避免持续发布无效命令。
+    sign = 1.0 if omega >= 0.0 else -1.0
+    if abs(omega) < self._align_deadband_omega:
+        omega = sign * self._align_deadband_omega
+```
+
+**死区参数** (132-133行):
+- `_align_deadband_omega: float = 0.55`  # 最小可执行角速度
+- `_align_deadband_error: float = 0.10`  # 误差阈值
+
+## 验证点确认
+
+✅ PATH 模式控制律位置已确认
+✅ PATH 模式**没有**死区补偿
+✅ ALIGN 模式**有**死区补偿（作为对比参考）
+
+## 关键差异
+
+| 特性 | PATH 模式 | ALIGN 模式 |
+|------|----------|-----------|
+| 控制律公式 | 1.7 * yaw_error - damping | 1.7 * align_error - damping |
+| 死区补偿 | ❌ 无 | ✅ 有 |
+| 最小角速度 | - | 0.55 rad/s |
+| 误差阈值 | - | 0.10 rad |
+
+## 根因假设验证
+
+**假设**: PATH 模式控制律缺少死区补偿，导致 4/5 seed 失败
+**验证结果**: ✅ 成立
+
+PATH 模式确实没有死区补偿，而 ALIGN 模式有完整的死区补偿逻辑。
+这与 01_DIAGNOSIS.md 中的假设完全一致。

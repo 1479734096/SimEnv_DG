@@ -168,7 +168,7 @@ def _resolve_start_escape(
                 neighbor_cells |= {
                     cell
                     for cell in record.inflated_cells
-                    if int(grid.base[cell[1], cell[0]]) in (FREE, VISITED)
+                    if int(grid.observation_layer[cell[1], cell[0]]) in (FREE, VISITED)
                 }
                 active_obstacle_cells = frozenset(neighbor_cells)
             else:
@@ -224,7 +224,7 @@ def _resolve_start_escape(
     escape_mask = formal.copy()
     for gx, gy in active_obstacle_cells:
         if (
-            int(grid.base[gy, gx]) in (FREE, VISITED)
+            int(grid.observation_layer[gy, gx]) in (FREE, VISITED)
             and not grid.black_owners.get((gx, gy))
             and not grid.negative_cell_owners.get((gx, gy))
             and (gx, gy) not in foreign

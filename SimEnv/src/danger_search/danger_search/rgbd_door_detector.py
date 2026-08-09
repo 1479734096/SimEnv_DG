@@ -748,10 +748,22 @@ class RgbdDoorDetector:
             self._dark_mask(rgb_roi),
             (0, 0, rgb_roi.shape[1], rgb_roi.shape[0]),
         )
+        # 返程电梯门可能只留下局部轿厢深处回波；当整块 ROI 都有有效深度且
+        # 几乎没有暗门板像素时，这是强开口证据，不能因单帧回波占比略低于
+        # 常规阈值而丢失确认。低有效覆盖或仍呈暗门板外观不走该容错。
+        partial_deeper_confirmed = bool(
+            valid_fraction >= 0.90
+            and dark_fraction <= min(0.10, self.maximum_opening_dark_ratio)
+            and deeper_fraction
+            >= max(0.15, 0.75 * self.minimum_opening_deeper_fraction)
+        )
         confirmed = bool(
             valid_count >= self.minimum_depth_pixels
             and valid_fraction >= self.minimum_opening_valid_depth_fraction
-            and deeper_fraction >= self.minimum_opening_deeper_fraction
+            and (
+                deeper_fraction >= self.minimum_opening_deeper_fraction
+                or partial_deeper_confirmed
+            )
             and dark_fraction <= self.maximum_opening_dark_ratio
         )
         return DoorOpeningChange(

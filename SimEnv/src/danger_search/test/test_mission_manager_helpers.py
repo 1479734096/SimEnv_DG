@@ -451,6 +451,40 @@ def _set_support_failure_witness(
     )
 
 class MissionManagerHelperTest(unittest.TestCase):
+    def test_tick_wall_timeout_triggers_even_when_ground_support_is_clear(self):
+        manager = _make_test_manager()
+        manager.tick_wall_stall_timeout = 5.0
+        manager.state = EXPLORE_FLOOR
+        manager._last_tick_wall_time = 100.0
+        manager._ground_support.gate = SimpleNamespace(state=GROUND_SUPPORT_CLEAR)
+
+        timed_out, reason = manager.check_tick_wall_timeout(105.0)
+
+        self.assertTrue(timed_out)
+        self.assertEqual(reason, "mission_tick_wall_stalled")
+
+    def test_tick_wall_timeout_is_not_armed_before_first_tick(self):
+        manager = _make_test_manager()
+        manager.tick_wall_stall_timeout = 5.0
+        manager.state = EXPLORE_FLOOR
+        manager._last_tick_wall_time = None
+
+        timed_out, reason = manager.check_tick_wall_timeout(105.0)
+
+        self.assertFalse(timed_out)
+        self.assertEqual(reason, "mission_tick_wall_stall_not_armed")
+
+    def test_tick_wall_timeout_can_be_disabled(self):
+        manager = _make_test_manager()
+        manager.tick_wall_stall_timeout = 0.0
+        manager.state = EXPLORE_FLOOR
+        manager._last_tick_wall_time = 100.0
+
+        timed_out, reason = manager.check_tick_wall_timeout(105.0)
+
+        self.assertFalse(timed_out)
+        self.assertEqual(reason, "mission_tick_wall_stall_disabled")
+
     def test_ground_support_scope_transition_invalidates_all_old_evidence_atomically(self):
         manager = _make_test_manager()
         manager.ground_support_params["production_gate_enabled"] = True
@@ -571,6 +605,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             goal_tolerance=0.35,
             set_command_gate=lambda gate: installed.append(gate),
+            poll_status=lambda: 'RUNNING',
         )
         manager._ground_support = GroundSupportCoordinator(
             params=manager.ground_support_params,
@@ -943,6 +978,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             stop=lambda **kwargs: stopped.append(kwargs),
             reset_progress_timer=lambda pose=None: reset.append(pose),
+            poll_status=lambda: 'RUNNING',
         )
         manager._transition_state = lambda state, **kwargs: transitions.append((state, kwargs))
         manager._record_failure = failures.append
@@ -982,6 +1018,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             stop=lambda **_kwargs: self.fail("新鲜定位不应停车"),
             reset_progress_timer=lambda _pose=None: None,
+            poll_status=lambda: 'RUNNING',
         )
         manager._log_structured = diagnostics.append
         sample = mission_manager_module.PoseSample(
@@ -1008,6 +1045,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         failures = []
         manager.controller = SimpleNamespace(
             stop=lambda **kwargs: stopped.append(kwargs),
+            poll_status=lambda: 'RUNNING',
         )
         manager._transition_state = lambda state, **kwargs: transitions.append((state, kwargs))
         manager._record_failure = failures.append
@@ -1039,6 +1077,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         transitions = []
         manager.controller = SimpleNamespace(
             stop=lambda **kwargs: stopped.append(kwargs),
+            poll_status=lambda: 'RUNNING',
         )
         manager._record_failure = failures.append
         manager._transition_state = lambda state, **kwargs: transitions.append(
@@ -1071,6 +1110,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager._elapsed = lambda: clock[0]
         manager.controller = SimpleNamespace(
             stop=lambda **kwargs: stopped.append(kwargs),
+            poll_status=lambda: 'RUNNING',
         )
         manager._transition_state = lambda state, **kwargs: transitions.append(
             (state, kwargs)
@@ -1221,6 +1261,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             active_motion_command_snapshot=lambda: next(commands),
             committed_command_snapshot=lambda: (0.0, 0.0, 0.0),
             command_transaction=lambda: mission_manager_module.nullcontext(),
+            poll_status=lambda: 'RUNNING',
         )
         manager._ground_support.grid = SimpleNamespace(
             process_frame=lambda **kwargs: (
@@ -1346,6 +1387,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             reset_progress_timer=lambda pose: controller_calls.append(("reset", pose)),
             stop=lambda **kwargs: controller_calls.append(("stop", kwargs)),
+            poll_status=lambda: 'RUNNING',
         )
         manager._record_failure = lambda reason: failures.append(reason)
         manager._transition_state = lambda state, **kwargs: transitions.append((state, kwargs))
@@ -1470,6 +1512,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             reset_progress_timer=lambda pose: controller_calls.append(("reset", pose)),
             stop=lambda **kwargs: controller_calls.append(("stop", kwargs)),
             clear_path=lambda **kwargs: controller_calls.append(("clear", kwargs)),
+            poll_status=lambda: 'RUNNING',
         )
         manager._record_failure = failures.append
         manager._transition_state = lambda state, **kwargs: transitions.append((state, kwargs))
@@ -1529,6 +1572,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             reset_progress_timer=lambda _pose: None,
             stop=lambda **_kwargs: None,
+            poll_status=lambda: 'RUNNING',
         )
         manager._record_failure = failures.append
         manager._transition_state = (
@@ -1573,6 +1617,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             reset_progress_timer=lambda _pose: None,
             stop=lambda **_kwargs: None,
             clear_path=lambda **_kwargs: None,
+            poll_status=lambda: 'RUNNING',
         )
         manager._record_failure = failures.append
         manager._transition_state = lambda state, **kwargs: transitions.append((state, kwargs))
@@ -1598,7 +1643,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         clears = []
         resets = []
         controller = SimpleNamespace(
-            clear_path=lambda **kwargs: clears.append(kwargs)
+            clear_path=lambda **kwargs: clears.append(kwargs),
+            poll_status=lambda: 'RUNNING',
         )
         gate = SimpleNamespace(state=SAFETY_BLOCKED)
 
@@ -1702,6 +1748,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             reset_progress_timer=lambda _pose: None,
             stop=lambda **_kwargs: None,
+            poll_status=lambda: 'RUNNING',
         )
         manager._record_failure = failures.append
         manager._transition_state = (
@@ -1738,7 +1785,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager._mission_success_eligible = True
         manager._record_failure = lambda reason: failures.append(reason)
         manager.controller = SimpleNamespace(
-            stop=lambda **kwargs: stop_reasons.append(kwargs.get("reason"))
+            stop=lambda **kwargs: stop_reasons.append(kwargs.get("reason")),
+            poll_status=lambda: 'RUNNING',
         )
 
         timed_out, reason = manager.check_ground_support_wall_timeout(123.0)
@@ -1853,6 +1901,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             reset_progress_timer=lambda pose: None,
             stop=lambda **kwargs: None,
             clear_path=lambda **kwargs: None,
+            poll_status=lambda: 'RUNNING',
         )
         manager._elapsed = lambda: 2.0
         manager._record_failure = lambda reason: None
@@ -1901,6 +1950,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             reset_progress_timer=lambda pose: None,
             stop=lambda **kwargs: None,
             clear_path=lambda **kwargs: None,
+            poll_status=lambda: 'RUNNING',
         )
         failures = []
         transitions = []
@@ -1978,6 +2028,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             reset_progress_timer=lambda pose: None,
             stop=lambda **kwargs: None,
             clear_path=lambda **kwargs: cleared.append(kwargs),
+            poll_status=lambda: 'RUNNING',
         )
         manager._record_failure = lambda reason: failures.append(reason)
         manager._log_structured = lambda payload: None
@@ -2025,6 +2076,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             reset_progress_timer=lambda pose: None,
             stop=lambda **kwargs: None,
             clear_path=lambda **kwargs: cleared.append(kwargs),
+            poll_status=lambda: 'RUNNING',
         )
         manager._log_structured = lambda payload: None
         _set_support_failure_witness(
@@ -2062,6 +2114,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             stop=lambda **kwargs: None,
             clear_path=lambda **kwargs: None,
             recover=lambda: recover_calls.append(True),
+            poll_status=lambda: 'RUNNING',
         )
         manager._record_failure = lambda reason: failures.append(reason)
         manager._transition_state = lambda state, **kwargs: transitions.append((state, kwargs))
@@ -2110,6 +2163,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             reset_progress_timer=lambda _pose: None,
             stop=lambda **_kwargs: None,
             clear_path=lambda **_kwargs: None,
+            poll_status=lambda: 'RUNNING',
         )
         manager._log_structured = lambda _payload: None
         failures = []
@@ -2261,6 +2315,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             stop=lambda **kwargs: diagnostics.append(
                 {"event": "controller_stop", "reason": kwargs.get("reason")}
             ),
+            poll_status=lambda: 'RUNNING',
         )
         manager._perception_runtime.sensor_buffer = SimpleNamespace(
             read_cloud_xyz=lambda *args, **kwargs: reads.append(True) or [(0.8, 0.0, 0.5)],
@@ -2495,6 +2550,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         manager.controller = SimpleNamespace(
             set_nearest_obstacle_distance=lambda distance: None,
+            poll_status=lambda: 'RUNNING',
         )
         stamp = SimpleNamespace(to_sec=lambda: 12.5)
         snapshot = SimpleNamespace(
@@ -3262,6 +3318,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         manager.controller = SimpleNamespace(
             clear_path=lambda reason=None: cleared.append(reason),
+            poll_status=lambda: 'RUNNING',
         )
 
         with patch.object(
@@ -3325,6 +3382,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             manager.controller = SimpleNamespace(
                 stop=lambda *args, **kwargs: None,
                 command_debug_summary=lambda: {},
+            poll_status=lambda: 'RUNNING',
             )
 
             with patch.object(mission_manager_module, "get_time", return_value=50.2), patch.object(
@@ -3456,6 +3514,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             clear_path=lambda *args, **kwargs: None,
             stop=lambda *args, **kwargs: None,
+            poll_status=lambda: 'RUNNING',
         )
         manager._map_runtime.tracker = SimpleNamespace(confirmed_positions=lambda now: [], tracks=[])
         manager._reporting = SimpleNamespace(
@@ -3567,7 +3626,8 @@ class MissionManagerHelperTest(unittest.TestCase):
                         region_ids=("support:3",), valid=False,
                     )
                 manager.controller = SimpleNamespace(
-                    stop=lambda *args, **kwargs: None
+                    stop=lambda *args, **kwargs: None,
+            poll_status=lambda: 'RUNNING',
                 )
                 manager._map_runtime.tracker = SimpleNamespace(
                     confirmed_positions=lambda now: [], tracks=[]
@@ -3690,6 +3750,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             goal_tolerance=0.35,
             stop=lambda **kwargs: stops.append(kwargs.get("reason")),
+            poll_status=lambda: 'RUNNING',
         )
         manager.building_features = SimpleNamespace(
             doors={
@@ -3735,7 +3796,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.door_transition_hold_distance = 2.5
         manager._map_runtime.mapper = SimpleNamespace(floor_height=2.6)
         manager.controller = SimpleNamespace(
-            clear_path=lambda **kwargs: cleared_reasons.append(kwargs.get("reason"))
+            clear_path=lambda **kwargs: cleared_reasons.append(kwargs.get("reason")),
+            poll_status=lambda: 'RUNNING',
         )
         manager.building_client = SimpleNamespace(doors={})
         observation = OpeningObservation(
@@ -4878,6 +4940,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             clear_path=lambda reason=None: calls.append(("clear", reason)),
             rotate_in_place=lambda speed: calls.append(("rotate", speed)),
             stop=lambda reason=None: calls.append(("stop", reason)),
+            poll_status=lambda: 'RUNNING',
         )
 
         def tick_visual_scan(now, pose):
@@ -4966,6 +5029,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             goal_tolerance=0.35,
             clear_path=lambda **kwargs: cleared.append(kwargs.get("reason")),
+            poll_status=lambda: 'RUNNING',
         )
 
         with patch.object(
@@ -5016,8 +5080,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             goal_tolerance=0.35,
             has_path=lambda: False,
-            set_path=lambda path: paths.append(path),
-            tick=lambda pose: "RUNNING",
+            set_path=lambda path, **kwargs: paths.append(path),
+            poll_status=lambda: "RUNNING",
             recover=lambda: None,
             stop=lambda reason=None: stops.append(reason),
         )
@@ -5076,8 +5140,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         stops = []
         manager.controller = SimpleNamespace(
             has_path=lambda: False,
-            set_path=lambda path: paths.append(path),
-            tick=lambda pose: "RUNNING",
+            set_path=lambda path, **kwargs: paths.append(path),
+            poll_status=lambda: "RUNNING",
             recover=lambda: None,
             stop=lambda reason=None: stops.append(reason),
         )
@@ -5131,8 +5195,8 @@ class MissionManagerHelperTest(unittest.TestCase):
             grid.mark_occupied(barrier_x, gy)
         manager.controller = SimpleNamespace(
             has_path=lambda: False,
-            set_path=lambda path: paths.append(path),
-            tick=lambda pose: "running",
+            set_path=lambda path, **kwargs: paths.append(path),
+            poll_status=lambda: "running",
             recover=lambda: None,
             stop=lambda reason=None: None,
         )
@@ -5298,6 +5362,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             recover=lambda reason=None: recoveries.append(reason),
             clear_path=lambda reason=None: cleared.append(reason),
             stop=lambda reason=None: stops.append(reason),
+            poll_status=lambda: 'RUNNING',
         )
         manager._transition_state = lambda state, **kwargs: transitions.append(
             (state, kwargs)
@@ -5372,6 +5437,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             clear_path=lambda reason=None: cleared.append(reason),
             stop=lambda reason=None: stops.append(reason),
             reverse_straight=lambda **kwargs: reverse_calls.append(kwargs) or True,
+            poll_status=lambda: 'RUNNING',
         )
         manager._mission_diagnostic_snapshot = lambda: {}
         events = []
@@ -5431,6 +5497,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             recover=lambda reason=None: recoveries.append(reason),
             clear_path=lambda reason=None: cleared.append(reason),
             stop=lambda reason=None: stops.append(reason),
+            poll_status=lambda: 'RUNNING',
         )
         manager._mission_diagnostic_snapshot = lambda: {}
         manager._log_structured = lambda payload: None
@@ -5591,6 +5658,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             max_angular=1.2,
             rotate_in_place=lambda angular: rotations.append(angular),
             stop=lambda reason=None: stops.append(reason),
+            poll_status=lambda: 'RUNNING',
         )
 
         self.assertTrue(
@@ -5634,7 +5702,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.building_client = SimpleNamespace(doors={})
         manager.controller = SimpleNamespace(
             has_path=lambda: False,
-            set_path=lambda path: paths.append(path),
+            set_path=lambda path, **kwargs: paths.append(path),
+            poll_status=lambda: 'RUNNING',
         )
 
         with patch.object(
@@ -5741,7 +5810,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             origin_x=-4.0,
             origin_y=-4.0,
         )
-        manager.controller = SimpleNamespace(set_path=lambda path: recorded_paths.append(path))
+        manager.controller = SimpleNamespace(set_path=lambda path, **kwargs: recorded_paths.append(path))
 
         with patch.object(mission_manager_module, "MissionReportingRuntime", SimpleNamespace(loginfo=lambda *args, **kwargs: None)):
             self.assertTrue(manager._try_probe_unknown_space((0.0, 0.8, math.pi / 2.0)))
@@ -5766,7 +5835,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             origin_x=-4.0,
             origin_y=-4.0,
         )
-        manager.controller = SimpleNamespace(set_path=lambda path: recorded_paths.append(path))
+        manager.controller = SimpleNamespace(set_path=lambda path, **kwargs: recorded_paths.append(path))
 
         with patch.object(
             mission_manager_module,
@@ -5797,7 +5866,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         grid = manager.mapper.floor(0)
         grid.mark_occupied(*grid.world_to_grid(0.0, 1.4))
-        manager.controller = SimpleNamespace(set_path=lambda path: recorded_paths.append(path))
+        manager.controller = SimpleNamespace(set_path=lambda path, **kwargs: recorded_paths.append(path))
 
         with patch.object(mission_manager_module, "MissionReportingRuntime", SimpleNamespace(loginfo=lambda *args, **kwargs: None)):
             self.assertTrue(manager._try_probe_unknown_space((0.0, 0.8, math.pi / 2.0)))
@@ -5828,8 +5897,8 @@ class MissionManagerHelperTest(unittest.TestCase):
             grid.mark_occupied(wall_x, gy)
         manager.controller = SimpleNamespace(
             has_path=lambda: False,
-            set_path=lambda path: recorded_paths.append(path),
-            tick=lambda pose: "idle",
+            set_path=lambda path, **kwargs: recorded_paths.append(path),
+            poll_status=lambda: "idle",
             recover=lambda: None,
             stop=lambda reason=None: None,
         )
@@ -6193,7 +6262,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         manager.controller = SimpleNamespace(
             has_path=lambda: True,
-            tick=lambda pose: STUCK,
+            poll_status=lambda: STUCK,
             recover=lambda: None,
             clear_path=lambda: None,
             stop=lambda *a, **k: None,
@@ -6280,7 +6349,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         manager.controller = SimpleNamespace(
             has_path=lambda: True,
-            tick=lambda pose: STUCK,
+            poll_status=lambda: STUCK,
             recover=lambda: recover_calls.append("recover"),
             clear_path=lambda: None,
             stop=lambda *a, **k: stop_reasons.append(k.get("reason")),
@@ -6478,7 +6547,7 @@ class MissionManagerHelperTest(unittest.TestCase):
 
     def test_main_entrance_clearance_keeps_axis_before_frontier_handoff(self):
         paths = []
-        tick_kwargs = []
+        set_path_kwargs = []
         manager = _make_test_manager()
         manager._entry.clearance_target = (0.0, 0.9)
         manager._entry.clearance_door_id = "main_entrance"
@@ -6487,8 +6556,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             goal_tolerance=0.25,
             has_path=lambda: False,
-            set_path=lambda path: paths.append(path),
-            tick=lambda pose, **kwargs: tick_kwargs.append(kwargs) or RUNNING,
+            set_path=lambda path, **kwargs: (paths.append(path), set_path_kwargs.append(kwargs)),
+            poll_status=lambda: RUNNING,
         )
 
         with patch.object(
@@ -6504,8 +6573,9 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         self.assertTrue(result.handled)
         self.assertEqual(paths, [[(0.12, 0.24), (0.0, 0.9)]])
-        self.assertEqual(tick_kwargs[0]["max_linear"], 0.4)
-        self.assertEqual(tick_kwargs[0]["goal_tolerance"], 0.12)
+        # 限速与终点容差随路径原子提交（固定频率控制读取）
+        self.assertEqual(set_path_kwargs[0]["max_linear"], 0.4)
+        self.assertEqual(set_path_kwargs[0]["goal_tolerance"], 0.12)
 
     def test_main_entrance_clearance_stuck_fails_instead_of_scanning(self):
         transitions = []
@@ -6521,7 +6591,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             goal_tolerance=0.25,
             has_path=lambda: True,
-            tick=lambda pose, **kwargs: STUCK,
+            poll_status=lambda: STUCK,
             clear_path=lambda reason=None: cleared.append(reason),
         )
         manager._transition_state = lambda state, **kwargs: transitions.append(
@@ -6597,8 +6667,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         cleared = []
         manager.controller = SimpleNamespace(
             has_path=lambda: False,
-            set_path=lambda path: recorded_paths.append(path),
-            tick=lambda pose: "idle",
+            set_path=lambda path, **kwargs: recorded_paths.append(path),
+            poll_status=lambda: "idle",
             recover=lambda: None,
             clear_path=lambda reason=None: cleared.append(reason),
             stop=lambda reason=None: None,
@@ -6634,6 +6704,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.controller = SimpleNamespace(
             has_path=lambda: False,
             stop=lambda reason=None: stops.append(reason),
+            poll_status=lambda: 'RUNNING',
         )
 
         def slow_plan(*_args, **_kwargs):
@@ -6762,6 +6833,11 @@ class TimeBudgetDecisionTest(unittest.TestCase):
     def test_floor_timeout_single_floor_uses_global_budget(self):
         """单层仍有收益且返航时间充足时，不应浪费剩余总预算。"""
         manager = self._make_manager(max_floor=1, max_runtime=120.0, floor_timeout=40.0)
+        now = mission_manager_module.get_time()
+        manager._exploration.progress_history = [
+            {"time": now - 5.0, "known_cells": 100, "free_or_visited_cells": 80, "confirmed_dangers": 0},
+            {"time": now, "known_cells": 130, "free_or_visited_cells": 110, "confirmed_dangers": 0},
+        ]
         action, reason = self._decide(manager,
             (3.0, 0.0, 0.0),
             manager.mapper.floor(0),
@@ -6794,6 +6870,11 @@ class TimeBudgetDecisionTest(unittest.TestCase):
         """多层任务的最后一层同样由全局返航边界收口。"""
         manager = self._make_manager(max_floor=3, max_runtime=200.0, floor_timeout=40.0)
         manager.current_floor = 2
+        now = mission_manager_module.get_time()
+        manager._exploration.progress_history = [
+            {"time": now - 5.0, "known_cells": 100, "free_or_visited_cells": 80, "confirmed_dangers": 0},
+            {"time": now, "known_cells": 130, "free_or_visited_cells": 110, "confirmed_dangers": 0},
+        ]
         action, reason = self._decide(manager,
             (1.0, 0.0, 0.0),
             manager.mapper.floor(0),
@@ -6934,11 +7015,11 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
         )
         manager.controller = SimpleNamespace(
             has_path=lambda: False,
-            tick=lambda pose: "running",
+            poll_status=lambda: "running",
             recover=lambda: None,
             clear_path=lambda *a, **k: None,
             stop=lambda *a, **k: None,
-            set_path=lambda p: None,
+            set_path=lambda p, **kwargs: None,
             reverse_speed=-0.15,
             reverse_straight=lambda **kwargs: True,
         )
@@ -7173,7 +7254,7 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
         manager._max_home_distance = 10.0
 
         set_path_calls = []
-        manager.controller.set_path = lambda p: set_path_calls.append(p)
+        manager.controller.set_path = lambda p, **kwargs: set_path_calls.append(p)
 
         with patch.object(mission_manager_module, "MissionReportingRuntime", SimpleNamespace(
             loginfo=lambda *a, **k: None, logwarn=lambda *a, **k: None,
@@ -7210,7 +7291,7 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
         )
         manager.no_frontier_scan_duration = 8.0
         recorded_paths = []
-        manager.controller.set_path = lambda path: recorded_paths.append(path)
+        manager.controller.set_path = lambda path, **kwargs: recorded_paths.append(path)
         manager.controller.rotate_in_place = lambda value: None
 
         with patch.object(
@@ -7303,7 +7384,7 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
         manager.controller.rotate_in_place = lambda v: rotate_calls.append(v)
 
         set_path_calls = []
-        manager.controller.set_path = lambda p: set_path_calls.append(p)
+        manager.controller.set_path = lambda p, **kwargs: set_path_calls.append(p)
 
         with patch.object(mission_manager_module, "MissionReportingRuntime", SimpleNamespace(
             loginfo=lambda *a, **k: None, logwarn=lambda *a, **k: None,
@@ -7358,7 +7439,7 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
         manager.explorer.extract_frontiers = lambda grid: [near_frontier]
         manager.controller.rotate_in_place = lambda value: None
         set_path_calls = []
-        manager.controller.set_path = lambda path: set_path_calls.append(path)
+        manager.controller.set_path = lambda path, **kwargs: set_path_calls.append(path)
 
         with patch.object(mission_manager_module, "MissionReportingRuntime", SimpleNamespace(
             loginfo=lambda *a, **k: None, logwarn=lambda *a, **k: None,
@@ -7643,7 +7724,7 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
             or (confirmed, [(0.0, 0.0), (4.5, 0.0)])
         )
         paths = []
-        manager.controller.set_path = paths.append
+        manager.controller.set_path = lambda path, **kwargs: paths.append(path)
         manager.controller.rotate_in_place = lambda value: None
 
         with patch.object(

@@ -179,6 +179,24 @@ TEST(StanceHealthMonitor, InconsistentGroundPlaneDoesNotOverrideUprightImu) {
   EXPECT_EQ(monitor.consecutive_bad_frames(), 0U);
 }
 
+TEST(StanceHealthMonitor, SlightlyTiltedGroundHeightDoesNotTripUprightImu) {
+  StanceHealthMonitorConfig config;
+  config.minimum_base_height = 0.14;
+  config.maximum_base_height = 0.60;
+  config.minimum_ground_normal_z = 0.94;
+  config.minimum_base_up_z = 0.90;
+  config.required_healthy_frames = 1;
+  config.required_unhealthy_frames = 3;
+  StanceHealthMonitor monitor(config);
+
+  ASSERT_TRUE(monitor.Update(Good()));
+  const StanceObservation false_height_drop{0.138, 0.966, 0.992, 0.496};
+  EXPECT_TRUE(monitor.Update(false_height_drop));
+  EXPECT_TRUE(monitor.Update(false_height_drop));
+  EXPECT_TRUE(monitor.Update(false_height_drop));
+  EXPECT_EQ(monitor.consecutive_bad_frames(), 0U);
+}
+
 TEST(StanceHealthMonitor, InconsistentGroundNeverMasksExplicitImuTilt) {
   StanceHealthMonitorConfig config;
   config.minimum_base_height = 0.14;

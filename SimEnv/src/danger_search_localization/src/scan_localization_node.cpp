@@ -266,6 +266,8 @@ class ScanLocalizationNode {
     double livox_imu_maximum_speed = 0.70;
     double livox_imu_translation_margin = 0.02;
     double livox_imu_absolute_translation_cap = 0.30;
+    double shared_map_livox_only_maximum_speed = 0.60;
+    int shared_map_livox_only_max_consecutive_vetoes = 3;
     double shared_map_depth_max_age = 0.35;
     double shared_map_max_source_divergence = 0.05;
     double shared_map_max_map_commit_difference = 0.05;
@@ -353,6 +355,12 @@ class ScanLocalizationNode {
     private_nh_.param("livox_imu_absolute_translation_cap",
                       livox_imu_absolute_translation_cap,
                       livox_imu_absolute_translation_cap);
+    private_nh_.param("shared_map_livox_only_maximum_speed",
+                      shared_map_livox_only_maximum_speed,
+                      shared_map_livox_only_maximum_speed);
+    private_nh_.param("shared_map_livox_only_max_consecutive_vetoes",
+                      shared_map_livox_only_max_consecutive_vetoes,
+                      shared_map_livox_only_max_consecutive_vetoes);
     private_nh_.param("shared_map_depth_max_age", shared_map_depth_max_age,
                       shared_map_depth_max_age);
     private_nh_.param("shared_map_max_source_divergence",
@@ -405,7 +413,11 @@ class ScanLocalizationNode {
         !std::isfinite(livox_imu_translation_margin) ||
         livox_imu_translation_margin < 0.0 ||
         !std::isfinite(livox_imu_absolute_translation_cap) ||
-        livox_imu_absolute_translation_cap <= 0.0) {
+        livox_imu_absolute_translation_cap <= 0.0 ||
+        !std::isfinite(shared_map_livox_only_maximum_speed) ||
+        shared_map_livox_only_maximum_speed <= 0.0 ||
+        shared_map_livox_only_maximum_speed > livox_imu_maximum_speed ||
+        shared_map_livox_only_max_consecutive_vetoes <= 0) {
       throw std::runtime_error("Livox-IMU 平面运动学上界参数无效");
     }
     if (!std::isfinite(shared_map_depth_max_age) ||
@@ -493,6 +505,11 @@ class ScanLocalizationNode {
     livox_imu_translation_margin_ = livox_imu_translation_margin;
     livox_imu_absolute_translation_cap_ =
         livox_imu_absolute_translation_cap;
+    shared_map_livox_only_maximum_speed_ =
+        shared_map_livox_only_maximum_speed;
+    shared_map_livox_only_max_consecutive_vetoes_ =
+        static_cast<std::uint32_t>(
+            shared_map_livox_only_max_consecutive_vetoes);
     adaptive_selector_config_.maximum_proposal_age = shared_map_depth_max_age;
     adaptive_selector_config_.maximum_source_divergence =
         shared_map_max_source_divergence;
@@ -1213,6 +1230,50 @@ class ScanLocalizationNode {
           }
         }
 
+        const bool rgbd_candidate_valid =
+            danger_search_localization::IsTranslationProposalValid(
+                rgbd_proposal, imu_odometry_->map_generation(),
+                adaptive_selector_config_.maximum_proposal_age);
+        if (!rgbd_candidate_valid && livox_proposal.accepted) {
+          const double livox_only_translation_limit =
+              danger_search_localization::PlanarTranslationLimit(
+                  frame_interval, shared_map_livox_only_maximum_speed_,
+                  livox_imu_translation_margin_,
+                  livox_imu_absolute_translation_cap_);
+          const auto guard_decision =
+              danger_search_localization::EvaluateLivoxOnlyGuard(
+                  livox_proposal, adaptive_base_translation_,
+                  livox_only_translation_limit,
+                  consecutive_livox_only_veto_count_,
+                  shared_map_livox_only_max_consecutive_vetoes_);
+          consecutive_livox_only_veto_count_ =
+              guard_decision.consecutive_vetoes;
+          if (!guard_decision.allow_proposal) {
+            // 深度候选失效时先用更保守的速度包络阻断孤立跳变；时间和
+            // 位移都相对最后正式输出计算，避免固定阈值形成冻结基准。
+            livox_proposal.accepted = false;
+            ROS_WARN_THROTTLE(
+                1.0,
+                "共享地图 Livox-only 平移超过动态保守上限，保持上一位姿："
+                "limit=%.3f delta=%.3f frame_interval=%.3f vetoes=%u/%u "
+                "rgbd_age=%.3f",
+                livox_only_translation_limit, guard_decision.planar_delta,
+                frame_interval, consecutive_livox_only_veto_count_,
+                shared_map_livox_only_max_consecutive_vetoes_,
+                rgbd_proposal.age_seconds);
+          } else if (guard_decision.abstained) {
+            ++livox_only_guard_abstain_count_;
+            ROS_WARN(
+                "共享地图 Livox-only 已连续达到后置否决上限，"
+                "本守卫弃权并交回通用运动学守卫裁决："
+                "limit=%.3f delta=%.3f frame_interval=%.3f abstains=%lu",
+                livox_only_translation_limit, guard_decision.planar_delta,
+                frame_interval,
+                static_cast<unsigned long>(livox_only_guard_abstain_count_));
+          }
+        } else {
+          consecutive_livox_only_veto_count_ = 0;
+        }
         const auto decision =
             danger_search_localization::DecideAdaptiveTranslation(
                 rgbd_proposal, livox_proposal,
@@ -1231,12 +1292,15 @@ class ScanLocalizationNode {
           ROS_WARN_THROTTLE(
               1.0,
               "共享地图两路平移候选均无效，停止更新 odom："
-              "livox_status=%s rgbd_age=%.3f generation=%lu count=%lu",
+              "livox_status=%s rgbd_age=%.3f generation=%lu count=%lu "
+              "livox_only_vetoes=%u abstains=%lu",
               danger_search_localization::ImuConstrainedOdometryStatusName(
                   livox_result.status),
               rgbd_proposal.age_seconds,
               static_cast<unsigned long>(imu_odometry_->map_generation()),
-              static_cast<unsigned long>(adaptive_both_invalid_count_));
+              static_cast<unsigned long>(adaptive_both_invalid_count_),
+              consecutive_livox_only_veto_count_,
+              static_cast<unsigned long>(livox_only_guard_abstain_count_));
           UpdateAndPublishStanceHealth(
               message->header.stamp, current_imu_sample, current_ground);
           return;
@@ -1276,7 +1340,7 @@ class ScanLocalizationNode {
             "共享地图自适应定位：source=%s reason=%s position=(%.3f, %.3f) "
             "delta=(%.3f, %.3f) divergence=%.3f rgbd_age=%.3f "
             "generation=%lu map_commit=%d selected=(rgbd:%lu livox:%lu) "
-            "both_invalid=%lu",
+            "both_invalid=%lu livox_only_vetoes=%u abstains=%lu",
             danger_search_localization::AdaptiveTranslationSourceName(
                 decision.source),
             danger_search_localization::AdaptiveTranslationReasonName(
@@ -1288,7 +1352,9 @@ class ScanLocalizationNode {
             map_committed ? 1 : 0,
             static_cast<unsigned long>(adaptive_rgbd_selected_count_),
             static_cast<unsigned long>(adaptive_livox_selected_count_),
-            static_cast<unsigned long>(adaptive_both_invalid_count_));
+            static_cast<unsigned long>(adaptive_both_invalid_count_),
+            consecutive_livox_only_veto_count_,
+            static_cast<unsigned long>(livox_only_guard_abstain_count_));
         world_livox = SE3d(
             SO3d(world_livox_rotation),
             adaptive_base_translation_ + base_to_livox_world);
@@ -2067,6 +2133,8 @@ class ScanLocalizationNode {
   double livox_imu_maximum_speed_ = 0.70;
   double livox_imu_translation_margin_ = 0.02;
   double livox_imu_absolute_translation_cap_ = 0.30;
+  double shared_map_livox_only_maximum_speed_ = 0.60;
+  std::uint32_t shared_map_livox_only_max_consecutive_vetoes_ = 3;
   danger_search_localization::AdaptiveTranslationConfig
       adaptive_selector_config_;
   double diagnostic_large_translation_threshold_ = 0.08;
@@ -2109,6 +2177,8 @@ class ScanLocalizationNode {
   std::uint64_t adaptive_rgbd_selected_count_ = 0;
   std::uint64_t adaptive_livox_selected_count_ = 0;
   std::uint64_t adaptive_both_invalid_count_ = 0;
+  std::uint32_t consecutive_livox_only_veto_count_ = 0;
+  std::uint64_t livox_only_guard_abstain_count_ = 0;
   Eigen::Vector2d depth_command_total_ = Eigen::Vector2d::Zero();
   ros::Time last_depth_accept_stamp_;
   bool scale_window_initialized_ = false;

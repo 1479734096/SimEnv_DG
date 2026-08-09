@@ -170,6 +170,16 @@ class InterfaceDocumentationTest(unittest.TestCase):
             float(config["controller"]["max_angular"]),
         )
 
+    def test_formal_controller_uses_wider_arc_turn_hysteresis(self):
+        config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
+        controller = config["controller"]
+
+        self.assertEqual(controller["turn_in_place_heading"], 0.70)
+        self.assertEqual(controller["turn_release_heading"], 0.20)
+        self.assertEqual(controller["turn_in_place_rate"], 0.45)
+        self.assertEqual(controller["turn_release_rate"], 0.20)
+        self.assertEqual(controller["turn_release_samples"], 3)
+
     def test_reference_marks_truth_topics_as_referee_only(self):
         content = REFERENCE_PATH.read_text(encoding="utf-8")
         self.assertIn("`/ground_truth/base_w`", content)
@@ -206,6 +216,16 @@ class InterfaceDocumentationTest(unittest.TestCase):
             float(support["stop_angular_threshold"]),
             float(support["odometry_angular_deadband"]),
         )
+
+    def test_formal_frontier_ranking_uses_local_unknown_gain_and_unit_path_cost(self):
+        config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
+        frontier = config["frontier"]
+
+        self.assertEqual(float(frontier["expected_gain_radius"]), 3.0)
+        self.assertEqual(float(frontier["information_gain_weight"]), 1.0)
+        self.assertEqual(float(frontier["path_cost_weight"]), 1.0)
+        self.assertEqual(int(frontier["max_planning_candidates"]), 8)
+        self.assertEqual(int(frontier["max_goal_candidates_per_frontier"]), 2)
 
 
 if __name__ == "__main__":

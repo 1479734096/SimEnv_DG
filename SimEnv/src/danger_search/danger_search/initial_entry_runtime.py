@@ -136,7 +136,12 @@ class InitialEntryRuntime:
                 controller.clear_path(reason="main_entrance_clearance_blocked")
                 self._clear_clearance()
                 return InitialEntryClearanceResult(True, failed=True, target=target)
-            controller.set_path([(pose[0], pose[1]), target])
+            controller.set_path(
+                [(pose[0], pose[1]), target],
+                max_linear=max_linear,
+                goal_tolerance=tolerance,
+                reason="initial_entry_clearance_path",
+            )
             if not self.clearance_path_started:
                 MissionReportingRuntime.loginfo(
                     "主入口过门后先沿门轴离开门框："
@@ -146,11 +151,7 @@ class InitialEntryRuntime:
                     distance,
                 )
             self.clearance_path_started = True
-        status = controller.tick(
-            pose,
-            max_linear=float(max_linear),
-            goal_tolerance=tolerance,
-        )
+        status = controller.poll_status()
         if status in (STUCK, IDLE):
             controller.clear_path(reason="main_entrance_clearance_failed")
             self._clear_clearance()
@@ -268,7 +269,7 @@ class InitialEntryRuntime:
                 controller.stop(reason="initial_entry_planning_constraint")
                 return InitialEntryTickResult(True)
             self.target = target
-            controller.set_path([(pose[0], pose[1]), target])
+            controller.set_path([(pose[0], pose[1]), target], reason="initial_entry_corridor_path")
             MissionReportingRuntime.loginfo(
                 "按传感器确认的自由走廊进入主入口："
                 "target=(%.2f, %.2f) distance=%.2f",
@@ -297,8 +298,8 @@ class InitialEntryRuntime:
             ):
                 controller.stop(reason="initial_entry_planning_constraint")
                 return InitialEntryTickResult(True)
-            controller.set_path([(pose[0], pose[1]), target])
-        status = controller.tick(pose)
+            controller.set_path([(pose[0], pose[1]), target], reason="initial_entry_reentry_path")
+        status = controller.poll_status()
         if status == STUCK:
             controller.clear_path(reason="initial_entry_stuck")
         elif status == DONE:

@@ -374,6 +374,28 @@ class RgbdDoorDetectorTest(unittest.TestCase):
         self.assertAlmostEqual(result.valid_depth_fraction, 6.0 / 28.0)
         self.assertGreater(result.deeper_fraction, 0.9)
 
+    def test_registered_door_plane_accepts_dense_depth_with_partial_deeper_echoes(self):
+        """有效深度完整且暗像素很少时，部分远端回波也能确认开口。"""
+        rgb = np.full((120, 160, 3), 180, dtype=np.uint8)
+        depth = np.full((120, 160), 2000, dtype=np.uint16)
+        # 注册门中央 ROI 为 x=[66, 94)，其中 5/28 列命中轿厢深处，
+        # 对应 Gazebo 返程电梯门实测约 0.17 的 deeper_fraction。
+        depth[:, 66:71] = 3500
+
+        result = self.detector.assess_registered_opening_arrays(
+            rgb,
+            depth,
+            self.camera_k,
+            self.camera_to_world,
+            door_xy=(2.0, 0.0),
+            door_yaw=math.pi,
+            door_width=1.4,
+        )
+
+        self.assertTrue(result.confirmed)
+        self.assertAlmostEqual(result.valid_depth_fraction, 1.0)
+        self.assertGreater(result.deeper_fraction, 0.15)
+
 
 if __name__ == "__main__":
     unittest.main()

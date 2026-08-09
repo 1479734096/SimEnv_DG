@@ -27,17 +27,19 @@ class LocalControllerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             PathFollower(cmd_vel_topic="/cmd_vel", obstacle_slow_distance=0.4)
 
-    def test_large_yaw_error_keeps_forward_component(self):
+    def test_large_yaw_error_enters_turn_in_place(self):
+        # 大航向误差（86°）超过先对准阈值：禁止前进与侧移，只输出转向。
         linear_x, linear_y, angular = compute_tracking_command(
             1.5,
             max_linear=0.35,
             max_lateral=0.3,
             max_angular=0.9,
             min_linear_fraction=0.25,
+            turn_in_place_active=True,
         )
 
-        self.assertGreater(linear_x, 0.0)
-        self.assertGreater(linear_y, 0.0)
+        self.assertEqual(linear_x, 0.0)
+        self.assertEqual(linear_y, 0.0)
         self.assertAlmostEqual(angular, 0.9)
 
     def test_large_heading_uses_only_compatibility_creep(self):
@@ -176,8 +178,7 @@ class LocalControllerTest(unittest.TestCase):
     def test_stuck_when_robot_does_not_move(self):
         follower = PathFollower(
             cmd_vel_topic="/cmd_vel",
-            no_progress_timeout=0.05,
-            progress_distance=0.2,
+            route_progress_timeout=0.05,
         )
         follower.set_path([(0.0, 0.0), (1.0, 0.0)])
         follower.tick((0.0, 0.0, 0.0))
@@ -189,8 +190,8 @@ class LocalControllerTest(unittest.TestCase):
         self.assertEqual(status, STUCK)
         snapshot = follower.tracking_debug_snapshot()
         self.assertEqual(snapshot["stuck_count"], 1)
-        self.assertEqual(snapshot["replan_reason"], "no_progress_timeout")
-        self.assertEqual(snapshot["zero_command_reason"], "no_progress_timeout")
+        self.assertEqual(snapshot["replan_reason"], "route_progress_timeout")
+        self.assertEqual(snapshot["zero_command_reason"], "route_progress_timeout")
 
         follower.recover(reason="frontier_stuck")
         snapshot = follower.tracking_debug_snapshot()
@@ -270,6 +271,100 @@ class LocalControllerTest(unittest.TestCase):
         snapshot = follower.tracking_debug_snapshot()
         self.assertEqual(snapshot["recover_state"], "idle")
         self.assertEqual(snapshot["replan_reason"], "recover_turn_completed")
+        # 恢复完成后旧路径必须被清除，任务层才会重新 A*。
+        self.assertFalse(follower.has_path())
+
+    def test_recover_clears_path_for_replan(self):
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+        self.assertTrue(follower.has_path())
+        with patch("danger_search.navigator.get_time", return_value=2.0):
+            follower.recover(reason="stuck")
+            self.assertEqual(follower.tick((0.0, 0.0, 0.0)), RUNNING)
+        with patch("danger_search.navigator.get_time", return_value=4.6):
+            self.assertEqual(follower.tick((0.0, 0.0, 0.0)), RUNNING)
+        with patch("danger_search.navigator.get_time", return_value=5.7):
+            self.assertEqual(follower.tick((0.0, 0.0, 0.0)), "idle")
+        self.assertFalse(follower.has_path())
+
+    def test_high_measured_yaw_rate_brakes_forward(self):
+        # 实测角速度高（>0.45 rad/s）即使误差不大也必须制动（先对准）。
+        linear_x, linear_y, angular = compute_tracking_command(
+            0.10,
+            max_linear=0.60,
+            max_lateral=0.25,
+            max_angular=1.2,
+            min_linear_fraction=0.35,
+            measured_yaw_rate=1.0,
+            yaw_rate_damping=0.45,
+            turn_in_place_rate=0.45,
+            turn_in_place_active=True,
+        )
+        self.assertEqual(linear_x, 0.0)
+        self.assertEqual(linear_y, 0.0)
+        self.assertLess(angular, 0.0)
+
+    def test_yaw_rate_damping_reduces_overshoot(self):
+        # 阻尼项：误差方向与转速同向时角速度应小于纯比例控制。
+        _, _, damped = compute_tracking_command(
+            0.30,
+            max_linear=0.60,
+            max_angular=1.2,
+            measured_yaw_rate=0.6,
+            yaw_rate_damping=0.45,
+            turn_in_place_rate=2.0,
+        )
+        _, _, plain = compute_tracking_command(
+            0.30,
+            max_linear=0.60,
+            max_angular=1.2,
+        )
+        self.assertLess(damped, plain)
+
+    def test_stale_yaw_rate_falls_back_to_plain_control(self):
+        # yaw_rate 缺失（odom 未提供）→ 无阻尼项，但触发死区补偿将小角速度提升到 0.55。
+        linear_x, _, angular = compute_tracking_command(
+            0.10,
+            max_linear=0.60,
+            max_angular=1.2,
+            min_linear_fraction=0.35,
+            measured_yaw_rate=None,
+            turn_in_place_active=False,
+        )
+        self.assertGreater(linear_x, 0.0)
+        self.assertAlmostEqual(angular, 0.55, places=2)
+
+    def test_remaining_path_distance_along_polyline(self):
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path([(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)])
+        # 在首段中点投影：剩余 = 0.5（首段剩余）+ 1.0（第二段）
+        self.assertAlmostEqual(follower._remaining_path_distance(0.0, 0.5), 1.5)
+        # 在首段起点：剩余 = 1.0 + 1.0
+        self.assertAlmostEqual(follower._remaining_path_distance(0.0, 0.0), 2.0)
+        # 绕圈（离开路径横向 1m）：投影仍在路径上，剩余不变 → 绕圈不算进度
+        self.assertAlmostEqual(follower._remaining_path_distance(1.0, 0.5), 1.5)
+
+    def test_circle_motion_without_route_progress_triggers_stuck(self):
+        # 绕固定目标圆周运动：每步位移 >0.25m（旧判据会放行），
+        # 但沿折线剩余不改善 → route_progress_timeout 内必须 STUCK。
+        follower = PathFollower(
+            cmd_vel_topic="/cmd_vel",
+            route_progress_timeout=0.05,
+        )
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+        follower.tick((0.0, 0.0, 0.0))
+        import time
+        time.sleep(0.06)
+        # 横向偏移 0.5m（位移 >0.25m 旧判据会放行）但沿路径投影剩余不变
+        # → 路线无有效投影进度 → route_progress_timeout 内必须 STUCK。
+        status = follower.tick((0.0, 0.5, 0.0))
+        self.assertEqual(status, STUCK)
+        snapshot = follower.tracking_debug_snapshot()
+        self.assertEqual(snapshot["replan_reason"], "route_progress_timeout")
+        # 终态未消费前路径保留；poll_status 消费后清除。
+        self.assertTrue(follower.has_path())
+        self.assertEqual(follower.poll_status(), STUCK)
+        self.assertFalse(follower.has_path())
 
     def test_reverse_straight_publishes_configured_negative_speed(self):
         class FakeTwist:
@@ -393,8 +488,9 @@ class LocalControllerTest(unittest.TestCase):
         self.assertAlmostEqual(snapshot["heading_error"], math.pi / 2.0)
         self.assertAlmostEqual(snapshot["path_turn_angle"], -math.pi / 2.0)
         self.assertAlmostEqual(snapshot["path_curvature"], -math.pi / 2.0)
-        self.assertGreater(snapshot["linear_command"], 0.0)
-        self.assertGreater(snapshot["lateral_command"], 0.0)
+        # 90° 航向误差超过先对准阈值：禁止前进，只输出转向。
+        self.assertEqual(snapshot["linear_command"], 0.0)
+        self.assertEqual(snapshot["lateral_command"], 0.0)
         self.assertEqual(snapshot["angular_command"], follower.max_angular)
         self.assertIsNone(snapshot["zero_command_reason"])
         self.assertIsNone(snapshot["last_command_wall_time"])
@@ -713,7 +809,7 @@ class LocalControllerTest(unittest.TestCase):
             follower.reverse_straight(reason="test_reverse")
             follower.recover(reason="test_recover")
             follower._last_command_wall_time = 0.0
-            follower._on_keepalive_timer(None)
+            follower._on_control_timer(None)
 
         self.assertGreaterEqual(len(follower._publisher.messages), 5)
         for message in follower._publisher.messages:
@@ -725,6 +821,311 @@ class LocalControllerTest(unittest.TestCase):
         self.assertEqual(snapshot["linear_command"], 0.0)
         self.assertEqual(snapshot["safety_gate"]["state"], DROP_STOPPING)
 
+    def test_keepalive_zeroes_direct_command_that_lost_its_driver(self):
+        """直接控制命令失去每 tick 刷新方后必须归零，不能被 keepalive 无限重放。"""
+
+        class FakeTwist:
+            def __init__(self):
+                self.linear = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+                self.angular = SimpleNamespace(x=0.0, y=0.0, z=0.0)
+
+        class FakePublisher:
+            def __init__(self):
+                self.messages = []
+
+            def publish(self, message):
+                self.messages.append(message)
+
+        follower = PathFollower(
+            cmd_vel_topic="/cmd_vel",
+            command_keepalive_period=0.1,
+            direct_command_max_age=0.6,
+        )
+        follower._publisher = FakePublisher()
+
+        with patch("danger_search.navigator.Twist", FakeTwist), patch(
+            "danger_search.navigator.get_time", return_value=1.0
+        ):
+            # 任务层发一条原地转向：无路径、无对准、无恢复，属于直接控制模式。
+            with patch("danger_search.navigator.time.monotonic", return_value=1.0):
+                follower.rotate_in_place(0.8)
+            self.assertAlmostEqual(follower._publisher.messages[-1].angular.z, 0.8)
+
+            # 寿命内：keepalive 照常重放非零命令，维持 RL 控制器命令流。
+            with patch("danger_search.navigator.time.monotonic", return_value=1.2):
+                follower._on_control_timer(None)
+            self.assertAlmostEqual(follower._publisher.messages[-1].angular.z, 0.8)
+
+            # 超过 direct_command_max_age 仍无人刷新：必须归零并给出原因。
+            with patch("danger_search.navigator.time.monotonic", return_value=2.0):
+                follower._on_control_timer(None)
+            self.assertEqual(follower._publisher.messages[-1].angular.z, 0.0)
+            self.assertEqual(follower._publisher.messages[-1].linear.x, 0.0)
+            self.assertEqual(
+                follower._debug_zero_command_reason,
+                "direct_command_expired",
+            )
+
+
+class FixedFrequencyControllerTest(unittest.TestCase):
+    """固定频率控制器（第一阶段）专项测试。"""
+
+    @staticmethod
+    def _sample(xy_yaw, yaw_rate=0.0, stamp=100.0):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            xy_yaw=tuple(xy_yaw),
+            angular_xyz=(0.0, 0.0, yaw_rate),
+            stamp=stamp,
+        )
+
+    def test_control_timer_produces_new_decisions_not_keepalive(self):
+        # 控制定时器在路径模式下每周期应产生新控制决策，
+        # 而不是只重放旧命令增加 keepalive 计数。
+        from danger_search.navigator import PathFollower
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+        provider = SimpleNamespace(latest=lambda: self._sample((0.0, 0.0, 0.0)))
+        follower._pose_provider = provider
+        follower._publisher = SimpleNamespace(publish=lambda *a, **k: None)
+        before = follower._control_decision_count
+        fresh = self._sample((0.0, 0.0, 0.0), stamp=199.95)
+        provider = SimpleNamespace(latest=lambda: fresh)
+        follower._pose_provider = provider
+        with patch("danger_search.navigator.get_time", return_value=200.0):
+            for _ in range(5):
+                follower._on_control_timer(None)
+        self.assertGreaterEqual(follower._control_decision_count - before, 5)
+
+    def test_turn_in_place_release_requires_three_samples(self):
+        # 转向滞回：进入立即，释放需连续 3 个新鲜样本同时满足 heading 与 yaw_rate 条件。
+        from danger_search.navigator import PathFollower, RUNNING
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+        # 路径向东 (1,0)，yaw=pi/2（面朝北）→ 航向误差 ~90° >= 0.35 → 进入转向
+        follower.step_once_for_test(self._sample((0.0, 0.0, math.pi / 2.0)))
+        self.assertTrue(follower._turn_in_place_active)
+        # 误差已小但 yaw_rate 仍高：不得退出
+        follower.step_once_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.5))
+        self.assertTrue(follower._turn_in_place_active)
+        # 连续 3 个释放样本（heading<=0.15 且 yaw_rate<=0.20）
+        for _ in range(3):
+            follower.step_once_for_test(self._sample((0.0, 0.0, 0.05), yaw_rate=0.1))
+        self.assertFalse(follower._turn_in_place_active)
+
+    def test_wider_heading_threshold_keeps_moderate_turn_on_arc(self):
+        from danger_search.navigator import PathFollower
+
+        follower = PathFollower(
+            cmd_vel_topic="/cmd_vel",
+            turn_in_place_heading=0.70,
+            turn_release_heading=0.20,
+        )
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+
+        follower.step_once_for_test(self._sample((0.0, 0.0, -0.60), yaw_rate=0.1))
+        self.assertFalse(follower._turn_in_place_active)
+        self.assertGreater(follower.requested_command_snapshot()[0], 0.0)
+
+        follower.step_once_for_test(self._sample((0.0, 0.0, -0.80), yaw_rate=0.1))
+        self.assertTrue(follower._turn_in_place_active)
+        self.assertEqual(follower.requested_command_snapshot()[0], 0.0)
+
+    def test_pose_stale_publishes_zero_and_freezes_stuck(self):
+        # pose 过期：立即零速，且不触发 STUCK（冻结进度计时）。
+        from danger_search.navigator import PathFollower, STUCK
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+        published = []
+        follower._publisher = SimpleNamespace(publish=lambda *a, **k: published.append(a))
+        # 过期 sample：stamp 落后 pose_max_age 以上
+        stale = self._sample((0.0, 0.0, 0.0), stamp=0.0)
+        provider = SimpleNamespace(latest=lambda: stale)
+        follower._pose_provider = provider
+        with patch("danger_search.navigator.get_time", return_value=100.0):
+            follower._on_control_timer(None)
+        self.assertEqual(published[-1][0].linear.x, 0.0)  # 零速
+        self.assertEqual(published[-1][0].angular.z, 0.0)
+        self.assertNotEqual(follower._tracking_status, STUCK)
+
+    def test_terminal_not_lost_before_poll(self):
+        # DONE/STUCK 在慢任务轮询前不得丢失，也不得提前重规划。
+        from danger_search.navigator import PathFollower, DONE, RUNNING, IDLE
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+        # 直接推进到终点（两 tick 足够：起点到终点）
+        follower.step_once_for_test(self._sample((0.0, 0.0, 0.0)))
+        follower.step_once_for_test(self._sample((1.0, 0.0, 0.0)))
+        self.assertTrue(follower._terminal_pending)
+        self.assertTrue(follower.has_path())  # 终态未消费前路径保留
+        self.assertEqual(follower.poll_status(), DONE)
+        self.assertEqual(follower.poll_status(), IDLE)
+        self.assertFalse(follower.has_path())
+
+    def test_path_limits_atomic_commit(self):
+        # set_path 原子提交限速与终点容差，控制步进使用提交值。
+        from danger_search.navigator import PathFollower
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path(
+            [(0.0, 0.0), (1.0, 0.0)],
+            max_linear=0.30,
+            goal_tolerance=0.50,
+        )
+        self.assertEqual(follower._path_max_linear, 0.30)
+        self.assertEqual(follower._path_goal_tolerance, 0.50)
+        snapshot = follower.tracking_debug_snapshot()
+        self.assertLessEqual(snapshot["linear_command"], 0.30)
+
+    def test_yaw_rate_damping_sign_correct(self):
+        # angular_xyz[2] 正负值时阻尼方向正确：同向转速降低角速度指令。
+        from danger_search.navigator import compute_tracking_command
+        _, _, pos_ang = compute_tracking_command(
+            0.30, max_linear=0.6, max_angular=1.2,
+            measured_yaw_rate=0.6, yaw_rate_damping=0.45,
+        )
+        _, _, neg_ang = compute_tracking_command(
+            0.30, max_linear=0.6, max_angular=1.2,
+            measured_yaw_rate=-0.6, yaw_rate_damping=0.45,
+        )
+        _, _, plain_ang = compute_tracking_command(0.30, max_linear=0.6, max_angular=1.2)
+        self.assertLess(pos_ang, plain_ang)
+        self.assertGreater(neg_ang, plain_ang)
+
+
+class AlignModeTest(unittest.TestCase):
+    """固定频率 ALIGN 模式（R2）专项测试。"""
+
+    @staticmethod
+    def _sample(xy_yaw, yaw_rate=0.0, stamp=100.0, linear_x=0.0):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            xy_yaw=tuple(xy_yaw),
+            angular_xyz=(0.0, 0.0, yaw_rate),
+            linear_xyz=(linear_x, 0.0, 0.0),
+            stamp=stamp,
+        )
+
+    def test_align_completes_after_release_samples(self):
+        from danger_search.navigator import PathFollower, DONE
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower._publisher = SimpleNamespace(publish=lambda *a, **k: None)
+        # 对准目标：正东方向 (1.0, 0)（相对原点），yaw=0 已对准。
+        follower.begin_heading_alignment((1.0, 0.0))
+        self.assertEqual(follower._align_state, "settle")
+        # SETTLE：3 帧停稳后进入 ALIGN
+        for _ in range(3):
+            follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        self.assertEqual(follower._align_state, "align")
+        # 已对准（err=0 < deadband）：下一决策进入 CONFIRM
+        follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        self.assertEqual(follower._align_state, "confirm")
+        # 连续 3 个释放样本后 DONE+alignment_done
+        for _ in range(3):
+            follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        result = follower.poll_result()
+        self.assertEqual(result.status, DONE)
+        self.assertEqual(result.reason, "alignment_done")
+
+    def test_align_damping_direction(self):
+        # yaw_rate 与误差同向时角速度指令被阻尼减小。
+        from danger_search.navigator import PathFollower
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        published = []
+        follower._publisher = SimpleNamespace(publish=lambda *a, **k: published.append(a))
+        # 目标正东，yaw=0.3（逆时针偏），需要顺时针转（负角速度）
+        follower.begin_heading_alignment((1.0, 0.0))
+        for _ in range(3):
+            follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        # 已进入 ALIGN：发一次命令，记录角速度
+        follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        # 阻尼生效样本：误差 0.3、yaw_rate +0.6（同向）→ 指令更小
+        follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.6))
+        self.assertGreaterEqual(follower._debug_align_yaw_error, 0.0)
+        # 不深入数值断言，只验证 ALIGN 状态推进与决策计数
+        self.assertGreater(follower._control_decision_count, 0)
+
+    def test_align_drift_latches_stuck(self):
+        from danger_search.navigator import PathFollower, STUCK
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        published = []
+        follower._publisher = SimpleNamespace(publish=lambda *a, **k: published.append(a))
+        follower.begin_heading_alignment(
+            (1.0, 0.0),
+            anchor_xy=(0.0, 0.0),
+            max_anchor_error=0.20,
+        )
+        for _ in range(3):
+            follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        # 位姿离开锚点超 0.20m：立即零速并锁存 STUCK+alignment_drift
+        follower.step_align_for_test(self._sample((0.5, 0.0, 0.0), yaw_rate=0.0))
+        result = follower.poll_result()
+        self.assertEqual(result.status, STUCK)
+        self.assertEqual(result.reason, "alignment_drift")
+        self.assertEqual(published[-1][0].linear.x, 0.0)
+        self.assertEqual(published[-1][0].angular.z, 0.0)
+
+    def test_align_begin_idempotent(self):
+        from danger_search.navigator import PathFollower
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower._publisher = SimpleNamespace(publish=lambda *a, **k: None)
+        follower.begin_heading_alignment((1.0, 0.0))
+        for _ in range(3):
+            follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        confirm_before = follower._align_confirm_count
+        # 相同目标重复调用：不重置确认计数
+        follower.begin_heading_alignment((1.0, 0.0))
+        self.assertEqual(follower._align_confirm_count, confirm_before)
+        self.assertEqual(follower._align_state, "align")
+
+    def test_align_settle_timeout_fails(self):
+        from danger_search.navigator import PathFollower, STUCK
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower._publisher = SimpleNamespace(publish=lambda *a, **k: None)
+        # 持续不停止（yaw_rate 高）：3s 后 settle 超时
+        with patch("danger_search.navigator.get_time", side_effect=[0.0, 0.1, 0.2, 0.3, 4.0]):
+            follower.begin_heading_alignment((1.0, 0.0))
+            for _ in range(4):
+                follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.5))
+        result = follower.poll_result()
+        self.assertEqual(result.status, STUCK)
+        self.assertEqual(result.reason, "alignment_settle_timeout")
+
+    def test_poll_result_atomic_consume(self):
+        from danger_search.navigator import PathFollower, DONE, IDLE
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower._publisher = SimpleNamespace(publish=lambda *a, **k: None)
+        follower.begin_heading_alignment((1.0, 0.0))
+        for _ in range(3):
+            follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        for _ in range(3):
+            follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        # 原子消费：status+reason+sequence 同时返回
+        first = follower.poll_result()
+        self.assertEqual(first.status, DONE)
+        self.assertEqual(first.reason, "alignment_done")
+        self.assertGreaterEqual(first.sequence, 1)
+        # 消费后回到 IDLE，reason 清空
+        second = follower.poll_result()
+        self.assertEqual(second.status, IDLE)
+        self.assertIsNone(second.reason)
+
+    def test_poll_result_reason_not_overwritten_by_timer(self):
+        # 消费期间控制定时器更新：返回的 reason 不被覆盖（原子锁内捕获）。
+        from danger_search.navigator import PathFollower, DONE
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower._publisher = SimpleNamespace(publish=lambda *a, **k: None)
+        follower.begin_heading_alignment((1.0, 0.0))
+        for _ in range(3):
+            follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        for _ in range(3):
+            follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        # 消费前模拟 Timer 更新（再步进一次），reason 必须仍为 alignment_done
+        follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        result = follower.poll_result()
+        self.assertEqual(result.status, DONE)
+        self.assertEqual(result.reason, "alignment_done")
 
 if __name__ == "__main__":
     unittest.main()

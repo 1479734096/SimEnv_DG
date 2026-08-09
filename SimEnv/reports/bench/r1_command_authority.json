@@ -1,0 +1,74 @@
+{
+  "git_head": "605a1305fd30acb6c8e854e3de37a29fd8850867",
+  "python": "3.8.10",
+  "timestamp": "2026-08-09T02:15:30",
+  "warmup_batches": 5,
+  "targets": {
+    "compute_tracking_command": {
+      "inner": 2000,
+      "reps": 40,
+      "median_us": 1.6812,
+      "p95_us": 1.7209,
+      "min_us": 1.6226,
+      "mean_us": 1.6835,
+      "deterministic": true,
+      "signature": "(0.424212246, 0.052475895, 0.4025)",
+      "signature_after": null
+    },
+    "publish_locked_no_gate": {
+      "inner": 5000,
+      "reps": 40,
+      "median_us": 1.0303,
+      "p95_us": 1.0375,
+      "min_us": 1.0229,
+      "mean_us": 1.0309,
+      "deterministic": true,
+      "signature": "((0.4, 0.0, 0.1), None, False)",
+      "signature_after": null
+    },
+    "publish_locked_with_gate": {
+      "inner": 2000,
+      "reps": 40,
+      "median_us": 2.9236,
+      "p95_us": 2.9736,
+      "min_us": 2.862,
+      "mean_us": 2.9226,
+      "deterministic": true,
+      "signature": "((0.4, 0.0, 0.1), None, 'CLEAR', None)",
+      "signature_after": null
+    },
+    "publish_with_lock": {
+      "inner": 2000,
+      "reps": 40,
+      "median_us": 3.2507,
+      "p95_us": 3.2925,
+      "min_us": 3.1951,
+      "mean_us": 3.2563,
+      "deterministic": true,
+      "signature": "((0.4, 0.0, 0.1), None, 'CLEAR')",
+      "signature_after": null
+    },
+    "gate_filter_command": {
+      "inner": 2000,
+      "reps": 40,
+      "median_us": 0.8632,
+      "p95_us": 0.8843,
+      "min_us": 0.8494,
+      "mean_us": 0.8652,
+      "deterministic": true,
+      "signature": "((0.4, 0.0, 0.1), 'CLEAR', None)",
+      "signature_after": null
+    },
+    "path_follower_tick": {
+      "inner": 300,
+      "reps": 40,
+      "median_us": 11.3483,
+      "p95_us": 11.5141,
+      "min_us": 11.2387,
+      "mean_us": 11.3671,
+      "deterministic": true,
+      "signature": "('running', True, (0.499756374, 0.0, 0.0))",
+      "signature_after": null
+    }
+  }
+}

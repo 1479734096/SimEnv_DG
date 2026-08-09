@@ -8,6 +8,7 @@ from danger_search.door_observation_runtime import (
     TIMEOUT,
     WAITING,
     DoorObservationRuntime,
+    minimum_refresh_width,
 )
 from danger_search.local_semantic_detector import OpeningObservation
 
@@ -79,6 +80,20 @@ def test_refresh_classifies_rejections_without_accepting_geometry():
         assert result.status == REJECTED
         assert result.reason == reason
     assert tracker.rejection_counts == {reason: 1 for _observation, reason in cases}
+
+
+def test_refresh_width_threshold_accounts_for_detector_quantization_without_crossing_sweep_width():
+    """0.05 米边缘量化不应误拒 1.05 米门洞，但真实窄门仍须关闭失败。"""
+    minimum_width = minimum_refresh_width(
+        sweep_half_width=0.435393,
+        clearance_margin=0.10,
+        measurement_resolution=0.05,
+    )
+
+    assert math.isclose(minimum_width, 1.020786)
+    assert 1.05 >= minimum_width
+    assert 1.00 < minimum_width
+    assert minimum_width >= 2.0 * 0.435393
 
 
 def test_refresh_accepts_two_consistent_observations_and_keeps_summary():

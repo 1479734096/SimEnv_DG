@@ -1,0 +1,96 @@
+任务 3: 配置参数检查
+
+## 核心配置类
+**类名**: PathFollower
+**文件**: src/danger_search/danger_search/navigator.py
+**行号**: 41-140+
+
+## 关键参数
+
+### 速度限制
+```python
+max_linear: float = 0.60     # 最大前进速度 (m/s)
+max_lateral: float = 0.25    # 最大侧向速度 (m/s)
+max_angular: float = 1.2     # 最大角速度 (rad/s)
+```
+
+### 控制律参数
+```python
+yaw_rate_damping: float = 0.45  # 角速度阻尼系数
+yaw_rate_max_age: float = 0.30  # 角速度测量最大延迟 (s)
+```
+
+**比例增益**: 硬编码为 1.7（在控制律公式中）
+
+### ALIGN 模式死区参数（仅用于 ALIGN）
+```python
+_align_deadband_omega: float = 0.55   # 最小可执行角速度 (rad/s)
+_align_deadband_error: float = 0.10   # 误差阈值 (rad, ~5.7°)
+```
+
+### 原地转向参数
+```python
+turn_in_place_heading: float = 0.35    # 触发原地转向的航向误差 (rad, ~20°)
+turn_in_place_rate: float = 0.45       # 触发原地转向的角速度阈值 (rad/s)
+turn_release_heading: float = 0.15     # 退出原地转向的航向误差 (rad, ~8.6°)
+turn_release_rate: float = 0.20        # 退出原地转向的角速度阈值 (rad/s)
+turn_release_samples: int = 3          # 退出需要连续满足的采样数
+```
+
+## PATH 模式控制律使用的参数
+
+在 `compute_tracking_command()` 调用中传递：
+```python
+linear_x, linear_y, angular = compute_tracking_command(
+    yaw_error,
+    max_linear=linear_limit,
+    max_lateral=self.max_lateral,
+    max_angular=self.max_angular,        # 1.2 rad/s
+    min_linear_fraction=self.min_linear_fraction,
+    path_curvature=curvature,
+    nearest_obstacle_distance=self._nearest_obstacle_distance,
+    obstacle_stop_distance=self.obstacle_stop_distance,
+    obstacle_slow_distance=self.obstacle_slow_distance,
+    measured_yaw_rate=yaw_rate,
+    yaw_rate_damping=self.yaw_rate_damping,  # 0.45
+    turn_in_place_heading=self.turn_in_place_heading,
+    turn_in_place_rate=self.turn_in_place_rate,
+    turn_in_place_active=self._turn_in_place_active,
+)
+```
+
+**硬编码比例增益**: 1.7（在函数内部，行 1541）
+
+## 缺失的参数
+
+PATH 模式**没有**使用的参数：
+- ❌ `deadband_omega` (最小可执行角速度)
+- ❌ `deadband_error` (死区误差阈值)
+
+## 参数对比
+
+| 参数 | ALIGN 模式 | PATH 模式 | 备注 |
+|------|-----------|----------|------|
+| 比例增益 | 1.7 | 1.7 | 相同 |
+| 阻尼系数 | 0.45 | 0.45 | 相同 |
+| 最大角速度 | 1.2 | 1.2 | 相同 |
+| 死区角速度 | 0.55 | - | **PATH 缺失** |
+| 死区误差阈值 | 0.10 | - | **PATH 缺失** |
+
+## 推荐的 PATH 死区参数
+
+基于 ALIGN 模式的成功经验，建议 PATH 模式使用相同参数：
+
+```python
+# 添加到 compute_tracking_command() 函数签名
+deadband_omega: float = 0.55,        # 最小可执行角速度 (rad/s)
+deadband_error: float = 0.10,        # 误差阈值 (rad)
+deadband_rate_threshold: float = 0.05,  # 转速检查阈值 (rad/s)
+```
+
+## 结论
+
+1. PATH 模式与 ALIGN 模式使用相同的控制律参数（增益、阻尼、限幅）
+2. PATH 模式缺少死区补偿所需的两个关键参数
+3. 可以直接复用 ALIGN 的死区参数值（0.55 和 0.10）
+4. 最小修改：在 `compute_tracking_command()` 中添加死区补偿逻辑和参数

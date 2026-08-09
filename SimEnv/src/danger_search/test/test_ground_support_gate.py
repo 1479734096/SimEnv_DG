@@ -994,8 +994,10 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
         )
         gate.check_control_timeout(12.01, wall_time=100.6)
 
-        self.assertEqual(gate.state, SAFETY_BLOCKED)
-        self.assertEqual(gate.reason_code, "support_veto_source_missing")
+        # 观察期超时且未捕获支撑失败边界：解除临时 hold 继续（明确 DROP
+        # 由 _fresh_drop_blocks 独立锁存停车），不再 SAFETY_BLOCKED 使任务失败。
+        self.assertEqual(gate.state, CLEAR)
+        self.assertEqual(gate.observation_hold_release_without_witness_count, 1)
 
     def test_wall_progress_alone_does_not_expire_observation_hold(self):
         gate = GroundSupportSafetyGate(_config(observation_hold_timeout=2.0))

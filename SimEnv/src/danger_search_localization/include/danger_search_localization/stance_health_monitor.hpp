@@ -21,6 +21,8 @@ struct StanceHealthMonitorConfig {
   double minimum_base_height = 0.20;
   double maximum_base_height = 0.55;
   double minimum_ground_normal_z = 0.94;
+  // 只有楼面法向与 IMU 竖直方向足够一致时，才采信楼面高度越界。
+  double maximum_ground_normal_alignment_error = 0.02;
   double minimum_base_up_z = 0.90;
   double maximum_angular_speed = 1.50;
   std::size_t required_healthy_frames = 8;
@@ -108,6 +110,9 @@ class StanceHealthMonitor {
         !std::isfinite(config.minimum_ground_normal_z) ||
         config.minimum_ground_normal_z <= 0.0 ||
         config.minimum_ground_normal_z > 1.0 ||
+        !std::isfinite(config.maximum_ground_normal_alignment_error) ||
+        config.maximum_ground_normal_alignment_error < 0.0 ||
+        config.maximum_ground_normal_alignment_error > 1.0 ||
         !std::isfinite(config.minimum_base_up_z) ||
         config.minimum_base_up_z <= 0.0 || config.minimum_base_up_z > 1.0 ||
         !std::isfinite(config.maximum_angular_speed) ||
@@ -130,9 +135,14 @@ class StanceHealthMonitor {
     if (up_known && observation.base_up_z < config_.minimum_base_up_z) {
       return Evidence::kBad;
     }
+    const bool normal_aligned_with_imu =
+        !up_known ||
+        std::abs(observation.ground_normal_z - observation.base_up_z) <=
+            config_.maximum_ground_normal_alignment_error;
     const bool reliable_ground =
         height_known && ground_known &&
-        observation.ground_normal_z >= config_.minimum_ground_normal_z;
+        observation.ground_normal_z >= config_.minimum_ground_normal_z &&
+        normal_aligned_with_imu;
     if (reliable_ground &&
         (observation.base_height < config_.minimum_base_height ||
          observation.base_height > config_.maximum_base_height)) {

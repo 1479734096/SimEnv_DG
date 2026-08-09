@@ -69,7 +69,7 @@ class NavigateToPose(NavigationTask):
             grid = context.mapper.floor(context.current_floor)
             result = context.plan_path(grid, (pose[0], pose[1]), self.target_xy)
             if result.reached:
-                context.controller.set_path(result.path)
+                context.controller.set_path(result.path, reason="navigate_to_pose_path")
             elif result.unreachable:
                 context.controller.stop(reason="navigation_target_unreachable")
                 return FAILED
@@ -78,7 +78,7 @@ class NavigateToPose(NavigationTask):
                 context.controller.stop(reason="navigation_budget_exhausted")
                 return RUNNING
 
-        status = context.controller.tick(pose)
+        status = context.controller.poll_status()
         if status == STUCK:
             context.controller.recover()
             return RUNNING  # 仍在恢复中
@@ -94,6 +94,11 @@ class OpenDoorAndPass(NavigationTask):
     """
     _PASS_ALIGN_TOLERANCE = 0.10
     _PASS_ALIGN_CONFIRMATIONS = 2
+    # GO_PASS_POINT 细对准总预算：settle + 旋转 + 确认。超时必须显式失败，
+    # 否则该分支只会一直返回 RUNNING，形成无超时活锁（实测可持续 395s）。
+    _PASS_ALIGN_TIMEOUT = 12.0
+    # 细对准期间允许的位置漂移半径：原地转向不应移动，超出即认为锚点失效。
+    _PASS_ALIGN_ANCHOR_RADIUS = 0.30
 
     def __init__(self, door_id: str, *, pass_offset: float = 0.8, commit_distance: float = 1.8):
         door_id = str(door_id).strip()
@@ -120,6 +125,8 @@ class OpenDoorAndPass(NavigationTask):
         self._pass_retry_timeout = 3.0
         self._pass_alignment_count = 0
         self._pass_path_started = False
+        self._pass_align_start_time: float | None = None
+        self._pass_alignment_done = False
         self._opening_sensor_confirmed = False
         self._commit_retry_count = 0
         self._commit_retry_start_time: float | None = None
@@ -242,6 +249,8 @@ class OpenDoorAndPass(NavigationTask):
             context.controller.clear_path(reason="door_opening_geometry_refreshed")
             self._pass_alignment_count = 0
             self._pass_path_started = False
+            self._pass_align_start_time = None
+            self._pass_alignment_done = False
             self.phase = "GO_REFRESHED_WAIT_POINT"
             return RUNNING
 
@@ -316,29 +325,35 @@ class OpenDoorAndPass(NavigationTask):
         crossing_tolerance = min(goal_tolerance, corner_tolerance)
 
         if not self._pass_path_started:
-            target_yaw = math.atan2(
-                self._pass_point[1] - pose[1],
-                self._pass_point[0] - pose[0],
-            )
-            yaw_error = _angle_wrap(target_yaw - pose[2])
-            if abs(yaw_error) > self._PASS_ALIGN_TOLERANCE:
-                self._pass_alignment_count = 0
-                angular_limit = abs(float(getattr(context.controller, "max_angular", 0.0)))
-                minimum_speed = abs(
-                    float(getattr(context.controller, "recover_angular_speed", 0.0))
-                )
-                angular_speed = min(
-                    angular_limit,
-                    max(abs(1.7 * yaw_error), minimum_speed),
-                )
-                context.controller.rotate_in_place(math.copysign(angular_speed, yaw_error))
+            align_status, watching = self._tick_pass_alignment(context, pose)
+            if align_status == FAILED:
+                return self._fail_crossing(context, "门洞细对准失败")
+            if align_status != DONE:
+                # 细对准必须有超时：转向未收敛时如果只返回 RUNNING，
+                # 下面的 STUCK/IDLE 判定与阻塞超时都不可达，会形成
+                # 无保护活锁（实测在主入口原地摆动数百秒直到外部杀进程）。
+                if watching:
+                    now = get_time()
+                    if self._pass_align_start_time is None:
+                        self._pass_align_start_time = now
+                    elif now - self._pass_align_start_time >= self._PASS_ALIGN_TIMEOUT:
+                        if rospy is not None:
+                            rospy.logerr(
+                                "[%s] 门洞细对准超时：door_id=%s 耗时=%.1fs "
+                                "pose=(%.2f, %.2f, %.2f) pass_point=(%.2f, %.2f)",
+                                self.name,
+                                self.door_id,
+                                now - self._pass_align_start_time,
+                                pose[0],
+                                pose[1],
+                                pose[2],
+                                self._pass_point[0],
+                                self._pass_point[1],
+                            )
+                        return self._fail_crossing(context, "门洞细对准超时未收敛")
                 return RUNNING
 
-            context.controller.stop(reason="door_pass_alignment_hold")
-            self._pass_alignment_count += 1
-            if self._pass_alignment_count < self._PASS_ALIGN_CONFIRMATIONS:
-                return RUNNING
-
+            self._pass_align_start_time = None
             _clear_opened_door_area(context, self.door_id)
             grid = context.mapper.floor(context.current_floor)
             if _segment_crosses_blocked_cell(
@@ -349,7 +364,13 @@ class OpenDoorAndPass(NavigationTask):
             ):
                 return self._handle_pass_blocked(context)
 
-            context.controller.set_path([(pose[0], pose[1]), self._pass_point])
+            pass_linear_cap = context.door_pass_max_linear
+            context.controller.set_path(
+                [(pose[0], pose[1]), self._pass_point],
+                max_linear=pass_linear_cap,
+                goal_tolerance=crossing_tolerance,
+                reason="door_pass_point_path",
+            )
             self._pass_path_started = True
             self._pass_retry_start_time = None
             return RUNNING
@@ -364,22 +385,123 @@ class OpenDoorAndPass(NavigationTask):
         if not context.controller.has_path():
             return self._fail_crossing(context, "过门直线路径意外丢失")
 
-        tick_kwargs = {"goal_tolerance": crossing_tolerance}
+        # 过门直线路径：限速与终点容差随路径原子提交（固定频率控制读取）。
         pass_linear_cap = context.door_pass_max_linear
-        if pass_linear_cap is not None:
-            tick_kwargs["max_linear"] = pass_linear_cap
-        status = context.controller.tick(pose, **tick_kwargs)
+        context.controller.set_tracking_limits(
+            goal_tolerance=crossing_tolerance,
+            max_linear=pass_linear_cap,
+        )
+        status = context.controller.poll_status()
         if status == DONE:
+            completion_pose = pose
+            tracking_snapshot = getattr(
+                context.controller,
+                "tracking_debug_snapshot",
+                None,
+            )
+            if callable(tracking_snapshot):
+                latest_pose = tracking_snapshot().get("pose")
+                if (
+                    isinstance(latest_pose, (list, tuple))
+                    and len(latest_pose) >= 3
+                    and all(math.isfinite(float(value)) for value in latest_pose[:3])
+                ):
+                    completion_pose = tuple(float(value) for value in latest_pose[:3])
             endpoint_distance = math.hypot(
-                self._pass_point[0] - pose[0],
-                self._pass_point[1] - pose[1],
+                self._pass_point[0] - completion_pose[0],
+                self._pass_point[1] - completion_pose[1],
             )
             if endpoint_distance <= crossing_tolerance:
-                return self._finish_pass(pose)
+                return self._finish_pass(completion_pose)
             return self._fail_crossing(context, "控制器提前结束过门路径")
         if status in (STUCK, IDLE):
             return self._fail_crossing(context, "过门通过阶段有命令但无有效位移")
         return RUNNING
+
+    def _tick_pass_alignment(
+        self,
+        context: NavigationTaskContext,
+        pose: tuple[float, float, float],
+    ) -> tuple[str, bool]:
+        """推进门洞细对准，返回 (状态, 是否计入超时预算)。
+
+        DONE 表示朝向已确认、可以提交直线路径；FAILED 表示对准硬失败。
+        第二个返回值仅在“正在转向或等待控制器收敛”时为 True：命中容差后的
+        确认 tick 不计入预算，避免把正常收敛过程误判成超时。
+
+        优先使用 PathFollower 的固定频率 ALIGN 模式（SETTLE->ALIGN->CONFIRM）：
+        它带 yaw_rate 阻尼、静置判定、多帧确认与锚点漂移保护，跑在控制频率上。
+        任务层以 10Hz 直接发 rotate_in_place 压不住 A1 的转向惯性——最小可执行
+        转速 0.55 rad/s 会反复冲出 ±0.10 rad 的对准窗口，确认数永远攒不满。
+        """
+        if self._pass_alignment_done:
+            return DONE, False
+
+        begin_alignment = getattr(context.controller, "begin_heading_alignment", None)
+        poll_result = getattr(context.controller, "poll_result", None)
+        if not callable(begin_alignment) or not callable(poll_result):
+            # 精简控制替身没有 ALIGN 接口：退回任务层自转，仍受上层超时保护。
+            return self._tick_pass_alignment_legacy(context, pose)
+
+        result = poll_result()
+        if result.status == DONE and result.reason == "alignment_done":
+            # 锁存：控制器完成后回到 idle，阻塞重试期间不得重新 SETTLE。
+            self._pass_alignment_done = True
+            return DONE, False
+        if result.status == STUCK:
+            if result.reason == "alignment_drift":
+                # 位置漂移使锚点失效：重新进入对准，不算硬失败。
+                begin_alignment(
+                    self._pass_point,
+                    anchor_xy=(pose[0], pose[1]),
+                    max_anchor_error=self._PASS_ALIGN_ANCHOR_RADIUS,
+                )
+                return RUNNING, True
+            if rospy is not None:
+                rospy.logerr(
+                    "[%s] 门洞细对准被控制器判定失败：door_id=%s reason=%s",
+                    self.name,
+                    self.door_id,
+                    result.reason,
+                )
+            return FAILED, False
+        if result.status == IDLE:
+            begin_alignment(
+                self._pass_point,
+                anchor_xy=(pose[0], pose[1]),
+                max_anchor_error=self._PASS_ALIGN_ANCHOR_RADIUS,
+            )
+        return RUNNING, True
+
+    def _tick_pass_alignment_legacy(
+        self,
+        context: NavigationTaskContext,
+        pose: tuple[float, float, float],
+    ) -> tuple[str, bool]:
+        """无 ALIGN 接口时的任务层自转对准（保留原有语义）。"""
+        target_yaw = math.atan2(
+            self._pass_point[1] - pose[1],
+            self._pass_point[0] - pose[0],
+        )
+        yaw_error = _angle_wrap(target_yaw - pose[2])
+        if abs(yaw_error) > self._PASS_ALIGN_TOLERANCE:
+            self._pass_alignment_count = 0
+            angular_limit = abs(float(getattr(context.controller, "max_angular", 0.0)))
+            minimum_speed = abs(
+                float(getattr(context.controller, "recover_angular_speed", 0.0))
+            )
+            angular_speed = min(
+                angular_limit,
+                max(abs(1.7 * yaw_error), minimum_speed),
+            )
+            context.controller.rotate_in_place(math.copysign(angular_speed, yaw_error))
+            return RUNNING, True
+
+        context.controller.stop(reason="door_pass_alignment_hold")
+        self._pass_alignment_count += 1
+        if self._pass_alignment_count < self._PASS_ALIGN_CONFIRMATIONS:
+            return RUNNING, False
+        return DONE, False
 
     def _finish_pass(self, pose: tuple[float, float, float]) -> str:
         if rospy is not None and self._wait_point is not None and self._pass_point is not None:
@@ -425,12 +547,20 @@ class OpenDoorAndPass(NavigationTask):
                 max_iterations=planning_max_iterations,
             )
             if result.reached:
-                context.controller.set_path(result.path)
+                context.controller.set_path(
+                    result.path,
+                    max_linear=max_linear,
+                    reason="door_navigate_planned_path",
+                )
             elif result.unreachable:
                 if allow_direct_fallback and context.segment_is_traversable(
                     grid, (pose[0], pose[1]), target_xy
                 ):
-                    context.controller.set_path([(pose[0], pose[1]), target_xy])
+                    context.controller.set_path(
+                        [(pose[0], pose[1]), target_xy],
+                        max_linear=max_linear,
+                        reason="door_navigate_direct_path",
+                    )
                 else:
                     self._last_navigation_blocked = True
                     return False
@@ -438,8 +568,7 @@ class OpenDoorAndPass(NavigationTask):
                 # 预算耗尽：可能可达，不退化为直连也不标记阻塞，等下轮重新规划。
                 return False
 
-        tick_kwargs = {} if max_linear is None else {"max_linear": max_linear}
-        status = context.controller.tick(pose, **tick_kwargs)
+        status = context.controller.poll_status()
         if status == STUCK:
             if self.phase in ("GO_PASS_POINT", "GO_COMMIT_POINT"):
                 self._last_navigation_stuck = True
@@ -608,6 +737,12 @@ class TakeElevator(NavigationTask):
     # 不一致时会出现每 tick 翻转的零速死循环；acceptance 已对齐二者，这里仅作
     # 安全网，避免今后其他语义退化再次形成永久振荡。
     _CABIN_TRANSIT_POSITION_ALIGN_FLIP_LIMIT = 4
+    # 控制器报 goal_reached 后允许任务层位姿追上的宽限 tick 数。
+    # 控制器用控制频率的新鲜位姿判到达，任务层用 mission tick 起点那份较旧的
+    # 位姿复算；两者容差同为 position_tolerance，但读取时刻不同。容差 0.15m 在
+    # 0.6m/s 下只需 0.25s 穿过，10Hz 下仅约 2.5 个 tick，任务层几乎必然落后，
+    # 于是把已经到位的跨越误判成 elevator_transit_incomplete_goal 并失败。
+    _CABIN_TRANSIT_GOAL_GRACE_TICKS = 5
     _EXIT_BACKOFF_DISTANCE = 0.35
     _EXIT_BACKOFF_ALIGN_TOLERANCE = 0.12
     _EXIT_BACKOFF_ALIGN_TIMEOUT = 4.0
@@ -640,6 +775,8 @@ class TakeElevator(NavigationTask):
         self._cabin_transit_start_xy: tuple[float, float] | None = None
         self._cabin_transit_target_xy: tuple[float, float] | None = None
         self._cabin_transit_door_clear_refreshed = False
+        self._cabin_transit_position_door_cleared = False
+        self._cabin_transit_goal_grace = 0
         self._exit_backoff_target_xy: tuple[float, float] | None = None
         self._exit_backoff_start_xy: tuple[float, float] | None = None
         self._exit_backoff_direction: tuple[float, float] | None = None
@@ -739,6 +876,8 @@ class TakeElevator(NavigationTask):
             # 完全看不到门板。先朝传感器注册得到的轿厢中心对准，既为
             # 开门前后视觉确认保留同一视角，也避免侧着开始 ENTER。
             if self._tick_target_door_alignment(context, pose, cabin_center):
+                if self.failure_reason is not None:
+                    return FAILED
                 self._exit_alignment_count = 0
                 self.phase = (
                     "REFRESH_CURRENT_ELEVATOR_GEOMETRY"
@@ -788,6 +927,8 @@ class TakeElevator(NavigationTask):
 
         if self.phase == "ALIGN_TO_REFRESHED_ELEVATOR_DOOR":
             if self._tick_target_door_alignment(context, pose, cabin_center):
+                if self.failure_reason is not None:
+                    return FAILED
                 self._exit_alignment_count = 0
                 self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
             return RUNNING
@@ -874,6 +1015,21 @@ class TakeElevator(NavigationTask):
                         self.cabin_transit_stage,
                     )
                 return FAILED
+            elif status == FAILED:
+                # 必须显式上抛：_navigate_to_with_status 的确定性失败
+                # （unreachable/budget/timeout 达上限）返回 FAILED，若不在此
+                # 判定就会掉进末尾的 return RUNNING 被吞掉。届时
+                # elevator_planning_retry_limit 的判决每 tick 触发又每 tick
+                # 丢弃，计数器不因失败重置，形成零速无界活锁
+                # （seed 8127 实测 45.6s 内触发 42 次仍未退出）。
+                if rospy is not None:
+                    rospy.logerr(
+                        "[%s] 进入轿厢准备阶段确定性失败：stage=%s reason=%s",
+                        self.name,
+                        self.cabin_transit_stage,
+                        self.failure_reason,
+                    )
+                return FAILED
             return RUNNING
 
         if self.phase == "CLOSE_CURRENT_FLOOR_DOOR":
@@ -881,6 +1037,8 @@ class TakeElevator(NavigationTask):
             if status == FAILED:
                 return FAILED
             aligned = self._tick_target_door_alignment(context, pose, target_wait)
+            if aligned and self.failure_reason is not None:
+                return FAILED
             if status == DONE and aligned:
                 self.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
             elif status == DONE:
@@ -889,6 +1047,8 @@ class TakeElevator(NavigationTask):
 
         if self.phase == "ALIGN_TO_TARGET_DOOR":
             if self._tick_target_door_alignment(context, pose, target_wait):
+                if self.failure_reason is not None:
+                    return FAILED
                 self.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
             return RUNNING
 
@@ -1042,6 +1202,17 @@ class TakeElevator(NavigationTask):
                     if rospy is not None:
                         rospy.logerr(f"[{self.name}] 离开轿厢失败。")
                     return FAILED
+            elif status == FAILED:
+                # 与 ENTER_CABIN 对称：确定性失败必须显式上抛，否则被
+                # 末尾的 return RUNNING 吞掉，形成零速无界活锁。
+                if rospy is not None:
+                    rospy.logerr(
+                        "[%s] 离开轿厢准备阶段确定性失败：stage=%s reason=%s",
+                        self.name,
+                        self.cabin_transit_stage,
+                        self.failure_reason,
+                    )
+                return FAILED
             return RUNNING
 
         if self.phase.startswith("EXIT_BACKOFF_"):
@@ -1056,7 +1227,19 @@ class TakeElevator(NavigationTask):
                 return DONE
             return RUNNING
 
-        return DONE
+        if self.phase == "DONE":
+            return DONE
+
+        # 强制穷举：此前这里是裸 return DONE，任何未注册 phase（拼写错误、
+        # 新增阶段忘记接分支、状态被外部改坏）都会被当成"乘梯完成"，任务层
+        # 据此推进到下一层，实际根本没换层。这与 NAV-006 同类但更严重：
+        # NAV-006 把 FAILED 吞成 RUNNING（活锁，至少不谎报成功），此处把
+        # 未知吞成 DONE（假成功）。未知阶段无法安全推进，只能显式失败。
+        return self._fail_navigation(
+            context,
+            "elevator_unknown_phase",
+            f"未注册的乘梯阶段: {self.phase!r}",
+        )
 
     def active_opened_door_id(self, client) -> str | None:
         """返回当前已确认开放且正在直线跨越的电梯门 ID。"""
@@ -1105,26 +1288,85 @@ class TakeElevator(NavigationTask):
         pose: tuple[float, float, float],
         target_wait: tuple[float, float],
     ) -> bool:
-        """机器人完整入厢后，利用关门等待时间原地朝向出口。"""
-        target_yaw = math.atan2(target_wait[1] - pose[1], target_wait[0] - pose[0])
-        yaw_error = _angle_wrap(target_yaw - pose[2])
-        if abs(yaw_error) > self._CABIN_TRANSIT_ALIGN_TOLERANCE:
-            self._exit_alignment_count = 0
-            proportional_speed = abs(1.7 * yaw_error)
-            minimum_speed = abs(
-                float(getattr(context.controller, "recover_angular_speed", 0.0))
-            )
-            angular_limit = abs(float(getattr(context.controller, "max_angular", 0.0)))
-            angular_speed = min(
-                angular_limit,
-                max(proportional_speed, minimum_speed),
-            )
-            context.controller.rotate_in_place(math.copysign(angular_speed, yaw_error))
-            return False
+        """利用关门/等待时间原地朝向目标（固定频率 ALIGN 模式）。
 
-        context.controller.stop(reason="elevator_target_door_alignment_hold")
-        self._exit_alignment_count += 1
-        return self._exit_alignment_count >= self._CABIN_TRANSIT_ALIGN_CONFIRMATIONS
+        对准由 PathFollower 控制定时器高频驱动（SETTLE->ALIGN->CONFIRM），
+        本函数只幂等进入与轮询结果：
+        - DONE+alignment_done：返回 True（进入下一阶段）；
+        - STUCK+alignment_drift：重新进入对准（位置漂移后重试）；
+        - 其他 STUCK（settle 超时等）：设置 failure_reason 并返回 True，
+          调用方必须检查 failure_reason 走失败路径。
+        """
+        controller = context.controller
+        result = controller.poll_result()
+        if result.status == DONE and result.reason == "alignment_done":
+            return True
+        if result.status == STUCK:
+            if result.reason == "alignment_drift":
+                # 位置漂移：锚点已失效，重新进入对准（重新 SETTLE）。
+                self._exit_alignment_count = 0
+                controller.begin_heading_alignment(target_wait)
+                return False
+            self.failure_reason = "elevator_alignment_failed:%s" % (
+                result.reason or "unknown"
+            )
+            return True
+        if result.status == IDLE:
+            controller.begin_heading_alignment(target_wait)
+            return False
+        return False
+
+    def _commit_cabin_cross(
+        self,
+        context: NavigationTaskContext,
+        pose: tuple[float, float, float],
+        position_xy: tuple[float, float],
+        target_xy: tuple[float, float],
+        *,
+        target_door_id: str,
+        position_tolerance: float,
+        max_linear: float | None,
+    ) -> str:
+        """对准完成后提交轿厢直线跨越路径（门区清理与阻塞检查保留）。
+
+        返回 RUNNING（进入 CROSS 或等待路径解除阻塞）。
+        """
+        if not self._cabin_transit_door_clear_refreshed:
+            _clear_opened_door_area(context, target_door_id)
+            self._cabin_transit_door_clear_refreshed = True
+        grid = context.mapper.floor(context.current_floor)
+        commit_start = (pose[0], pose[1])
+        if _segment_crosses_blocked_cell(
+            grid,
+            commit_start,
+            target_xy,
+            constraints=context.planning_constraints,
+        ):
+            self._cabin_transit_alignment_count = 0
+            if rospy is not None:
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[%s] 电梯直线跨越路径仍被地图阻塞，保持原地等待",
+                    self.name,
+                )
+            return RUNNING
+        self._cabin_transit_start_xy = commit_start
+        self._cabin_transit_target_xy = target_xy
+        context.controller.set_path(
+            [commit_start, target_xy],
+            max_linear=max_linear,
+            goal_tolerance=position_tolerance,
+            reason="elevator_cabin_cross_path",
+        )
+        self.cabin_transit_stage = "CROSS"
+        self._cabin_transit_position_align_flips = 0
+        self._log_cabin_transit_stage(
+            "CROSS",
+            pose,
+            commit_start,
+            target_xy,
+        )
+        return RUNNING
 
     def _tick_cabin_transit(
         self,
@@ -1157,6 +1399,16 @@ class TakeElevator(NavigationTask):
         position_acceptance = self._cabin_transit_position_acceptance(context)
 
         if self.cabin_transit_stage == "POSITION":
+            if not self._cabin_transit_position_door_cleared:
+                # 门已由局部传感器确认开启（WAIT_*_DOOR_OPEN 的前置条件），但门板
+                # 残留的膨胀 OCC 仍覆盖候梯点与机器人当前格。此前只在
+                # ALIGN->CROSS 提交时才清理，导致 POSITION 规划时起点仍困在膨胀
+                # 域内，A* 返回 obstacle_inflation_escape_unreachable，形成
+                # “门区要等 POSITION 完成才清、POSITION 又被没清的门区挡住”的
+                # 死锁。clear_opened_door_area 的清理深度本就按门两侧等待点加
+                # 膨胀半径设计，正是为此场景准备。
+                _clear_opened_door_area(context, door_id)
+                self._cabin_transit_position_door_cleared = True
             status = self._navigate_to_with_status(
                 context,
                 pose,
@@ -1176,22 +1428,39 @@ class TakeElevator(NavigationTask):
             return status
 
         if self.cabin_transit_stage == "ALIGN":
-            position_error = math.hypot(position_xy[0] - pose[0], position_xy[1] - pose[1])
-            if position_error > position_acceptance:
+            # 固定频率对准模式：SETTLE 停稳 -> ALIGN 旋转 -> CONFIRM 释放，
+            # 由 PathFollower 控制定时器每 0.1s 新鲜决策；本函数只幂等
+            # 进入与轮询结果。锚点=轿厢中心，漂移由控制器锁存
+            # STUCK(alignment_drift)。
+            if math.hypot(target_xy[0] - pose[0], target_xy[1] - pose[1]) <= position_tolerance:
+                context.controller.clear_path(reason="elevator_transit_already_complete")
+                return DONE
+            result = context.controller.poll_result()
+            if result.status == DONE and result.reason == "alignment_done":
+                self._cabin_transit_alignment_count = 0
+                # 对准完成：提交直线跨越路径（门区清理与阻塞检查保留）。
+                return self._commit_cabin_cross(
+                    context,
+                    pose,
+                    position_xy,
+                    target_xy,
+                    target_door_id=door_id,
+                    position_tolerance=position_tolerance,
+                    max_linear=max_linear,
+                )
+            if result.status == STUCK and result.reason == "alignment_drift":
                 self._cabin_transit_position_align_flips += 1
                 if self._cabin_transit_position_align_flips > self._CABIN_TRANSIT_POSITION_ALIGN_FLIP_LIMIT:
                     context.controller.stop(reason="elevator_transit_position_align_oscillation")
                     if rospy is not None:
                         rospy.logerr(
                             "[%s] 电梯轿厢 POSITION/ALIGN 反复翻转超过上限，判定为确定性失败："
-                            "mode=%s position_error=%.3f acceptance=%.3f",
+                            "mode=%s acceptance=%.3f",
                             self.name,
                             self._cabin_transit_mode,
-                            position_error,
                             position_acceptance,
                         )
                     return STUCK
-                context.controller.clear_path(reason="elevator_transit_position_drift")
                 self.cabin_transit_stage = "POSITION"
                 self._cabin_transit_alignment_count = 0
                 self._log_cabin_transit_stage(
@@ -1201,76 +1470,22 @@ class TakeElevator(NavigationTask):
                     target_xy,
                 )
                 return RUNNING
-
-            target_dx = target_xy[0] - pose[0]
-            target_dy = target_xy[1] - pose[1]
-            if math.hypot(target_dx, target_dy) <= position_tolerance:
-                context.controller.clear_path(reason="elevator_transit_already_complete")
-                return DONE
-
-            target_yaw = math.atan2(target_dy, target_dx)
-            yaw_error = _angle_wrap(target_yaw - pose[2])
-            alignment_limit = self._CABIN_TRANSIT_ALIGN_TOLERANCE
-            if self._cabin_transit_alignment_count > 0:
-                # A1 停止纯转向后仍会有少量余转。首次进入必须满足严格阈值，
-                # 确认期间用窄迟滞避免在最小可执行转速两侧反复振荡。
-                alignment_limit = self._CABIN_TRANSIT_ALIGN_RELEASE_TOLERANCE
-            if abs(yaw_error) > alignment_limit:
-                self._cabin_transit_alignment_count = 0
-                proportional_speed = abs(1.7 * yaw_error)
-                minimum_speed = abs(
-                    float(getattr(context.controller, "recover_angular_speed", 0.0))
-                )
-                angular_limit = abs(float(getattr(context.controller, "max_angular", 0.0)))
-                # A1 的纯转向在小角速度下存在执行死区；复用已验证的恢复转速，
-                # 避免对准阶段在阈值外持续发布无效命令。
-                angular_speed = min(
-                    angular_limit,
-                    max(proportional_speed, minimum_speed),
-                )
-                context.controller.rotate_in_place(math.copysign(angular_speed, yaw_error))
-                return RUNNING
-
-            context.controller.stop(reason="elevator_transit_alignment_hold")
-            self._cabin_transit_alignment_count += 1
-            if self._cabin_transit_alignment_count < self._CABIN_TRANSIT_ALIGN_CONFIRMATIONS:
-                return RUNNING
-
-            # 开门确认与完成对准之间仍会处理新点云，动态门板或门槛的膨胀
-            # OCC 可能被重新写回。提交直线路径前只刷新一次既有门区清理；
-            # clear_dynamic_door_strip 不会清除 BLACK，后面的正障碍检查仍保留。
-            if not self._cabin_transit_door_clear_refreshed:
-                _clear_opened_door_area(context, door_id)
-                self._cabin_transit_door_clear_refreshed = True
-            grid = context.mapper.floor(context.current_floor)
-            commit_start = (pose[0], pose[1])
-            if _segment_crosses_blocked_cell(
-                grid,
-                commit_start,
-                target_xy,
-                constraints=context.planning_constraints,
-            ):
-                self._cabin_transit_alignment_count = 0
+            if result.status == STUCK:
+                # 其他 STUCK（settle 超时等）不能当 drift 吞掉：显式失败。
                 if rospy is not None:
-                    rospy.logwarn_throttle(
-                        2.0,
-                        "[%s] 电梯直线跨越路径仍被地图阻塞，保持原地等待",
+                    rospy.logerr(
+                        "[%s] 电梯轿厢对准失败：mode=%s reason=%s",
                         self.name,
+                        self._cabin_transit_mode,
+                        result.reason,
                     )
-                return RUNNING
-
-            self._cabin_transit_start_xy = commit_start
-            self._cabin_transit_target_xy = target_xy
-            context.controller.set_path([commit_start, target_xy])
-            self.cabin_transit_stage = "CROSS"
-            self._cabin_transit_position_align_flips = 0
-            self._log_cabin_transit_stage(
-                "CROSS",
-                pose,
-                commit_start,
-                target_xy,
-                yaw_error=yaw_error,
-            )
+                return STUCK
+            if result.status == IDLE:
+                context.controller.begin_heading_alignment(
+                    target_xy,
+                    anchor_xy=position_xy,
+                    max_anchor_error=position_acceptance,
+                )
             return RUNNING
 
         if self.cabin_transit_stage == "CROSS":
@@ -1286,6 +1501,7 @@ class TakeElevator(NavigationTask):
                 end_xy,
                 position_tolerance,
             )
+
             if complete:
                 context.controller.clear_path(reason="elevator_transit_completed")
                 if rospy is not None:
@@ -1299,14 +1515,61 @@ class TakeElevator(NavigationTask):
                     )
                 return DONE
 
-            if not context.controller.has_path():
-                context.controller.stop(reason="elevator_transit_path_lost")
+            if self._cabin_transit_goal_grace > 0:
+                # 控制器已按同一容差判到终点并消费终态清掉路径，此时 has_path()
+                # 必然为 False。宽限期内不能把它当成路径丢失：只等任务层位姿
+                # 追上（零速等待），预算用尽才判失败。
+                self._cabin_transit_goal_grace -= 1
+                context.controller.stop(reason="elevator_transit_goal_grace")
+                if self._cabin_transit_goal_grace > 0:
+                    return RUNNING
+                if rospy is not None:
+                    rospy.logerr(
+                        "[%s] CROSS阶段宽限用尽仍未确认到达：mode=%s "
+                        "endpoint_distance=%.3f tolerance=%.3f progress=%.3f cross_track=%.3f",
+                        self.name,
+                        self._cabin_transit_mode,
+                        endpoint_distance,
+                        position_tolerance,
+                        progress,
+                        cross_track,
+                    )
                 return STUCK
 
-            tick_kwargs = {"goal_tolerance": position_tolerance}
-            if max_linear is not None:
-                tick_kwargs["max_linear"] = max_linear
-            status = context.controller.tick(pose, **tick_kwargs)
+            if not context.controller.has_path():
+                context.controller.stop(reason="elevator_transit_path_lost")
+                if rospy is not None:
+                    rospy.logerr(
+                        "[%s] CROSS阶段路径丢失：stage=%s mode=%s endpoint_distance=%.3f",
+                        self.name,
+                        self.cabin_transit_stage,
+                        self._cabin_transit_mode,
+                        math.hypot(end_xy[0] - pose[0], end_xy[1] - pose[1]) if end_xy else -1,
+                    )
+                return STUCK
+
+            status = context.controller.poll_status()
+
+            # 每 5 秒记录一次 CROSS 进度，用于定位失败前的收敛趋势。
+            # 时间源必须用 time_utils.get_time()：rospy.get_time() 在 rospy 可导入
+            # 但未 init_node 的进程（单元测试、离线回放）会抛 ROSInitException。
+            # 复用上面已取得的 status，避免重复轮询控制器。
+            if rospy is not None:
+                now = get_time()
+                if now - getattr(self, "_cross_last_log_time", 0.0) >= 5.0:
+                    self._cross_last_log_time = now
+                    rospy.loginfo(
+                        "[%s] CROSS进行中: endpoint_distance=%.3f tolerance=%.3f "
+                        "progress=%.3f cross_track=%.3f status=%s path_active=%s",
+                        self.name,
+                        endpoint_distance,
+                        position_tolerance,
+                        progress,
+                        cross_track,
+                        status,
+                        context.controller.has_path(),
+                    )
+
             if status == DONE:
                 complete, progress, cross_track, endpoint_distance = self._cabin_transit_complete(
                     pose,
@@ -1315,11 +1578,32 @@ class TakeElevator(NavigationTask):
                     position_tolerance,
                 )
                 if complete:
+                    self._cabin_transit_goal_grace = 0
                     return DONE
-                context.controller.stop(reason="elevator_transit_incomplete_goal")
-                return STUCK
+                # 控制器按同一容差判到了、任务层位姿还没追上：装填宽限，
+                # 零速等位姿刷新，不在这一 tick 就判失败。
+                self._cabin_transit_goal_grace = self._CABIN_TRANSIT_GOAL_GRACE_TICKS
+                context.controller.stop(reason="elevator_transit_goal_grace")
+                if rospy is not None:
+                    rospy.logwarn(
+                        "[%s] CROSS阶段控制器报告DONE但任务层未确认到达，进入宽限："
+                        "endpoint_distance=%.3f tolerance=%.3f progress=%.3f cross_track=%.3f grace=%d",
+                        self.name,
+                        endpoint_distance,
+                        position_tolerance,
+                        progress,
+                        cross_track,
+                        self._cabin_transit_goal_grace,
+                    )
+                return RUNNING
             if status == IDLE:
                 context.controller.stop(reason="elevator_transit_unexpected_idle")
+                if rospy is not None:
+                    rospy.logerr(
+                        "[%s] CROSS阶段控制器意外进入IDLE：endpoint_distance=%.3f",
+                        self.name,
+                        math.hypot(end_xy[0] - pose[0], end_xy[1] - pose[1]) if end_xy else -1,
+                    )
                 return STUCK
             return status
 
@@ -1339,6 +1623,8 @@ class TakeElevator(NavigationTask):
         self._cabin_transit_start_xy = None
         self._cabin_transit_target_xy = target_xy
         self._cabin_transit_door_clear_refreshed = False
+        self._cabin_transit_position_door_cleared = False
+        self._cabin_transit_goal_grace = 0
         self._log_cabin_transit_stage(
             "POSITION",
             None,
@@ -1354,6 +1640,8 @@ class TakeElevator(NavigationTask):
         self._cabin_transit_start_xy = None
         self._cabin_transit_target_xy = None
         self._cabin_transit_door_clear_refreshed = False
+        self._cabin_transit_position_door_cleared = False
+        self._cabin_transit_goal_grace = 0
 
     @staticmethod
     def _cabin_transit_position_tolerance(context: NavigationTaskContext) -> float:
@@ -1635,7 +1923,16 @@ class TakeElevator(NavigationTask):
                 max_iterations=max_iterations,
             )
             if result.reached:
-                context.controller.set_path(result.path)
+                context.controller.set_path(
+                    result.path,
+                    max_linear=max_linear,
+                    goal_tolerance=(
+                        effective_goal_tolerance
+                        if goal_tolerance is not None
+                        else None
+                    ),
+                    reason="elevator_navigate_planned_path",
+                )
                 self._navigation_unreachable_count = 0
                 self._navigation_budget_count = 0
                 self._navigation_next_plan_time = 0.0
@@ -1704,15 +2001,8 @@ class TakeElevator(NavigationTask):
                 self._navigation_next_plan_time = now + self._PLAN_RETRY_INTERVAL
                 return RUNNING
 
-        if max_linear is None and goal_tolerance is None:
-            status = context.controller.tick(pose)
-        else:
-            tick_kwargs = {}
-            if max_linear is not None:
-                tick_kwargs["max_linear"] = max_linear
-            if goal_tolerance is not None:
-                tick_kwargs["goal_tolerance"] = effective_goal_tolerance
-            status = context.controller.tick(pose, **tick_kwargs)
+        # 限速/终点容差随路径原子提交（固定频率控制读取），这里只轮询状态。
+        status = context.controller.poll_status()
         if status == STUCK:
             self._navigation_stuck_count += 1
             stuck_limit = context.elevator_stuck_retry_limit

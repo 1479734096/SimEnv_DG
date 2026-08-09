@@ -83,7 +83,7 @@ class MissionNodeRuntime:
         manager = self._manager
         manager.pose_provider.start()
         manager.sensor_buffer.start()
-        manager.controller.start()
+        manager.controller.start(pose_provider=manager.pose_provider)
         if manager.building_services_required():
             manager.building_client.start(connect_elevator=manager.max_floor > 1)
         manager.start_elevator_visual_preparation()
@@ -110,12 +110,12 @@ class MissionNodeRuntime:
                 rospy.Duration(manager.ground_support_assessment_period),
                 self._on_ground_support_timer,
             )
-            self._wall_thread = Thread(
-                target=self._ground_support_wall_watch,
-                name="ground-support-wall-watch",
-                daemon=True,
-            )
-            self._wall_thread.start()
+        self._wall_thread = Thread(
+            target=self._ground_support_wall_watch,
+            name="mission-wall-watch",
+            daemon=True,
+        )
+        self._wall_thread.start()
         rospy.on_shutdown(self.shutdown)
         rospy.loginfo("danger_search 已启动，等待传感器数据")
 
@@ -163,8 +163,17 @@ class MissionNodeRuntime:
 
     def _ground_support_wall_watch(self) -> None:
         manager = self._manager
-        gate = manager.ground_support_gate
-        while gate is not None and not self._wall_stop.wait(0.05):
+        while not self._wall_stop.wait(0.05):
+            tick_timed_out, tick_reason = manager.check_tick_wall_timeout(
+                time.monotonic()
+            )
+            if tick_timed_out:
+                manager.handle_tick_wall_timeout(tick_reason)
+                self.request_shutdown(tick_reason)
+                return
+            gate = manager.ground_support_gate
+            if gate is None:
+                continue
             timed_out, reason = manager.check_ground_support_wall_timeout(
                 time.monotonic()
             )

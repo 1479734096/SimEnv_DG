@@ -35,6 +35,158 @@ class ExplorationBudgetDecision:
     reason_code: str
 
 
+@dataclass(frozen=True)
+class FrontierArrivalGainResult:
+    """一次真实前沿到达后的实际地图收益及区域冷却决定。"""
+
+    floor: int
+    map_epoch: int
+    target: tuple[float, float]
+    expected_unknown_gain: float
+    actual_known_gain: int
+    low_gain_count: int
+    cooldown_center: tuple[float, float] | None
+
+    def diagnostic(self) -> dict[str, object]:
+        return {
+            "event": "frontier_arrival_gain",
+            "floor": self.floor,
+            "map_epoch": self.map_epoch,
+            "target": [round(value, 3) for value in self.target],
+            "expected_unknown_gain": round(self.expected_unknown_gain, 3),
+            "actual_known_gain": self.actual_known_gain,
+            "low_gain_count": self.low_gain_count,
+            "cooled": self.cooldown_center is not None,
+            "cooldown_center": (
+                [round(value, 3) for value in self.cooldown_center]
+                if self.cooldown_center is not None
+                else None
+            ),
+        }
+
+
+@dataclass
+class _FrontierGainRegion:
+    center: tuple[float, float]
+    low_gain_count: int = 0
+
+
+class FrontierArrivalGainRuntime:
+    """按楼层区域记录成功但低收益的真实前沿到达。"""
+
+    def __init__(
+        self,
+        *,
+        region_radius: float = 1.0,
+        minimum_known_gain: int = 30,
+        low_gain_limit: int = 2,
+    ) -> None:
+        self.region_radius = max(0.0, float(region_radius))
+        self.minimum_known_gain = max(0, int(minimum_known_gain))
+        self.low_gain_limit = max(1, int(low_gain_limit))
+        self._context: tuple[int, int] | None = None
+        self._active: dict[str, object] | None = None
+        self._regions: list[_FrontierGainRegion] = []
+
+    def begin(
+        self,
+        *,
+        floor: int,
+        map_epoch: int,
+        target: tuple[float, float],
+        known_cells: int,
+        expected_gain: float,
+        is_real_frontier: bool,
+    ) -> None:
+        self._sync_context(floor, map_epoch)
+        if not is_real_frontier:
+            self._active = None
+            return
+        self._active = {
+            "floor": int(floor),
+            "map_epoch": int(map_epoch),
+            "target": (float(target[0]), float(target[1])),
+            "known_cells": int(known_cells),
+            "expected_gain": max(0.0, float(expected_gain)),
+        }
+
+    def cancel(self) -> None:
+        self._active = None
+
+    def arrive(
+        self,
+        *,
+        floor: int,
+        map_epoch: int,
+        known_cells: int,
+    ) -> FrontierArrivalGainResult | None:
+        context = (int(floor), int(map_epoch))
+        if context != self._context:
+            self._sync_context(*context)
+            return None
+        active = self._active
+        self._active = None
+        if active is None:
+            return None
+
+        target = active["target"]
+        assert isinstance(target, tuple)
+        region = self._region_for(target)
+        actual_gain = max(0, int(known_cells) - int(active["known_cells"]))
+        if region is None:
+            region = _FrontierGainRegion(center=target)
+            self._regions.append(region)
+        else:
+            region.center = target
+
+        cooldown_center = None
+        if actual_gain < self.minimum_known_gain:
+            region.low_gain_count += 1
+            low_gain_count = region.low_gain_count
+            if low_gain_count >= self.low_gain_limit:
+                cooldown_center = target
+                # 冷却到期后允许该区域重新积累证据，避免永久封禁。
+                region.low_gain_count = 0
+        else:
+            region.low_gain_count = 0
+            low_gain_count = 0
+
+        return FrontierArrivalGainResult(
+            floor=int(active["floor"]),
+            map_epoch=int(active["map_epoch"]),
+            target=target,
+            expected_unknown_gain=float(active["expected_gain"]),
+            actual_known_gain=actual_gain,
+            low_gain_count=low_gain_count,
+            cooldown_center=cooldown_center,
+        )
+
+    def _sync_context(self, floor: int, map_epoch: int) -> None:
+        context = (int(floor), int(map_epoch))
+        if context == self._context:
+            return
+        self._context = context
+        self._active = None
+        self._regions = []
+
+    def _region_for(
+        self,
+        target: tuple[float, float],
+    ) -> _FrontierGainRegion | None:
+        return next(
+            (
+                region
+                for region in self._regions
+                if math.hypot(
+                    region.center[0] - target[0],
+                    region.center[1] - target[1],
+                )
+                <= self.region_radius
+            ),
+            None,
+        )
+
+
 def decide_exploration_budget(
     facts: ExplorationBudgetInput,
 ) -> ExplorationBudgetDecision:
@@ -71,6 +223,13 @@ def decide_exploration_budget(
         if not facts.last_floor_uses_global_budget:
             return ExplorationBudgetDecision(
                 "RETURN_HOME", "floor_timeout_return_home"
+            )
+        known_growth = (
+            facts.known_cells_growth * facts.exploration_progress_window
+        )
+        if known_growth < facts.minimum_progress_cells:
+            return ExplorationBudgetDecision(
+                "RETURN_HOME", "floor_low_progress_return_home"
             )
 
     if (

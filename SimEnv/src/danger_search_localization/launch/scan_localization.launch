@@ -35,6 +35,10 @@
   <arg name="livox_imu_maximum_speed" default="0.70"/>
   <arg name="livox_imu_translation_margin" default="0.02"/>
   <arg name="livox_imu_absolute_translation_cap" default="0.30"/>
+  <!-- RGB-D 失效时按正式输出间隔收紧 Livox-only 运动学上限。 -->
+  <arg name="shared_map_livox_only_maximum_speed" default="0.60"/>
+  <!-- 连续第三次后置否决时交回通用运动学守卫裁决，避免冻结正式位姿。 -->
+  <arg name="shared_map_livox_only_max_consecutive_vetoes" default="3"/>
   <!-- 共享地图候选只按实时测量有效性选源，不读取任务阶段。 -->
   <arg name="shared_map_depth_max_age" default="0.35"/>
   <arg name="shared_map_max_source_divergence" default="0.05"/>
@@ -82,6 +86,10 @@
            value="$(arg livox_imu_translation_margin)"/>
     <param name="livox_imu_absolute_translation_cap"
            value="$(arg livox_imu_absolute_translation_cap)"/>
+    <param name="shared_map_livox_only_maximum_speed"
+           value="$(arg shared_map_livox_only_maximum_speed)"/>
+    <param name="shared_map_livox_only_max_consecutive_vetoes"
+           value="$(arg shared_map_livox_only_max_consecutive_vetoes)"/>
     <param name="shared_map_depth_max_age"
            value="$(arg shared_map_depth_max_age)"/>
     <param name="shared_map_max_source_divergence"

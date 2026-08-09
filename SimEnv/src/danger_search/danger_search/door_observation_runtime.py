@@ -22,6 +22,24 @@ TIMEOUT = "timeout"
 REJECTED = "rejected"
 
 
+def minimum_refresh_width(
+    *,
+    sweep_half_width: float,
+    clearance_margin: float,
+    measurement_resolution: float,
+) -> float:
+    """按门洞宽度量化误差修正净空阈值，同时不突破机器人扫掠宽度。"""
+    sweep_width = 2.0 * max(0.0, float(sweep_half_width))
+    requested_width = 2.0 * (
+        max(0.0, float(sweep_half_width))
+        + max(0.0, float(clearance_margin))
+    )
+    resolution = float(measurement_resolution)
+    if not math.isfinite(resolution) or resolution < 0.0:
+        resolution = 0.0
+    return max(sweep_width, requested_width - resolution)
+
+
 def _observations_are_consistent(
     previous: OpeningObservation,
     current: OpeningObservation,
@@ -319,8 +337,14 @@ class DoorObservationRuntime:
             cloud_points=cloud_points,
             floor_height=float(floor_height),
         )
-        minimum_width = 2.0 * (
-            config.sweep_half_width + config.clearance_margin
+        minimum_width = minimum_refresh_width(
+            sweep_half_width=config.sweep_half_width,
+            clearance_margin=config.clearance_margin,
+            measurement_resolution=getattr(
+                local_detector,
+                "opening_width_resolution",
+                0.0,
+            ),
         )
         assessment = self.refresh.assess(
             observation=observation,

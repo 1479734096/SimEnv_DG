@@ -2,8 +2,9 @@
 
 前沿是已知可通行格与 UNKNOWN 的边界。选择流程先连通域聚类，再为每个聚类
 向已知自由区内部寻找具有障碍净距和未知退让距离的安全落点；只有 A* 确认可达
-的候选才参与最终评分。评分综合信息增益、路径长度、转向、重复访问以及过门后
-上下文。规划预算耗尽与真正不可达严格区分，前者不会触发黑名单。
+的候选才参与最终评分。边界格数只承担提取阈值，候选排序改用安全落点附近的
+局部连通未知潜力，并综合路径长度、转向、重复访问以及过门后上下文。规划预算
+耗尽与真正不可达严格区分，前者不会触发黑名单。
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ class Frontier:
     centroid: tuple[float, float]
     information_gain: float
     score: float = 0.0
+    expected_unknown_gain: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,9 @@ class FrontierCandidateDebug:
     reachability_result: str
     source: str = "frontier"
     selected: bool = False
+    expected_unknown_gain: float = 0.0
+    optimistic_score: float | None = None
+    elimination_stage: str = ""
 
 
 @dataclass(frozen=True)
@@ -157,6 +162,7 @@ class FrontierExplorer:
         frontier_obstacle_clearance: float = 0.25,
         frontier_unknown_standoff: float = 0.20,
         frontier_min_information_gain: float = 1.0,
+        expected_gain_radius: float = 3.0,
         door_front_half_plane_penalty: float = 6.0,
         door_front_half_plane_radius: float = 1.5,
         door_preferred_direction_bonus: float = 1.5,
@@ -176,6 +182,7 @@ class FrontierExplorer:
         self.frontier_obstacle_clearance = float(frontier_obstacle_clearance)
         self.frontier_unknown_standoff = float(frontier_unknown_standoff)
         self.frontier_min_information_gain = float(frontier_min_information_gain)
+        self.expected_gain_radius = float(expected_gain_radius)
         self.door_front_half_plane_penalty = float(door_front_half_plane_penalty)
         self.door_front_half_plane_radius = float(door_front_half_plane_radius)
         self.door_preferred_direction_bonus = float(door_preferred_direction_bonus)
@@ -192,6 +199,7 @@ class FrontierExplorer:
             self.frontier_obstacle_clearance,
             self.frontier_unknown_standoff,
             self.frontier_min_information_gain,
+            self.expected_gain_radius,
             self.door_front_half_plane_penalty,
             self.door_front_half_plane_radius,
             self.door_preferred_direction_bonus,
@@ -204,6 +212,7 @@ class FrontierExplorer:
             or self.max_planning_candidates <= 0
             or self.max_goal_candidates_per_frontier <= 0
             or self.max_fallback_planning_candidates <= 0
+            or self.expected_gain_radius <= 0.0
             or not math.isfinite(self.goal_tolerance)
             or self.goal_tolerance <= 0.0
             or not all(
@@ -216,6 +225,15 @@ class FrontierExplorer:
         self._fail_counts: dict[tuple[int, int], int] = {}
         self.last_selection_debug: FrontierSelectionDebug | None = None
         self._last_extraction_rejections: list[_FrontierExtractionRejection] = []
+        self._last_planning_targets_cache: dict[
+            Frontier, list[tuple[float, float]]
+        ] = {}
+        self._last_expected_gain_cache: dict[
+            tuple[Frontier, tuple[float, float]], float
+        ] = {}
+        self._last_optimistic_score_cache: dict[
+            tuple[Frontier, tuple[float, float]], float
+        ] = {}
 
     def select_frontier(
         self,
@@ -250,6 +268,7 @@ class FrontierExplorer:
                 door_context_penalty=0.0,
                 blacklist_status="not_evaluated",
                 reachability_result="not_evaluated",
+                elimination_stage="extraction",
             )
             for rejection in self._last_extraction_rejections
         ]
@@ -265,12 +284,54 @@ class FrontierExplorer:
         context_filtered_count = 0
         budget_exhausted_count = 0
         inside_tolerance_count = 0
+        robot_xy = (robot_pose[0], robot_pose[1])
+        all_targets_cache: dict[Frontier, list[tuple[float, float]]] = {}
+        planning_targets_cache: dict[Frontier, list[tuple[float, float]]] = {}
+        expected_gain_cache: dict[
+            tuple[Frontier, tuple[float, float]], float
+        ] = {}
+        optimistic_score_cache: dict[
+            tuple[Frontier, tuple[float, float]], float
+        ] = {}
+        frontier_best_target: dict[Frontier, tuple[float, float] | None] = {}
+        frontier_optimistic_score: dict[Frontier, float] = {}
+        for frontier in frontiers:
+            (
+                all_targets,
+                planning_targets,
+                target_gains,
+                target_scores,
+                best_target,
+                best_optimistic_score,
+            ) = self._prepare_frontier_targets(
+                grid,
+                frontier,
+                robot_pose,
+                selection_context,
+            )
+            all_targets_cache[frontier] = all_targets
+            planning_targets_cache[frontier] = planning_targets
+            expected_gain_cache.update(
+                ((frontier, target), gain)
+                for target, gain in target_gains.items()
+            )
+            optimistic_score_cache.update(
+                ((frontier, target), score)
+                for target, score in target_scores.items()
+            )
+            frontier_best_target[frontier] = best_target
+            frontier_optimistic_score[frontier] = best_optimistic_score
+        self._last_expected_gain_cache = dict(expected_gain_cache)
+        self._last_optimistic_score_cache = dict(optimistic_score_cache)
+        self._last_planning_targets_cache = {
+            frontier: list(targets)
+            for frontier, targets in planning_targets_cache.items()
+        }
         ranked_frontiers = sorted(
             frontiers,
-            key=lambda frontier: self._optimistic_score(frontier, robot_pose),
+            key=lambda frontier: frontier_optimistic_score[frontier],
             reverse=True,
         )
-        robot_xy = (robot_pose[0], robot_pose[1])
         formal_component = reachable_traversable_component(grid, robot_xy)
         effective_component = (
             formal_component
@@ -283,9 +344,7 @@ class FrontierExplorer:
         for frontier in ranked_frontiers:
             candidate_cells = {
                 cell
-                for target in self._candidate_targets_for_frontier(
-                    grid, frontier, robot_xy
-                )
+                for target in all_targets_cache[frontier]
                 for cell in [grid.world_to_grid(*target)]
                 if cell is not None
             }
@@ -308,6 +367,10 @@ class FrontierExplorer:
         ]
         for frontier in not_planned:
             formal_reachable, effective_reachable = membership[frontier]
+            best_target = frontier_best_target[frontier]
+            debug_position = (
+                best_target if best_target is not None else frontier.centroid
+            )
             rejection_reason = (
                 "planning_candidate_limit"
                 if effective_reachable
@@ -319,11 +382,11 @@ class FrontierExplorer:
             )
             candidate_debug_records.append(
                 FrontierCandidateDebug(
-                    position=frontier.centroid,
+                    position=debug_position,
                     cluster_size=len(frontier.cells),
                     information_gain=frontier.information_gain,
                     euclidean_distance=_world_distance(
-                        frontier.centroid,
+                        debug_position,
                         (robot_pose[0], robot_pose[1]),
                     ),
                     path_length=None,
@@ -335,6 +398,17 @@ class FrontierExplorer:
                     reachability_result=(
                         "not_evaluated" if effective_reachable else "unreachable"
                     ),
+                    expected_unknown_gain=(
+                        expected_gain_cache.get((frontier, best_target), 0.0)
+                        if best_target is not None
+                        else 0.0
+                    ),
+                    optimistic_score=(
+                        frontier_optimistic_score[frontier]
+                        if math.isfinite(frontier_optimistic_score[frontier])
+                        else None
+                    ),
+                    elimination_stage="preplanning",
                 )
             )
         for frontier in planned_frontiers:
@@ -353,6 +427,17 @@ class FrontierExplorer:
                 robot_pose,
                 selection_context=selection_context,
                 planning_constraints=planning_constraints,
+                candidate_targets=planning_targets_cache[frontier],
+                expected_gain_cache={
+                    target: expected_gain_cache[(frontier, target)]
+                    for target in planning_targets_cache[frontier]
+                    if (frontier, target) in expected_gain_cache
+                },
+                optimistic_score_cache={
+                    target: optimistic_score_cache[(frontier, target)]
+                    for target in planning_targets_cache[frontier]
+                    if (frontier, target) in optimistic_score_cache
+                },
             )
             if target_xy is None or not path:
                 candidate_debug_records.append(candidate_debug)
@@ -373,7 +458,13 @@ class FrontierExplorer:
                     self.record_failure(grid, frontier.centroid)
                 continue
             reachable_count += 1
-            score = self._score_frontier(frontier, path, robot_pose, target_xy=target_xy) + context_adjustment
+            score = self._score_frontier(
+                frontier,
+                path,
+                robot_pose,
+                target_xy=target_xy,
+                expected_unknown_gain=candidate_debug.expected_unknown_gain,
+            ) + context_adjustment
             candidate_debug_records.append(
                 replace(
                     candidate_debug,
@@ -381,6 +472,7 @@ class FrontierExplorer:
                     final_score=score,
                     rejection_reason="",
                     reachability_result="reached",
+                    elimination_stage="final_scoring",
                 )
             )
             if score > best_score:
@@ -390,6 +482,7 @@ class FrontierExplorer:
                     centroid=target_xy,
                     information_gain=frontier.information_gain,
                     score=score,
+                    expected_unknown_gain=candidate_debug.expected_unknown_gain,
                 )
                 best_path = path
             if (
@@ -406,6 +499,7 @@ class FrontierExplorer:
                     centroid=target_xy,
                     information_gain=frontier.information_gain,
                     score=score,
+                    expected_unknown_gain=candidate_debug.expected_unknown_gain,
                 )
                 best_current_region_path = path
         if best_frontier is None:
@@ -621,7 +715,7 @@ class FrontierExplorer:
                 _context_filtered_only,
                 _budget_exhausted,
                 _inside_tolerance_only,
-                _candidate_debug,
+                candidate_debug,
             ) = self._resolve_frontier_target(
                 grid,
                 frontier,
@@ -630,6 +724,29 @@ class FrontierExplorer:
                 planning_max_iterations=None,
                 exhaustive_goal_candidates=True,
                 planning_constraints=planning_constraints,
+                candidate_targets=getattr(
+                    self,
+                    "_last_planning_targets_cache",
+                    {},
+                ).get(frontier),
+                expected_gain_cache={
+                    target: gain
+                    for (cached_frontier, target), gain in getattr(
+                        self,
+                        "_last_expected_gain_cache",
+                        {},
+                    ).items()
+                    if cached_frontier == frontier
+                },
+                optimistic_score_cache={
+                    target: score
+                    for (cached_frontier, target), score in getattr(
+                        self,
+                        "_last_optimistic_score_cache",
+                        {},
+                    ).items()
+                    if cached_frontier == frontier
+                },
             )
             if target_xy is None or not path:
                 continue
@@ -639,6 +756,7 @@ class FrontierExplorer:
                     path,
                     robot_pose,
                     target_xy=target_xy,
+                    expected_unknown_gain=candidate_debug.expected_unknown_gain,
                 )
                 + context_adjustment
             )
@@ -648,6 +766,7 @@ class FrontierExplorer:
                     centroid=target_xy,
                     information_gain=frontier.information_gain,
                     score=score,
+                    expected_unknown_gain=candidate_debug.expected_unknown_gain,
                 ),
                 path,
             )
@@ -722,11 +841,20 @@ class FrontierExplorer:
 
     def record_stuck_failure(self, grid: FloorGrid, world_xy: tuple[float, float]) -> None:
         """对真实卡住位置使用更大半径黑名单，避免立即选择同一区域。"""
-        """临时排除已确认卡住目标附近区域，避免前沿质心漂移绕过单格黑名单。"""
+        self.blacklist_region(grid, world_xy, radius=self.stuck_blacklist_radius)
+
+    def blacklist_region(
+        self,
+        grid: FloorGrid,
+        world_xy: tuple[float, float],
+        *,
+        radius: float,
+    ) -> None:
+        """按现有 TTL 临时排除目标区域，避免质心小幅漂移绕过单格黑名单。"""
         center = grid.world_to_grid(world_xy[0], world_xy[1])
         if center is None:
             return
-        radius = max(grid.resolution, self.stuck_blacklist_radius)
+        radius = max(grid.resolution, float(radius))
         radius_cells = int(math.ceil(radius / grid.resolution))
         expiry = get_time() + self.blacklist_ttl
         for gy in range(center[1] - radius_cells, center[1] + radius_cells + 1):
@@ -750,6 +878,131 @@ class FrontierExplorer:
         for cell in expired:
             self._blacklist.pop(cell, None)
 
+    def _prepare_frontier_targets(
+        self,
+        grid: FloorGrid,
+        frontier: Frontier,
+        robot_pose: tuple[float, float, float],
+        selection_context: FrontierSelectionContext | None,
+    ) -> tuple[
+        list[tuple[float, float]],
+        list[tuple[float, float]],
+        dict[tuple[float, float], float],
+        dict[tuple[float, float], float],
+        tuple[float, float] | None,
+        float,
+    ]:
+        """冻结一个 frontier 的落点、局部收益和 A* 前乐观分数。"""
+        robot_xy = (robot_pose[0], robot_pose[1])
+        all_targets = self._candidate_targets_for_frontier(
+            grid,
+            frontier,
+            robot_xy,
+        )
+        if selection_context is not None:
+            all_targets.sort(
+                key=lambda target: (
+                    self._selection_context_effect(target, selection_context)[1],
+                    -self._selection_context_effect(target, selection_context)[0],
+                )
+            )
+
+        planning_targets: list[tuple[float, float]] = []
+        expected_gains: dict[tuple[float, float], float] = {}
+        optimistic_scores: dict[tuple[float, float], float] = {}
+        valid_count = 0
+        for target in all_targets:
+            planning_targets.append(target)
+            context_adjustment, skip_target, _context_penalty = (
+                self._selection_context_effect(target, selection_context)
+            )
+            if (
+                self._is_blacklisted(grid, target)
+                or skip_target
+                or _world_distance(target, robot_xy) <= self.goal_tolerance
+            ):
+                continue
+            gain = self._expected_unknown_gain(grid, frontier, target)
+            expected_gains[target] = gain
+            optimistic_scores[target] = self._optimistic_score(
+                frontier,
+                robot_pose,
+                target_xy=target,
+                expected_unknown_gain=gain,
+                context_adjustment=context_adjustment,
+            )
+            valid_count += 1
+            if valid_count >= self.max_goal_candidates_per_frontier:
+                break
+
+        if optimistic_scores:
+            best_target = max(
+                optimistic_scores,
+                key=lambda target: optimistic_scores[target],
+            )
+            best_score = optimistic_scores[best_target]
+        else:
+            best_target = None
+            best_score = -math.inf
+        return (
+            all_targets,
+            planning_targets,
+            expected_gains,
+            optimistic_scores,
+            best_target,
+            best_score,
+        )
+
+    def _expected_unknown_gain(
+        self,
+        grid: FloorGrid,
+        frontier: Frontier,
+        target_xy: tuple[float, float],
+    ) -> float:
+        """统计安全落点半径内、与该 frontier 相邻的四连通 UNKNOWN。"""
+        radius_sq = self.expected_gain_radius * self.expected_gain_radius
+
+        def inside_radius(cell: tuple[int, int]) -> bool:
+            wx, wy = grid.grid_to_world(*cell)
+            return (
+                (wx - target_xy[0]) * (wx - target_xy[0])
+                + (wy - target_xy[1]) * (wy - target_xy[1])
+                <= radius_sq + 1e-12
+            )
+
+        seeds = {
+            neighbor
+            for cell in frontier.cells
+            for neighbor in _neighbors8_cells(cell)
+            if (
+                0 <= neighbor[0] < grid.size_x
+                and 0 <= neighbor[1] < grid.size_y
+                and int(grid.data[neighbor[1], neighbor[0]]) == UNKNOWN
+                and inside_radius(neighbor)
+            )
+        }
+        visited = set(seeds)
+        queue = deque(seeds)
+        while queue:
+            gx, gy = queue.popleft()
+            for neighbor in (
+                (gx + 1, gy),
+                (gx - 1, gy),
+                (gx, gy + 1),
+                (gx, gy - 1),
+            ):
+                nx, ny = neighbor
+                if (
+                    neighbor in visited
+                    or not (0 <= nx < grid.size_x and 0 <= ny < grid.size_y)
+                    or int(grid.data[ny, nx]) != UNKNOWN
+                    or not inside_radius(neighbor)
+                ):
+                    continue
+                visited.add(neighbor)
+                queue.append(neighbor)
+        return float(len(visited))
+
     def _score_frontier(
         self,
         frontier: Frontier,
@@ -757,15 +1010,20 @@ class FrontierExplorer:
         robot_pose: tuple[float, float, float],
         *,
         target_xy: tuple[float, float] | None = None,
+        expected_unknown_gain: float | None = None,
     ) -> float:
         cost = path_length(path)
         goal_xy = target_xy if target_xy is not None else frontier.centroid
         target_yaw = math.atan2(goal_xy[1] - robot_pose[1], goal_xy[0] - robot_pose[0])
         yaw_cost = abs(_angle_wrap(target_yaw - robot_pose[2]))
         revisit_penalty = 1.0 if cost < 0.8 else 0.0
-        effective_ig = math.sqrt(min(float(frontier.information_gain), 25.0))
+        gain = (
+            frontier.expected_unknown_gain
+            if expected_unknown_gain is None
+            else float(expected_unknown_gain)
+        )
         return (
-            self.information_gain_weight * effective_ig
+            self.information_gain_weight * math.sqrt(max(0.0, gain))
             - self.path_cost_weight * cost
             - self.yaw_cost_weight * yaw_cost
             - self.revisit_penalty_weight * revisit_penalty
@@ -775,19 +1033,32 @@ class FrontierExplorer:
         self,
         frontier: Frontier,
         robot_pose: tuple[float, float, float],
+        *,
+        target_xy: tuple[float, float] | None = None,
+        expected_unknown_gain: float | None = None,
+        context_adjustment: float = 0.0,
     ) -> float:
         """不运行规划的候选预排序，下界用欧氏距离，最终选择仍使用路径长度。"""
-        distance = _world_distance(frontier.centroid, (robot_pose[0], robot_pose[1]))
+        goal_xy = target_xy if target_xy is not None else frontier.centroid
+        distance = _world_distance(goal_xy, (robot_pose[0], robot_pose[1]))
         target_yaw = math.atan2(
-            frontier.centroid[1] - robot_pose[1],
-            frontier.centroid[0] - robot_pose[0],
+            goal_xy[1] - robot_pose[1],
+            goal_xy[0] - robot_pose[0],
         )
         yaw_cost = abs(_angle_wrap(target_yaw - robot_pose[2]))
+        revisit_penalty = 1.0 if distance < 0.8 else 0.0
+        gain = (
+            frontier.expected_unknown_gain
+            if expected_unknown_gain is None
+            else float(expected_unknown_gain)
+        )
         return (
             self.information_gain_weight
-            * math.sqrt(min(float(frontier.information_gain), 25.0))
+            * math.sqrt(max(0.0, gain))
             - self.path_cost_weight * distance
             - self.yaw_cost_weight * yaw_cost
+            - self.revisit_penalty_weight * revisit_penalty
+            + context_adjustment
         )
 
     def _select_free_space_goal(
@@ -1066,6 +1337,9 @@ class FrontierExplorer:
         planning_max_iterations: int | None = DEFAULT_MAX_ITERATIONS,
         exhaustive_goal_candidates: bool = False,
         planning_constraints: PlanningConstraints | None = None,
+        candidate_targets: list[tuple[float, float]] | None = None,
+        expected_gain_cache: dict[tuple[float, float], float] | None = None,
+        optimistic_score_cache: dict[tuple[float, float], float] | None = None,
     ) -> tuple[
         tuple[float, float] | None,
         list[tuple[float, float]],
@@ -1077,15 +1351,26 @@ class FrontierExplorer:
         FrontierCandidateDebug,
     ]:
         robot_xy = (robot_pose[0], robot_pose[1])
-        candidates = self._candidate_targets_for_frontier(grid, frontier, robot_xy)
-        if selection_context is not None:
-            # 在精确规划次数受限时，先规划门上下文更偏好的合法落点。
-            candidates.sort(
-                key=lambda target: (
-                    self._selection_context_effect(target, selection_context)[1],
-                    -self._selection_context_effect(target, selection_context)[0],
-                )
+        if candidate_targets is None:
+            (
+                _all_targets,
+                candidates,
+                prepared_gains,
+                prepared_scores,
+                _best_target,
+                _best_score,
+            ) = self._prepare_frontier_targets(
+                grid,
+                frontier,
+                robot_pose,
+                selection_context,
             )
+            expected_gain_cache = prepared_gains
+            optimistic_score_cache = prepared_scores
+        else:
+            candidates = list(candidate_targets)
+        expected_gain_cache = expected_gain_cache or {}
+        optimistic_score_cache = optimistic_score_cache or {}
         if not candidates:
             return (
                 None,
@@ -1107,6 +1392,7 @@ class FrontierExplorer:
                     door_context_penalty=0.0,
                     blacklist_status="not_evaluated",
                     reachability_result="not_evaluated",
+                    elimination_stage="target_generation",
                 ),
             )
         saw_non_blacklisted = False
@@ -1125,7 +1411,15 @@ class FrontierExplorer:
         last_path_position: tuple[float, float] | None = None
         last_path_context_adjustment = 0.0
         last_path_context_penalty: float | None = 0.0
-        best_choice: tuple[tuple[float, float], list[tuple[float, float]], float, float, float | None] | None = None
+        best_choice: tuple[
+            tuple[float, float],
+            list[tuple[float, float]],
+            float,
+            float,
+            float | None,
+            float,
+            float | None,
+        ] | None = None
         for target_xy in candidates:
             if self._is_blacklisted(grid, target_xy):
                 blacklisted_target_count += 1
@@ -1169,30 +1463,14 @@ class FrontierExplorer:
                     saw_context_path_skip = True
                     debug_path_length = path_length(result.path)
                     continue
-                if selection_context is None:
-                    return (
-                        target_xy,
-                        result.path,
-                        False,
-                        0.0,
-                        False,
-                        False,
-                        False,
-                        FrontierCandidateDebug(
-                            position=target_xy,
-                            cluster_size=len(frontier.cells),
-                            information_gain=frontier.information_gain,
-                            euclidean_distance=_world_distance(target_xy, robot_xy),
-                            path_length=path_length(result.path),
-                            final_score=None,
-                            rejection_reason="",
-                            door_context_adjustment=0.0,
-                            door_context_penalty=0.0,
-                            blacklist_status="partial" if blacklisted_target_count else "not_blacklisted",
-                            reachability_result="reached",
-                        ),
-                    )
-                candidate_score = context_adjustment - path_length(result.path)
+                expected_gain = expected_gain_cache.get(target_xy, 0.0)
+                candidate_score = self._score_frontier(
+                    frontier,
+                    result.path,
+                    robot_pose,
+                    target_xy=target_xy,
+                    expected_unknown_gain=expected_gain,
+                ) + context_adjustment
                 if best_choice is None or candidate_score > best_choice[3]:
                     best_choice = (
                         target_xy,
@@ -1200,6 +1478,8 @@ class FrontierExplorer:
                         context_adjustment,
                         candidate_score,
                         context_penalty,
+                        expected_gain,
+                        optimistic_score_cache.get(target_xy),
                     )
             elif result.budget_exhausted:
                 # 预算耗尽：可能可达，不能黑名单，标记后跳过本轮。
@@ -1227,6 +1507,9 @@ class FrontierExplorer:
                     door_context_penalty=best_choice[4],
                     blacklist_status="partial" if blacklisted_target_count else "not_blacklisted",
                     reachability_result="reached",
+                    expected_unknown_gain=best_choice[5],
+                    optimistic_score=best_choice[6],
+                    elimination_stage="final_scoring",
                 ),
             )
         # 没有可达候选：若全是预算耗尽，则不视为不可达，避免误黑名单。
@@ -1285,6 +1568,17 @@ class FrontierExplorer:
                 door_context_penalty=debug_context_penalty,
                 blacklist_status=blacklist_status,
                 reachability_result=reachability_result,
+                expected_unknown_gain=expected_gain_cache.get(debug_position, 0.0),
+                optimistic_score=optimistic_score_cache.get(debug_position),
+                elimination_stage=(
+                    "planning"
+                    if rejection_reason in (
+                        "planning_budget_exhausted",
+                        "unreachable",
+                        "door_context_path_gate",
+                    )
+                    else "goal_filtering"
+                ),
             ),
         )
 
@@ -1611,6 +1905,9 @@ class FrontierExplorer:
             "budget_exhausted_count": budget_exhausted_count,
             "used_fallback": used_fallback,
             "final_target": list(debug.final_target) if debug.final_target is not None else None,
+            "final_expected_unknown_gain": (
+                frontier.expected_unknown_gain if frontier is not None else 0.0
+            ),
             "final_score": debug.final_score,
             "path_length": debug.path_length,
             "retained_by_inertia": debug.retained_by_inertia,
@@ -1648,10 +1945,26 @@ class FrontierExplorer:
             context_effect = "penalized"
         else:
             context_effect = "unaffected"
+        elimination_stage = candidate.elimination_stage
+        if not elimination_stage:
+            if candidate.source == "free_space_fallback":
+                elimination_stage = "fallback"
+            elif candidate.reachability_result == "reached":
+                elimination_stage = "final_scoring"
+            elif candidate.reachability_result in (
+                UNREACHABLE,
+                "budget_exhausted",
+            ):
+                elimination_stage = "planning"
+            else:
+                elimination_stage = "goal_filtering"
         return {
             "position": list(candidate.position),
             "cluster_size": candidate.cluster_size,
+            "frontier_boundary_cells": candidate.cluster_size,
             "information_gain": candidate.information_gain,
+            "expected_unknown_gain": candidate.expected_unknown_gain,
+            "optimistic_score": candidate.optimistic_score,
             "euclidean_distance": candidate.euclidean_distance,
             "path_length": candidate.path_length,
             "final_score": candidate.final_score,
@@ -1672,6 +1985,7 @@ class FrontierExplorer:
             "reachability_result": candidate.reachability_result,
             "source": candidate.source,
             "selected": candidate.selected,
+            "elimination_stage": elimination_stage,
         }
 
     @staticmethod

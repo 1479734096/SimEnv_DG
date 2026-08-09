@@ -16,7 +16,7 @@ from danger_search.navigation_tasks import (
 )
 from danger_search.mapper import BLACK, FREE, MultiFloorGridMap
 from danger_search.navigation_context import NavigationTaskContext
-from danger_search.navigator import STUCK
+from danger_search.navigator import STUCK, ControlResult
 from danger_search.planner import BUDGET_EXHAUSTED, PlanResult, UNREACHABLE
 
 
@@ -138,9 +138,10 @@ class NavigateToPoseTest(unittest.TestCase):
         controller = SimpleNamespace(
             goal_tolerance=0.1,
             has_path=lambda: False,
-            set_path=lambda path: paths.append(path),
+            set_path=lambda path, **kwargs: paths.append(path),
             stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
-            tick=lambda pose: RUNNING,
+            poll_status=lambda: RUNNING,
+                set_tracking_limits=lambda **kwargs: None,
         )
         return (
             SimpleNamespace(
@@ -340,8 +341,8 @@ class OpenDoorAndPassTest(unittest.TestCase):
             controller=SimpleNamespace(
                 goal_tolerance=0.35,
                 has_path=lambda: False,
-                set_path=lambda path: None,
-                tick=lambda pose: RUNNING,
+                set_path=lambda path, **kwargs: None,
+                poll_status=lambda: RUNNING,
                 recover=lambda: None,
                 stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
             ),
@@ -385,8 +386,8 @@ class OpenDoorAndPassTest(unittest.TestCase):
             controller=SimpleNamespace(
                 goal_tolerance=0.35,
                 has_path=lambda: False,
-                set_path=lambda path: None,
-                tick=lambda pose: RUNNING,
+                set_path=lambda path, **kwargs: None,
+                poll_status=lambda: RUNNING,
                 recover=lambda: None,
                 stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
                 clear_path=lambda **kwargs: cleared.append(kwargs.get("reason")),
@@ -433,8 +434,8 @@ class OpenDoorAndPassTest(unittest.TestCase):
             controller=SimpleNamespace(
                 goal_tolerance=0.35,
                 has_path=lambda: False,
-                set_path=lambda path: None,
-                tick=lambda pose: RUNNING,
+                set_path=lambda path, **kwargs: None,
+                poll_status=lambda: RUNNING,
                 recover=lambda: None,
                 stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
             ),
@@ -476,9 +477,9 @@ class OpenDoorAndPassTest(unittest.TestCase):
             controller=SimpleNamespace(
                 goal_tolerance=0.35,
                 has_path=lambda: False,
-                set_path=lambda path: recorded_paths.append(path),
+                set_path=lambda path, **kwargs: recorded_paths.append(path),
                 clear_path=lambda: cleared_paths.append(True),
-                tick=lambda pose: RUNNING,
+                poll_status=lambda: RUNNING,
                 recover=lambda: None,
             ),
             clear_opened_door_area=lambda door_id: cleared_doors.append(door_id),
@@ -513,7 +514,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
         )
         grid = mapper.floor(0)
 
-        def set_path(path):
+        def set_path(path, **kwargs):
             recorded_paths.append(path)
             path_active[0] = True
 
@@ -529,7 +530,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
                 has_path=lambda: path_active[0],
                 set_path=set_path,
                 clear_path=lambda **kwargs: path_active.__setitem__(0, False),
-                tick=lambda pose, **kwargs: RUNNING,
+                poll_status=lambda: RUNNING,
                 recover=lambda: None,
                 rotate_in_place=lambda angular: None,
                 stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
@@ -556,7 +557,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
         astar.assert_not_called()
 
     def test_active_pass_applies_dedicated_linear_cap(self):
-        observed_kwargs = []
+        observed_limits = []
         task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
         task.phase = "GO_PASS_POINT"
         task._wait_point = (0.0, -0.8)
@@ -570,7 +571,8 @@ class OpenDoorAndPassTest(unittest.TestCase):
                 goal_tolerance=0.35,
                 corner_tolerance=0.15,
                 has_path=lambda: True,
-                tick=lambda pose, **kwargs: observed_kwargs.append(kwargs) or RUNNING,
+                set_tracking_limits=lambda **kw: observed_limits.append(kw),
+                poll_status=lambda: RUNNING,
             ),
         )
 
@@ -579,8 +581,8 @@ class OpenDoorAndPassTest(unittest.TestCase):
             RUNNING,
         )
 
-        self.assertEqual(observed_kwargs[0]["max_linear"], 0.25)
-        self.assertEqual(observed_kwargs[0]["goal_tolerance"], 0.15)
+        self.assertEqual(observed_limits[0]["max_linear"], 0.25)
+        self.assertEqual(observed_limits[0]["goal_tolerance"], 0.15)
 
     def test_opening_sensor_confirmation_is_explicit_and_latched(self):
         task = OpenDoorAndPass("main_entrance")
@@ -623,9 +625,9 @@ class OpenDoorAndPassTest(unittest.TestCase):
                 max_angular=1.2,
                 recover_angular_speed=0.55,
                 has_path=lambda: False,
-                set_path=lambda path: None,
+                set_path=lambda path, **kwargs: None,
                 clear_path=lambda **kwargs: cleared_paths.append(kwargs.get("reason")),
-                tick=lambda pose, **kwargs: RUNNING,
+                poll_status=lambda: RUNNING,
                 recover=lambda: recovered.append(True),
                 rotate_in_place=lambda angular: None,
                 stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
@@ -675,7 +677,8 @@ class OpenDoorAndPassTest(unittest.TestCase):
                 goal_tolerance=0.35,
                 corner_tolerance=0.15,
                 has_path=lambda: True,
-                tick=lambda pose, **kwargs: STUCK,
+                set_tracking_limits=lambda **kwargs: None,
+                poll_status=lambda: STUCK,
                 recover=lambda: recovered.append(True),
                 clear_path=lambda **kwargs: None,
             ),
@@ -703,7 +706,8 @@ class OpenDoorAndPassTest(unittest.TestCase):
                 goal_tolerance=0.35,
                 corner_tolerance=0.15,
                 has_path=lambda: True,
-                tick=lambda pose, **kwargs: DONE,
+                set_tracking_limits=lambda **kwargs: None,
+                poll_status=lambda: DONE,
                 clear_path=lambda **kwargs: None,
             ),
             _record_failure=lambda reason: failures.append(reason),
@@ -713,6 +717,211 @@ class OpenDoorAndPassTest(unittest.TestCase):
 
         self.assertEqual(status, FAILED)
         self.assertEqual(failures, ["控制器提前结束过门路径"])
+
+    def test_pass_point_done_uses_latest_controller_pose_when_task_pose_is_stale(self):
+        failures = []
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "GO_PASS_POINT"
+        task._wait_point = (0.0, -0.8)
+        task._pass_point = (0.0, 0.8)
+        task._commit_point = (0.0, 1.8)
+        task._pass_path_started = True
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(),
+            current_floor=0,
+            controller=SimpleNamespace(
+                goal_tolerance=0.35,
+                corner_tolerance=0.15,
+                has_path=lambda: True,
+                set_tracking_limits=lambda **kwargs: None,
+                poll_status=lambda: DONE,
+                tracking_debug_snapshot=lambda: {
+                    "pose": (0.0, 0.66, math.pi / 2.0),
+                },
+                clear_path=lambda **kwargs: None,
+            ),
+            _record_failure=lambda reason: failures.append(reason),
+        )
+
+        status = task.tick(_task_context(manager), (0.0, 0.61, math.pi / 2.0))
+
+        self.assertEqual(status, DONE)
+        self.assertEqual(failures, [])
+
+    def test_pass_path_commits_crossing_tolerance_before_controller_can_finish(self):
+        recorded = []
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "GO_PASS_POINT"
+        task._wait_point = (0.0, -0.8)
+        task._pass_point = (0.0, 0.8)
+        task._commit_point = (0.0, 1.8)
+        task._pass_alignment_done = True
+
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+        )
+        manager = SimpleNamespace(
+            mapper=SimpleNamespace(floor=lambda _floor: mapper.floor(0)),
+            current_floor=0,
+            controller=SimpleNamespace(
+                goal_tolerance=0.35,
+                corner_tolerance=0.15,
+                has_path=lambda: False,
+                set_path=lambda path, **kwargs: recorded.append((path, kwargs)),
+                set_tracking_limits=lambda **kwargs: None,
+                poll_status=lambda: RUNNING,
+                clear_path=lambda **kwargs: None,
+            ),
+            _record_failure=lambda _reason: None,
+        )
+
+        status = task.tick(_task_context(manager), (0.0, -0.8, math.pi / 2.0))
+
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0][1]["goal_tolerance"], 0.15)
+
+    def test_pass_alignment_uses_controller_align_mode_not_task_layer_rotation(self):
+        """门洞细对准应交给固定频率 ALIGN 模式，任务层不再自转。
+
+        任务层以 10Hz 直接发 rotate_in_place 压不住 A1 转向惯性：最小可执行
+        转速 0.55 rad/s 会反复冲出 ±0.10 rad 对准窗口，确认数永远攒不满。
+        """
+        align_calls = []
+        recorded_paths = []
+        rotations = []
+        cleared_doors = []
+        path_active = [False]
+        align_status = [IDLE, RUNNING, DONE]
+
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "GO_PASS_POINT"
+        task._wait_point = (0.0, -0.8)
+        task._pass_point = (0.0, 0.8)
+        task._commit_point = (0.0, 1.8)
+
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+        ).floor(0)
+
+        def poll_result():
+            status = align_status.pop(0) if align_status else RUNNING
+            reason = "alignment_done" if status == DONE else None
+            return ControlResult(status=status, reason=reason, sequence=1)
+
+        def set_path(path, **kwargs):
+            recorded_paths.append(list(path))
+            path_active[0] = True
+
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(),
+            mapper=SimpleNamespace(floor=lambda floor_index: grid),
+            current_floor=0,
+            controller=SimpleNamespace(
+                goal_tolerance=0.35,
+                corner_tolerance=0.15,
+                max_angular=1.2,
+                recover_angular_speed=0.55,
+                has_path=lambda: path_active[0],
+                set_path=set_path,
+                clear_path=lambda **kwargs: path_active.__setitem__(0, False),
+                poll_status=lambda: RUNNING,
+                poll_result=poll_result,
+                begin_heading_alignment=lambda target_xy, **kwargs: align_calls.append(
+                    (tuple(target_xy), kwargs)
+                ),
+                rotate_in_place=lambda angular: rotations.append(angular),
+                stop=lambda **kwargs: None,
+            ),
+            clear_opened_door_area=lambda door_id: cleared_doors.append(door_id),
+        )
+
+        # yaw=0 时朝向严重偏离通过点：旧实现会在这里持续自转。
+        pose = (0.2, -1.1, 0.0)
+        with patch("danger_search.navigation_tasks.astar_plan") as astar:
+            first = task.tick(_task_context(manager), pose)
+            second = task.tick(_task_context(manager), pose)
+            third = task.tick(_task_context(manager), pose)
+
+        self.assertEqual([first, second, third], [RUNNING, RUNNING, RUNNING])
+        # IDLE 时进入 ALIGN 模式，并带位置漂移保护锚点。
+        self.assertEqual(len(align_calls), 1)
+        self.assertEqual(align_calls[0][0], (0.0, 0.8))
+        self.assertEqual(align_calls[0][1]["anchor_xy"], (0.2, -1.1))
+        self.assertEqual(
+            align_calls[0][1]["max_anchor_error"],
+            task._PASS_ALIGN_ANCHOR_RADIUS,
+        )
+        # 任务层不得再自转。
+        self.assertEqual(rotations, [])
+        # 控制器确认对准后才提交直线路径。
+        self.assertEqual(len(recorded_paths), 1)
+        self.assertEqual(recorded_paths[0][0], (0.2, -1.1))
+        self.assertEqual(recorded_paths[0][-1], (0.0, 0.8))
+        self.assertTrue(task._pass_path_started)
+        self.assertEqual(cleared_doors, ["main_entrance"])
+        astar.assert_not_called()
+
+    def test_pass_alignment_not_converging_fails_on_timeout_instead_of_livelock(self):
+        """细对准长期不收敛必须显式失败，不能无限返回 RUNNING。
+
+        回归实测：主入口 GO_PASS_POINT 持续摆动 395s，STUCK/IDLE 判定与阻塞
+        超时都在 `_pass_path_started` 为 False 时不可达，只能靠外部杀进程。
+        """
+        failures = []
+        cleared_paths = []
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "GO_PASS_POINT"
+        task._wait_point = (0.0, -0.8)
+        task._pass_point = (0.0, 0.8)
+        task._commit_point = (0.0, 1.8)
+
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(),
+            mapper=SimpleNamespace(floor=lambda floor_index: object()),
+            current_floor=0,
+            controller=SimpleNamespace(
+                goal_tolerance=0.35,
+                corner_tolerance=0.15,
+                max_angular=1.2,
+                recover_angular_speed=0.55,
+                has_path=lambda: False,
+                set_path=lambda path, **kwargs: None,
+                clear_path=lambda **kwargs: cleared_paths.append(kwargs.get("reason")),
+                poll_status=lambda: RUNNING,
+                # 控制器始终未确认对准（settle/align/confirm 反复循环）。
+                poll_result=lambda: ControlResult(
+                    status=RUNNING, reason=None, sequence=1
+                ),
+                begin_heading_alignment=lambda target_xy, **kwargs: None,
+                rotate_in_place=lambda angular: None,
+                stop=lambda **kwargs: None,
+            ),
+            _record_failure=lambda reason: failures.append(reason),
+        )
+
+        pose = (0.2, -1.1, 0.0)
+        # 首 tick 装填预算起点，第二 tick 超出 _PASS_ALIGN_TIMEOUT。
+        with patch(
+            "danger_search.navigation_tasks.get_time",
+            side_effect=[100.0, 100.0 + task._PASS_ALIGN_TIMEOUT + 0.1],
+        ):
+            first = task.tick(_task_context(manager), pose)
+            second = task.tick(_task_context(manager), pose)
+
+        self.assertEqual(first, RUNNING)
+        self.assertEqual(second, FAILED)
+        self.assertEqual(failures, ["门洞细对准超时未收敛"])
+        self.assertEqual(cleared_paths, ["door_crossing_failed"])
+        self.assertFalse(task._pass_path_started)
 
 
 class TakeElevatorTest(unittest.TestCase):
@@ -735,6 +944,10 @@ class TakeElevatorTest(unittest.TestCase):
                 self.paths = []
                 self.path_active = False
                 self.tick_calls = []
+                self.limits_calls = []
+                self.align_calls = []
+                self._align_started = False
+                self._align_started = False
                 self.next_tick_status = RUNNING
 
             def stop(self, *, reason="stop"):
@@ -744,10 +957,41 @@ class TakeElevatorTest(unittest.TestCase):
                 self.clear_reasons.append(reason)
                 self.path_active = False
 
+            def set_path(self, path, **kwargs):
+                self.paths.append(list(path))
+                self.path_active = True
+
+            def set_tracking_limits(self, **kwargs):
+                self.limits_calls.append(kwargs)
+                return None
+
+            def poll_status(self):
+                return getattr(self, "next_tick_status", RUNNING)
+
+            def begin_heading_alignment(self, target_xy, **kwargs):
+                self.align_calls.append((tuple(target_xy), kwargs))
+                self._align_started = True
+
+            def end_heading_alignment(self):
+                return None
+
+            def poll_result(self):
+                status = getattr(self, "next_align_status", None)
+                if status is not None:
+                    self.next_align_status = None
+                    return ControlResult(
+                        status=status,
+                        reason=getattr(self, "next_align_reason", None),
+                        sequence=1,
+                    )
+                if not getattr(self, "_align_started", False):
+                    return ControlResult(status=IDLE, reason=None, sequence=1)
+                return ControlResult(status=RUNNING, reason=None, sequence=1)
+
             def has_path(self):
                 return self.path_active
 
-            def set_path(self, path):
+            def set_path(self, path, **kwargs):
                 self.paths.append(list(path))
                 self.path_active = True
 
@@ -852,11 +1096,11 @@ class TakeElevatorTest(unittest.TestCase):
 
         self.assertEqual(task.phase, "ALIGN_TO_CURRENT_DOOR")
         self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, math.pi / 2.0)), RUNNING)
-        self.assertTrue(manager.controller.turn_commands)
+        self.assertTrue(manager.controller.align_calls)
         self.assertEqual(task.phase, "ALIGN_TO_CURRENT_DOOR")
 
-        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
-        self.assertEqual(task.phase, "ALIGN_TO_CURRENT_DOOR")
+        manager.controller.next_align_status = DONE
+        manager.controller.next_align_reason = "alignment_done"
         self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
 
@@ -1169,7 +1413,7 @@ class TakeElevatorTest(unittest.TestCase):
         manager = self._exit_manager(grid)
         manager.exit_first_max_linear = 0.25
         manager.exit_cabin_backoff_enabled = False
-        observed_caps = []
+        observed_polls = []
 
         task = TakeElevator(0, 1)
         task.phase = "EXIT_CABIN"
@@ -1179,17 +1423,18 @@ class TakeElevatorTest(unittest.TestCase):
         task._cabin_transit_target_xy = (0.85, 2.60)
         manager.controller.path_active = True
 
-        def tick_controller(pose, **kwargs):
-            observed_caps.append(kwargs.get("max_linear"))
+        def poll_controller():
+            observed_polls.append(True)
             return RUNNING
 
-        manager.controller.tick = tick_controller
+        manager.controller.poll_status = poll_controller
 
         self.assertEqual(task.tick(_task_context(manager), (2.0, 2.60, math.pi)), RUNNING)
         task._retry_count = 1
         self.assertEqual(task.tick(_task_context(manager), (2.0, 2.60, math.pi)), RUNNING)
 
-        self.assertEqual(observed_caps, [0.25, None])
+        # 首次退出限速 0.25 与重试无 cap 均由 set_path 原子提交，CROSS 只轮询状态。
+        self.assertEqual(observed_polls, [True, True])
         self.assertFalse(hasattr(manager.controller, "max_linear"))
 
     def test_unconfigured_exit_cap_keeps_legacy_controller_call(self):
@@ -1201,8 +1446,8 @@ class TakeElevatorTest(unittest.TestCase):
             origin_y=0.0,
         ).floor(1)
         manager = self._exit_manager(grid)
-        observed_poses = []
-        manager.controller.tick = lambda pose, **kwargs: observed_poses.append((pose, kwargs)) or RUNNING
+        observed_polls = []
+        manager.controller.poll_status = lambda: observed_polls.append(True) or RUNNING
         task = TakeElevator(0, 1)
         task.phase = "EXIT_CABIN"
         task._cabin_transit_mode = "exit"
@@ -1213,7 +1458,8 @@ class TakeElevatorTest(unittest.TestCase):
 
         self.assertEqual(task.tick(_task_context(manager), (2.0, 2.60, math.pi)), RUNNING)
 
-        self.assertEqual(observed_poses, [((2.0, 2.60, math.pi), {"goal_tolerance": 0.15})])
+        # 限制（goal_tolerance/max_linear）在 set_path 时原子提交，CROSS 只轮询状态。
+        self.assertEqual(observed_polls, [True])
 
     def test_disabled_exit_backoff_fails_on_first_stuck_without_recovery(self):
         grid = MultiFloorGridMap(
@@ -1384,13 +1630,49 @@ class TakeElevatorTest(unittest.TestCase):
                 self.clear_reasons = []
                 self.turn_commands = []
                 self.paths = []
+                self.limits_calls = []
+                self.align_calls = []
+                self._align_started = False
 
-            def set_path(self, path):
+            def set_path(self, path, **kwargs):
                 self.paths.append(list(path))
                 self._path = list(path)
 
             def has_path(self):
                 return bool(self._path)
+
+            def set_tracking_limits(self, **kwargs):
+                self.limits_calls.append(kwargs)
+                return None
+
+            def poll_status(self):
+                return self.poll_result().status
+
+            def poll_result(self):
+                pose = getattr(self, "_test_pose", None)
+                if pose is not None and self._path:
+                    goal = self._path[-1]
+                    d = math.hypot(goal[0] - pose[0], goal[1] - pose[1])
+                    eff = self.goal_tolerance
+                    if d <= eff:
+                        self.clear_path(reason="goal_reached")
+                        return ControlResult(status=DONE, reason="goal_reached", sequence=1)
+                status = getattr(self, "next_align_status", None)
+                if status is not None:
+                    self.next_align_status = None
+                    return ControlResult(
+                        status=status,
+                        reason=getattr(self, "next_align_reason", None),
+                        sequence=1,
+                    )
+                return ControlResult(status=RUNNING, reason=None, sequence=1)
+
+            def begin_heading_alignment(self, target_xy, **kwargs):
+                self.align_calls.append((tuple(target_xy), kwargs))
+                self._align_started = True
+
+            def end_heading_alignment(self):
+                return None
 
             def clear_path(self, *, reason="path_cleared"):
                 self.clear_reasons.append(reason)
@@ -1431,7 +1713,10 @@ class TakeElevatorTest(unittest.TestCase):
         # 朝向已对准目标，避免对准逻辑干扰，聚焦 POSITION/ALIGN 一致性
         yaw = math.atan2(target_wait[1] - robot[1], target_wait[0] - robot[0])
         pose = (robot[0], robot[1], yaw)
+        manager.controller._test_pose = pose
 
+        manager.controller.next_align_status = DONE
+        manager.controller.next_align_reason = "alignment_done"
         stages = []
         for _ in range(6):
             task._tick_cabin_transit(
@@ -1477,7 +1762,11 @@ class TakeElevatorTest(unittest.TestCase):
 
         flip_limit = TakeElevator._CABIN_TRANSIT_POSITION_ALIGN_FLIP_LIMIT
         status = RUNNING
-        # 强制 POSITION 始终立即 DONE，ALIGN 始终漂移退回，模拟语义退化
+        # 强制 POSITION 始终立即 DONE，ALIGN 始终漂移退回（控制器锁存
+        # STUCK+alignment_drift），模拟语义退化。
+        manager.controller.poll_result = lambda: ControlResult(
+            status=STUCK, reason="alignment_drift", sequence=1
+        )
         with patch.object(task, "_navigate_to_with_status", return_value=DONE):
             for _ in range(2 * (flip_limit + 1)):
                 status = task._tick_cabin_transit(
@@ -1509,12 +1798,12 @@ class TakeElevatorTest(unittest.TestCase):
         task.cabin_transit_stage = "ALIGN"
 
         self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, 0.0)), RUNNING)
-        self.assertTrue(manager.controller.turn_commands)
+        self.assertTrue(manager.controller.align_calls)
         self.assertEqual(manager.controller.paths, [])
 
-        self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, math.pi)), RUNNING)
-        self.assertEqual(manager.controller.paths, [])
-
+        # CONFIRM 由固定频率控制器完成；任务层收到 alignment_done 后提交直线跨越。
+        manager.controller.next_align_status = DONE
+        manager.controller.next_align_reason = "alignment_done"
         self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, math.pi)), RUNNING)
         self.assertEqual(task.cabin_transit_stage, "CROSS")
         self.assertEqual(
@@ -1539,10 +1828,9 @@ class TakeElevatorTest(unittest.TestCase):
 
         self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, -0.14)), RUNNING)
 
-        self.assertGreaterEqual(
-            abs(manager.controller.turn_commands[-1]),
-            manager.controller.recover_angular_speed,
-        )
+        # 执行死区补偿（0.55 最小转速）由 PathFollower ALIGN 模式负责，
+        # 任务层通过 begin_heading_alignment 进入后只轮询结果。
+        self.assertTrue(manager.controller.align_calls)
 
     def test_exit_does_not_finish_at_general_goal_tolerance_or_replan_mid_crossing(self):
         grid = MultiFloorGridMap(
@@ -1568,15 +1856,250 @@ class TakeElevatorTest(unittest.TestCase):
         self.assertEqual(task.phase, "EXIT_CABIN")
         self.assertEqual(task.cabin_transit_stage, "CROSS")
         self.assertEqual(manager.controller.paths, [])
-        self.assertEqual(
-            manager.controller.tick_calls,
-            [((1.12, 2.60, math.pi), {"goal_tolerance": 0.15})],
-        )
+        # 限制（goal_tolerance）由 set_path 原子提交；CROSS 阶段只轮询状态。
+        self.assertEqual(manager.controller.tick_calls, [])
         planner.assert_not_called()
 
         status = task.tick(_task_context(manager), (0.98, 2.60, math.pi))
         self.assertEqual(status, RUNNING)
         self.assertEqual(task.phase, "CLOSE_TARGET_FLOOR_DOOR")
+
+    def _cross_grace_task(self, grid):
+        """构造停在 CROSS 阶段、start/target 已提交的乘梯任务。"""
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+        task._cabin_transit_mode = "exit"
+        task.cabin_transit_stage = "CROSS"
+        task._cabin_transit_start_xy = (2.60, 2.60)
+        task._cabin_transit_target_xy = (0.85, 2.60)
+        return task
+
+    def _cross_grace_tick(self, task, manager, pose):
+        """直接推进 CROSS 阶段，绕开上层阶段机以隔离宽限语义。"""
+        return task._tick_cabin_transit(
+            _task_context(manager),
+            pose,
+            mode="exit",
+            position_xy=(2.60, 2.60),
+            target_xy=(0.85, 2.60),
+            door_id="elevator_door_1",
+        )
+
+    def test_cross_done_but_task_pose_lagging_waits_instead_of_failing(self):
+        """seed 8127 回归：控制器按同一容差判到、任务层位姿滞后时不得立即失败。
+
+        真实失败链是控制器以新鲜位姿判到终点（0.123m<=0.15）触发 goal_reached
+        并消费终态清掉路径，任务层却用同一 tick 起点较旧的位姿（0.412m）重算
+        判未到达，直接 STUCK。宽限必须先于 path_lost 检查生效，否则被清掉的
+        路径会立刻误判成路径丢失。
+        """
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        task = self._cross_grace_task(grid)
+        manager.controller.path_active = True
+        manager.controller.next_tick_status = DONE
+
+        # 任务层位姿仍在 0.27m 处：控制器报 DONE，但完成判定不成立。
+        self.assertEqual(
+            self._cross_grace_tick(task, manager, (1.12, 2.60, math.pi)),
+            RUNNING,
+        )
+        self.assertEqual(
+            task._cabin_transit_goal_grace,
+            task._CABIN_TRANSIT_GOAL_GRACE_TICKS,
+        )
+        self.assertIn("elevator_transit_goal_grace", manager.controller.stop_reasons)
+
+        # goal_reached 已清路径：宽限期内不得判成 path_lost。
+        manager.controller.path_active = False
+        self.assertEqual(
+            self._cross_grace_tick(task, manager, (1.12, 2.60, math.pi)),
+            RUNNING,
+        )
+        self.assertNotIn("elevator_transit_path_lost", manager.controller.stop_reasons)
+
+        # 位姿追上后正常收工，而不是像 seed 8127 那样判失败。
+        self.assertEqual(
+            self._cross_grace_tick(task, manager, (0.98, 2.60, math.pi)),
+            DONE,
+        )
+        self.assertIn("elevator_transit_completed", manager.controller.clear_reasons)
+
+    def test_cross_grace_exhaustion_still_fails_closed(self):
+        """宽限是有界的：位姿始终追不上必须显式 STUCK，不能无限等待。"""
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        task = self._cross_grace_task(grid)
+        manager.controller.path_active = True
+        manager.controller.next_tick_status = DONE
+
+        pose = (1.12, 2.60, math.pi)
+        self.assertEqual(self._cross_grace_tick(task, manager, pose), RUNNING)
+        manager.controller.path_active = False
+
+        # 装填后剩余预算逐 tick 递减，用尽当 tick 判失败。
+        for _ in range(task._CABIN_TRANSIT_GOAL_GRACE_TICKS - 1):
+            self.assertEqual(self._cross_grace_tick(task, manager, pose), RUNNING)
+
+        self.assertEqual(self._cross_grace_tick(task, manager, pose), STUCK)
+        self.assertEqual(task._cabin_transit_goal_grace, 0)
+
+    def test_enter_cabin_propagates_deterministic_failed_instead_of_running(self):
+        """seed 8127 第二次回归：确定性 FAILED 不得被吞成 RUNNING。
+
+        _navigate_to_with_status 在 unreachable/budget/timeout 达上限后返回
+        FAILED，POSITION 分支原样上抛。旧实现的 ENTER_CABIN 只判 DONE 和
+        STUCK，FAILED 会掉进末尾的 return RUNNING；而失败不重置计数器，于是
+        elevator_planning_retry_limit 的判决每 tick 触发又每 tick 被丢弃，
+        形成零速无界活锁（实测挂 45.6s，attempt 涨到 44 仍未退出）。
+        """
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        task = TakeElevator(0, 1)
+        task.phase = "ENTER_CABIN"
+        task.cabin_transit_stage = "POSITION"
+
+        # POSITION 且 _retry_count=0：STUCK 会走 recover 重试，FAILED 不得走。
+        with patch.object(task, "_tick_cabin_transit", return_value=FAILED):
+            self.assertEqual(
+                task.tick(_task_context(manager), (0.70, 2.60, 0.0)),
+                FAILED,
+            )
+        self.assertEqual(manager.controller.recover_reasons, [])
+
+    def test_exit_cabin_propagates_deterministic_failed_instead_of_running(self):
+        """与 ENTER_CABIN 对称：离厢侧同样不得把 FAILED 吞成 RUNNING。"""
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+        task.cabin_transit_stage = "POSITION"
+
+        with patch.object(task, "_tick_cabin_transit", return_value=FAILED), patch(
+            "danger_search.navigation_tasks.get_time", return_value=10.0
+        ):
+            self.assertEqual(
+                task.tick(_task_context(manager), (2.60, 2.60, math.pi)),
+                FAILED,
+            )
+        self.assertEqual(manager.controller.reverse_reasons, [])
+
+    def test_enter_cabin_unreachable_position_fails_within_retry_limit(self):
+        """端到端活性：A* 恒不可达时必须在重试上限内退出，不能无界等待。
+
+        固定几何 + 推进时钟，直接驱动 task.tick。旧实现在此输入下永远返回
+        RUNNING（复现 400 tick 未退出）。
+        """
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        task = TakeElevator(0, 1)
+        task.phase = "ENTER_CABIN"
+        task.cabin_transit_stage = "POSITION"
+
+        ticks = {"now": 0.0}
+
+        def advancing_clock():
+            # 必须推进：_PLAN_RETRY_INTERVAL 用时间闸门控制重规划，
+            # 冻结时钟会让计数器停在 1，掩盖活锁。
+            ticks["now"] += 0.1
+            return ticks["now"]
+
+        statuses = []
+        with patch(
+            "danger_search.navigation_tasks.astar_plan",
+            return_value=PlanResult(status=UNREACHABLE),
+        ), patch(
+            "danger_search.navigation_tasks.get_time",
+            side_effect=advancing_clock,
+        ):
+            for _ in range(60):
+                status = task.tick(_task_context(manager), (0.30, 2.60, 0.0))
+                statuses.append(status)
+                if status == FAILED:
+                    break
+
+        self.assertEqual(statuses[-1], FAILED)
+        self.assertEqual(task.failure_reason, "elevator_navigation_unreachable")
+        self.assertNotIn(RUNNING, statuses[len(statuses) - 1 :])
+
+    def test_enter_clears_confirmed_door_area_before_first_position_plan(self):
+        """修复 B：POSITION 首次规划前必须先清理已确认开放的门区。
+
+        旧实现只在 ALIGN->CROSS 提交时清理，POSITION 规划时起点仍困在门框
+        膨胀域内，A* 返回 obstacle_inflation_escape_unreachable，形成“门区
+        要等 POSITION 完成才清、POSITION 又被没清的门区挡住”的死锁。
+        """
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        events = []
+        manager.clear_opened_door_area = lambda door_id: events.append(
+            ("clear_door", door_id)
+        )
+
+        task = TakeElevator(0, 1)
+        task.phase = "ENTER_CABIN"
+        task.cabin_transit_stage = "POSITION"
+
+        def recording_plan(*_args, **_kwargs):
+            events.append(("plan_path", None))
+            return PlanResult(status=UNREACHABLE)
+
+        with patch(
+            "danger_search.navigation_tasks.astar_plan",
+            side_effect=recording_plan,
+        ), patch("danger_search.navigation_tasks.get_time", return_value=10.0):
+            task.tick(_task_context(manager), (0.30, 2.60, 0.0))
+
+        self.assertEqual(events[0], ("clear_door", "lift_door_ground"))
+        self.assertIn(("plan_path", None), events)
+        self.assertLess(
+            events.index(("clear_door", "lift_door_ground")),
+            events.index(("plan_path", None)),
+        )
+        # 每次 transit 只清一次，不得每 tick 重复改写地图。
+        self.assertEqual(
+            [event for event in events if event[0] == "clear_door"],
+            [("clear_door", "lift_door_ground")],
+        )
 
     def test_enter_uses_same_position_align_and_cross_sequence(self):
         grid = MultiFloorGridMap(
@@ -1594,8 +2117,12 @@ class TakeElevatorTest(unittest.TestCase):
         task.cabin_transit_stage = "ALIGN"
 
         self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
-        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.cabin_transit_stage, "ALIGN")
+        self.assertTrue(manager.controller.align_calls)
 
+        manager.controller.next_align_status = DONE
+        manager.controller.next_align_reason = "alignment_done"
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.cabin_transit_stage, "CROSS")
         self.assertEqual(
             manager.controller.paths,
@@ -1628,6 +2155,9 @@ class TakeElevatorTest(unittest.TestCase):
         task.cabin_transit_stage = "ALIGN"
         task._cabin_transit_alignment_count = 1
 
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
+        manager.controller.next_align_status = DONE
+        manager.controller.next_align_reason = "alignment_done"
         self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
 
         self.assertEqual(cleared, ["lift_door_ground"])
@@ -1680,7 +2210,11 @@ class TakeElevatorTest(unittest.TestCase):
 
         self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.12)), RUNNING)
-
+        self.assertTrue(manager.controller.align_calls)
+        # 余转释放由固定频率控制器 CONFIRM 判据负责，任务层只轮询结果。
+        manager.controller.next_align_status = DONE
+        manager.controller.next_align_reason = "alignment_done"
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.12)), RUNNING)
         self.assertEqual(task.cabin_transit_stage, "CROSS")
         self.assertEqual(
             manager.controller.paths,
@@ -1735,10 +2269,12 @@ class TakeElevatorTest(unittest.TestCase):
 
         self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.phase, "ALIGN_TO_TARGET_DOOR")
-        self.assertTrue(manager.controller.turn_commands)
+        self.assertTrue(manager.controller.align_calls)
 
         self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, math.pi)), RUNNING)
         self.assertEqual(task.phase, "ALIGN_TO_TARGET_DOOR")
+        manager.controller.next_align_status = DONE
+        manager.controller.next_align_reason = "alignment_done"
         self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, math.pi)), RUNNING)
         self.assertEqual(task.phase, "CALL_ELEVATOR_TO_TARGET_FLOOR")
         self.assertEqual(manager.controller.paths, [])
@@ -1998,6 +2534,146 @@ class TakeElevatorTest(unittest.TestCase):
         self.assertEqual(task.phase, "OPEN_CURRENT_FLOOR_DOOR")
         self.assertEqual(open_calls, [])
         self.assertEqual(stop_calls, [True])
+
+
+class TakeElevatorPhaseExhaustivenessTest(unittest.TestCase):
+    """未注册的乘梯阶段必须显式失败，不得沿用兜底 return DONE。
+
+    `TakeElevator.tick` 由 20 个平铺 `if self.phase == ...` 分支加末尾一条
+    `return DONE` 组成。兜底对 `phase == "DONE"` 是正确的，但任何未注册
+    phase（改名、拼写错误、新增阶段忘记登记）也会落到同一条兜底上，
+    使任务层收到 DONE 并认为换层已完成 —— 一次谎报的乘梯成功。
+
+    这与 NAV-006 同类但更严重：NAV-006 把 FAILED 吞成 RUNNING（活锁，
+    至少不会推进任务），此处把未知吞成 DONE（假成功，任务据此推进到
+    下一层）。修复前实测：未注册 phase 与空字符串 phase 均返回 done、
+    failure_reason 为 None、无任何 stop 命令。
+    """
+
+    @staticmethod
+    def _source():
+        stop_reasons = []
+        clear_reasons = []
+        controller = SimpleNamespace(
+            goal_tolerance=0.1,
+            has_path=lambda: False,
+            poll_status=lambda: RUNNING,
+            stop=lambda **kwargs: stop_reasons.append(kwargs.get("reason")),
+            clear_path=lambda **kwargs: clear_reasons.append(kwargs.get("reason")),
+            set_path=lambda path, **kwargs: None,
+        )
+        source = SimpleNamespace(
+            controller=controller,
+            current_floor=0,
+            building_client=SimpleNamespace(
+                get_elevator_points=lambda elevator_id, floor: (
+                    (0.85, 2.60),
+                    (2.60, 2.60),
+                ),
+                elevator_door_id=lambda floor: f"lift_door_{int(floor)}",
+            ),
+        )
+        return source, stop_reasons, clear_reasons
+
+    def test_unregistered_phase_fails_instead_of_claiming_done(self):
+        for phase in ("TYPO_PHASE_NOT_REGISTERED", ""):
+            with self.subTest(phase=phase):
+                source, stop_reasons, clear_reasons = self._source()
+                task = TakeElevator(0, 1)
+                task.phase = phase
+
+                status = task.tick(_task_context(source), (0.85, 2.60, 0.0))
+
+                self.assertEqual(
+                    status,
+                    FAILED,
+                    f"未注册 phase {phase!r} 仍被兜底判为成功",
+                )
+                self.assertEqual(task.failure_reason, "elevator_unknown_phase")
+                self.assertIn("elevator_unknown_phase", stop_reasons)
+                self.assertIn("elevator_unknown_phase", clear_reasons)
+
+    def test_done_phase_still_returns_done(self):
+        # 兜底原本的正当用途必须保留：phase 已是 DONE 时返回 DONE 且不失败。
+        source, stop_reasons, clear_reasons = self._source()
+        task = TakeElevator(0, 1)
+        task.phase = "DONE"
+
+        status = task.tick(_task_context(source), (0.85, 2.60, 0.0))
+
+        self.assertEqual(status, DONE)
+        self.assertIsNone(task.failure_reason)
+        self.assertEqual(stop_reasons, [])
+        self.assertEqual(clear_reasons, [])
+
+    def test_every_assigned_phase_is_handled_by_tick(self):
+        """类内所有 `self.phase = X` 的 X 都必须被 tick 显式处理。
+
+        用 AST 比对赋值集与处理集，防止新增阶段时忘记登记分支 —— 那正是
+        兜底 fail-open 的触发条件。
+        """
+        import ast
+        from pathlib import Path
+
+        source_path = (
+            Path(__file__).resolve().parents[1]
+            / "danger_search"
+            / "navigation_tasks.py"
+        )
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        take_elevator = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "TakeElevator"
+        )
+
+        assigned = set()
+        for node in ast.walk(take_elevator):
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "phase"
+                    and isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, str)
+                ):
+                    assigned.add(node.value.value)
+
+        tick = next(
+            node
+            for node in take_elevator.body
+            if isinstance(node, ast.FunctionDef) and node.name == "tick"
+        )
+        compared = set()
+        prefixes = set()
+        for node in ast.walk(tick):
+            if isinstance(node, ast.Compare):
+                for comparator in node.comparators:
+                    if isinstance(comparator, ast.Constant) and isinstance(
+                        comparator.value, str
+                    ):
+                        compared.add(comparator.value)
+            # phase.startswith("EXIT_BACKOFF_") 形式的前缀派发
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "startswith"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+            ):
+                prefixes.add(node.args[0].value)
+
+        unhandled = {
+            phase
+            for phase in assigned - compared - {"DONE"}
+            if not any(phase.startswith(prefix) for prefix in prefixes)
+        }
+        self.assertEqual(
+            unhandled,
+            set(),
+            f"以下 phase 被赋值但 tick 未显式处理，会落进兜底：{sorted(unhandled)}",
+        )
 
 
 if __name__ == "__main__":
