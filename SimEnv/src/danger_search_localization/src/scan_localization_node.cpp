@@ -236,6 +236,7 @@ class ScanLocalizationNode {
     std::string scene_info_path;
     bool require_scene_info = true;
     bool allow_relative_origin = false;
+    bool adaptive_rgbd_localization_enabled = false;
     double min_range = 0.5;
     double max_range = 15.0;
     double voxel_size = 0.15;
@@ -287,6 +288,9 @@ class ScanLocalizationNode {
     private_nh_.param("team_scene_info_path", scene_info_path, std::string());
     private_nh_.param("require_team_scene_info", require_scene_info, require_scene_info);
     private_nh_.param("allow_relative_origin", allow_relative_origin, allow_relative_origin);
+    private_nh_.param("adaptive_rgbd_localization_enabled",
+                      adaptive_rgbd_localization_enabled,
+                      adaptive_rgbd_localization_enabled);
     private_nh_.param("min_range", min_range, min_range);
     private_nh_.param("max_range", max_range, max_range);
     private_nh_.param("voxel_size", voxel_size, voxel_size);
@@ -385,7 +389,7 @@ class ScanLocalizationNode {
     imu_frame_ = imu_frame;
     depth_cloud_frame_ = depth_cloud_frame;
     if (!std::isfinite(min_range) || !std::isfinite(max_range) || min_range < 0.0 ||
-        max_range < min_range) {
+        max_range <= min_range) {
       throw std::runtime_error("定位点云量程参数无效");
     }
     if (!std::isfinite(voxel_size) || voxel_size <= 0.0 ||
@@ -453,17 +457,19 @@ class ScanLocalizationNode {
     use_adaptive_shared_map_ =
         localization_backend == "adaptive_shared_map";
     use_rgbd_livox_ = localization_backend == "rgbd_livox";
+    adaptive_rgbd_localization_enabled_ =
+        use_adaptive_shared_map_ && adaptive_rgbd_localization_enabled;
     const bool requires_imu =
         use_imu_constrained_ || use_livox_imu_local_map_ ||
         use_adaptive_shared_map_ || use_rgbd_livox_ || stance_health_enabled;
-    if ((use_rgbd_livox_ || use_adaptive_shared_map_) &&
+    if ((use_rgbd_livox_ || adaptive_rgbd_localization_enabled_) &&
         depth_cloud_topic != "/real_sense/depth/points") {
       throw std::runtime_error(
           "RGB-D/Livox 定位仅允许使用 /real_sense/depth/points");
     }
     const StartPose start = ReadPublicStartPose(
         scene_info_path, require_scene_info, allow_relative_origin,
-        requires_imu, use_rgbd_livox_ || use_adaptive_shared_map_,
+        requires_imu, use_rgbd_livox_ || adaptive_rgbd_localization_enabled_,
         use_livox_imu_local_map_ || use_adaptive_shared_map_ || use_rgbd_livox_);
     if ((use_imu_constrained_ || use_livox_imu_local_map_ ||
          use_adaptive_shared_map_ || use_rgbd_livox_) &&
@@ -473,7 +479,7 @@ class ScanLocalizationNode {
     start_pose_ = start;
     base_to_livox_ = SE3d(RotationFromRpy(base_to_livox_rpy),
                            VectorFromParam(base_to_livox_xyz, "base_to_livox_xyz"));
-    if (use_rgbd_livox_ || use_adaptive_shared_map_) {
+    if (use_rgbd_livox_ || adaptive_rgbd_localization_enabled_) {
       if (!private_nh_.getParam("base_to_depth_xyz", base_to_depth_xyz) ||
           !private_nh_.getParam("base_to_depth_rpy", base_to_depth_rpy)) {
         throw std::runtime_error("缺少已公开的 base_to_depth 固定外参");
@@ -595,13 +601,15 @@ class ScanLocalizationNode {
       command_subscriber_ = nh_.subscribe(
           "/cmd_vel", 50, &ScanLocalizationNode::OnCommand, this);
     }
-    if (use_rgbd_livox_ || use_adaptive_shared_map_) {
+    if (use_rgbd_livox_ || adaptive_rgbd_localization_enabled_) {
       depth_subscriber_ = nh_.subscribe(
           depth_cloud_topic, 1, &ScanLocalizationNode::OnDepthCloud, this);
     }
     ROS_INFO(
-        "scan_localization 已启动：输入 /scan，后端=%s，deskew 关闭，坐标系=%s",
-        localization_backend.c_str(), frame_id_.c_str());
+        "scan_localization 已启动：输入 /scan，后端=%s，量程=%.1f m，"
+        "RGB-D 定位候选=%d，deskew 关闭，坐标系=%s",
+        localization_backend.c_str(), max_range_,
+        adaptive_rgbd_localization_enabled_ ? 1 : 0, frame_id_.c_str());
   }
 
  private:
@@ -2122,6 +2130,7 @@ class ScanLocalizationNode {
   bool use_imu_constrained_ = false;
   bool use_livox_imu_local_map_ = false;
   bool use_adaptive_shared_map_ = false;
+  bool adaptive_rgbd_localization_enabled_ = false;
   bool use_rgbd_livox_ = false;
   bool imu_anchor_initialized_ = false;
   bool fusion_initialized_ = false;

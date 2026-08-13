@@ -11,6 +11,8 @@
   <arg name="imu_frame" default="imu_link"/>
   <arg name="depth_cloud_frame" default="real_sense_optical_frame"/>
   <arg name="localization_backend" default="kiss_icp"/>
+  <arg name="max_range" default="15.0"/>
+  <arg name="adaptive_rgbd_localization_enabled" default="false"/>
   <arg name="team_scene_info_path" default="$(find danger_search)/../../generated_building/team_scene_info.json"/>
   <arg name="require_team_scene_info" default="true"/>
   <arg name="allow_relative_origin" default="false"/>
@@ -58,6 +60,8 @@
     <param name="imu_frame" value="$(arg imu_frame)"/>
     <param name="depth_cloud_frame" value="$(arg depth_cloud_frame)"/>
     <param name="localization_backend" value="$(arg localization_backend)"/>
+    <param name="adaptive_rgbd_localization_enabled"
+           value="$(arg adaptive_rgbd_localization_enabled)"/>
     <param name="team_scene_info_path" value="$(arg team_scene_info_path)"/>
     <param name="require_team_scene_info" value="$(arg require_team_scene_info)"/>
     <param name="allow_relative_origin" value="$(arg allow_relative_origin)"/>
@@ -115,7 +119,7 @@
            value="$(arg health_required_unknown_frames)"/>
     <param name="health_latch_unhealthy" value="$(arg health_latch_unhealthy)"/>
     <param name="min_range" value="0.5"/>
-    <param name="max_range" value="15.0"/>
+    <param name="max_range" value="$(arg max_range)"/>
     <param name="voxel_size" value="0.15"/>
     <!-- 控制先验只用于点云退化方向的 GICP 初值，可由后续实测替换。 -->
     <param name="command_velocity_scale" value="1.0"/>

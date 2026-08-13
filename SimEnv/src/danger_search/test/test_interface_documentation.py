@@ -65,12 +65,23 @@ class InterfaceDocumentationTest(unittest.TestCase):
         self.assertEqual(
             launch_arguments.get("localization_backend"), "adaptive_shared_map"
         )
+        self.assertEqual(launch_arguments.get("localization_max_range"), "15.0")
+        self.assertEqual(
+            launch_arguments.get("adaptive_rgbd_localization_enabled"), "false"
+        )
         self.assertEqual(
             launch_arguments.get("controller_ready_ack"),
             "false",
         )
         self.assertEqual(
             arguments.get("localization_backend"), "$(arg localization_backend)"
+        )
+        self.assertEqual(
+            arguments.get("max_range"), "$(arg localization_max_range)"
+        )
+        self.assertEqual(
+            arguments.get("adaptive_rgbd_localization_enabled"),
+            "$(arg adaptive_rgbd_localization_enabled)",
         )
         formal_node = next(
             node for node in root.findall("node") if node.get("name") == "danger_search"
@@ -119,6 +130,10 @@ class InterfaceDocumentationTest(unittest.TestCase):
         string_parameters = {item.get("name") for item in node.findall("param")}
         arguments = {item.get("name"): item.get("default") for item in root.findall("arg")}
         self.assertEqual(arguments.get("localization_backend"), "kiss_icp")
+        self.assertEqual(arguments.get("max_range"), "15.0")
+        self.assertEqual(
+            arguments.get("adaptive_rgbd_localization_enabled"), "false"
+        )
         self.assertEqual(arguments.get("shared_map_depth_max_age"), "0.35")
         self.assertEqual(arguments.get("raw_cloud_frame"), "laser_livox")
         self.assertEqual(arguments.get("imu_frame"), "imu_link")
@@ -147,6 +162,11 @@ class InterfaceDocumentationTest(unittest.TestCase):
         }
         for name in ("raw_cloud_frame", "imu_frame", "depth_cloud_frame"):
             self.assertEqual(configured_values.get(name), f"$(arg {name})")
+        self.assertEqual(configured_values.get("max_range"), "$(arg max_range)")
+        self.assertEqual(
+            configured_values.get("adaptive_rgbd_localization_enabled"),
+            "$(arg adaptive_rgbd_localization_enabled)",
+        )
 
     def test_truth_restriction_is_listed_in_all_interface_documents(self):
         for path in (ALGORITHM_INTERFACES_PATH, REFERENCE_PATH):

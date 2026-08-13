@@ -1,0 +1,132 @@
+Panels:
+  - Class: rviz/Displays
+    Name: 显示
+  - Class: rviz/Views
+    Name: 视图
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.35
+      Cell Size: 1
+      Class: rviz/Grid
+      Color: 120; 120; 120
+      Enabled: true
+      Name: 参考网格
+      Plane: XY
+      Plane Cell Count: 40
+      Reference Frame: world
+    - Alpha: 0.82
+      Class: rviz/Map
+      Color Scheme: map
+      Draw Behind: true
+      Enabled: true
+      Name: DOG 栅格地图
+      Topic: /nav/map_debug
+      Unreliable: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/PointCloud2
+      Color: 120; 210; 255
+      Color Transformer: FlatColor
+      Decay Time: 0.35
+      Enabled: true
+      Name: 定位注册点云
+      Position Transformer: XYZ
+      Queue Size: 10
+      Selectable: false
+      Size (Pixels): 2
+      Style: Points
+      Topic: /danger_search/localization/cloud_registered
+      Unreliable: false
+    - Angle Tolerance: 0.05
+      Class: rviz/Odometry
+      Enabled: true
+      Keep: 500
+      Name: DOG 定位轨迹
+      Position Tolerance: 0.05
+      Shape:
+        Alpha: 1
+        Axes Length: 0.35
+        Axes Radius: 0.03
+        Color: 255; 230; 0
+        Head Length: 0.18
+        Head Radius: 0.07
+        Shaft Length: 0.25
+        Shaft Radius: 0.03
+        Value: Arrow
+      Topic: /danger_search/localization/odom
+      Unreliable: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 230; 50; 50
+      Enabled: true
+      Line Style: Lines
+      Line Width: 0.04
+      Name: A星原始路径
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0.04
+      Pose Style: None
+      Topic: /danger_search/path_raw
+      Unreliable: false
+    - Alpha: 1
+      Buffer Length: 1
+      Class: rviz/Path
+      Color: 40; 220; 90
+      Enabled: true
+      Line Style: Lines
+      Line Width: 0.07
+      Name: 实际跟随路径
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0.08
+      Pose Style: None
+      Topic: /danger_search/path_followed
+      Unreliable: false
+    - Alpha: 1
+      Axes Length: 0.5
+      Axes Radius: 0.05
+      Class: rviz/Pose
+      Color: 255; 170; 0
+      Enabled: true
+      Head Length: 0.25
+      Head Radius: 0.09
+      Name: 局部跟踪目标
+      Shaft Length: 0.35
+      Shaft Radius: 0.05
+      Shape: Arrow
+      Topic: /danger_search/local_target
+      Unreliable: false
+  Enabled: true
+  Global Options:
+    Background Color: 28; 31; 35
+    Default Light: true
+    Fixed Frame: world
+    Frame Rate: 20
+  Name: DOG 二层基线观察
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+  Value: true
+Views:
+  Current:
+    Angle: 0
+    Class: rviz/TopDownOrtho
+    Name: 二维俯视
+    Near Clip Distance: 0.01
+    Scale: 35
+    Target Frame: world
+    X: 0
+    Y: 5
+  Saved: ~
+Window Geometry:
+  Height: 850
+  Width: 1200
+  X: 40
+  Y: 60

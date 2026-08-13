@@ -24,6 +24,8 @@ ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH="${ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH:-0}"
 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS="${ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS:-0}"
 ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS="${ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS:-0}"
 ELEVATOR_TEST_LOCALIZATION_BACKEND="${ELEVATOR_TEST_LOCALIZATION_BACKEND:-adaptive_shared_map}"
+ELEVATOR_TEST_LOCALIZATION_MAX_RANGE="${ELEVATOR_TEST_LOCALIZATION_MAX_RANGE:-15.0}"
+ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED="${ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED:-false}"
 LOG_DIR="${ELEVATOR_TEST_LOG_DIR:-/tmp/danger_search_elevator_test_$(date +%Y%m%d_%H%M%S)}"
 
 AUTO_PID=""
@@ -64,6 +66,8 @@ usage() {
   ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=1  启用逐帧定位日志并在诊断 bag 录制 /scan
   ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS=1  启用只读电梯地标漂移诊断
   ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map  选择定位后端，默认 adaptive_shared_map
+  ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0  定位点云最大量程，必须大于 0.5 m
+  ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false  是否让 RGB-D 参与共享地图定位
   ELEVATOR_TEST_KEEP_RUNNING=1         成功后保留 GUI，按 Ctrl-C 清理
   ELEVATOR_TEST_LOG_DIR=/tmp/...       证据目录
 
@@ -145,6 +149,8 @@ write_summary() {
     printf 'localization_diagnostics=%s\n' "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS"
     printf 'landmark_drift_diagnostics=%s\n' "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS"
     printf 'localization_backend=%s\n' "$ELEVATOR_TEST_LOCALIZATION_BACKEND"
+    printf 'localization_max_range=%s\n' "$ELEVATOR_TEST_LOCALIZATION_MAX_RANGE"
+    printf 'adaptive_rgbd_localization_enabled=%s\n' "$ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED"
     printf 'diagnostic_bag=%s/elevator_diagnostic.bag\n' "$LOG_DIR"
     printf 'rgbd_bag=%s/elevator_rgbd.bag\n' "$LOG_DIR"
     printf 'drift_summary=%s/localization_drift.json\n' "$LOG_DIR"
@@ -311,6 +317,17 @@ case "$ELEVATOR_TEST_LOCALIZATION_BACKEND" in
     exit 2
     ;;
 esac
+if ! is_positive_number "$ELEVATOR_TEST_LOCALIZATION_MAX_RANGE" || \
+   ! awk -v value="$ELEVATOR_TEST_LOCALIZATION_MAX_RANGE" \
+       'BEGIN { exit !(value > 0.5) }'; then
+  printf 'ELEVATOR_TEST_LOCALIZATION_MAX_RANGE 必须大于 min_range=0.5\n' >&2
+  exit 2
+fi
+if [[ "$ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED" != "true" && \
+      "$ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED" != "false" ]]; then
+  printf 'ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED 只能是 true 或 false\n' >&2
+  exit 2
+fi
 for flag in "$ELEVATOR_TEST_RECORD_DRIFT" "$ELEVATOR_TEST_RECORD_RGBD" "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS"; do
   if [[ "$flag" != "0" && "$flag" != "1" ]]; then
     printf '诊断开关只能是 0 或 1：%s\n' "$flag" >&2
@@ -457,6 +474,8 @@ setsid roslaunch danger_search danger_search.launch \
   controller_ready_ack:=true \
   config:="$TEST_CONFIG" \
   localization_backend:="$ELEVATOR_TEST_LOCALIZATION_BACKEND" \
+  localization_max_range:="$ELEVATOR_TEST_LOCALIZATION_MAX_RANGE" \
+  adaptive_rgbd_localization_enabled:="$ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED" \
   localization_diagnostic_frame_details:="$([[ "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" == "1" ]] && printf true || printf false)" \
   > "$MISSION_LOG" 2>&1 &
 MISSION_PID=$!
@@ -488,13 +507,29 @@ if [[ "$ELEVATOR_TEST_RECORD_DRIFT" == "1" ]]; then
 fi
 
 sleep 2
+rosnode info /danger_search > "$LOG_DIR/danger_search_node_info.txt" 2>&1 || true
+rosnode info /scan_localization > "$LOG_DIR/scan_localization_node_info.txt" 2>&1 || true
 {
-  rosnode info /danger_search 2>&1 || true
-  rosnode info /scan_localization 2>&1 || true
+  cat "$LOG_DIR/danger_search_node_info.txt"
+  cat "$LOG_DIR/scan_localization_node_info.txt"
 } > "$LOG_DIR/production_node_info.txt"
 if grep -Eq '/ground_truth/|/Odometry_gazebo' "$LOG_DIR/production_node_info.txt"; then
   fail "生产节点订阅审计发现禁用真值输入" 2
   exit $?
+fi
+if [[ "$ELEVATOR_TEST_LOCALIZATION_BACKEND" == "adaptive_shared_map" ]]; then
+  if [[ "$ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED" == "false" ]] && \
+     grep -Fq '/real_sense/depth/points' \
+       "$LOG_DIR/scan_localization_node_info.txt"; then
+    fail "RGB-D 定位关闭后仍订阅深度点云" 2
+    exit $?
+  fi
+  if [[ "$ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED" == "true" ]] && \
+     ! grep -Fq '/real_sense/depth/points' \
+       "$LOG_DIR/scan_localization_node_info.txt"; then
+    fail "RGB-D 定位开启后未订阅深度点云" 2
+    exit $?
+  fi
 fi
 
 started=$SECONDS

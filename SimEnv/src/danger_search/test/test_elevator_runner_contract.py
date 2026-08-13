@@ -29,6 +29,10 @@ class ElevatorRunnerContractTest(unittest.TestCase):
         self.assertIn(
             "ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map", result.stdout
         )
+        self.assertIn("ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0", result.stdout)
+        self.assertIn(
+            "ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false", result.stdout
+        )
         self.assertIn("到达显式楼层数的最高层", result.stdout)
         self.assertNotIn("完成 0→1 电梯任务", result.stdout)
 
@@ -141,6 +145,66 @@ class ElevatorRunnerContractTest(unittest.TestCase):
             "printf 'localization_backend=%s\\n' \"$ELEVATOR_TEST_LOCALIZATION_BACKEND\"",
             source,
         )
+
+    def test_runner_passes_localization_ab_parameters_to_formal_launch(self):
+        source = RUNNER.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'ELEVATOR_TEST_LOCALIZATION_MAX_RANGE="${ELEVATOR_TEST_LOCALIZATION_MAX_RANGE:-15.0}"',
+            source,
+        )
+        self.assertIn(
+            'ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED="${ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED:-false}"',
+            source,
+        )
+        self.assertIn(
+            'localization_max_range:="$ELEVATOR_TEST_LOCALIZATION_MAX_RANGE"',
+            source,
+        )
+        self.assertIn(
+            'adaptive_rgbd_localization_enabled:="$ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED"',
+            source,
+        )
+        self.assertIn(
+            "printf 'localization_max_range=%s\\n' \"$ELEVATOR_TEST_LOCALIZATION_MAX_RANGE\"",
+            source,
+        )
+        self.assertIn(
+            "printf 'adaptive_rgbd_localization_enabled=%s\\n' \"$ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED\"",
+            source,
+        )
+        self.assertIn("scan_localization_node_info.txt", source)
+        self.assertIn("RGB-D 定位关闭后仍订阅深度点云", source)
+
+    def test_invalid_localization_max_range_fails_before_starting_ros(self):
+        environment = dict(os.environ)
+        environment["ELEVATOR_TEST_LOCALIZATION_MAX_RANGE"] = "0.5"
+        result = subprocess.run(
+            ["bash", str(RUNNER)],
+            cwd=SIMENV_ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("必须大于 min_range=0.5", result.stderr)
+
+    def test_invalid_adaptive_rgbd_switch_fails_before_starting_ros(self):
+        environment = dict(os.environ)
+        environment["ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED"] = "1"
+        result = subprocess.run(
+            ["bash", str(RUNNER)],
+            cwd=SIMENV_ROOT,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("只能是 true 或 false", result.stderr)
 
 
 if __name__ == "__main__":

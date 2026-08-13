@@ -12,13 +12,19 @@
   <arg name="localization_diagnostic_frame_details" default="false"/>
   <!-- 仅允许定位节点自身白名单中的后端；正式默认使用共享地图自适应后端。 -->
   <arg name="localization_backend" default="adaptive_shared_map"/>
+  <!-- 正式定位采用 G3：Livox 单源平移候选、15m 量程；RGB-D 仍供任务视觉感知。 -->
+  <arg name="localization_max_range" default="15.0"/>
+  <arg name="adaptive_rgbd_localization_enabled" default="false"/>
 
   <!-- 参数加载到全局命名空间；MissionManager 只读取并分组，不允许子组件私取配置。 -->
   <rosparam command="load" file="$(arg config)"/>
 
   <include file="$(find danger_search_localization)/launch/scan_localization.launch">
-    <!-- 正式后端只使用公开 /scan、深度点云、/trunk_imu 和自身控制先验。 -->
+    <!-- 正式后端使用公开 /scan、/trunk_imu 和自身控制先验。 -->
     <arg name="localization_backend" value="$(arg localization_backend)"/>
+    <arg name="max_range" value="$(arg localization_max_range)"/>
+    <arg name="adaptive_rgbd_localization_enabled"
+         value="$(arg adaptive_rgbd_localization_enabled)"/>
     <arg name="stance_health_enabled" value="true"/>
     <arg name="team_scene_info_path"
          value="$(find danger_search)/../../generated_building/team_scene_info.json"/>

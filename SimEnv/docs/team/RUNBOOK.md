@@ -1,5 +1,81 @@
 # 开发与验证手册
 
+## 定位源与量程单次对照矩阵
+
+定位漂移对照固定使用 `adaptive_shared_map`，只改变 RGB-D 是否生成定位候选和 Livox
+定位点云最大量程。正式默认已采用 G3：`max_range=15m` 且关闭 RGB-D 定位候选；RGB-D
+仍用于危险源、门和电梯感知。四组各运行一次，固定按 G1、G2、G3、G4 顺序执行；算法
+失败不补跑。只有定位 ready、
+MissionManager 已创建并开始任务预算才计为该组一次有效运行；此前的环境启动失败不计入
+参数试验，并停止矩阵先排查环境。
+
+四组公共参数为：`seed=8127`、两层、`floor_timeout=280s`、最短探索 `60s`、总预算
+`620s`、完整往返、Gazebo GUI 开启、逐帧定位诊断关闭。每组使用新的空证据目录，运行前
+确认 ROS 端口 `11311` 空闲且没有残留 Gazebo、定位、任务、控制器或 rosbag 进程。
+
+```bash
+# G1：生产重复基线，RGB-D 参与定位，max_range=15m
+SEED=8127 GUI=true ELEVATOR_TEST_FLOOR_COUNT=2 \
+ELEVATOR_TEST_FLOOR_TIMEOUT=280 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
+ELEVATOR_TEST_MAX_RUNTIME=620 ELEVATOR_TEST_WALL_TIMEOUT=10800 \
+ELEVATOR_TEST_FULL_CYCLE=1 ELEVATOR_TEST_RECORD_DRIFT=1 \
+ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0 \
+ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map \
+ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0 \
+ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=true \
+ELEVATOR_TEST_LOG_DIR=/home/xbh/tzb26/evidence/simenv/seed8127_loc_ab_g1_77e85d5_r15 \
+tools/sim/run_elevator_gui_test.sh
+
+# G2：仅把 max_range 改为 5m
+SEED=8127 GUI=true ELEVATOR_TEST_FLOOR_COUNT=2 \
+ELEVATOR_TEST_FLOOR_TIMEOUT=280 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
+ELEVATOR_TEST_MAX_RUNTIME=620 ELEVATOR_TEST_WALL_TIMEOUT=10800 \
+ELEVATOR_TEST_FULL_CYCLE=1 ELEVATOR_TEST_RECORD_DRIFT=1 \
+ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0 \
+ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map \
+ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=5.0 \
+ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=true \
+ELEVATOR_TEST_LOG_DIR=/home/xbh/tzb26/evidence/simenv/seed8127_loc_ab_g2_77e85d5_r5 \
+tools/sim/run_elevator_gui_test.sh
+
+# G3：仅关闭 RGB-D 定位候选，max_range 保持 15m
+SEED=8127 GUI=true ELEVATOR_TEST_FLOOR_COUNT=2 \
+ELEVATOR_TEST_FLOOR_TIMEOUT=280 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
+ELEVATOR_TEST_MAX_RUNTIME=620 ELEVATOR_TEST_WALL_TIMEOUT=10800 \
+ELEVATOR_TEST_FULL_CYCLE=1 ELEVATOR_TEST_RECORD_DRIFT=1 \
+ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0 \
+ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map \
+ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0 \
+ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false \
+ELEVATOR_TEST_LOG_DIR=/home/xbh/tzb26/evidence/simenv/seed8127_loc_ab_g3_77e85d5_livox_r15 \
+tools/sim/run_elevator_gui_test.sh
+
+# G4：关闭 RGB-D 定位候选，并把 max_range 改为 5m
+SEED=8127 GUI=true ELEVATOR_TEST_FLOOR_COUNT=2 \
+ELEVATOR_TEST_FLOOR_TIMEOUT=280 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
+ELEVATOR_TEST_MAX_RUNTIME=620 ELEVATOR_TEST_WALL_TIMEOUT=10800 \
+ELEVATOR_TEST_FULL_CYCLE=1 ELEVATOR_TEST_RECORD_DRIFT=1 \
+ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0 \
+ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map \
+ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=5.0 \
+ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false \
+ELEVATOR_TEST_LOG_DIR=/home/xbh/tzb26/evidence/simenv/seed8127_loc_ab_g4_77e85d5_livox_r5 \
+tools/sim/run_elevator_gui_test.sh
+```
+
+退出后比较 RMSE、P95、最大/末端误差、真值行程、完整闭环结果，以及历史
+`elapsed=120～163s` 窗口的误差增长。候选最低门槛为 RMSE `<=0.20m`、P95
+`<=0.30m`、最大和末端误差 `<=0.35m`，且不能通过少走路、定位冻结或超过 `3s` 的
+odom 陈旧规避问题路段。G3 单次结果尚未达到定位门槛；用户已明确决定将其设为正式
+默认，后续仍需用独立复测确认泛化效果。
+
+本矩阵暂不测试 `max_range=8m`、`minimum_residual_cutoff=0.06`、
+`maximum_map_distance=8m`、`maximum_iterations=8`、
+`shared_map_max_source_divergence=0.02`、`maximum_correspondence_distance=0.35`、体素大小
+或独立 `livox_imu_local_map` 后端。若 `5m` 胜出，优先补测 `8m`；其他参数继续按单变量
+顺序评估。不得把 `scan_to_map_maximum_correction` 降到 `0.005m`，不得用命令速度尺度
+补偿少走距离，也不得恢复共同模式门、冻结子图或定位 state/epoch。
+
 ## 构建
 
 ```bash
@@ -53,7 +129,8 @@ roslaunch danger_search_localization scan_localization.launch \
 危险源、门和电梯感知。Stage15 固定 seed 闭环未通过，禁止在正式运行中选择该候选，
 也禁止根据任务阶段或实时输入在它与正式 `adaptive_shared_map` 之间自动切换。
 
-正式启动默认使用 `adaptive_shared_map`；也可用下面命令独立诊断：
+正式启动默认使用 `adaptive_shared_map`、`max_range=15m`，并关闭 RGB-D 定位候选；也可用
+下面命令独立诊断：
 
 ```bash
 source devel/setup.bash
@@ -61,10 +138,12 @@ roslaunch danger_search_localization scan_localization.launch \
   localization_backend:=adaptive_shared_map
 ```
 
-该后端使用 `/trunk_imu` 定姿、Livox 维护唯一局部地图，并让 RGB-D 与 Livox 针对同一
-地图逐帧竞争平移候选。它不是任务阶段切源：启动后后端保持不变，PoseProvider 仍只有
-一条正式位姿。两路都无效时会停止发布新 odom/cloud，调用方必须保留既有陈旧定位和
-3 秒不可用门，不能用旧位姿伪造新时间戳。Stage17 当前 `8/20` 个有效 seed 全部完成
+该后端使用 `/trunk_imu` 定姿、Livox 维护唯一局部地图并提供平移候选。定位节点默认不
+订阅 RGB-D 深度点云；任务节点仍使用 RGB-D 完成危险源、门和电梯感知。Livox 候选无效
+时会停止发布新 odom/cloud，调用方必须保留既有陈旧定位和 3 秒不可用门，不能用旧位姿
+伪造新时间戳。需要复现 G1 时可显式传入
+`adaptive_rgbd_localization_enabled:=true`，恢复 RGB-D 与 Livox 针对同一地图逐帧竞争
+平移候选。Stage17 当前 `8/20` 个有效 seed 全部完成
 闭环且没有定位诱发失败，但矩阵尚未完成，seed `1612` 的末端误差也超过冻结硬门。
 正式默认是按用户明确决策直接切换，不代表矩阵已经通过；禁止现场修改
 `shared_map_*` 阈值。Stage17 工程验收状态为通过，剩余矩阵属于后续风险量化。
