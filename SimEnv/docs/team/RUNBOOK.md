@@ -183,6 +183,12 @@ python3 -m pytest -q \
   src/danger_search/test/test_frontier_explorer.py
 ```
 
+正式配置默认开启分楼层轨迹保护：`trail_protection_radius=0.25`、
+`trail_protection_near_range=2.0`、`trail_protection_confirm_generations=3`、
+`trail_protection_confirm_positions=2`。验收时必须同时检查：远距漂移障碍不能堵塞历史轨迹，
+近场真实障碍经多代次、多位姿后仍会阻挡，开门清除和严格反证能撤销该阻挡。需要回退旧优先级
+时只设置 `map/trail_protection_enabled:=false`，不得联动修改定位、规划或控制参数。
+
 阶段性能测量使用默认 `280×480` 栅格。普通 A* 必须保留迭代预算；`BUDGET_EXHAUSTED` 不等于不可达，不得据此写 BLACK 或前沿黑名单。无预算长墙绕行约 170 ms；第 7 层已要求返航穷举只在地图和历史轨迹快照的后台线程运行，主 tick 在结果就绪前持续零速。
 
 ## 第 4 层路径执行与安全门测试
@@ -224,6 +230,23 @@ python3 -m pytest -q \
 
 测试使用 fake manager 和注入式服务函数验证异步协议，不连接真实比赛服务。重点断言：未知 ID/楼层拒绝、授权请求字段保持、门洞/轿厢必须有点云证据、A* 不可达与预算耗尽均不生成直线路径，以及过门/进出厢的对齐和阻塞失败边界。
 
+电梯开门后的局部穿越回归还必须执行：
+
+```bash
+source devel/setup.bash
+python3 -m pytest -q \
+  src/danger_search/test/test_elevator_crossing_runtime.py \
+  src/danger_search/test/test_navigation_tasks.py
+```
+
+正式默认要求 3 个不同 Livox 点云代次，最大间隔 `0.5s`；4s 内无法确认时返回
+`elevator_open_crossing_geometry_unavailable`，不得回退旧注册中心。目标层位姿距新轿厢中心
+超过 `0.80m` 返回 `elevator_cabin_center_offset_exceeded`。当前点云中位于有限穿越走廊内的
+实体仍返回 `elevator_crossing_corridor_blocked`；不得因此降低全局近障停车距离。
+局部门洞还按 POSITION 站位限制距离：进厢 `0.45～1.15m`、出厢 `0.60～1.30m`。
+若近处稳定结构和远处真实门框同时存在，必须跳过近处结构继续搜索距离窗口内的门框；
+不能把“三帧稳定”单独当作语义正确。
+
 `use_truth_proximity_detector` 只保留历史诊断兼容，正式 profile 必须为 false。真实 `/set_door_state`、`/call_elevator` 与视觉开口闭环留到第 8/10 层正式 runner 验收。
 
 第 10.1 层主入口 GUI 回归必须确认：机器人原地请求开门，近场连续两帧确认净空后再
@@ -263,6 +286,31 @@ PAUSED=true AUTO_UNPAUSE=1 \
 涉及运行时行为的阶段至少记录：Git 提交、seed、楼层数、关键环境变量、ROS/Gazebo 隔离端口、仿真与墙钟时长、传感器频率、状态转换、结果摘要和退出后的残留进程。一次运行足以证明确定性边界时不扩大矩阵；随机性使结论不清时再做固定 seed 复测。
 
 Gazebo 日志、bag、生成场景和真值不提交到 Git，只把与结论直接相关的短摘要写入对应 `reports/STAGE<N>_REPORT.md`。
+
+本地电梯穿越修复固定跑两轮，代码在两轮之间冻结，只改变定位 `max_range`。公共条件为
+seed=8127、G3 Livox-only、两层、`floor_timeout=280s`、最短探索 `60s`、总预算 `620s`、
+完整往返、GUI=true、逐帧定位诊断关闭、离线真值只在结束后分析。环境变量分别使用
+`ELEVATOR_SIM_STALL_WALL=300` 和 `ELEVATOR_GO_TO_DOOR_STALL_WALL=120`；总墙钟上限为
+`1800s`。每轮使用新空目录，runner 就绪后另开 RViz：
+
+```bash
+source devel/setup.bash
+rviz -d src/danger_search/config/elevator_baseline.rviz
+```
+
+该 RViz 配置的 Fixed Frame 为 `world`。正式运行时，定位 odom、配准点云、
+`/nav/map_debug`、`/danger_search/path_raw`、`/danger_search/path_followed` 和
+`/danger_search/local_target` 的 `header.frame_id` 都应为 `world`。若显示错位，先用
+`rostopic echo -n 1 <topic>/header` 核对标签，不能添加恒等静态 TF；相对原点 smoke
+使用 `danger_search_relative`，不适用正式 RViz 配置。
+
+第一轮 `ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0`，第二轮仅改为 `8.0`；均设置
+`ELEVATOR_TEST_RECORD_DRIFT=1`、`ELEVATOR_TEST_RECORD_RGBD=0`、
+`ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1`、`ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0`、
+`ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS=0`、
+`ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false`。验收必须同时报告完整闭环、两个
+本地几何确认事件、CROSS 结果和离线 RMSE/P95/最大/末端误差；启动成功不等于闭环成功，
+人工中止不记算法失败。
 
 ## 第 8 层正式入口与结果闭包
 

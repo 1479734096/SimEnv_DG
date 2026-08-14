@@ -12,6 +12,9 @@ SIMENV_ROOT = Path(__file__).resolve().parents[3]
 REFERENCE_PATH = SIMENV_ROOT / "docs" / "reference.md"
 FORMAL_LAUNCH_PATH = SIMENV_ROOT / "src" / "danger_search" / "launch" / "danger_search.launch"
 FORMAL_CONFIG_PATH = SIMENV_ROOT / "src" / "danger_search" / "config" / "danger_search.yaml"
+SMOKE_LAUNCH_PATH = (
+    SIMENV_ROOT / "src" / "danger_search" / "launch" / "danger_search_smoke.launch"
+)
 LOCALIZATION_LAUNCH_PATH = (
     SIMENV_ROOT
     / "src"
@@ -37,6 +40,25 @@ class InterfaceDocumentationTest(unittest.TestCase):
         self.assertEqual(
             require_internal_output_topic(status_topic, purpose="任务状态"),
             status_topic,
+        )
+
+    def test_diagnostic_outputs_share_localization_global_frame(self):
+        config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(config["localization"]["global_frame_id"], "world")
+
+        root = ElementTree.parse(SMOKE_LAUNCH_PATH).getroot()
+        smoke_node = next(
+            node
+            for node in root.findall("node")
+            if node.get("name") == "danger_search_smoke"
+        )
+        parameters = {
+            param.get("name"): param.get("value")
+            for param in smoke_node.findall("param")
+        }
+        self.assertEqual(
+            parameters.get("localization/global_frame_id"),
+            "danger_search_relative",
         )
 
     def test_formal_launch_explicitly_passes_public_scene_path_to_localization(self):
@@ -245,13 +267,14 @@ class InterfaceDocumentationTest(unittest.TestCase):
             float(support["odometry_angular_deadband"]),
         )
 
-    def test_formal_frontier_ranking_uses_local_unknown_gain_and_unit_path_cost(self):
+    def test_formal_frontier_ranking_prioritizes_path_cost_over_yaw_cost(self):
         config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
         frontier = config["frontier"]
 
         self.assertEqual(float(frontier["expected_gain_radius"]), 3.0)
         self.assertEqual(float(frontier["information_gain_weight"]), 1.0)
-        self.assertEqual(float(frontier["path_cost_weight"]), 1.0)
+        self.assertEqual(float(frontier["path_cost_weight"]), 2.4)
+        self.assertEqual(float(frontier["yaw_cost_weight"]), 0.2)
         self.assertEqual(int(frontier["max_planning_candidates"]), 8)
         self.assertEqual(int(frontier["max_goal_candidates_per_frontier"]), 2)
 

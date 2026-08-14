@@ -37,6 +37,15 @@ class ObstacleCoreRecord:
     hit_generation_count: int = 0
     last_counter_generation: int | None = None
     counter_generation_count: int = 0
+    protected_hit_generations: set[int] = field(default_factory=set)
+    protected_hit_pose_samples: list[tuple[int, float, float]] = field(
+        default_factory=list
+    )
+    protected_counter_generations: set[int] = field(default_factory=set)
+    protected_counter_world_poses: list[tuple[float, float]] = field(default_factory=list)
+    last_protected_hit_generation: int | None = None
+    last_protected_counter_generation: int | None = None
+    protected_trail_confirmed: bool = False
 
 
 class ObstacleEvidenceLedger:
@@ -89,6 +98,21 @@ class ObstacleEvidenceLedger:
                 hit_generation_count=record.hit_generation_count,
                 last_counter_generation=record.last_counter_generation,
                 counter_generation_count=record.counter_generation_count,
+                protected_hit_generations=set(record.protected_hit_generations),
+                protected_hit_pose_samples=list(record.protected_hit_pose_samples),
+                protected_counter_generations=set(
+                    record.protected_counter_generations
+                ),
+                protected_counter_world_poses=list(
+                    record.protected_counter_world_poses
+                ),
+                last_protected_hit_generation=(
+                    record.last_protected_hit_generation
+                ),
+                last_protected_counter_generation=(
+                    record.last_protected_counter_generation
+                ),
+                protected_trail_confirmed=record.protected_trail_confirmed,
             )
             for cell, record in self.cores.items()
         }
@@ -101,6 +125,15 @@ class ObstacleEvidenceLedger:
         return any(
             owner in self.cores
             and self.cores[owner].kind in BLOCKING_OBSTACLE_KINDS
+            for owner in self.inflation_owners.get(cell, ())
+        )
+
+    def protected_trail_blocking_at(self, cell: tuple[int, int]) -> bool:
+        """仅返回已获得近场确认权的阻挡来源。"""
+        return any(
+            owner in self.cores
+            and self.cores[owner].kind in BLOCKING_OBSTACLE_KINDS
+            and self.cores[owner].protected_trail_confirmed
             for owner in self.inflation_owners.get(cell, ())
         )
 
@@ -142,10 +175,13 @@ class ObstacleEvidenceLedger:
                 floor_index=self.floor_index,
                 map_epoch=int(map_epoch),
                 localization_epoch=int(localization_epoch),
+                protected_trail_confirmed=(kind == LEGACY_HARD),
             )
             self.cores[center] = core
         if kind in {HIGH_HARD, LEGACY_HARD}:
             core.kind = kind
+            if kind == LEGACY_HARD:
+                core.protected_trail_confirmed = True
         elif core.kind not in BLOCKING_OBSTACLE_KINDS:
             core.kind = LOW_CANDIDATE
 
@@ -175,6 +211,9 @@ class ObstacleEvidenceLedger:
             core.counter_world_poses.clear()
             core.counter_generation_count = 0
             core.last_counter_generation = None
+            core.protected_counter_generations.clear()
+            core.protected_counter_world_poses.clear()
+            core.last_protected_counter_generation = None
             if (
                 core.kind == LOW_CANDIDATE
                 and len(core.hit_generations) >= int(low_confirm_generations)
@@ -188,6 +227,55 @@ class ObstacleEvidenceLedger:
             self.inflation_owners.setdefault(cell, set()).add(center)
         core.inflated_cells.update(affected)
         return changed
+
+    def record_protected_trail_observation(
+        self,
+        x: float,
+        y: float,
+        *,
+        cloud_generation: int,
+        robot_xy: tuple[float, float],
+        confirm_generations: int,
+        confirm_positions: int,
+        generation_window: int,
+        pose_separation: float,
+    ) -> set[tuple[int, int]]:
+        """为已存在的障碍核心累计覆盖历史足迹所需的近场证据。"""
+        center = self.world_to_grid(x, y)
+        core = self.cores.get(center) if center is not None else None
+        generation = int(cloud_generation)
+        if core is None or generation <= 0:
+            return set()
+        if generation == core.last_protected_hit_generation:
+            return set()
+
+        minimum = generation - int(generation_window) + 1
+        core.protected_hit_generations.add(generation)
+        core.protected_hit_generations = {
+            item for item in core.protected_hit_generations if item >= minimum
+        }
+        core.protected_hit_pose_samples = [
+            sample
+            for sample in core.protected_hit_pose_samples
+            if sample[0] >= minimum
+        ]
+        core.last_protected_hit_generation = generation
+        _upsert_generation_pose(
+            core.protected_hit_pose_samples,
+            generation,
+            robot_xy,
+            pose_separation,
+        )
+        core.protected_counter_generations.clear()
+        core.protected_counter_world_poses.clear()
+        core.last_protected_counter_generation = None
+        was_confirmed = core.protected_trail_confirmed
+        if not core.protected_trail_confirmed and (
+            len(core.protected_hit_generations) >= int(confirm_generations)
+            and len(core.protected_hit_pose_samples) >= int(confirm_positions)
+        ):
+            core.protected_trail_confirmed = True
+        return set(core.inflated_cells) if core.protected_trail_confirmed != was_confirmed else set()
 
     def remove_core(self, cell: tuple[int, int]) -> set[tuple[int, int]]:
         core = self.cores.pop(tuple(cell), None)
@@ -224,7 +312,9 @@ class ObstacleEvidenceLedger:
         index_by_cell = {cell: index for index, cell in enumerate(ray)}
         removed_cells: set[tuple[int, int]] = set()
         for cell, core in tuple(self.cores.items()):
-            if core.kind not in {LOW_CANDIDATE, LOW_CONFIRMED}:
+            low_lifecycle = core.kind in {LOW_CANDIDATE, LOW_CONFIRMED}
+            protected_lifecycle = core.protected_trail_confirmed
+            if not low_lifecycle and not protected_lifecycle:
                 continue
             if cell in hit_cells or cell not in index_by_cell:
                 continue
@@ -238,35 +328,65 @@ class ObstacleEvidenceLedger:
             ):
                 continue
             generation = int(cloud_generation)
-            if generation <= 0 or generation == core.last_counter_generation:
+            if generation <= 0:
                 continue
-            core.counter_generations.add(generation)
-            limit = max(int(candidate_generations), int(confirmed_generations))
-            if len(core.counter_generations) > limit:
-                core.counter_generations = set(
-                    sorted(core.counter_generations)[-limit:]
+            if (
+                protected_lifecycle
+                and generation != core.last_protected_counter_generation
+            ):
+                core.protected_counter_generations.add(generation)
+                if len(core.protected_counter_generations) > int(confirmed_generations):
+                    core.protected_counter_generations = set(
+                        sorted(core.protected_counter_generations)[
+                            -int(confirmed_generations):
+                        ]
+                    )
+                core.last_protected_counter_generation = generation
+                _append_separated_pose(
+                    core.protected_counter_world_poses,
+                    robot_xy,
+                    pose_separation,
                 )
-            core.counter_generation_count = min(
-                limit, core.counter_generation_count + 1
-            )
-            core.last_counter_generation = generation
-            _append_separated_pose(
-                core.counter_world_poses,
-                robot_xy,
-                pose_separation,
-            )
-            if core.kind == LOW_CANDIDATE:
-                removable = (
-                    len(core.counter_generations) >= int(candidate_generations)
-                    and len(core.counter_world_poses) >= int(candidate_positions)
+                if (
+                    len(core.protected_counter_generations)
+                    >= int(confirmed_generations)
+                    and len(core.protected_counter_world_poses)
+                    >= int(confirmed_positions)
+                ):
+                    core.protected_trail_confirmed = False
+                    core.protected_hit_generations.clear()
+                    core.protected_hit_pose_samples.clear()
+                    core.last_protected_hit_generation = None
+                    removed_cells.update(core.inflated_cells)
+
+            if low_lifecycle and generation != core.last_counter_generation:
+                core.counter_generations.add(generation)
+                limit = max(int(candidate_generations), int(confirmed_generations))
+                if len(core.counter_generations) > limit:
+                    core.counter_generations = set(
+                        sorted(core.counter_generations)[-limit:]
+                    )
+                core.counter_generation_count = min(
+                    limit, core.counter_generation_count + 1
                 )
-            else:
-                removable = (
-                    len(core.counter_generations) >= int(confirmed_generations)
-                    and len(core.counter_world_poses) >= int(confirmed_positions)
+                core.last_counter_generation = generation
+                _append_separated_pose(
+                    core.counter_world_poses,
+                    robot_xy,
+                    pose_separation,
                 )
-            if removable:
-                removed_cells.update(self.remove_core(cell))
+                if core.kind == LOW_CANDIDATE:
+                    removable = (
+                        len(core.counter_generations) >= int(candidate_generations)
+                        and len(core.counter_world_poses) >= int(candidate_positions)
+                    )
+                else:
+                    removable = (
+                        len(core.counter_generations) >= int(confirmed_generations)
+                        and len(core.counter_world_poses) >= int(confirmed_positions)
+                    )
+                if removable:
+                    removed_cells.update(self.remove_core(cell))
         return removed_cells
 
     def world_to_grid(self, x: float, y: float) -> tuple[int, int] | None:
@@ -317,6 +437,23 @@ def _append_separated_pose(
     poses.append(candidate)
     if len(poses) > _POSE_SAMPLE_LIMIT:
         del poses[:-_POSE_SAMPLE_LIMIT]
+
+
+def _upsert_generation_pose(
+    samples: list[tuple[int, float, float]],
+    generation: int,
+    pose: tuple[float, float],
+    separation: float,
+) -> None:
+    """在代次窗口内刷新同一位姿，或登记一个空间独立的新位姿。"""
+    px, py = float(pose[0]), float(pose[1])
+    for index, (_old_generation, old_x, old_y) in enumerate(samples):
+        if math.hypot(px - old_x, py - old_y) < float(separation):
+            samples[index] = (int(generation), px, py)
+            return
+    samples.append((int(generation), px, py))
+    if len(samples) > _POSE_SAMPLE_LIMIT:
+        del samples[:-_POSE_SAMPLE_LIMIT]
 
 
 def _bresenham(x0: int, y0: int, x1: int, y1: int) -> list[tuple[int, int]]:

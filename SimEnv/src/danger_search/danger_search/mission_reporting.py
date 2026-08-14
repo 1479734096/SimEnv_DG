@@ -49,13 +49,18 @@ class MissionReportingRuntime:
         mission_summary_file: str | Path | None,
         status_topic: str,
         map_topic: str,
+        frame_id: str = "world",
     ) -> None:
+        normalized_frame_id = str(frame_id).strip()
+        if normalized_frame_id not in {"world", "danger_search_relative"}:
+            raise ValueError("任务诊断全局坐标系仅支持 world 或 danger_search_relative")
         self._result_writer = ResultWriter(result_file)
         self._summary_path = (
             Path(mission_summary_file) if mission_summary_file else None
         )
         self._status_topic = str(status_topic)
         self._map_topic = str(map_topic)
+        self._frame_id = normalized_frame_id
         self._status_publisher = None
         self._map_publisher = None
 
@@ -84,7 +89,7 @@ class MissionReportingRuntime:
         if self._map_publisher is not None:
             message = OccupancyGrid()
             message.header.stamp = rospy.Time.now()
-            message.header.frame_id = "odom"
+            message.header.frame_id = self._frame_id
             message.info.resolution = grid.resolution
             message.info.width = grid.size_x
             message.info.height = grid.size_y

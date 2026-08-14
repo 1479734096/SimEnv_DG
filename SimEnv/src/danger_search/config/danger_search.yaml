@@ -25,6 +25,8 @@ localization:
   team_scene_info_path: generated_building/team_scene_info.json
   require_team_scene_info: true
   allow_relative_origin: false
+  # 与定位 odom/cloud 的 header.frame_id 一致，地图、路径和局部目标统一使用该坐标系。
+  global_frame_id: world
   # formal 必须消费定位节点的持续姿态健康；仅 diagnostic smoke 可关闭。
   stance_health_required: true
   # 当前合规 RGB-D/Livox 后端只估计平面运动；z 是当前楼层局部高度。
@@ -66,6 +68,17 @@ mission:
   elevator_navigation_timeout: 120.0
   elevator_planning_retry_limit: 3
   elevator_stuck_retry_limit: 4
+  # 开门确认后以当前 Livox 连续重测本次穿越轴，吸收定位平移漂移；不改写注册地图。
+  elevator_local_crossing_geometry_enabled: true
+  elevator_local_crossing_timeout: 4.0
+  elevator_local_crossing_confirmations: 3
+  elevator_local_crossing_confirmation_max_gap: 0.5
+  elevator_local_crossing_center_tolerance: 0.15
+  elevator_local_crossing_width_tolerance: 0.20
+  elevator_local_crossing_yaw_tolerance: 0.15
+  elevator_local_crossing_yaw_search_half_range: 0.20
+  elevator_local_crossing_yaw_search_step: 0.05
+  elevator_local_crossing_max_center_correction: 0.80
   explore_coverage_ratio: 0.80
   no_frontier_scan_duration: 4.0
   # 贴墙时禁止无前沿扫描/普通卡滞恢复原地转向，避免腿部旋转包络扫墙导致倾倒。
@@ -172,6 +185,13 @@ map:
   # 0=关闭对应过滤（回退原行为）
   low_near_exempt_radius: 0.5
   low_candidate_max_range: 5.0
+  # 已走轨迹核心只防远距定位漂移污染，不是无条件穿障：2m 内的新障碍仍需
+  # 3 个点云代次和 2 个相隔至少 0.15m 的观测位姿确认后覆盖 VISITED。
+  trail_protection_enabled: true
+  trail_protection_radius: 0.25
+  trail_protection_near_range: 2.0
+  trail_protection_confirm_generations: 3
+  trail_protection_confirm_positions: 2
   cloud_stride: 4
   cloud_max_points: 24000
 
@@ -184,8 +204,8 @@ frontier:
   stuck_blacklist_radius: 1.0
   no_progress_timeout: 6.0
   information_gain_weight: 1.0
-  path_cost_weight: 1.0
-  yaw_cost_weight: 0.3
+  path_cost_weight: 2.4
+  yaw_cost_weight: 0.2
   revisit_penalty_weight: 2.0
   # frontier 目标优先落在更安全的 free cell，不贴障碍和 unknown 边缘。
   frontier_obstacle_clearance: 0.25

@@ -187,6 +187,7 @@ _CONFIG_GROUP_FIELDS = {
             "localization_unavailable_timeout",
             "localization_stance_health_required",
             "localization_vertical_reference",
+            "global_frame_id",
             "landmark_drift_config",
         }
     ),
@@ -240,6 +241,16 @@ _CONFIG_GROUP_FIELDS = {
             "elevator_geometry_refresh_timeout",
             "elevator_navigation_timeout",
             "elevator_opening_confirmation_timeout",
+            "elevator_local_crossing_geometry_enabled",
+            "elevator_local_crossing_timeout",
+            "elevator_local_crossing_confirmations",
+            "elevator_local_crossing_confirmation_max_gap",
+            "elevator_local_crossing_center_tolerance",
+            "elevator_local_crossing_width_tolerance",
+            "elevator_local_crossing_yaw_tolerance",
+            "elevator_local_crossing_yaw_search_half_range",
+            "elevator_local_crossing_yaw_search_step",
+            "elevator_local_crossing_max_center_correction",
             "elevator_planning_retry_limit",
             "elevator_stuck_retry_limit",
             "elevator_visual_confirmation_max_gap",
@@ -407,6 +418,15 @@ class _MissionConfigBuilder:
         self.localization_stance_health_required = bool(
             _param("localization/stance_health_required", True)
         )
+        self.global_frame_id = str(
+            _param("localization/global_frame_id", "world")
+        ).strip()
+        if self.global_frame_id not in {"world", "danger_search_relative"}:
+            raise ValueError(
+                "localization/global_frame_id 仅支持 world 或 danger_search_relative"
+            )
+        if self.runtime_profile == "formal" and self.global_frame_id != "world":
+            raise ValueError("正式运行的 localization/global_frame_id 必须为 world")
         self.localization_vertical_reference = str(
             _param("localization/vertical_reference", "floor_local")
         ).strip()
@@ -696,6 +716,21 @@ class _MissionConfigBuilder:
             ),
             "low_candidate_max_range": float(
                 _param("map/low_candidate_max_range", 0.0)
+            ),
+            "trail_protection_enabled": bool(
+                _param("map/trail_protection_enabled", True)
+            ),
+            "trail_protection_radius": float(
+                _param("map/trail_protection_radius", 0.25)
+            ),
+            "trail_protection_near_range": float(
+                _param("map/trail_protection_near_range", 2.0)
+            ),
+            "trail_protection_confirm_generations": int(
+                _param("map/trail_protection_confirm_generations", 3)
+            ),
+            "trail_protection_confirm_positions": int(
+                _param("map/trail_protection_confirm_positions", 2)
             ),
             "counter_pose_separation": float(
                 _param("map/counter_pose_separation", 0.15)
@@ -1046,6 +1081,36 @@ class _MissionConfigBuilder:
         self.elevator_opening_confirmation_timeout = float(
             _param("local_semantic/elevator_opening_confirmation_timeout", 8.0)
         )
+        self.elevator_local_crossing_geometry_enabled = bool(
+            _param("mission/elevator_local_crossing_geometry_enabled", True)
+        )
+        self.elevator_local_crossing_timeout = float(
+            _param("mission/elevator_local_crossing_timeout", 4.0)
+        )
+        self.elevator_local_crossing_confirmations = int(
+            _param("mission/elevator_local_crossing_confirmations", 3)
+        )
+        self.elevator_local_crossing_confirmation_max_gap = float(
+            _param("mission/elevator_local_crossing_confirmation_max_gap", 0.5)
+        )
+        self.elevator_local_crossing_center_tolerance = float(
+            _param("mission/elevator_local_crossing_center_tolerance", 0.15)
+        )
+        self.elevator_local_crossing_width_tolerance = float(
+            _param("mission/elevator_local_crossing_width_tolerance", 0.20)
+        )
+        self.elevator_local_crossing_yaw_tolerance = float(
+            _param("mission/elevator_local_crossing_yaw_tolerance", 0.15)
+        )
+        self.elevator_local_crossing_yaw_search_half_range = float(
+            _param("mission/elevator_local_crossing_yaw_search_half_range", 0.20)
+        )
+        self.elevator_local_crossing_yaw_search_step = float(
+            _param("mission/elevator_local_crossing_yaw_search_step", 0.05)
+        )
+        self.elevator_local_crossing_max_center_correction = float(
+            _param("mission/elevator_local_crossing_max_center_correction", 0.80)
+        )
         self.elevator_geometry_refresh_timeout = float(
             _param("local_semantic/elevator_geometry_refresh_timeout", 6.0)
         )
@@ -1106,6 +1171,25 @@ class _MissionConfigBuilder:
             and 0.0 < self.elevator_visual_min_width < self.elevator_visual_max_width
             and self.elevator_visual_max_distance > 0.0
             and self.elevator_opening_confirmation_timeout > 0.0
+            and math.isfinite(self.elevator_local_crossing_timeout)
+            and self.elevator_local_crossing_timeout > 0.0
+            and self.elevator_local_crossing_confirmations > 0
+            and math.isfinite(self.elevator_local_crossing_confirmation_max_gap)
+            and 0.0 < self.elevator_local_crossing_confirmation_max_gap
+            <= self.elevator_local_crossing_timeout
+            and math.isfinite(self.elevator_local_crossing_center_tolerance)
+            and self.elevator_local_crossing_center_tolerance > 0.0
+            and math.isfinite(self.elevator_local_crossing_width_tolerance)
+            and self.elevator_local_crossing_width_tolerance > 0.0
+            and math.isfinite(self.elevator_local_crossing_yaw_tolerance)
+            and 0.0 < self.elevator_local_crossing_yaw_tolerance <= math.pi
+            and math.isfinite(self.elevator_local_crossing_yaw_search_half_range)
+            and self.elevator_local_crossing_yaw_search_half_range > 0.0
+            and math.isfinite(self.elevator_local_crossing_yaw_search_step)
+            and 0.0 < self.elevator_local_crossing_yaw_search_step
+            <= 2.0 * self.elevator_local_crossing_yaw_search_half_range
+            and math.isfinite(self.elevator_local_crossing_max_center_correction)
+            and self.elevator_local_crossing_max_center_correction > 0.0
             and math.isfinite(self.elevator_geometry_refresh_timeout)
             and self.elevator_geometry_refresh_timeout > 0.0
             and math.isfinite(self.elevator_geometry_refresh_standoff)

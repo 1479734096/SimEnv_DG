@@ -1,6 +1,6 @@
 """局部路径跟踪器与全项目唯一的生产速度发送出口。
 
-上层传入 world/odom 平面折线路径，本模块压缩共线点、在当前线段内计算
+上层传入定位全局坐标系内的平面折线路径，本模块压缩共线点、在当前线段内计算
 pure-pursuit 前视目标，并根据航向误差、局部曲率和前向实体净距生成机体系
 ``(linear_x, linear_y, angular_z)``。命令发布前还会经过可选
 ``GroundSupportSafetyGate``，所有停车、恢复、门/电梯直线跨越最终都复用
@@ -50,7 +50,7 @@ class PathFollower:
     path_raw_topic: str = "/danger_search/path_raw"
     path_followed_topic: str = "/danger_search/path_followed"
     local_target_topic: str = "/danger_search/local_target"
-    path_frame_id: str = "odom"
+    path_frame_id: str = "world"
     max_linear: float = 0.60
     max_lateral: float = 0.25
     max_angular: float = 1.2
@@ -181,6 +181,9 @@ class PathFollower:
     keepalive_publish_count: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
+        self.path_frame_id = str(self.path_frame_id).strip()
+        if self.path_frame_id not in {"world", "danger_search_relative"}:
+            raise ValueError("路径诊断全局坐标系仅支持 world 或 danger_search_relative")
         self.cmd_vel_topic = require_allowed_output_topic(
             self.cmd_vel_topic,
             purpose="PathFollower 控制输出",

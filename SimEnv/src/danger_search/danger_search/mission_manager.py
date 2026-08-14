@@ -91,6 +91,11 @@ from danger_search.map_update_runtime import (
     nearest_forward_obstacle_observation,
     nearest_radial_obstacle_distance,
 )
+from danger_search.elevator_crossing_runtime import (
+    ElevatorCrossingConfig,
+    ElevatorCrossingRuntime,
+    crossing_corridor_obstacle,
+)
 from danger_search.floor_transition_runtime import FloorTransitionRuntime
 from danger_search.navigation_context import NavigationTaskContext
 from danger_search.elevator_observation_runtime import (
@@ -222,6 +227,7 @@ class MissionManager:
         self._floor_navigation_traces: dict[int, list[tuple[float, float]]] = {}
         # 多帧电梯观测由独立账本持有；编排器只决定何时读取或提交服务动作。
         self._elevator_observation = ElevatorObservationRuntime()
+        self._elevator_crossing = ElevatorCrossingRuntime()
         self._node_runtime = None
         self._finished = False
         self._shutdown_requested = False
@@ -295,6 +301,26 @@ class MissionManager:
             ),
             required_confirmations=int(
                 self.config.entry["initial_entry_opening_confirmations"]
+            ),
+            sweep_half_width=float(
+                self.config.mapping["ground_support_params"]["sweep_half_width"]
+            ),
+        )
+        self._elevator_crossing_config = ElevatorCrossingConfig(
+            timeout=float(self.elevator_local_crossing_timeout),
+            confirmations=int(self.elevator_local_crossing_confirmations),
+            confirmation_max_gap=float(
+                self.elevator_local_crossing_confirmation_max_gap
+            ),
+            center_tolerance=float(self.elevator_local_crossing_center_tolerance),
+            width_tolerance=float(self.elevator_local_crossing_width_tolerance),
+            yaw_tolerance=float(self.elevator_local_crossing_yaw_tolerance),
+            yaw_search_half_range=float(
+                self.elevator_local_crossing_yaw_search_half_range
+            ),
+            yaw_search_step=float(self.elevator_local_crossing_yaw_search_step),
+            maximum_center_correction=float(
+                self.elevator_local_crossing_max_center_correction
             ),
             sweep_half_width=float(
                 self.config.mapping["ground_support_params"]["sweep_half_width"]
@@ -405,14 +431,26 @@ class MissionManager:
             elevator_opening_confirmation_timeout=float(
                 getattr(self, "elevator_opening_confirmation_timeout", 8.0)
             ),
+            elevator_local_crossing_geometry_enabled=bool(
+                getattr(self, "elevator_local_crossing_geometry_enabled", True)
+            ),
+            elevator_local_crossing_timeout=float(
+                getattr(self, "elevator_local_crossing_timeout", 4.0)
+            ),
+            elevator_local_crossing_max_center_correction=float(
+                getattr(self, "elevator_local_crossing_max_center_correction", 0.8)
+            ),
             elevator_stuck_retry_limit=int(self.elevator_stuck_retry_limit),
             exit_first_max_linear=getattr(self, "exit_first_max_linear", None),
             exit_cabin_backoff_enabled=bool(
                 getattr(self, "exit_cabin_backoff_enabled", False)
             ),
             clear_opened_door_area_fn=self.clear_opened_door_area,
+            clear_elevator_crossing_area_fn=self.clear_elevator_crossing_area,
             refresh_open_door_geometry_fn=self.refresh_open_door_geometry,
             refresh_elevator_geometry_fn=self.refresh_elevator_geometry,
+            refresh_elevator_crossing_geometry_fn=self.refresh_elevator_crossing_geometry,
+            elevator_crossing_obstacle_fn=self.elevator_crossing_obstacle,
             record_failure_fn=self._record_failure,
             log_structured_fn=self._log_structured,
             begin_floor_transition_fn=self.begin_floor_transition,
@@ -2799,6 +2837,33 @@ class MissionManager:
             depth,
         )
 
+    def clear_elevator_crossing_area(self, geometry) -> None:
+        """按当前 Livox 门洞清理本次穿越条带，不改写长期注册几何。"""
+        half_depth = max(
+            0.95 + self.mapper.obstacle_inflation_radius + self.mapper.resolution,
+            self.door_clear_radius,
+        )
+        self.mapper.clear_dynamic_door_strip(
+            self.current_floor,
+            geometry.door_center[0],
+            geometry.door_center[1],
+            geometry.outward_yaw,
+            geometry.width,
+            2.0 * half_depth,
+        )
+        self._log_structured(
+            {
+                "event": "elevator_local_crossing_strip_cleared",
+                "door_id": geometry.door_id,
+                "mode": geometry.mode,
+                "floor": int(self.current_floor),
+                "center": [round(value, 3) for value in geometry.door_center],
+                "yaw": round(geometry.outward_yaw, 3),
+                "width": round(geometry.width, 3),
+                "depth": round(2.0 * half_depth, 3),
+            }
+        )
+
     def _active_opened_door_obstacle_exclusion(
         self,
     ) -> tuple[float, float, float, float, float] | None:
@@ -3047,6 +3112,67 @@ class MissionManager:
             elapsed=self._elapsed(),
         )
         return self._apply_elevator_refresh_result(result)
+
+    def refresh_elevator_crossing_geometry(
+        self,
+        *,
+        door_id: str,
+        mode: str,
+        expected_crossing_yaw: float,
+        old_door_center: tuple[float, float],
+        pose: tuple[float, float, float],
+    ):
+        """用当前 Livox 刷新本次穿越几何，不写回长期电梯注册。"""
+        result = self._elevator_crossing.observe(
+            now=get_time(),
+            door_id=door_id,
+            mode=mode,
+            expected_crossing_yaw=expected_crossing_yaw,
+            old_door_center=old_door_center,
+            pose=pose,
+            cloud_stamp=self._map_runtime.last_cloud_stamp,
+            cloud_points=self._map_runtime.latest_cloud_points,
+            floor_index=self.current_floor,
+            floor_height=float(self.mapper.floor_height),
+            local_detector=self.local_detector,
+            config=self._elevator_crossing_config,
+        )
+        if result.diagnostic is not None:
+            self._log_structured(result.diagnostic)
+        return result
+
+    def elevator_crossing_obstacle(
+        self,
+        start_xy: tuple[float, float],
+        end_xy: tuple[float, float],
+        geometry,
+    ):
+        observation = crossing_corridor_obstacle(
+            self._map_runtime.latest_cloud_points,
+            start_xy=start_xy,
+            end_xy=end_xy,
+            floor_index=self.current_floor,
+            floor_height=float(self.mapper.floor_height),
+            obstacle_min_height=float(self.mapper.obstacle_min_z),
+            obstacle_max_height=float(self.mapper.obstacle_max_z),
+            sweep_half_width=float(self._elevator_crossing_config.sweep_half_width),
+            door_center=geometry.door_center,
+            door_yaw=geometry.outward_yaw,
+            door_width=geometry.width,
+        )
+        if observation is not None:
+            self._log_structured(
+                {
+                    "event": "elevator_crossing_corridor_blocked",
+                    "door_id": geometry.door_id,
+                    "mode": geometry.mode,
+                    "distance": round(observation.distance, 3),
+                    "forward": round(observation.forward, 3),
+                    "lateral": round(observation.lateral, 3),
+                    "world_xyz": [round(value, 3) for value in observation.world_xyz],
+                }
+            )
+        return observation
 
     def elevator_approach_trace_candidates(
         self,

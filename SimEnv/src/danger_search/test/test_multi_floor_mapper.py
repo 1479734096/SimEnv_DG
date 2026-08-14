@@ -60,6 +60,442 @@ class MultiFloorMapperTest(unittest.TestCase):
         self.assertFalse(grid.is_traversable(*center))
         self.assertFalse(grid.is_traversable(*neighbor))
 
+    @staticmethod
+    def _trail_protection_mapper(**overrides):
+        params = {
+            "resolution": 0.1,
+            "width": 10.0,
+            "length": 6.0,
+            "origin_x": -5.0,
+            "origin_y": -3.0,
+            "visited_radius": 0.0,
+            "obstacle_inflation_radius": 0.2,
+            "free_clear_enabled": False,
+            "evidence_lifecycle_enabled": True,
+            "trail_protection_enabled": True,
+            "trail_protection_radius": 0.25,
+            "trail_protection_near_range": 2.0,
+            "trail_protection_confirm_generations": 3,
+            "trail_protection_confirm_positions": 2,
+            "counter_pose_separation": 0.15,
+        }
+        params.update(overrides)
+        return MultiFloorGridMap(**params)
+
+    def test_far_obstacle_cannot_block_protected_trail_or_its_inflation(self):
+        mapper = self._trail_protection_mapper()
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        grid = mapper.floor(0)
+        trail_cell = grid.world_to_grid(0.0, 0.0)
+        inflated_trail_cell = grid.world_to_grid(0.15, 0.0)
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(3.0, 0.0, 0.6),
+            points=[(0.0, 0.0, 0.6)],
+            cloud_generation=2,
+        )
+
+        self.assertEqual(int(grid.data[trail_cell[1], trail_cell[0]]), VISITED)
+        self.assertEqual(
+            int(grid.data[inflated_trail_cell[1], inflated_trail_cell[0]]),
+            VISITED,
+        )
+        self.assertIn(trail_cell, grid.occ_cores)
+
+    def test_disabled_trail_protection_preserves_original_obstacle_priority(self):
+        mapper = self._trail_protection_mapper(trail_protection_enabled=False)
+        grid = mapper.floor(0)
+        trail_cell = grid.world_to_grid(0.0, 0.0)
+        grid.set_base_state(*trail_cell, VISITED)
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(3.0, 0.0, 0.6),
+            points=[(0.0, 0.0, 0.6)],
+            cloud_generation=1,
+        )
+
+        self.assertEqual(int(grid.data[trail_cell[1], trail_cell[0]]), OCC)
+        self.assertFalse(grid.protected_trail_cells)
+
+    def test_far_hidden_obstacle_still_occludes_same_frame_free_ray(self):
+        mapper = self._trail_protection_mapper(
+            obstacle_inflation_radius=0.0,
+            point_free_clear_max_range=5.0,
+        )
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        grid = mapper.floor(0)
+        hidden_obstacle = grid.world_to_grid(0.0, 0.0)
+        behind = grid.world_to_grid(-0.5, 0.0)
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(3.0, 0.0, 0.6),
+            points=[(0.0, 0.0, 0.6), (-1.0, 0.0, 0.0)],
+            cloud_generation=2,
+        )
+
+        self.assertEqual(
+            int(grid.data[hidden_obstacle[1], hidden_obstacle[0]]), VISITED
+        )
+        self.assertEqual(int(grid.data[behind[1], behind[0]]), UNKNOWN)
+
+    def test_two_meter_hit_is_near_but_over_two_meter_hit_is_not(self):
+        mapper = self._trail_protection_mapper(
+            obstacle_inflation_radius=0.0,
+            trail_protection_confirm_generations=1,
+            trail_protection_confirm_positions=1,
+        )
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        grid = mapper.floor(0)
+        protected = grid.world_to_grid(0.0, 0.0)
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(2.0, 0.0, 0.6),
+            points=[(0.0, 0.0, 0.6)],
+            cloud_generation=2,
+        )
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), OCC)
+
+        mapper = self._trail_protection_mapper(
+            obstacle_inflation_radius=0.0,
+            trail_protection_confirm_generations=1,
+            trail_protection_confirm_positions=1,
+        )
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        grid = mapper.floor(0)
+        protected = grid.world_to_grid(0.0, 0.0)
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(2.01, 0.0, 0.6),
+            points=[(0.0, 0.0, 0.6)],
+            cloud_generation=2,
+        )
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), VISITED)
+
+    def test_near_obstacle_requires_three_generations_and_two_positions(self):
+        mapper = self._trail_protection_mapper(obstacle_inflation_radius=0.0)
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        grid = mapper.floor(0)
+        protected = grid.world_to_grid(0.0, 0.0)
+
+        for generation in (2, 3, 4):
+            mapper.update_from_cloud(
+                floor_index=0,
+                robot_xyz=(1.8, 0.0, 0.6),
+                points=[(0.0, 0.0, 0.6)],
+                cloud_generation=generation,
+            )
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), VISITED)
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(1.78, 0.20, 0.6),
+            points=[(0.0, 0.0, 0.6)],
+            cloud_generation=5,
+        )
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), OCC)
+
+    def test_confirmed_protected_obstacle_stays_latched_across_hit_window(self):
+        mapper = self._trail_protection_mapper(obstacle_inflation_radius=0.0)
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        grid = mapper.floor(0)
+        protected = grid.world_to_grid(0.0, 0.0)
+        for generation, robot_xy in (
+            (2, (1.8, 0.0)),
+            (3, (1.8, 0.0)),
+            (4, (1.78, 0.2)),
+        ):
+            mapper.update_from_cloud(
+                floor_index=0,
+                robot_xyz=(*robot_xy, 0.6),
+                points=[(0.0, 0.0, 0.6)],
+                cloud_generation=generation,
+            )
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), OCC)
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(1.8, 0.0, 0.6),
+            points=[(0.0, 0.0, 0.6)],
+            cloud_generation=100,
+        )
+
+        self.assertTrue(grid.occ_cores[protected].protected_trail_confirmed)
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), OCC)
+
+    def test_unconfirmed_protected_pose_samples_expire_with_hit_window(self):
+        mapper = self._trail_protection_mapper(obstacle_inflation_radius=0.0)
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        grid = mapper.floor(0)
+        protected = grid.world_to_grid(0.0, 0.0)
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(1.78, 0.2, 0.6),
+            points=[(0.0, 0.0, 0.6)],
+            cloud_generation=2,
+        )
+        for generation in (100, 101, 102):
+            mapper.update_from_cloud(
+                floor_index=0,
+                robot_xyz=(1.8, 0.0, 0.6),
+                points=[(0.0, 0.0, 0.6)],
+                cloud_generation=generation,
+            )
+
+        self.assertFalse(grid.occ_cores[protected].protected_trail_confirmed)
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), VISITED)
+
+    def test_black_and_negative_override_protected_trail(self):
+        mapper = self._trail_protection_mapper(obstacle_inflation_radius=0.0)
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        grid = mapper.floor(0)
+        black_cell = grid.world_to_grid(0.0, 0.0)
+        negative_cell = grid.world_to_grid(0.2, 0.0)
+
+        grid.mark_black(*black_cell, owner="test:trail")
+        commit = mapper.persist_negative_clusters_atomic(
+            (self._negative_record(mapper, negative_cell),)
+        )
+
+        self.assertTrue(commit.committed)
+        self.assertEqual(int(grid.data[black_cell[1], black_cell[0]]), BLACK)
+        self.assertEqual(
+            int(grid.data[negative_cell[1], negative_cell[0]]), NEGATIVE
+        )
+
+    def test_counterevidence_revokes_protected_trail_obstacle_confirmation(self):
+        mapper = self._trail_protection_mapper(
+            obstacle_inflation_radius=0.0,
+            point_free_clear_max_range=4.0,
+            trail_protection_confirm_generations=2,
+            trail_protection_confirm_positions=2,
+            low_candidate_counter_generations=2,
+            low_candidate_counter_positions=2,
+            low_confirmed_counter_generations=2,
+            low_confirmed_counter_positions=2,
+        )
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        grid = mapper.floor(0)
+        protected = grid.world_to_grid(0.0, 0.0)
+        for generation, robot_xy in ((2, (1.8, 0.0)), (3, (1.78, 0.2))):
+            mapper.update_from_cloud(
+                floor_index=0,
+                robot_xyz=(*robot_xy, 0.6),
+                points=[(0.0, 0.0, 0.6)],
+                cloud_generation=generation,
+            )
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), OCC)
+
+        counter_observations = (
+            (4, (1.8, 0.0), (-1.0, 0.0, 0.0)),
+            (5, (1.8, 0.2), (-1.0, -0.05, 0.0)),
+        )
+        for generation, robot_xy, free_point in counter_observations:
+            mapper.update_from_cloud(
+                floor_index=0,
+                robot_xyz=(*robot_xy, 0.6),
+                points=[free_point],
+                cloud_generation=generation,
+            )
+
+        self.assertIn(protected, grid.occ_cores)
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), VISITED)
+
+    def test_reobserved_obstacle_resets_protected_counterevidence(self):
+        mapper = self._trail_protection_mapper(
+            obstacle_inflation_radius=0.0,
+            point_free_clear_max_range=4.0,
+            trail_protection_confirm_generations=2,
+            trail_protection_confirm_positions=2,
+            low_candidate_counter_generations=2,
+            low_candidate_counter_positions=2,
+            low_confirmed_counter_generations=2,
+            low_confirmed_counter_positions=2,
+        )
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        grid = mapper.floor(0)
+        protected = grid.world_to_grid(0.0, 0.0)
+        for generation, robot_xy in ((2, (1.8, 0.0)), (3, (1.78, 0.2))):
+            mapper.update_from_cloud(
+                floor_index=0,
+                robot_xyz=(*robot_xy, 0.6),
+                points=[(0.0, 0.0, 0.6)],
+                cloud_generation=generation,
+            )
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), OCC)
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(1.8, 0.0, 0.6),
+            points=[(-1.0, 0.0, 0.0)],
+            cloud_generation=4,
+        )
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(1.8, 0.2, 0.6),
+            points=[(0.0, 0.0, 0.6)],
+            cloud_generation=5,
+        )
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(1.8, 0.4, 0.6),
+            points=[(-1.0, -0.1, 0.0)],
+            cloud_generation=6,
+        )
+
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), OCC)
+
+    def test_dynamic_door_clear_removes_confirmed_protected_obstacle(self):
+        mapper = self._trail_protection_mapper(
+            obstacle_inflation_radius=0.0,
+            trail_protection_confirm_generations=2,
+            trail_protection_confirm_positions=2,
+        )
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        grid = mapper.floor(0)
+        protected = grid.world_to_grid(0.0, 0.0)
+        for generation, robot_xy in ((2, (1.8, 0.0)), (3, (1.78, 0.2))):
+            mapper.update_from_cloud(
+                floor_index=0,
+                robot_xyz=(*robot_xy, 0.6),
+                points=[(0.0, 0.0, 0.6)],
+                cloud_generation=generation,
+            )
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), OCC)
+
+        mapper.clear_dynamic_door_strip(
+            0, 0.0, 0.0, 0.0, width=0.4, depth=0.4
+        )
+
+        self.assertNotIn(protected, grid.occ_cores)
+        self.assertIn(protected, grid.protected_trail_cells)
+        self.assertEqual(int(grid.data[protected[1], protected[0]]), VISITED)
+
+    def test_trail_protection_is_per_floor_and_survives_copy(self):
+        mapper = self._trail_protection_mapper()
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        mapper.update_from_cloud(
+            floor_index=1,
+            robot_xyz=(1.0, 0.0, 3.2),
+            points=[],
+            cloud_generation=2,
+        )
+        floor_zero = mapper.floor(0)
+        floor_one = mapper.floor(1)
+        zero_cell = floor_zero.world_to_grid(0.0, 0.0)
+        one_cell = floor_one.world_to_grid(1.0, 0.0)
+        copied = floor_zero.copy()
+
+        self.assertIn(zero_cell, floor_zero.protected_trail_cells)
+        self.assertNotIn(one_cell, floor_zero.protected_trail_cells)
+        self.assertIn(one_cell, floor_one.protected_trail_cells)
+        self.assertEqual(copied.protected_trail_cells, floor_zero.protected_trail_cells)
+        self.assertIsNot(copied.protected_trail_cells, floor_zero.protected_trail_cells)
+
+    def test_trail_protection_fills_between_consecutive_poses(self):
+        mapper = self._trail_protection_mapper(trail_protection_radius=0.25)
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.4, 0.0, 0.6),
+            points=[],
+            cloud_generation=2,
+        )
+        grid = mapper.floor(0)
+
+        for x in (0.0, 0.1, 0.2, 0.3, 0.4):
+            cell = grid.world_to_grid(x, 0.0)
+            self.assertIn(cell, grid.protected_trail_cells)
+            self.assertEqual(int(grid.data[cell[1], cell[0]]), VISITED)
+
+    def test_trail_protection_does_not_connect_large_pose_jump(self):
+        mapper = self._trail_protection_mapper(trail_protection_radius=0.25)
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=1,
+        )
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(2.0, 0.0, 0.6),
+            points=[],
+            cloud_generation=2,
+        )
+        grid = mapper.floor(0)
+        midpoint = grid.world_to_grid(1.0, 0.0)
+
+        self.assertNotIn(midpoint, grid.protected_trail_cells)
+        self.assertEqual(int(grid.data[midpoint[1], midpoint[0]]), UNKNOWN)
+
     def test_low_candidate_does_not_block_visited_until_distinct_pose_confirmation(self):
         mapper = MultiFloorGridMap(
             resolution=0.1,

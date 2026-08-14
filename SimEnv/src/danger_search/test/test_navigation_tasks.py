@@ -15,6 +15,10 @@ from danger_search.navigation_tasks import (
     TakeElevator,
 )
 from danger_search.mapper import BLACK, FREE, MultiFloorGridMap
+from danger_search.elevator_crossing_runtime import (
+    ElevatorCrossingGeometry,
+    ElevatorCrossingResult,
+)
 from danger_search.navigation_context import NavigationTaskContext
 from danger_search.navigator import STUCK, ControlResult
 from danger_search.planner import BUDGET_EXHAUSTED, PlanResult, UNREACHABLE
@@ -60,6 +64,15 @@ def _task_context(source) -> NavigationTaskContext:
         elevator_opening_confirmation_timeout=float(
             getattr(source, "elevator_opening_confirmation_timeout", 8.0)
         ),
+        elevator_local_crossing_geometry_enabled=bool(
+            getattr(source, "elevator_local_crossing_geometry_enabled", False)
+        ),
+        elevator_local_crossing_timeout=float(
+            getattr(source, "elevator_local_crossing_timeout", 4.0)
+        ),
+        elevator_local_crossing_max_center_correction=float(
+            getattr(source, "elevator_local_crossing_max_center_correction", 0.8)
+        ),
         elevator_stuck_retry_limit=int(
             getattr(source, "elevator_stuck_retry_limit", 4)
         ),
@@ -70,6 +83,9 @@ def _task_context(source) -> NavigationTaskContext:
         clear_opened_door_area_fn=getattr(
             source, "clear_opened_door_area", lambda _door_id: None
         ),
+        clear_elevator_crossing_area_fn=getattr(
+            source, "clear_elevator_crossing_area", lambda _geometry: None
+        ),
         refresh_open_door_geometry_fn=getattr(
             source, "refresh_open_door_geometry", lambda _door_id, _pose: DONE
         ),
@@ -77,6 +93,12 @@ def _task_context(source) -> NavigationTaskContext:
             source,
             "refresh_elevator_geometry",
             lambda _elevator_id, _floor, _door_id, _pose: IDLE,
+        ),
+        refresh_elevator_crossing_geometry_fn=getattr(
+            source, "refresh_elevator_crossing_geometry", lambda **_kwargs: None
+        ),
+        elevator_crossing_obstacle_fn=getattr(
+            source, "elevator_crossing_obstacle", lambda *_args, **_kwargs: None
         ),
         record_failure_fn=getattr(source, "_record_failure", lambda _reason: None),
         log_structured_fn=getattr(source, "_log_structured", lambda _payload: None),
@@ -1103,6 +1125,142 @@ class TakeElevatorTest(unittest.TestCase):
         manager.controller.next_align_reason = "alignment_done"
         self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
+
+    def test_confirmed_current_door_refreshes_live_crossing_before_enter(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        manager.elevator_local_crossing_geometry_enabled = True
+        geometry = ElevatorCrossingGeometry(
+            door_id="lift_door_ground",
+            mode="enter",
+            door_center=(1.42, 2.60),
+            outward_yaw=math.pi,
+            width=1.20,
+            wait_point=(0.62, 2.60),
+            cabin_center=(2.37, 2.60),
+            generation_count=3,
+            old_center_shift=0.57,
+        )
+        manager.refresh_elevator_crossing_geometry = lambda **_kwargs: (
+            ElevatorCrossingResult(DONE, geometry=geometry)
+        )
+        task = TakeElevator(0, 1)
+        task.phase = "WAIT_CURRENT_DOOR_OPEN"
+
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "REFRESH_CURRENT_OPEN_CROSSING")
+        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "ENTER_CABIN")
+        self.assertEqual(task._current_crossing_geometry, geometry)
+
+    def test_current_crossing_translates_remembered_door_by_stand_pose_offset(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        manager.elevator_local_crossing_geometry_enabled = True
+        captured = {}
+
+        def refresh(**kwargs):
+            captured.update(kwargs)
+            return ElevatorCrossingResult(RUNNING)
+
+        manager.refresh_elevator_crossing_geometry = refresh
+        task = TakeElevator(0, 1)
+        task.phase = "REFRESH_CURRENT_OPEN_CROSSING"
+
+        task.tick(_task_context(manager), (0.95, 2.70, 0.0))
+
+        self.assertAlmostEqual(captured["old_door_center"][0], 1.75, places=2)
+        self.assertAlmostEqual(captured["old_door_center"][1], 2.70, places=2)
+
+    def test_target_live_cabin_center_offset_fails_closed(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 1
+        manager.elevator_local_crossing_geometry_enabled = True
+        geometry = ElevatorCrossingGeometry(
+            door_id="lift_door_upper",
+            mode="exit",
+            door_center=(1.42, 2.60),
+            outward_yaw=math.pi,
+            width=1.20,
+            wait_point=(0.62, 2.60),
+            cabin_center=(2.37, 2.60),
+            generation_count=3,
+            old_center_shift=0.57,
+        )
+        manager.refresh_elevator_crossing_geometry = lambda **_kwargs: (
+            ElevatorCrossingResult(DONE, geometry=geometry)
+        )
+        task = TakeElevator(0, 1)
+        task.phase = "REFRESH_TARGET_OPEN_CROSSING"
+
+        status = task.tick(_task_context(manager), (3.30, 2.60, math.pi))
+
+        self.assertEqual(status, FAILED)
+        self.assertEqual(task.failure_reason, "elevator_cabin_center_offset_exceeded")
+
+    def test_live_crossing_corridor_block_is_bounded(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        manager.elevator_local_crossing_timeout = 4.0
+        manager.elevator_crossing_obstacle = lambda *_args, **_kwargs: object()
+        task = TakeElevator(0, 1)
+        task._cabin_transit_mode = "enter"
+        task._current_crossing_geometry = object()
+
+        with patch(
+            "danger_search.navigation_tasks._segment_crosses_blocked_cell",
+            return_value=False,
+        ), patch("danger_search.navigation_tasks.get_time", side_effect=(10.0, 14.1)):
+            first = task._commit_cabin_cross(
+                _task_context(manager),
+                (0.85, 2.60, 0.0),
+                (0.85, 2.60),
+                (2.60, 2.60),
+                target_door_id="lift_door_ground",
+                position_tolerance=0.15,
+                max_linear=None,
+            )
+            second = task._commit_cabin_cross(
+                _task_context(manager),
+                (0.85, 2.60, 0.0),
+                (0.85, 2.60),
+                (2.60, 2.60),
+                target_door_id="lift_door_ground",
+                position_tolerance=0.15,
+                max_linear=None,
+            )
+
+        self.assertEqual(first, RUNNING)
+        self.assertEqual(second, STUCK)
+        self.assertEqual(task.failure_reason, "elevator_crossing_corridor_blocked")
 
     def test_elevator_unreachable_planning_fails_after_bounded_retries(self):
         grid = MultiFloorGridMap(

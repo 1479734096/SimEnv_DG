@@ -54,6 +54,42 @@ class LocalSemanticDetectorTest(unittest.TestCase):
         self.assertAlmostEqual(opening.width, 0.90, places=2)
         self.assertAlmostEqual(opening.yaw, math.pi / 2.0, places=2)
 
+    def test_opening_distance_window_skips_near_internal_structure(self):
+        detector = LocalSemanticDetector(max_distance=3.0, min_evidence_points=3)
+        robot_pose = (0.0, 0.0, 0.0)
+        points = self._opening_points(robot_pose, forward=0.35)
+        points.extend(self._opening_points(robot_pose, forward=0.95))
+
+        opening = detector.detect_opening_ahead(
+            robot_pose=robot_pose,
+            floor_index=0,
+            cloud_points=points,
+            floor_height=2.6,
+            minimum_distance=0.60,
+            maximum_distance=1.30,
+        )
+
+        self.assertIsNotNone(opening)
+        self.assertAlmostEqual(opening.distance, 0.95, places=2)
+
+    def test_reports_all_openings_for_memory_based_selection(self):
+        detector = LocalSemanticDetector(max_distance=3.0, min_evidence_points=3)
+        robot_pose = (0.0, 0.0, 0.0)
+        points = self._opening_points(robot_pose, forward=0.70)
+        points.extend(self._opening_points(robot_pose, forward=0.95))
+
+        openings = detector.detect_openings_ahead(
+            robot_pose=robot_pose,
+            floor_index=0,
+            cloud_points=points,
+            floor_height=2.6,
+        )
+
+        self.assertEqual(
+            [round(opening.distance, 2) for opening in openings],
+            [0.70, 0.95],
+        )
+
     def test_opening_ahead_rejects_structure_across_center_lane(self):
         detector = LocalSemanticDetector(max_distance=3.0, min_evidence_points=3)
 

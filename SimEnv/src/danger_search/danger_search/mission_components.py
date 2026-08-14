@@ -68,6 +68,7 @@ class MissionRuntimeComponents:
             mission_summary_file=output["mission_summary_file"],
             status_topic=topics["status_topic"],
             map_topic=topics["map_topic"],
+            frame_id=localization_config["global_frame_id"],
         )
         perception = PerceptionRuntime.from_topics(
             cloud_topic=topics["cloud_topic"],
@@ -104,6 +105,7 @@ class MissionRuntimeComponents:
             path_raw_topic=topics["path_raw_topic"],
             path_followed_topic=topics["path_followed_topic"],
             local_target_topic=topics["local_target_topic"],
+            path_frame_id=localization_config["global_frame_id"],
             **return_home["controller_params"],
         )
         ground_support = GroundSupportCoordinator(

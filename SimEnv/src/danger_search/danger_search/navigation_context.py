@@ -17,12 +17,18 @@ class NavigationTaskContext:
     elevator_geometry_refresh_enabled: bool
     elevator_geometry_refresh_standoff: float
     elevator_opening_confirmation_timeout: float
+    elevator_local_crossing_geometry_enabled: bool
+    elevator_local_crossing_timeout: float
+    elevator_local_crossing_max_center_correction: float
     elevator_stuck_retry_limit: int
     exit_first_max_linear: float | None
     exit_cabin_backoff_enabled: bool
     clear_opened_door_area_fn: Callable[[str], None]
+    clear_elevator_crossing_area_fn: Callable[[object], None]
     refresh_open_door_geometry_fn: Callable[..., str]
     refresh_elevator_geometry_fn: Callable[..., str]
+    refresh_elevator_crossing_geometry_fn: Callable[..., object]
+    elevator_crossing_obstacle_fn: Callable[..., object]
     record_failure_fn: Callable[[str], None]
     log_structured_fn: Callable[[dict[str, object]], None]
     begin_floor_transition_fn: Callable[..., None]
@@ -40,11 +46,20 @@ class NavigationTaskContext:
     def clear_opened_door_area(self, door_id: str) -> None:
         self.clear_opened_door_area_fn(door_id)
 
+    def clear_elevator_crossing_area(self, geometry) -> None:
+        self.clear_elevator_crossing_area_fn(geometry)
+
     def refresh_open_door_geometry(self, *args, **kwargs) -> str:
         return self.refresh_open_door_geometry_fn(*args, **kwargs)
 
     def refresh_elevator_geometry(self, *args, **kwargs) -> str:
         return self.refresh_elevator_geometry_fn(*args, **kwargs)
+
+    def refresh_elevator_crossing_geometry(self, *args, **kwargs):
+        return self.refresh_elevator_crossing_geometry_fn(*args, **kwargs)
+
+    def elevator_crossing_obstacle(self, *args, **kwargs):
+        return self.elevator_crossing_obstacle_fn(*args, **kwargs)
 
     def record_failure(self, reason: str) -> None:
         self.record_failure_fn(str(reason))

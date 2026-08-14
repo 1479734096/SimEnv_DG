@@ -26,6 +26,7 @@ ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS="${ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOS
 ELEVATOR_TEST_LOCALIZATION_BACKEND="${ELEVATOR_TEST_LOCALIZATION_BACKEND:-adaptive_shared_map}"
 ELEVATOR_TEST_LOCALIZATION_MAX_RANGE="${ELEVATOR_TEST_LOCALIZATION_MAX_RANGE:-15.0}"
 ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED="${ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED:-false}"
+ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED="${ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED:-true}"
 LOG_DIR="${ELEVATOR_TEST_LOG_DIR:-/tmp/danger_search_elevator_test_$(date +%Y%m%d_%H%M%S)}"
 
 AUTO_PID=""
@@ -68,6 +69,7 @@ usage() {
   ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map  选择定位后端，默认 adaptive_shared_map
   ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0  定位点云最大量程，必须大于 0.5 m
   ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false  是否让 RGB-D 参与共享地图定位
+  ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED=true  是否启用开门后的 Livox 穿越几何刷新
   ELEVATOR_TEST_KEEP_RUNNING=1         成功后保留 GUI，按 Ctrl-C 清理
   ELEVATOR_TEST_LOG_DIR=/tmp/...       证据目录
 
@@ -151,6 +153,7 @@ write_summary() {
     printf 'localization_backend=%s\n' "$ELEVATOR_TEST_LOCALIZATION_BACKEND"
     printf 'localization_max_range=%s\n' "$ELEVATOR_TEST_LOCALIZATION_MAX_RANGE"
     printf 'adaptive_rgbd_localization_enabled=%s\n' "$ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED"
+    printf 'local_crossing_geometry_enabled=%s\n' "$ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED"
     printf 'diagnostic_bag=%s/elevator_diagnostic.bag\n' "$LOG_DIR"
     printf 'rgbd_bag=%s/elevator_rgbd.bag\n' "$LOG_DIR"
     printf 'drift_summary=%s/localization_drift.json\n' "$LOG_DIR"
@@ -328,6 +331,11 @@ if [[ "$ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED" != "true" && \
   printf 'ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED 只能是 true 或 false\n' >&2
   exit 2
 fi
+if [[ "$ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED" != "true" && \
+      "$ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED" != "false" ]]; then
+  printf 'ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED 只能是 true 或 false\n' >&2
+  exit 2
+fi
 for flag in "$ELEVATOR_TEST_RECORD_DRIFT" "$ELEVATOR_TEST_RECORD_RGBD" "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS"; do
   if [[ "$flag" != "0" && "$flag" != "1" ]]; then
     printf '诊断开关只能是 0 或 1：%s\n' "$flag" >&2
@@ -400,12 +408,14 @@ sed \
   -e "s/^  runtime_by_floor: \[\[1, 300[.]0\], \[2, 620[.]0\], \[3, 840[.]0\]\]$/  runtime_by_floor: [[1, $ELEVATOR_TEST_MAX_RUNTIME], [2, $ELEVATOR_TEST_MAX_RUNTIME], [3, $ELEVATOR_TEST_MAX_RUNTIME]]/" \
   -e "s/^  floor_timeout: 280[.]0$/  floor_timeout: $ELEVATOR_TEST_FLOOR_TIMEOUT/" \
   -e "s/^  min_floor_explore_time: 60[.]0$/  min_floor_explore_time: $ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME/" \
+  -e "s/^  elevator_local_crossing_geometry_enabled: true$/  elevator_local_crossing_geometry_enabled: $ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED/" \
   -e "s/^  landmark_drift_diagnostic_enabled: false$/  landmark_drift_diagnostic_enabled: $LANDMARK_DIAGNOSTIC_VALUE/" \
   "$BASE_CONFIG" > "$TEST_CONFIG"
 
 if ! grep -Fq "  floor_timeout: $ELEVATOR_TEST_FLOOR_TIMEOUT" "$TEST_CONFIG" || \
    ! grep -Fq "  min_floor_explore_time: $ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME" "$TEST_CONFIG" || \
    ! grep -Fq "  runtime_by_floor: [[1, $ELEVATOR_TEST_MAX_RUNTIME], [2, $ELEVATOR_TEST_MAX_RUNTIME], [3, $ELEVATOR_TEST_MAX_RUNTIME]]" "$TEST_CONFIG" || \
+   ! grep -Fq "  elevator_local_crossing_geometry_enabled: $ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED" "$TEST_CONFIG" || \
    ! grep -Fq "  landmark_drift_diagnostic_enabled: $LANDMARK_DIAGNOSTIC_VALUE" "$TEST_CONFIG"; then
   fail "专项配置覆盖失败，正式配置字段可能已变化" 2
   exit $?

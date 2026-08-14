@@ -660,6 +660,14 @@ class LocalControllerTest(unittest.TestCase):
 
         self.assertEqual(len(follower._raw_path_publisher.messages), 1)
         self.assertEqual(len(follower._followed_path_publisher.messages), 1)
+        self.assertEqual(
+            follower._raw_path_publisher.messages[0].header.frame_id,
+            "world",
+        )
+        self.assertEqual(
+            follower._followed_path_publisher.messages[0].header.frame_id,
+            "world",
+        )
         self.assertEqual(len(follower._raw_path_publisher.messages[0].poses), 3)
         self.assertEqual(len(follower._followed_path_publisher.messages[0].poses), 2)
 

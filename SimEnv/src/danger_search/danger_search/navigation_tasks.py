@@ -801,6 +801,9 @@ class TakeElevator(NavigationTask):
         self._start_retreat_attempted = False
         self._start_retreat_target_xy: tuple[float, float] | None = None
         self._start_retreat_deadline = 0.0
+        self._current_crossing_geometry = None
+        self._target_crossing_geometry = None
+        self._crossing_blocked_since: float | None = None
 
     def tick(self, context: NavigationTaskContext, pose: tuple[float, float, float]) -> str:
         """推进一个乘梯阶段；任一失败都显式返回 FAILED 而不猜测所在楼层。"""
@@ -812,6 +815,12 @@ class TakeElevator(NavigationTask):
             if rospy is not None:
                 rospy.logerr(f"TakeElevator 失败: {e}")
             return FAILED
+        if self._current_crossing_geometry is not None:
+            current_wait = self._current_crossing_geometry.wait_point
+            cabin_center = self._current_crossing_geometry.cabin_center
+        if self._target_crossing_geometry is not None:
+            target_wait = self._target_crossing_geometry.wait_point
+            cabin_center = self._target_crossing_geometry.cabin_center
         refresh_wait = self._refresh_viewpoint(
             current_wait,
             cabin_center,
@@ -983,11 +992,42 @@ class TakeElevator(NavigationTask):
                 constraints=context.planning_constraints,
             ):
                 self._reset_cabin_transit()
-                self.phase = "ENTER_CABIN"
+                self.phase = (
+                    "REFRESH_CURRENT_OPEN_CROSSING"
+                    if context.elevator_local_crossing_geometry_enabled
+                    else "ENTER_CABIN"
+                )
             elif get_time() - self._wait_start_time > 10.0:
                 if rospy is not None:
                     rospy.logwarn("[%s] 等待当前楼层电梯门可通行超时，继续等待地图连通", self.name)
                 self._wait_start_time = get_time()
+            return RUNNING
+
+        if self.phase == "REFRESH_CURRENT_OPEN_CROSSING":
+            context.controller.stop(reason="elevator_local_crossing_refresh")
+            expected_yaw = math.atan2(
+                cabin_center[1] - current_wait[1],
+                cabin_center[0] - current_wait[0],
+            )
+            result = context.refresh_elevator_crossing_geometry(
+                door_id=current_door_id,
+                mode="enter",
+                expected_crossing_yaw=expected_yaw,
+                old_door_center=self._door_center(current_wait, cabin_center),
+                pose=pose,
+            )
+            if result is None or result.status == RUNNING:
+                return RUNNING
+            if result.status != DONE or result.geometry is None:
+                return self._fail_navigation(
+                    context,
+                    result.failure or "elevator_open_crossing_geometry_unavailable",
+                    "当前层开门后的 Livox 穿越几何未能连续确认",
+                )
+            self._current_crossing_geometry = result.geometry
+            context.clear_elevator_crossing_area(result.geometry)
+            self._reset_cabin_transit()
+            self.phase = "ENTER_CABIN"
             return RUNNING
 
         if self.phase == "ENTER_CABIN":
@@ -1117,6 +1157,9 @@ class TakeElevator(NavigationTask):
                         rospy.logerr("[%s] 目标门已确认但楼层过渡无效：%s", self.name, exc)
                     return FAILED
                 self._floor_transition_confirmed = True
+            if context.elevator_local_crossing_geometry_enabled:
+                self.phase = "REFRESH_TARGET_OPEN_CROSSING"
+                return RUNNING
             grid = context.mapper.floor(self.target_floor)
             straight_segment_blocked = _segment_crosses_blocked_cell(
                 grid,
@@ -1156,6 +1199,51 @@ class TakeElevator(NavigationTask):
                 if rospy is not None:
                     rospy.logwarn("[%s] 等待目标楼层电梯门可通行超时，继续等待地图连通", self.name)
                 self._wait_start_time = get_time()
+            return RUNNING
+
+        if self.phase == "REFRESH_TARGET_OPEN_CROSSING":
+            context.controller.stop(reason="elevator_local_crossing_refresh")
+            expected_yaw = math.atan2(
+                target_wait[1] - cabin_center[1],
+                target_wait[0] - cabin_center[0],
+            )
+            result = context.refresh_elevator_crossing_geometry(
+                door_id=target_door_id,
+                mode="exit",
+                expected_crossing_yaw=expected_yaw,
+                old_door_center=self._door_center(
+                    cabin_center,
+                    target_wait,
+                    first_standoff=0.95,
+                ),
+                pose=pose,
+            )
+            if result is None or result.status == RUNNING:
+                return RUNNING
+            if result.status != DONE or result.geometry is None:
+                return self._fail_navigation(
+                    context,
+                    result.failure or "elevator_open_crossing_geometry_unavailable",
+                    "目标层开门后的 Livox 穿越几何未能连续确认",
+                )
+            center_offset = math.hypot(
+                result.geometry.cabin_center[0] - pose[0],
+                result.geometry.cabin_center[1] - pose[1],
+            )
+            if center_offset > context.elevator_local_crossing_max_center_correction:
+                return self._fail_navigation(
+                    context,
+                    "elevator_cabin_center_offset_exceeded",
+                    "当前位姿与 Livox 轿厢中心偏差 %.3fm 超过 %.3fm"
+                    % (
+                        center_offset,
+                        context.elevator_local_crossing_max_center_correction,
+                    ),
+                )
+            self._target_crossing_geometry = result.geometry
+            context.clear_elevator_crossing_area(result.geometry)
+            self._reset_cabin_transit()
+            self.phase = "EXIT_CABIN"
             return RUNNING
 
         if self.phase == "EXIT_CABIN":
@@ -1223,6 +1311,8 @@ class TakeElevator(NavigationTask):
             if status == FAILED:
                 return FAILED
             if status == DONE:
+                self._current_crossing_geometry = None
+                self._target_crossing_geometry = None
                 self.phase = "DONE"
                 return DONE
             return RUNNING
@@ -1336,7 +1426,12 @@ class TakeElevator(NavigationTask):
             self._cabin_transit_door_clear_refreshed = True
         grid = context.mapper.floor(context.current_floor)
         commit_start = (pose[0], pose[1])
-        if _segment_crosses_blocked_cell(
+        crossing_geometry = (
+            self._current_crossing_geometry
+            if self._cabin_transit_mode == "enter"
+            else self._target_crossing_geometry
+        )
+        if crossing_geometry is None and _segment_crosses_blocked_cell(
             grid,
             commit_start,
             target_xy,
@@ -1350,6 +1445,25 @@ class TakeElevator(NavigationTask):
                     self.name,
                 )
             return RUNNING
+        if crossing_geometry is not None:
+            obstacle = context.elevator_crossing_obstacle(
+                commit_start,
+                target_xy,
+                crossing_geometry,
+            )
+            if obstacle is not None:
+                now = get_time()
+                if self._crossing_blocked_since is None:
+                    self._crossing_blocked_since = now
+                if now - self._crossing_blocked_since > context.elevator_local_crossing_timeout:
+                    self.failure_reason = "elevator_crossing_corridor_blocked"
+                    context.record_failure(self.failure_reason)
+                    context.controller.stop(reason=self.failure_reason)
+                    return STUCK
+                self._cabin_transit_alignment_count = 0
+                context.controller.stop(reason="elevator_crossing_corridor_wait")
+                return RUNNING
+        self._crossing_blocked_since = None
         self._cabin_transit_start_xy = commit_start
         self._cabin_transit_target_xy = target_xy
         context.controller.set_path(
@@ -1625,6 +1739,7 @@ class TakeElevator(NavigationTask):
         self._cabin_transit_door_clear_refreshed = False
         self._cabin_transit_position_door_cleared = False
         self._cabin_transit_goal_grace = 0
+        self._crossing_blocked_since = None
         self._log_cabin_transit_stage(
             "POSITION",
             None,
@@ -1642,6 +1757,23 @@ class TakeElevator(NavigationTask):
         self._cabin_transit_door_clear_refreshed = False
         self._cabin_transit_position_door_cleared = False
         self._cabin_transit_goal_grace = 0
+        self._crossing_blocked_since = None
+
+    @staticmethod
+    def _door_center(
+        first_xy: tuple[float, float],
+        second_xy: tuple[float, float],
+        *,
+        first_standoff: float = _DEFAULT_WAIT_STANDOFF,
+    ) -> tuple[float, float]:
+        """按既有 0.80/0.95m 候梯点语义恢复注册门面中心。"""
+        dx = second_xy[0] - first_xy[0]
+        dy = second_xy[1] - first_xy[1]
+        distance = math.hypot(dx, dy)
+        if distance <= 1e-6:
+            return first_xy
+        ratio = float(first_standoff) / distance
+        return (first_xy[0] + ratio * dx, first_xy[1] + ratio * dy)
 
     @staticmethod
     def _cabin_transit_position_tolerance(context: NavigationTaskContext) -> float:
@@ -2208,6 +2340,8 @@ class TakeElevator(NavigationTask):
         detail: str,
     ) -> str:
         self.failure_reason = str(reason_code)
+        self._current_crossing_geometry = None
+        self._target_crossing_geometry = None
         context.controller.clear_path(reason=reason_code)
         context.controller.stop(reason=reason_code)
         if rospy is not None:

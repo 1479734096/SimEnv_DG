@@ -83,6 +83,8 @@ class MapperDebugSnapshot:
     hard_core_count: int = 0
     low_core_removed_count: int = 0
     low_core_removed_total: int = 0
+    protected_trail_cell_count: int = 0
+    protected_trail_confirmed_core_count: int = 0
 
 
 @dataclass
@@ -275,6 +277,8 @@ class FloorGrid:
         )
         self.evidence_scope = (self.floor_index, 1, 1)
         self.black_owners: dict[tuple[int, int], set[str]] = {}
+        self.protected_trail_cells: set[tuple[int, int]] = set()
+        self.last_protected_trail_xy: tuple[float, float] | None = None
 
         # NEGATIVE 可能暂时被 OCC/BLACK 覆盖；单独保存来源，动态门清除 OCC 时
         # 才能恢复负障，而直接楼面证据也只能移除这一来源。
@@ -323,14 +327,24 @@ class FloorGrid:
         cell = (int(gx), int(gy))
         if not self._in_bounds(*cell):
             return
-        if self.obstacle_evidence.blocking_at(cell):
-            state = OCC
-        elif self.black_owners.get(cell):
-            state = BLACK
-        elif self.negative_cell_owners.get(cell):
-            state = NEGATIVE
+        if cell in self.protected_trail_cells:
+            if self.black_owners.get(cell):
+                state = BLACK
+            elif self.negative_cell_owners.get(cell):
+                state = NEGATIVE
+            elif self.obstacle_evidence.protected_trail_blocking_at(cell):
+                state = OCC
+            else:
+                state = int(self.observation_layer[cell[1], cell[0]])
         else:
-            state = int(self.observation_layer[cell[1], cell[0]])
+            if self.obstacle_evidence.blocking_at(cell):
+                state = OCC
+            elif self.black_owners.get(cell):
+                state = BLACK
+            elif self.negative_cell_owners.get(cell):
+                state = NEGATIVE
+            else:
+                state = int(self.observation_layer[cell[1], cell[0]])
         self.planning_layer[cell[1], cell[0]] = state
 
     def _refresh_cells(self, cells: Iterable[tuple[int, int]]) -> None:
@@ -366,6 +380,8 @@ class FloorGrid:
             origin_y=self.origin_y,
         )
         self.black_owners.clear()
+        self.protected_trail_cells.clear()
+        self.last_protected_trail_xy = None
         self.negative_cells.clear()
         self.negative_cell_owners.clear()
         for gy in range(self.size_y):
@@ -420,6 +436,8 @@ class FloorGrid:
         result.black_owners = {
             cell: set(owners) for cell, owners in self.black_owners.items()
         }
+        result.protected_trail_cells = set(self.protected_trail_cells)
+        result.last_protected_trail_xy = self.last_protected_trail_xy
         result.negative_cells = set(self.negative_cells)
         result.negative_cluster_records = dict(self.negative_cluster_records)
         result.negative_cell_owners = {
@@ -617,7 +635,10 @@ class FloorGrid:
         for gx, gy in occupied_before:
             current_state = int(self.planning_layer[gy, gx])
             if current_state not in (OCC, BLACK, NEGATIVE):
-                self.set_base_state(gx, gy, FREE)
+                restored_state = (
+                    VISITED if (gx, gy) in self.protected_trail_cells else FREE
+                )
+                self.set_base_state(gx, gy, restored_state)
 
         # 计算实际清除数量
         occupied_after = sum(
@@ -682,6 +703,50 @@ class FloorGrid:
                 wx, wy = self.grid_to_world(gx, gy)
                 if math.hypot(wx - x, wy - y) <= radius:
                     self.set_base_state(gx, gy, VISITED)
+
+    def protect_trail_radius(self, x: float, y: float, radius: float) -> None:
+        """把机身实际通过的核心区域登记为本层持久 VISITED。"""
+        current = (float(x), float(y))
+        if self.world_to_grid(*current) is None:
+            return
+        start = self.last_protected_trail_xy or current
+        distance = math.hypot(current[0] - start[0], current[1] - start[1])
+        # 仅连接能够由相邻足迹圆连续覆盖的位姿；较大跳变可能来自定位修正或
+        # 长时间无点云，不能据此臆造机器人实际走过的永久自由通道。
+        if distance > max(2.0 * float(radius), self.resolution) + 1e-9:
+            start = current
+            distance = 0.0
+        samples = max(
+            1,
+            int(math.ceil(distance / max(self.resolution * 0.5, 1e-9))),
+        )
+        for index in range(samples + 1):
+            ratio = index / samples
+            sample = (
+                start[0] + (current[0] - start[0]) * ratio,
+                start[1] + (current[1] - start[1]) * ratio,
+            )
+            self._protect_trail_sample(*sample, radius=float(radius))
+        self.last_protected_trail_xy = current
+
+    def _protect_trail_sample(self, x: float, y: float, *, radius: float) -> None:
+        center = self.world_to_grid(x, y)
+        if center is None:
+            return
+        cells = int(math.ceil(float(radius) / self.resolution))
+        for gy in range(center[1] - cells, center[1] + cells + 1):
+            for gx in range(center[0] - cells, center[0] + cells + 1):
+                if not self._in_bounds(gx, gy):
+                    continue
+                wx, wy = self.grid_to_world(gx, gy)
+                if (
+                    math.hypot(wx - float(x), wy - float(y))
+                    > float(radius) + 1e-9
+                ):
+                    continue
+                self.protected_trail_cells.add((gx, gy))
+                self.observation_layer[gy, gx] = VISITED
+                self._refresh_cell(gx, gy)
 
     def coverage_ratio(self) -> float:
         # 不使用真值：以当前观测到的地图包围盒为分母，衡量内部未知空洞是否已填充。
@@ -767,6 +832,11 @@ class MultiFloorGridMap:
         counter_pose_separation: float = 0.15,
         low_near_exempt_radius: float = 0.0,
         low_candidate_max_range: float = 0.0,
+        trail_protection_enabled: bool = False,
+        trail_protection_radius: float = 0.25,
+        trail_protection_near_range: float = 2.0,
+        trail_protection_confirm_generations: int = 3,
+        trail_protection_confirm_positions: int = 2,
     ):
         self.resolution = float(resolution)
         self.width = float(width)
@@ -805,6 +875,15 @@ class MultiFloorGridMap:
         self.counter_pose_separation = float(counter_pose_separation)
         self.low_near_exempt_radius = max(0.0, float(low_near_exempt_radius))
         self.low_candidate_max_range = max(0.0, float(low_candidate_max_range))
+        self.trail_protection_enabled = bool(trail_protection_enabled)
+        self.trail_protection_radius = float(trail_protection_radius)
+        self.trail_protection_near_range = float(trail_protection_near_range)
+        self.trail_protection_confirm_generations = int(
+            trail_protection_confirm_generations
+        )
+        self.trail_protection_confirm_positions = int(
+            trail_protection_confirm_positions
+        )
         self._negative_cluster_revision = 0
         self._low_core_removed_total = 0
         finite_parameters = (
@@ -828,6 +907,8 @@ class MultiFloorGridMap:
             self.counter_pose_separation,
             self.low_near_exempt_radius,
             self.low_candidate_max_range,
+            self.trail_protection_radius,
+            self.trail_protection_near_range,
         )
         if not all(math.isfinite(value) for value in finite_parameters):
             raise ValueError("建图参数必须为有限数")
@@ -854,6 +935,10 @@ class MultiFloorGridMap:
             or self.low_confirmed_counter_positions
             < self.low_candidate_counter_positions
             or self.counter_pose_separation < 0.0
+            or self.trail_protection_radius < 0.0
+            or self.trail_protection_near_range <= 0.0
+            or self.trail_protection_confirm_generations <= 0
+            or self.trail_protection_confirm_positions <= 0
         ):
             raise ValueError("建图尺寸、楼高、障碍范围或距离参数无效")
         self.point_free_clear_max_range = max(0.0, self.point_free_clear_max_range)
@@ -915,6 +1000,10 @@ class MultiFloorGridMap:
             self._store_debug_snapshot(grid, stats)
             return
         grid.mark_visited_radius(robot_xyz[0], robot_xyz[1], self.visited_radius)
+        if self.trail_protection_enabled:
+            grid.protect_trail_radius(
+                robot_xyz[0], robot_xyz[1], self.trail_protection_radius
+            )
         floor_base_z = floor_index * self.floor_height
         angle_bins: dict[int, _AngleBinObservation] = {}
         observations: list[
@@ -1006,6 +1095,30 @@ class MultiFloorGridMap:
                         ),
                         pose_separation=self.counter_pose_separation,
                     )
+                    core = grid.occ_cores.get(_target_cell)
+                    if (
+                        self.trail_protection_enabled
+                        and _distance <= self.trail_protection_near_range
+                        and core is not None
+                        and bool(core.inflated_cells & grid.protected_trail_cells)
+                    ):
+                        changed = (
+                            grid.obstacle_evidence.record_protected_trail_observation(
+                                px,
+                                py,
+                                cloud_generation=int(cloud_generation),
+                                robot_xy=(robot_xyz[0], robot_xyz[1]),
+                                confirm_generations=(
+                                    self.trail_protection_confirm_generations
+                                ),
+                                confirm_positions=(
+                                    self.trail_protection_confirm_positions
+                                ),
+                                generation_window=self.low_confirm_window_generations,
+                                pose_separation=self.counter_pose_separation,
+                            )
+                        )
+                        grid._refresh_cells(changed)
 
         for px, py, _pz, distance, is_obstacle_point, target_cell in observations:
             ray_target = target_cell
@@ -1048,6 +1161,7 @@ class MultiFloorGridMap:
                 robot_cell,
                 ray_target,
                 stop_at_blocked=True,
+                blocked_cells=obstacle_hit_cells,
             )
             stats.point_ray_count += 1
             stats.max_clearing_length = max(stats.max_clearing_length, clear_length)
@@ -1090,6 +1204,11 @@ class MultiFloorGridMap:
             ),
             low_core_removed_count=int(stats.low_core_removed_count),
             low_core_removed_total=int(self._low_core_removed_total),
+            protected_trail_cell_count=len(grid.protected_trail_cells),
+            protected_trail_confirmed_core_count=sum(
+                core.protected_trail_confirmed
+                for core in grid.occ_cores.values()
+            ),
         )
 
     def persist_negative_clusters_atomic(
@@ -1283,10 +1402,14 @@ class MultiFloorGridMap:
         end: tuple[int, int],
         *,
         stop_at_blocked: bool = True,
+        blocked_cells: frozenset[tuple[int, int]] = frozenset(),
     ) -> tuple[float, bool]:
         last_cleared = start
         for gx, gy in _bresenham(start[0], start[1], end[0], end[1])[:-1]:
-            if stop_at_blocked and int(grid.data[gy, gx]) in (OCC, BLACK, NEGATIVE):
+            if stop_at_blocked and (
+                (gx, gy) in blocked_cells
+                or int(grid.data[gy, gx]) in (OCC, BLACK, NEGATIVE)
+            ):
                 return _grid_distance(grid, start, last_cleared), True
             grid.mark_free(gx, gy)
             last_cleared = (gx, gy)

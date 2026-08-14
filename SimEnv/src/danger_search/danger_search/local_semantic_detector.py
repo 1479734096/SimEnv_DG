@@ -103,8 +103,23 @@ class LocalSemanticDetector:
         floor_index: int,
         cloud_points: Iterable[tuple[float, float, float]],
         floor_height: float = 2.6,
+        minimum_distance: float = 0.15,
+        maximum_distance: float | None = None,
     ) -> OpeningObservation | None:
         """从前方两侧竖直结构之间确认门洞，不依赖门坐标真值。"""
+        minimum_distance = float(minimum_distance)
+        maximum_distance = (
+            self.max_distance
+            if maximum_distance is None
+            else min(self.max_distance, float(maximum_distance))
+        )
+        if (
+            not math.isfinite(minimum_distance)
+            or not math.isfinite(maximum_distance)
+            or minimum_distance < 0.0
+            or maximum_distance <= minimum_distance
+        ):
+            raise ValueError("门洞检测距离窗口必须为有限递增范围")
         heading = (math.cos(robot_pose[2]), math.sin(robot_pose[2]))
         lateral_axis = (-heading[1], heading[0])
         floor_z = floor_index * floor_height
@@ -117,7 +132,7 @@ class LocalSemanticDetector:
             dy = py - robot_pose[1]
             forward = dx * heading[0] + dy * heading[1]
             lateral = dx * lateral_axis[0] + dy * lateral_axis[1]
-            if not 0.15 <= forward <= self.max_distance:
+            if not minimum_distance <= forward <= maximum_distance:
                 continue
             if abs(lateral) > self.opening_max_width:
                 continue

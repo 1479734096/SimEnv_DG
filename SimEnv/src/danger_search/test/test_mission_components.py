@@ -110,3 +110,20 @@ def test_config_fields_are_partitioned_once_into_read_only_sections():
         pass
     else:
         raise AssertionError("配置分组必须只读")
+
+
+def test_global_frame_is_wired_to_map_and_path_diagnostics():
+    config = load_mission_config(
+        lambda name, default=None: (
+            "diagnostic"
+            if name == "runtime/profile"
+            else "danger_search_relative"
+            if name == "localization/global_frame_id"
+            else default
+        )
+    )
+
+    components = MissionRuntimeComponents.build(config, start_time=0.0)
+
+    assert components.reporting._frame_id == "danger_search_relative"
+    assert components.controller.path_frame_id == "danger_search_relative"
