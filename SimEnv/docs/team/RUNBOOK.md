@@ -312,6 +312,42 @@ rviz -d src/danger_search/config/elevator_baseline.rviz
 本地几何确认事件、CROSS 结果和离线 RMSE/P95/最大/末端误差；启动成功不等于闭环成功，
 人工中止不记算法失败。
 
+### 8m 人工中止轮与后续复现口径
+
+`seed8127_g3_old_crossing_full_max8_20260814_r1` 虽按完整闭环参数启动，但在任务 elapsed
+`153.5s`、真值行程 `38.24m` 时人工结束，尚未达到一层 `280s` 预算，也未进入电梯；只能
+用于分析前半程定位和建图，不能登记为“8m 完整轮”。离线指标为 RMSE `0.1219m`、P95
+`0.1668m`、最大 `0.2013m`、末端 `0.1731m`、最大 yaw `0.00463rad`。
+
+与同机 15m 轮比较时必须按相同真值行程截取，不能拿 8m 的 38m 与 15m 的 62m 或完整长轮
+直接比较。15m 在前 `38.24m` 的 RMSE/P95/最大/末端为
+`0.1271/0.1827/0.1973/0.1499m`；结果混合且路径不同，只能说明 8m 有轻微改善迹象，不能
+证明 8m 最优，也不能证明它没有效果。8m 定位输出为 `9.947Hz`、最大间隔 `0.204s`，本轮
+没有形成硬件负载导致的定位掉帧链。两份旧证据都未保存 Git SHA 和定位可执行文件哈希，且
+15m 轮早于当天最终提交，不能把它们写成严格的代码冻结 A/B。
+
+历史 Stage17 的 seed=8127 指标 `RMSE=0.0869m/P95=0.1379m` 来自
+`floor_timeout=33s、min_floor_explore_time=5s、max_runtime=180s、GUI=false` 的短闭环；
+当前 8m 轮是一层 `153.5s` 长探索。两者运动路段、任务时序和运行条件均不同，Stage17 数字
+不能作为当前 8m 长轮应达到的直接基准，且该 handoff 没有把 `max_range` 写入冻结配置。
+
+当前 runner 的 `elevator_diagnostic.bag` 默认没有录制 `/nav/map_debug` 或
+`/danger_search/localization/cloud_registered`；只有在逐帧定位诊断开启时才额外录 `/scan`。
+因此现有 8m bag 不能逐格重建截图中的假障碍来源。下一次跨电脑比较必须同时冻结并记录：
+Git SHA、定位可执行文件哈希、有效参数、seed、GUI/诊断开关、场景公开文件哈希、仿真时长、
+真值行程、odom 频率和最大间隔。优先在两台电脑重放同一份 `/scan + /trunk_imu + /cmd_vel`
+原始 bag：若输出不同，检查构建和数值环境；若输出一致而在线 Gazebo 不同，差异来自物理轨迹
+或调度，不再归因于 `max_range`。
+
+定位后续严格按单变量执行：先保持 `max_range=8m` 测 `maximum_map_distance=8m`，再分别测试
+`minimum_residual_cutoff=0.06` 和 `maximum_iterations=8`；每个候选先做同 bag 离线重放，
+胜出后才做 GUI 完整闭环。地图假障碍另行处理 HIGH_HARD 严格反证生命周期，不能通过扩大
+历史轨迹永久 FREE 范围、降低障碍高度阈值或降低全局停车距离掩盖。
+
+该问题已于 2026-08-14 暂停。恢复前先阅读
+`docs/team/LOCALIZATION_MAP_HANDOFF_20260814.md`，不要把随后处理的“返航时无法出大门、无法
+回到出生点”与本轮定位/地图结论混为同一根因。
+
 ## 第 8 层正式入口与结果闭包
 
 机器人稳定站立后，应先让底盘进入可消费 `/cmd_vel` 的 RL 模式，再启动正式节点：

@@ -22,6 +22,13 @@ class ElevatorRunnerContractTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("ELEVATOR_TEST_FLOOR_COUNT=2", result.stdout)
+        self.assertIn("ELEVATOR_TEST_FLOOR_TIMEOUT=280.0", result.stdout)
+        self.assertIn(
+            "ELEVATOR_TEST_MAX_RUNTIME=按楼层：2层620.0、3层840.0",
+            result.stdout,
+        )
+        self.assertIn("ELEVATOR_TEST_WALL_TIMEOUT=7200", result.stdout)
+        self.assertIn("ELEVATOR_TEST_FULL_CYCLE=1", result.stdout)
         self.assertIn(
             "ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS=1",
             result.stdout,
@@ -29,7 +36,7 @@ class ElevatorRunnerContractTest(unittest.TestCase):
         self.assertIn(
             "ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map", result.stdout
         )
-        self.assertIn("ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0", result.stdout)
+        self.assertIn("ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=8.0", result.stdout)
         self.assertIn(
             "ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false", result.stdout
         )
@@ -54,6 +61,29 @@ class ElevatorRunnerContractTest(unittest.TestCase):
     def test_runner_passes_floor_count_and_tracks_highest_floor(self):
         source = RUNNER.read_text(encoding="utf-8")
 
+        self.assertIn(
+            'ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-280.0}"',
+            source,
+        )
+        self.assertIn(
+            'ELEVATOR_TEST_WALL_TIMEOUT="${ELEVATOR_TEST_WALL_TIMEOUT:-7200}"',
+            source,
+        )
+        self.assertIn('2) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="620.0" ;;', source)
+        self.assertIn('3) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="840.0" ;;', source)
+        self.assertIn(
+            'ELEVATOR_TEST_MAX_RUNTIME="${ELEVATOR_TEST_MAX_RUNTIME:-$ELEVATOR_TEST_DEFAULT_MAX_RUNTIME}"',
+            source,
+        )
+        self.assertIn(
+            'ELEVATOR_TEST_FULL_CYCLE="${ELEVATOR_TEST_FULL_CYCLE:-1}"',
+            source,
+        )
+        self.assertNotIn(
+            "runtime_by_floor: [[1, $ELEVATOR_TEST_MAX_RUNTIME], "
+            "[2, $ELEVATOR_TEST_MAX_RUNTIME], [3, $ELEVATOR_TEST_MAX_RUNTIME]]",
+            source,
+        )
         self.assertIn('FLOOR_COUNT="$ELEVATOR_TEST_FLOOR_COUNT"', source)
         self.assertIn(
             "highest_floor=$((ELEVATOR_TEST_FLOOR_COUNT - 1))",
@@ -150,7 +180,7 @@ class ElevatorRunnerContractTest(unittest.TestCase):
         source = RUNNER.read_text(encoding="utf-8")
 
         self.assertIn(
-            'ELEVATOR_TEST_LOCALIZATION_MAX_RANGE="${ELEVATOR_TEST_LOCALIZATION_MAX_RANGE:-15.0}"',
+            'ELEVATOR_TEST_LOCALIZATION_MAX_RANGE="${ELEVATOR_TEST_LOCALIZATION_MAX_RANGE:-8.0}"',
             source,
         )
         self.assertIn(
