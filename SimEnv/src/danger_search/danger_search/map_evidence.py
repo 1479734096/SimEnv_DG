@@ -309,18 +309,20 @@ class ObstacleEvidenceLedger:
         ray = _bresenham(start[0], start[1], end[0], end[1])
         if len(ray) < 3:
             return set()
-        index_by_cell = {cell: index for index, cell in enumerate(ray)}
         removed_cells: set[tuple[int, int]] = set()
-        for cell, core in tuple(self.cores.items()):
+        # 核心以栅格坐标为键，沿射线直接查询即可；遍历整张账本会让每帧
+        # 反证成本随永久 HIGH_HARD 核心数量持续增长。
+        for cell in ray[:-1]:
+            core = self.cores.get(cell)
+            if core is None:
+                continue
             low_lifecycle = core.kind in {LOW_CANDIDATE, LOW_CONFIRMED}
             protected_lifecycle = core.protected_trail_confirmed
             if not low_lifecycle and not protected_lifecycle:
                 continue
-            if cell in hit_cells or cell not in index_by_cell:
+            if cell in hit_cells:
                 continue
             # 终点必须严格位于核心之后，不能把止于核心的射线当作反证。
-            if index_by_cell[cell] >= len(ray) - 1:
-                continue
             if (
                 core.map_epoch != int(map_epoch)
                 or core.localization_epoch != int(localization_epoch)
