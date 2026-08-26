@@ -212,13 +212,13 @@ class InterfaceDocumentationTest(unittest.TestCase):
             float(config["controller"]["max_angular"]),
         )
 
-    def test_formal_controller_uses_wider_arc_turn_hysteresis(self):
+    def test_formal_controller_uses_balanced_arc_turn_hysteresis(self):
         config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
         controller = config["controller"]
 
-        self.assertEqual(controller["turn_in_place_heading"], 0.70)
+        self.assertEqual(controller["turn_in_place_heading"], 0.90)
         self.assertEqual(controller["turn_release_heading"], 0.20)
-        self.assertEqual(controller["turn_in_place_rate"], 0.45)
+        self.assertEqual(controller["turn_in_place_rate"], 0.65)
         self.assertEqual(controller["turn_release_rate"], 0.20)
         self.assertEqual(controller["turn_release_samples"], 3)
 
@@ -272,8 +272,8 @@ class InterfaceDocumentationTest(unittest.TestCase):
         frontier = config["frontier"]
 
         self.assertEqual(float(frontier["expected_gain_radius"]), 3.0)
-        self.assertEqual(float(frontier["information_gain_weight"]), 1.0)
-        self.assertEqual(float(frontier["path_cost_weight"]), 2.4)
+        self.assertEqual(float(frontier["information_gain_weight"]), 0.5)
+        self.assertEqual(float(frontier["path_cost_weight"]), 3.0)
         self.assertEqual(float(frontier["yaw_cost_weight"]), 0.2)
         self.assertEqual(int(frontier["max_planning_candidates"]), 8)
         self.assertEqual(int(frontier["max_goal_candidates_per_frontier"]), 2)

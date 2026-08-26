@@ -921,23 +921,37 @@ class FixedFrequencyControllerTest(unittest.TestCase):
             follower.step_once_for_test(self._sample((0.0, 0.0, 0.05), yaw_rate=0.1))
         self.assertFalse(follower._turn_in_place_active)
 
-    def test_wider_heading_threshold_keeps_moderate_turn_on_arc(self):
+    def test_balanced_turn_threshold_keeps_moderate_turn_on_arc(self):
         from danger_search.navigator import PathFollower
 
         follower = PathFollower(
             cmd_vel_topic="/cmd_vel",
-            turn_in_place_heading=0.70,
+            turn_in_place_heading=0.90,
+            turn_in_place_rate=0.65,
             turn_release_heading=0.20,
         )
         follower.set_path([(0.0, 0.0), (1.0, 0.0)])
 
-        follower.step_once_for_test(self._sample((0.0, 0.0, -0.60), yaw_rate=0.1))
+        follower.step_once_for_test(self._sample((0.0, 0.0, -0.80), yaw_rate=0.50))
         self.assertFalse(follower._turn_in_place_active)
         self.assertGreater(follower.requested_command_snapshot()[0], 0.0)
 
-        follower.step_once_for_test(self._sample((0.0, 0.0, -0.80), yaw_rate=0.1))
+        follower.step_once_for_test(self._sample((0.0, 0.0, -0.80), yaw_rate=0.70))
         self.assertTrue(follower._turn_in_place_active)
         self.assertEqual(follower.requested_command_snapshot()[0], 0.0)
+
+        heading_follower = PathFollower(
+            cmd_vel_topic="/cmd_vel",
+            turn_in_place_heading=0.90,
+            turn_in_place_rate=0.65,
+            turn_release_heading=0.20,
+        )
+        heading_follower.set_path([(0.0, 0.0), (1.0, 0.0)])
+        heading_follower.step_once_for_test(
+            self._sample((0.0, 0.0, -0.95), yaw_rate=0.10)
+        )
+        self.assertTrue(heading_follower._turn_in_place_active)
+        self.assertEqual(heading_follower.requested_command_snapshot()[0], 0.0)
 
     def test_pose_stale_publishes_zero_and_freezes_stuck(self):
         # pose 过期：立即零速，且不触发 STUCK（冻结进度计时）。

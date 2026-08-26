@@ -754,30 +754,52 @@ class FrontierExplorerTest(unittest.TestCase):
             "information_gain_below_minimum",
         )
 
-    def test_large_far_cluster_does_not_overwhelm_nearer_reachable_frontier(self):
-        """巨大聚类的信息增益应边际递减，不能仅凭格子数压过更近目标。"""
+    def test_balanced_breadth_first_prefers_near_frontier_unless_gain_is_extreme(self):
+        """常规收益先探索近处，但极高收益仍可覆盖路径代价。"""
         explorer = FrontierExplorer(
             min_cluster_size=1,
-            information_gain_weight=1.0,
+            information_gain_weight=0.5,
             path_cost_weight=3.0,
             yaw_cost_weight=0.0,
             revisit_penalty_weight=0.0,
         )
-        far = Frontier(cells=((0, 0),), centroid=(11.03, 0.0), information_gain=937.0)
-        near = Frontier(cells=((0, 0),), centroid=(9.44, 0.0), information_gain=5.0)
-
-        far_score = explorer._score_frontier(
-            far,
-            [(0.0, 0.0), (11.03, 0.0)],
-            (0.0, 0.0, 0.0),
+        near = Frontier(
+            cells=((0, 0),),
+            centroid=(3.0, 0.0),
+            information_gain=400.0,
+            expected_unknown_gain=400.0,
         )
+        far = Frontier(
+            cells=((0, 0),),
+            centroid=(8.0, 0.0),
+            information_gain=1600.0,
+            expected_unknown_gain=1600.0,
+        )
+        extreme_far = Frontier(
+            cells=((0, 0),),
+            centroid=(8.0, 0.0),
+            information_gain=3600.0,
+            expected_unknown_gain=3600.0,
+        )
+
         near_score = explorer._score_frontier(
             near,
-            [(0.0, 0.0), (9.44, 0.0)],
+            [(0.0, 0.0), (3.0, 0.0)],
+            (0.0, 0.0, 0.0),
+        )
+        far_score = explorer._score_frontier(
+            far,
+            [(0.0, 0.0), (8.0, 0.0)],
+            (0.0, 0.0, 0.0),
+        )
+        extreme_far_score = explorer._score_frontier(
+            extreme_far,
+            [(0.0, 0.0), (8.0, 0.0)],
             (0.0, 0.0, 0.0),
         )
 
         self.assertGreater(near_score, far_score)
+        self.assertGreater(extreme_far_score, near_score)
 
     def test_falls_back_to_far_free_cell_when_no_unknown_frontier_exists(self):
         grid = FloorGrid(

@@ -203,8 +203,9 @@ frontier:
   # STUCK 后临时排除同一前沿簇附近目标，避免质心轻微漂移后立刻重试同一路线。
   stuck_blacklist_radius: 1.0
   no_progress_timeout: 6.0
-  information_gain_weight: 1.0
-  path_cost_weight: 2.4
+  # 平方根收益保留高价值远目标机会，同时提高路程代价以形成收益兼顾的广度优先。
+  information_gain_weight: 0.5
+  path_cost_weight: 3.0
   yaw_cost_weight: 0.2
   revisit_penalty_weight: 2.0
   # frontier 目标优先落在更安全的 free cell，不贴障碍和 unknown 边缘。
@@ -250,9 +251,9 @@ controller:
   obstacle_stop_distance: 0.40
   obstacle_slow_distance: 0.70
   progress_distance: 0.25
-  # 中等航向误差继续使用现有 yaw/曲率混合走弧线；大角度或高速旋转仍原地转向。
-  turn_in_place_heading: 0.70
-  turn_in_place_rate: 0.45
+  # 中等航向误差继续使用现有 yaw/曲率混合走弧线；仅大角度或高速旋转原地转向。
+  turn_in_place_heading: 0.90
+  turn_in_place_rate: 0.65
   turn_release_heading: 0.20
   turn_release_rate: 0.20
   turn_release_samples: 3
