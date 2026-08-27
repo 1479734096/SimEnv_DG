@@ -261,13 +261,13 @@ class ScanLocalizationNode {
     double velocity_minimum_interval = 0.80;
     double velocity_linear_deadband = 0.05;
     double velocity_angular_deadband = 0.03;
-    double diagnostic_large_translation_threshold = 0.08;
+    double diagnostic_large_translation_threshold = 0.10;
     double diagnostic_summary_period = 2.0;
     double scan_to_map_maximum_correction = 0.10;
-    double livox_imu_maximum_speed = 0.70;
+    double livox_imu_maximum_speed = 1.00;
     double livox_imu_translation_margin = 0.02;
     double livox_imu_absolute_translation_cap = 0.30;
-    double shared_map_livox_only_maximum_speed = 0.60;
+    double shared_map_livox_only_maximum_speed = 0.90;
     int shared_map_livox_only_max_consecutive_vetoes = 3;
     double shared_map_depth_max_age = 0.35;
     double shared_map_max_source_divergence = 0.05;

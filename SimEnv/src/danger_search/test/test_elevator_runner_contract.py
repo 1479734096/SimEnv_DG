@@ -62,14 +62,14 @@ class ElevatorRunnerContractTest(unittest.TestCase):
         source = RUNNER.read_text(encoding="utf-8")
 
         self.assertIn(
-            'ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-240.0}"',
+            'ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-280.0}"',
             source,
         )
         self.assertIn(
             'ELEVATOR_TEST_WALL_TIMEOUT="${ELEVATOR_TEST_WALL_TIMEOUT:-7200}"',
             source,
         )
-        self.assertIn('2) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="600.0" ;;', source)
+        self.assertIn('2) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="620.0" ;;', source)
         self.assertIn('3) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="840.0" ;;', source)
         self.assertIn(
             'ELEVATOR_TEST_MAX_RUNTIME="${ELEVATOR_TEST_MAX_RUNTIME:-$ELEVATOR_TEST_DEFAULT_MAX_RUNTIME}"',

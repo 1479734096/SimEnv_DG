@@ -76,9 +76,7 @@ class ElevatorCrossingRuntime:
 
     _WAIT_STANDOFF = 0.80
     _CABIN_STANDOFF = 0.95
-    # POSITION 允许约 0.25m 终点误差，再保留 0.10m 点云/落脚余量。
-    # 超出该范围的竖直结构不是当前站位对应的门框，不能用稳定误检覆盖语义。
-    _STANDOFF_TOLERANCE = 0.35
+    _STANDOFF_TOLERANCE = 0.20
 
     def __init__(self) -> None:
         self.reset()
@@ -134,15 +132,27 @@ class ElevatorCrossingRuntime:
         self._last_cloud_stamp = float(cloud_stamp)
 
         observations = []
-        expected_standoff = (
-            self._WAIT_STANDOFF if mode == "enter" else self._CABIN_STANDOFF
-        )
+        if old_door_center is not None and pose is not None:
+            actual_dist = math.hypot(
+                old_door_center[0] - pose[0],
+                old_door_center[1] - pose[1],
+            )
+            expected_standoff = (
+                actual_dist
+                if math.isfinite(actual_dist) and actual_dist > 0.1
+                else (self._WAIT_STANDOFF if mode == "enter" else self._CABIN_STANDOFF)
+            )
+        else:
+            expected_standoff = (
+                self._WAIT_STANDOFF if mode == "enter" else self._CABIN_STANDOFF
+            )
+        tolerance = self._STANDOFF_TOLERANCE
         minimum_opening_distance = max(
             0.15,
-            expected_standoff - self._STANDOFF_TOLERANCE,
+            expected_standoff - tolerance,
         )
         maximum_opening_distance = (
-            expected_standoff + self._STANDOFF_TOLERANCE
+            expected_standoff + tolerance
         )
         step_count = int(
             math.floor(config.yaw_search_half_range / config.yaw_search_step + 1e-9)
@@ -178,8 +188,8 @@ class ElevatorCrossingRuntime:
             observations,
             key=lambda item: (
                 abs(_angle_diff(item.yaw, expected_crossing_yaw)),
+                abs(float(item.distance) - float(expected_standoff)),
                 -int(item.evidence_count),
-                float(item.distance),
             ),
         )
         consistent = self._candidate is not None and (

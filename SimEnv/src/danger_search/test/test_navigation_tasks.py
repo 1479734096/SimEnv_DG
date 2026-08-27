@@ -1,9 +1,12 @@
 import math
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import danger_search.navigation_tasks as navigation_tasks_module
+
+if navigation_tasks_module.rospy is None:
+    navigation_tasks_module.rospy = MagicMock()
 
 from danger_search.navigation_tasks import (
     DONE,
@@ -1183,8 +1186,8 @@ class TakeElevatorTest(unittest.TestCase):
 
         task.tick(_task_context(manager), (0.95, 2.70, 0.0))
 
-        self.assertAlmostEqual(captured["old_door_center"][0], 1.75, places=2)
-        self.assertAlmostEqual(captured["old_door_center"][1], 2.70, places=2)
+        self.assertAlmostEqual(captured["old_door_center"][0], 1.65, places=2)
+        self.assertAlmostEqual(captured["old_door_center"][1], 2.60, places=2)
 
     def test_target_live_cabin_center_offset_fails_closed(self):
         grid = MultiFloorGridMap(
@@ -1716,7 +1719,7 @@ class TakeElevatorTest(unittest.TestCase):
         self.assertEqual(manager.controller.reverse_reasons, [])
         self.assertIn("exit_backoff_failed", manager.controller.stop_reasons)
 
-    def test_exit_positions_at_cabin_center_with_tight_tolerance_before_alignment(self):
+    def test_exit_skips_cabin_center_position_and_starts_in_align(self):
         grid = MultiFloorGridMap(
             resolution=0.1,
             width=5.0,
@@ -1737,9 +1740,9 @@ class TakeElevatorTest(unittest.TestCase):
             status = task.tick(_task_context(manager), (2.32, 2.53, 0.0))
 
         self.assertEqual(status, RUNNING)
+        # 离厢直接从 ALIGN 开始，跳过回轿厢中心的 POSITION 导航，避免额外 180°+180° 掉头
         self.assertEqual(task.cabin_transit_stage, "ALIGN")
-        # POSITION 仍用严格 position_tolerance；ALIGN 的漂移检查才放宽到 acceptance。
-        self.assertEqual(calls, [((2.60, 2.60), {"goal_tolerance": 0.15})])
+        self.assertEqual(calls, [])
 
     def test_cabin_transit_position_align_does_not_oscillate_at_grid_snap_boundary(self):
         """栅格量化终点与精确 cabin center 完成语义不一致的回归测试。
@@ -1880,7 +1883,7 @@ class TakeElevatorTest(unittest.TestCase):
             task._tick_cabin_transit(
                 _task_context(manager),
                 pose,
-                mode="exit",
+                mode="enter",
                 position_xy=cabin_center,
                 target_xy=target_wait,
                 door_id="lift_door_1",
@@ -1907,7 +1910,7 @@ class TakeElevatorTest(unittest.TestCase):
         ).floor(1)
         manager = self._exit_manager(grid)
         task = TakeElevator(0, 1)
-        task._cabin_transit_mode = "exit"
+        task._cabin_transit_mode = "enter"
 
         cabin_center = (2.60, 2.60)
         target_wait = (0.85, 2.60)
@@ -1930,7 +1933,7 @@ class TakeElevatorTest(unittest.TestCase):
                 status = task._tick_cabin_transit(
                     _task_context(manager),
                     pose,
-                    mode="exit",
+                    mode="enter",
                     position_xy=cabin_center,
                     target_xy=target_wait,
                     door_id="lift_door_1",
@@ -2529,7 +2532,8 @@ class TakeElevatorTest(unittest.TestCase):
             "danger_search.navigation_tasks.astar_plan",
             return_value=PlanResult(path=[(2.60, 2.60), (0.85, 2.60)], status="reached"),
         ) as planner, patch(
-            "danger_search.navigation_tasks.rospy.logwarn_throttle"
+            "danger_search.navigation_tasks.rospy.logwarn_throttle",
+            create=True,
         ):
             status = task.tick(_task_context(manager), (2.60, 2.60, math.pi))
 

@@ -34,11 +34,11 @@
   <!-- scan-to-map 是慢漂校正层，不允许一次匹配直接注入旧 0.25 m 上限。 -->
   <arg name="scan_to_map_maximum_correction" default="0.10"/>
   <!-- 候选后端按控制器速度包络拒绝不可信跳变；拒绝帧不写入局部地图。 -->
-  <arg name="livox_imu_maximum_speed" default="0.70"/>
+  <arg name="livox_imu_maximum_speed" default="1.00"/>
   <arg name="livox_imu_translation_margin" default="0.02"/>
   <arg name="livox_imu_absolute_translation_cap" default="0.30"/>
   <!-- RGB-D 失效时按正式输出间隔收紧 Livox-only 运动学上限。 -->
-  <arg name="shared_map_livox_only_maximum_speed" default="0.60"/>
+  <arg name="shared_map_livox_only_maximum_speed" default="0.90"/>
   <!-- 连续第三次后置否决时交回通用运动学守卫裁决，避免冻结正式位姿。 -->
   <arg name="shared_map_livox_only_max_consecutive_vetoes" default="3"/>
   <!-- 共享地图候选只按实时测量有效性选源，不读取任务阶段。 -->

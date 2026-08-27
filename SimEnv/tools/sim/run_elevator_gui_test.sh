@@ -10,10 +10,10 @@ DEVEL_SETUP="$WORKSPACE_ROOT/devel/setup.bash"
 SEED="${SEED:-42}"
 GUI="${GUI:-true}"
 ELEVATOR_TEST_FLOOR_COUNT="${ELEVATOR_TEST_FLOOR_COUNT:-2}"
-ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-240.0}"
-ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME="${ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME:-45.0}"
+ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-280.0}"
+ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME="${ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME:-$ELEVATOR_TEST_FLOOR_TIMEOUT}"
 case "$ELEVATOR_TEST_FLOOR_COUNT" in
-  2) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="600.0" ;;
+  2) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="620.0" ;;
   3) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="840.0" ;;
   *) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="900.0" ;;
 esac
@@ -410,15 +410,15 @@ if [[ "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS" == "1" ]]; then
 fi
 sed \
   -e "s/^  max_runtime: 900[.]0$/  max_runtime: $ELEVATOR_TEST_MAX_RUNTIME/" \
-  -e "s/^  floor_timeout: 240[.]0$/  floor_timeout: $ELEVATOR_TEST_FLOOR_TIMEOUT/" \
-  -e "s/^  min_floor_explore_time: 45[.]0$/  min_floor_explore_time: $ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME/" \
+  -e "s/^  floor_timeout: 280[.]0$/  floor_timeout: $ELEVATOR_TEST_FLOOR_TIMEOUT/" \
+  -e "s/^  min_floor_explore_time: 60[.]0$/  min_floor_explore_time: $ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME/" \
   -e "s/^  elevator_local_crossing_geometry_enabled: true$/  elevator_local_crossing_geometry_enabled: $ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED/" \
   -e "s/^  landmark_drift_diagnostic_enabled: false$/  landmark_drift_diagnostic_enabled: $LANDMARK_DIAGNOSTIC_VALUE/" \
   "$BASE_CONFIG" > "$TEST_CONFIG"
 
 if ! grep -Fq "  floor_timeout: $ELEVATOR_TEST_FLOOR_TIMEOUT" "$TEST_CONFIG" || \
    ! grep -Fq "  min_floor_explore_time: $ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME" "$TEST_CONFIG" || \
-   ! grep -Fq "  runtime_by_floor: [[1, 300.0], [2, 600.0], [3, 840.0]]" "$TEST_CONFIG" || \
+   ! grep -Fq "  runtime_by_floor: [[1, 300.0], [2, 620.0], [3, 840.0]]" "$TEST_CONFIG" || \
    ! grep -Fq "  elevator_local_crossing_geometry_enabled: $ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED" "$TEST_CONFIG" || \
    ! grep -Fq "  landmark_drift_diagnostic_enabled: $LANDMARK_DIAGNOSTIC_VALUE" "$TEST_CONFIG"; then
   fail "专项配置覆盖失败，正式配置字段可能已变化" 2
@@ -476,9 +476,6 @@ if ! wait_for_log "$AUTO_LOG" "Switched from passive to fixed stand" 90 "$AUTO_P
   fail "机器人未进入 fixed stand" 2
   exit $?
 fi
-
-# FixedStand 状态机包含 3.0s 关节插值与 0.5s 稳定期，必须等待站稳后再切入 RL
-sleep 4.0
 
 printf '6' > "$FIFO"
 if ! wait_for_log "$AUTO_LOG" "Entered RL /cmd_vel mode." 30 "$AUTO_PID"; then

@@ -483,12 +483,11 @@ class _MissionConfigBuilder:
             max_floor=self.max_floor,
             runtime_by_floor=runtime_by_floor,
         )
-        default_floor_timeout = 300.0 if self.max_floor == 1 else 240.0
-        self.floor_timeout = float(_param("mission/floor_timeout", default_floor_timeout))
+        self.floor_timeout = float(_param("mission/floor_timeout", 180.0))
         self.last_floor_uses_global_budget = bool(
             _param("mission/last_floor_uses_global_budget", True)
         )
-        self.min_floor_explore_time = float(_param("mission/min_floor_explore_time", 45.0))
+        self.min_floor_explore_time = float(_param("mission/min_floor_explore_time", 20.0))
 
         # 方案 C：全局时间预算参数
         self.return_safety_buffer = float(_param("mission/return_safety_buffer", 30.0))
@@ -680,7 +679,7 @@ class _MissionConfigBuilder:
             "origin_x": float(_param("map/origin_x", -14.0)),
             "origin_y": float(_param("map/origin_y", -6.0)),
             "floor_height": float(_param("map/floor_height", 2.6)),
-            "obstacle_min_z": float(_param("map/obstacle_min_z", 0.15)),
+            "obstacle_min_z": float(_param("map/obstacle_min_z", 0.20)),
             "obstacle_max_z": float(_param("map/obstacle_max_z", 1.40)),
             "obstacle_inflation_radius": float(_param("map/obstacle_inflation_radius", 0.25)),
             "raycast_max_range": float(_param("map/raycast_max_range", 12.0)),
@@ -696,7 +695,7 @@ class _MissionConfigBuilder:
             "evidence_lifecycle_enabled": bool(
                 _param("map/evidence_lifecycle_enabled", True)
             ),
-            "low_height_max_z": float(_param("map/low_height_max_z", 0.30)),
+            "low_height_max_z": float(_param("map/low_height_max_z", 0.40)),
             "low_confirm_generations": int(
                 _param("map/low_confirm_generations", 3)
             ),
@@ -766,7 +765,7 @@ class _MissionConfigBuilder:
             "validated_max_speed": float(stop_distance_table[-1][0]),
             "stop_distance_table": stop_distance_table,
             "localization_speed_anomaly_threshold": float(
-                _param("ground_support/localization_speed_anomaly_threshold", 1.0)
+                _param("ground_support/localization_speed_anomaly_threshold", 1.20)
             ),
             "localization_speed_anomaly_timeout": float(
                 _param("ground_support/localization_speed_anomaly_timeout", 2.0)
@@ -940,9 +939,9 @@ class _MissionConfigBuilder:
             "controller/exit_first_max_linear",
         )
         self.controller_params = {
-            "max_linear": float(_param("controller/max_linear", 0.65)),
+            "max_linear": float(_param("controller/max_linear", 0.80)),
             "max_lateral": float(_param("controller/max_lateral", 0.25)),
-            "max_angular": float(_param("controller/max_angular", 1.20)),
+            "max_angular": float(_param("controller/max_angular", 1.2)),
             "min_linear_fraction": float(_param("controller/min_linear_fraction", 0.35)),
             "goal_tolerance": float(_param("controller/goal_tolerance", 0.35)),
             "waypoint_tolerance": float(_param("controller/waypoint_tolerance", 0.25)),

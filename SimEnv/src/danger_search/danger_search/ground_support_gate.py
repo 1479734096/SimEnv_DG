@@ -95,7 +95,7 @@ class GroundSupportGateConfig:
         (0.80, 0.15200000000000000),
         (1.00, 0.23000000000000000),
     )
-    localization_speed_anomaly_threshold: float = 1.0
+    localization_speed_anomaly_threshold: float = 1.20
     localization_speed_anomaly_timeout: float = 2.0
     drop_evidence_max_age: float = 0.05
     decision_period: float = 0.10

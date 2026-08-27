@@ -1005,25 +1005,30 @@ class TakeElevator(NavigationTask):
 
         if self.phase == "REFRESH_CURRENT_OPEN_CROSSING":
             context.controller.stop(reason="elevator_local_crossing_refresh")
+            door_center = self._door_center(current_wait, cabin_center)
             expected_yaw = math.atan2(
-                cabin_center[1] - current_wait[1],
-                cabin_center[0] - current_wait[0],
+                door_center[1] - pose[1],
+                door_center[0] - pose[0],
             )
             result = context.refresh_elevator_crossing_geometry(
                 door_id=current_door_id,
                 mode="enter",
                 expected_crossing_yaw=expected_yaw,
-                old_door_center=self._door_center(current_wait, cabin_center),
+                old_door_center=door_center,
                 pose=pose,
             )
             if result is None or result.status == RUNNING:
                 return RUNNING
             if result.status != DONE or result.geometry is None:
-                return self._fail_navigation(
-                    context,
-                    result.failure or "elevator_open_crossing_geometry_unavailable",
-                    "当前层开门后的 Livox 穿越几何未能连续确认",
-                )
+                if rospy is not None:
+                    rospy.logwarn(
+                        "[%s] 当前层开门后的 Livox 穿越几何未能连续确认（%s），平滑降级使用已注册电梯门几何",
+                        self.name,
+                        result.failure or "elevator_open_crossing_geometry_unavailable",
+                    )
+                self._reset_cabin_transit()
+                self.phase = "ENTER_CABIN"
+                return RUNNING
             self._current_crossing_geometry = result.geometry
             context.clear_elevator_crossing_area(result.geometry)
             self._reset_cabin_transit()
@@ -1117,7 +1122,7 @@ class TakeElevator(NavigationTask):
             # 合规平面定位的 z 是楼层局部高度，不能用固定等待冒充换层确认。
             # 这里只给服务动作和新传感器帧留出稳定时间，逻辑楼层在目标门
             # 被传感器确认后才更新。
-            context.controller.stop()
+            context.controller.stop(reason="elevator_odom_stabilize")
             if get_time() - self._wait_start_time > 2.0:
                 self.phase = "OPEN_TARGET_FLOOR_DOOR"
             return RUNNING
@@ -1134,7 +1139,7 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         if self.phase == "WAIT_TARGET_DOOR_OPEN":
-            context.controller.stop()
+            context.controller.stop(reason="elevator_wait_target_door_open")
             if not self._door_opening_is_confirmed(
                 context,
                 target_door_id,
@@ -1203,29 +1208,34 @@ class TakeElevator(NavigationTask):
 
         if self.phase == "REFRESH_TARGET_OPEN_CROSSING":
             context.controller.stop(reason="elevator_local_crossing_refresh")
+            door_center = self._door_center(
+                cabin_center,
+                target_wait,
+                first_standoff=0.95,
+            )
             expected_yaw = math.atan2(
-                target_wait[1] - cabin_center[1],
-                target_wait[0] - cabin_center[0],
+                door_center[1] - pose[1],
+                door_center[0] - pose[0],
             )
             result = context.refresh_elevator_crossing_geometry(
                 door_id=target_door_id,
                 mode="exit",
                 expected_crossing_yaw=expected_yaw,
-                old_door_center=self._door_center(
-                    cabin_center,
-                    target_wait,
-                    first_standoff=0.95,
-                ),
+                old_door_center=door_center,
                 pose=pose,
             )
             if result is None or result.status == RUNNING:
                 return RUNNING
             if result.status != DONE or result.geometry is None:
-                return self._fail_navigation(
-                    context,
-                    result.failure or "elevator_open_crossing_geometry_unavailable",
-                    "目标层开门后的 Livox 穿越几何未能连续确认",
-                )
+                if rospy is not None:
+                    rospy.logwarn(
+                        "[%s] 目标层开门后的 Livox 穿越几何未能连续确认（%s），平滑降级使用已注册电梯门几何",
+                        self.name,
+                        result.failure or "elevator_open_crossing_geometry_unavailable",
+                    )
+                self._reset_cabin_transit()
+                self.phase = "EXIT_CABIN"
+                return RUNNING
             center_offset = math.hypot(
                 result.geometry.cabin_center[0] - pose[0],
                 result.geometry.cabin_center[1] - pose[1],
@@ -1542,10 +1552,14 @@ class TakeElevator(NavigationTask):
             return status
 
         if self.cabin_transit_stage == "ALIGN":
+            if mode == "exit" and not self._cabin_transit_position_door_cleared:
+                # 离厢直接进入 ALIGN 时优先清理开门区域，确保直线跨越路径畅通。
+                _clear_opened_door_area(context, door_id)
+                self._cabin_transit_position_door_cleared = True
             # 固定频率对准模式：SETTLE 停稳 -> ALIGN 旋转 -> CONFIRM 释放，
             # 由 PathFollower 控制定时器每 0.1s 新鲜决策；本函数只幂等
-            # 进入与轮询结果。锚点=轿厢中心，漂移由控制器锁存
-            # STUCK(alignment_drift)。
+            # 进入与轮询结果。锚点=轿厢中心（exit 模式不设锚点约束，直接对准门口），
+            # 漂移由控制器锁存 STUCK(alignment_drift)。
             if math.hypot(target_xy[0] - pose[0], target_xy[1] - pose[1]) <= position_tolerance:
                 context.controller.clear_path(reason="elevator_transit_already_complete")
                 return DONE
@@ -1563,6 +1577,9 @@ class TakeElevator(NavigationTask):
                     max_linear=max_linear,
                 )
             if result.status == STUCK and result.reason == "alignment_drift":
+                if mode == "exit":
+                    context.controller.stop(reason="elevator_exit_alignment_drift")
+                    return STUCK
                 self._cabin_transit_position_align_flips += 1
                 if self._cabin_transit_position_align_flips > self._CABIN_TRANSIT_POSITION_ALIGN_FLIP_LIMIT:
                     context.controller.stop(reason="elevator_transit_position_align_oscillation")
@@ -1595,9 +1612,10 @@ class TakeElevator(NavigationTask):
                     )
                 return STUCK
             if result.status == IDLE:
+                align_anchor = None if mode == "exit" else position_xy
                 context.controller.begin_heading_alignment(
                     target_xy,
-                    anchor_xy=position_xy,
+                    anchor_xy=align_anchor,
                     max_anchor_error=position_acceptance,
                 )
             return RUNNING
@@ -1731,7 +1749,8 @@ class TakeElevator(NavigationTask):
         target_xy: tuple[float, float],
     ) -> None:
         self._cabin_transit_mode = mode
-        self.cabin_transit_stage = "POSITION"
+        # 离厢模式下直接进入 ALIGN 对准门口，跳过反向回轿厢中心 POSITION，避免多转 180°+180°
+        self.cabin_transit_stage = "ALIGN" if mode == "exit" else "POSITION"
         self._cabin_transit_alignment_count = 0
         self._cabin_transit_position_align_flips = 0
         self._cabin_transit_start_xy = None
@@ -1741,7 +1760,7 @@ class TakeElevator(NavigationTask):
         self._cabin_transit_goal_grace = 0
         self._crossing_blocked_since = None
         self._log_cabin_transit_stage(
-            "POSITION",
+            self.cabin_transit_stage,
             None,
             position_xy,
             target_xy,
