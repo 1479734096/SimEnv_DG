@@ -1731,7 +1731,81 @@ class FrontierExplorerTest(unittest.TestCase):
         # 收益与路程相同情况下，正前方得分高出 1.0
         self.assertAlmostEqual(score_straight - score_perp, 1.0)
 
+    def test_far_small_enclosed_pocket_is_pruned(self):
+        """验证距离超过 3.5m 且期望收益小于 30 的封闭孤岛前沿被直接剪枝。"""
+        grid = FloorGrid(
+            floor_index=0, resolution=0.1, width=10.0, length=10.0,
+            origin_x=0.0, origin_y=0.0,
+        )
+        robot_pose = (0.0, 0.0, 0.0)
+        # 远距离小前沿 (距离 5.0m, gain=10 < 30)
+        far_target = (5.0, 0.0)
+        far_frontier = Frontier(cells=((50, 0),), centroid=far_target, information_gain=10.0)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            min_far_expected_gain=30.0,
+            far_prune_distance=3.5,
+        )
+        explorer._candidate_targets_for_frontier = lambda *_args: [far_target]
+        explorer._expected_unknown_gain = lambda *_args: 10.0
+
+        targets, planning, gains, scores, best_target, best_score = explorer._prepare_frontier_targets(
+            grid, far_frontier, robot_pose, None
+        )
+        self.assertIsNone(best_target)
+        self.assertEqual(best_score, -math.inf)
+        self.assertEqual(scores, {})
+
+    def test_near_small_enclosed_pocket_is_retained(self):
+        """验证距离在 3.5m 以内的小前沿正常保留（近场顺路扫除）。"""
+        grid = FloorGrid(
+            floor_index=0, resolution=0.1, width=10.0, length=10.0,
+            origin_x=0.0, origin_y=0.0,
+        )
+        robot_pose = (0.0, 0.0, 0.0)
+        # 近距离小前沿 (距离 2.0m, gain=10 < 30)
+        near_target = (2.0, 0.0)
+        near_frontier = Frontier(cells=((20, 0),), centroid=near_target, information_gain=10.0)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            min_far_expected_gain=30.0,
+            far_prune_distance=3.5,
+        )
+        explorer._candidate_targets_for_frontier = lambda *_args: [near_target]
+        explorer._expected_unknown_gain = lambda *_args: 10.0
+
+        targets, planning, gains, scores, best_target, best_score = explorer._prepare_frontier_targets(
+            grid, near_frontier, robot_pose, None
+        )
+        self.assertEqual(best_target, near_target)
+        self.assertGreater(best_score, -math.inf)
+        self.assertIn(near_target, scores)
+
+    def test_far_large_open_frontier_is_retained(self):
+        """验证距离超过 3.5m 但期望收益大于等于 30 的开放大前沿正常保留。"""
+        grid = FloorGrid(
+            floor_index=0, resolution=0.1, width=10.0, length=10.0,
+            origin_x=0.0, origin_y=0.0,
+        )
+        robot_pose = (0.0, 0.0, 0.0)
+        # 远距离大前沿 (距离 5.0m, gain=100 >= 30)
+        far_target = (5.0, 0.0)
+        far_frontier = Frontier(cells=((50, 0),), centroid=far_target, information_gain=100.0)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            min_far_expected_gain=30.0,
+            far_prune_distance=3.5,
+        )
+        explorer._candidate_targets_for_frontier = lambda *_args: [far_target]
+        explorer._expected_unknown_gain = lambda *_args: 100.0
+
+        targets, planning, gains, scores, best_target, best_score = explorer._prepare_frontier_targets(
+            grid, far_frontier, robot_pose, None
+        )
+        self.assertEqual(best_target, far_target)
+        self.assertGreater(best_score, -math.inf)
+        self.assertIn(far_target, scores)
+
 
 if __name__ == "__main__":
     unittest.main()
-

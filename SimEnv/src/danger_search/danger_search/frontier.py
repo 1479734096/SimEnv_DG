@@ -171,6 +171,8 @@ class FrontierExplorer:
         max_goal_candidates_per_frontier: int = 2,
         max_fallback_planning_candidates: int = 8,
         goal_tolerance: float = 0.35,
+        min_far_expected_gain: float = 0.0,
+        far_prune_distance: float = 0.0,
     ):
         self.min_cluster_size = int(min_cluster_size)
         self.blacklist_ttl = float(blacklist_ttl)
@@ -192,6 +194,8 @@ class FrontierExplorer:
         self.max_goal_candidates_per_frontier = int(max_goal_candidates_per_frontier)
         self.max_fallback_planning_candidates = int(max_fallback_planning_candidates)
         self.goal_tolerance = float(goal_tolerance)
+        self.min_far_expected_gain = float(min_far_expected_gain)
+        self.far_prune_distance = float(far_prune_distance)
         finite_nonnegative = (
             self.stuck_blacklist_radius,
             self.information_gain_weight,
@@ -206,6 +210,8 @@ class FrontierExplorer:
             self.door_front_half_plane_penalty,
             self.door_front_half_plane_radius,
             self.door_preferred_direction_bonus,
+            self.min_far_expected_gain,
+            self.far_prune_distance,
         )
         if (
             not math.isfinite(self.blacklist_ttl)
@@ -919,13 +925,21 @@ class FrontierExplorer:
             context_adjustment, skip_target, _context_penalty = (
                 self._selection_context_effect(target, selection_context)
             )
+            target_dist = _world_distance(target, robot_xy)
             if (
                 self._is_blacklisted(grid, target)
                 or skip_target
-                or _world_distance(target, robot_xy) <= self.goal_tolerance
+                or target_dist <= self.goal_tolerance
             ):
                 continue
             gain = self._expected_unknown_gain(grid, frontier, target)
+            if (
+                self.far_prune_distance > 0.0
+                and self.min_far_expected_gain > 0.0
+                and target_dist > self.far_prune_distance
+                and gain < self.min_far_expected_gain
+            ):
+                continue
             expected_gains[target] = gain
             optimistic_scores[target] = self._optimistic_score(
                 frontier,

@@ -2428,17 +2428,10 @@ class TakeElevatorTest(unittest.TestCase):
         task.phase = "CLOSE_CURRENT_FLOOR_DOOR"
         task._service_task = _DoneService()
 
+        # 关门服务完成即切入 CALL_ELEVATOR_TO_TARGET_FLOOR 发起升梯，调头在升梯中并行
         self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, 0.0)), RUNNING)
-        self.assertEqual(task.phase, "ALIGN_TO_TARGET_DOOR")
-        self.assertTrue(manager.controller.align_calls)
-
-        self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, math.pi)), RUNNING)
-        self.assertEqual(task.phase, "ALIGN_TO_TARGET_DOOR")
-        manager.controller.next_align_status = DONE
-        manager.controller.next_align_reason = "alignment_done"
-        self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, math.pi)), RUNNING)
         self.assertEqual(task.phase, "CALL_ELEVATOR_TO_TARGET_FLOOR")
-        self.assertEqual(manager.controller.paths, [])
+        self.assertTrue(manager.controller.align_calls)
 
     def test_target_door_confirmation_updates_floor_before_exit_mapping(self):
         grid = MultiFloorGridMap(
@@ -2512,7 +2505,7 @@ class TakeElevatorTest(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(service_calls, [("elevator_main", 1, False)])
+        self.assertEqual(service_calls, [("elevator_main", 1, True)])
 
     def test_wait_target_door_requires_unblocked_straight_cabin_segment(self):
         grid = MultiFloorGridMap(

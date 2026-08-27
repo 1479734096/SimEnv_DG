@@ -191,11 +191,20 @@ class LocalSemanticDetector:
                 + plane_distance * heading[1]
                 + lateral_center * lateral_axis[1],
             )
+            left_forward = sum(sample[0] for sample in left_evidence) / len(left_evidence)
+            right_forward = sum(sample[0] for sample in right_evidence) / len(right_evidence)
+            d_forward = left_forward - right_forward
+            d_lateral = left_inner - right_inner
+            opening_yaw_offset = math.atan2(-d_forward, d_lateral)
+            opening_yaw = math.atan2(
+                math.sin(float(robot_pose[2]) + opening_yaw_offset),
+                math.cos(float(robot_pose[2]) + opening_yaw_offset),
+            )
             observations.append(
                 OpeningObservation(
                     distance=plane_distance,
                     world_xy=world_xy,
-                    yaw=float(robot_pose[2]),
+                    yaw=opening_yaw,
                     width=width,
                     evidence_count=len(edge_evidence),
                 )
@@ -203,6 +212,119 @@ class LocalSemanticDetector:
         if not observations:
             return None
         return min(observations, key=lambda observation: observation.distance)
+
+    def detect_openings_ahead(
+        self,
+        *,
+        robot_pose: tuple[float, float, float],
+        floor_index: int,
+        cloud_points: Iterable[tuple[float, float, float]],
+        floor_height: float = 2.6,
+        minimum_distance: float = 0.15,
+        maximum_distance: float | None = None,
+    ) -> list[OpeningObservation]:
+        """返回前方所有有效门洞观测列表，按距离由近及远排序。"""
+        minimum_distance = float(minimum_distance)
+        maximum_distance = (
+            self.max_distance
+            if maximum_distance is None
+            else min(self.max_distance, float(maximum_distance))
+        )
+        if (
+            not math.isfinite(minimum_distance)
+            or not math.isfinite(maximum_distance)
+            or minimum_distance < 0.0
+            or maximum_distance <= minimum_distance
+        ):
+            raise ValueError("门洞检测距离窗口必须为有限递增范围")
+        heading = (math.cos(robot_pose[2]), math.sin(robot_pose[2]))
+        lateral_axis = (-heading[1], heading[0])
+        floor_z = floor_index * floor_height
+        samples: list[tuple[float, float, float]] = []
+        for px, py, pz in cloud_points:
+            z_rel = pz - floor_z
+            if not self.min_evidence_height <= z_rel <= self.max_evidence_height:
+                continue
+            dx = px - robot_pose[0]
+            dy = py - robot_pose[1]
+            forward = dx * heading[0] + dy * heading[1]
+            lateral = dx * lateral_axis[0] + dy * lateral_axis[1]
+            if not minimum_distance <= forward <= maximum_distance:
+                continue
+            if abs(lateral) > self.opening_max_width:
+                continue
+            samples.append((forward, lateral, z_rel))
+        if not samples:
+            return []
+
+        search_step = max(0.05, self.opening_plane_depth / 3.0)
+        candidate_distances = sorted(
+            {
+                round(forward / search_step) * search_step
+                for forward, _lateral, _height in samples
+            }
+        )
+        half_depth = max(0.05, self.opening_plane_depth * 0.5)
+        minimum_side_points = max(3, self.min_evidence_points)
+        observations: list[OpeningObservation] = []
+        for distance in candidate_distances:
+            plane = [sample for sample in samples if abs(sample[0] - distance) <= half_depth]
+            lateral_bin_width = self.opening_width_resolution
+            lateral_bins: dict[int, list[tuple[float, float, float]]] = {}
+            for sample in plane:
+                bucket = int(round(sample[1] / lateral_bin_width))
+                lateral_bins.setdefault(bucket, []).append(sample)
+            vertical_bins: list[tuple[float, list[tuple[float, float, float]]]] = []
+            for bucket, bucket_samples in lateral_bins.items():
+                if len(bucket_samples) < minimum_side_points:
+                    continue
+                height_span = max(sample[2] for sample in bucket_samples) - min(
+                    sample[2] for sample in bucket_samples
+                )
+                if height_span < self.opening_min_side_height_span:
+                    continue
+                vertical_bins.append((bucket * lateral_bin_width, bucket_samples))
+            left = [item for item in vertical_bins if item[0] > 0.05]
+            right = [item for item in vertical_bins if item[0] < -0.05]
+            if not left or not right:
+                continue
+            left_inner, left_evidence = min(left, key=lambda item: item[0])
+            right_inner, right_evidence = max(right, key=lambda item: item[0])
+            width = left_inner - right_inner
+            if not self.opening_min_width <= width <= self.opening_max_width:
+                continue
+            lateral_center = 0.5 * (left_inner + right_inner)
+            edge_evidence = left_evidence + right_evidence
+            plane_distance = sum(sample[0] for sample in edge_evidence) / len(
+                edge_evidence
+            )
+            world_xy = (
+                robot_pose[0]
+                + plane_distance * heading[0]
+                + lateral_center * lateral_axis[0],
+                robot_pose[1]
+                + plane_distance * heading[1]
+                + lateral_center * lateral_axis[1],
+            )
+            left_forward = sum(sample[0] for sample in left_evidence) / len(left_evidence)
+            right_forward = sum(sample[0] for sample in right_evidence) / len(right_evidence)
+            d_forward = left_forward - right_forward
+            d_lateral = left_inner - right_inner
+            opening_yaw_offset = math.atan2(-d_forward, d_lateral)
+            opening_yaw = math.atan2(
+                math.sin(float(robot_pose[2]) + opening_yaw_offset),
+                math.cos(float(robot_pose[2]) + opening_yaw_offset),
+            )
+            observations.append(
+                OpeningObservation(
+                    distance=plane_distance,
+                    world_xy=world_xy,
+                    yaw=opening_yaw,
+                    width=width,
+                    evidence_count=len(edge_evidence),
+                )
+            )
+        return sorted(observations, key=lambda observation: observation.distance)
 
     def detect_elevator_opening_ahead(
         self,

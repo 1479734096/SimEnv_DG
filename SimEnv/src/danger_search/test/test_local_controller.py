@@ -631,7 +631,10 @@ class LocalControllerTest(unittest.TestCase):
 
     def test_path_diagnostics_are_published_when_publishers_exist(self):
         """诊断 publisher 存在且 ROS 时钟可用时，set_path 仍发布 raw/followed path。"""
-        import rospy
+        try:
+            import rospy
+        except ImportError:
+            rospy = None
 
         class FakePublisher:
             def __init__(self):
@@ -653,9 +656,10 @@ class LocalControllerTest(unittest.TestCase):
         follower = PathFollower(cmd_vel_topic="/cmd_vel")
         follower._raw_path_publisher = FakePublisher()
         follower._followed_path_publisher = FakePublisher()
+        fake_rospy = SimpleNamespace(Time=SimpleNamespace(now=lambda: SimpleNamespace()))
         with patch("danger_search.navigator.PathMessage", FakePathMessage), patch(
             "danger_search.navigator.PoseStamped", FakePoseStamped
-        ), patch.object(rospy.Time, "now", return_value=SimpleNamespace()):
+        ), patch("danger_search.navigator.rospy", fake_rospy):
             follower.set_path([(0.0, 0.0), (0.5, 0.0), (1.0, 0.0)])
 
         self.assertEqual(len(follower._raw_path_publisher.messages), 1)
@@ -802,7 +806,11 @@ class LocalControllerTest(unittest.TestCase):
                 ),
             )
         )
-        follower = PathFollower(cmd_vel_topic="/cmd_vel", command_keepalive_period=0.1)
+        follower = PathFollower(
+            cmd_vel_topic="/cmd_vel",
+            command_keepalive_period=0.1,
+            max_linear=0.60,
+        )
         follower.set_command_gate(gate)
         follower._publisher = FakePublisher()
         follower.set_path([(0.0, 0.0), (1.0, 0.0)])

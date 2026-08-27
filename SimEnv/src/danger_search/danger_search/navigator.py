@@ -118,6 +118,8 @@ class PathFollower:
     _path_max_linear: float | None = field(default=None, init=False)
     _path_max_lateral: float | None = field(default=None, init=False)
     _path_goal_tolerance: float | None = field(default=None, init=False)
+    _path_obstacle_stop_distance: float | None = field(default=None, init=False)
+    _path_obstacle_slow_distance: float | None = field(default=None, init=False)
     _recover_until: float = field(default=0.0, init=False)
     _recover_phase: str = field(default="idle", init=False)
     _recover_turn_direction: float = field(default=1.0, init=False)
@@ -274,6 +276,8 @@ class PathFollower:
         max_linear: float | None = None,
         goal_tolerance: float | None = None,
         max_lateral: float | None = None,
+        obstacle_stop_distance: float | None = None,
+        obstacle_slow_distance: float | None = None,
         reason: str = "path_set",
     ) -> None:
         """替换活动路径并原子提交跟踪限制，重置进度监督、恢复与终态锁存。
@@ -288,6 +292,8 @@ class PathFollower:
                 max_linear=max_linear,
                 goal_tolerance=goal_tolerance,
                 max_lateral=max_lateral,
+                obstacle_stop_distance=obstacle_stop_distance,
+                obstacle_slow_distance=obstacle_slow_distance,
                 reason=reason,
             )
 
@@ -298,6 +304,8 @@ class PathFollower:
         max_linear: float | None = None,
         goal_tolerance: float | None = None,
         max_lateral: float | None = None,
+        obstacle_stop_distance: float | None = None,
+        obstacle_slow_distance: float | None = None,
         reason: str = "path_set",
     ) -> None:
         try:
@@ -341,6 +349,16 @@ class PathFollower:
         )
         self._path_goal_tolerance = (
             max(0.0, float(goal_tolerance)) if goal_tolerance is not None else None
+        )
+        self._path_obstacle_stop_distance = (
+            max(0.0, float(obstacle_stop_distance))
+            if obstacle_stop_distance is not None
+            else None
+        )
+        self._path_obstacle_slow_distance = (
+            max(0.0, float(obstacle_slow_distance))
+            if obstacle_slow_distance is not None
+            else None
         )
         if self._path:
             self._debug_current_waypoint = self._path[min(1, len(self._path) - 1)]
@@ -732,6 +750,16 @@ class PathFollower:
             else:
                 self._turn_release_count = 0
 
+        effective_stop_distance = (
+            self._path_obstacle_stop_distance
+            if self._path_obstacle_stop_distance is not None
+            else self.obstacle_stop_distance
+        )
+        effective_slow_distance = (
+            self._path_obstacle_slow_distance
+            if self._path_obstacle_slow_distance is not None
+            else self.obstacle_slow_distance
+        )
         linear_x, linear_y, angular = compute_tracking_command(
             yaw_error,
             max_linear=linear_limit,
@@ -740,8 +768,8 @@ class PathFollower:
             min_linear_fraction=self.min_linear_fraction,
             path_curvature=self._debug_path_curvature,
             nearest_obstacle_distance=self._nearest_obstacle_distance,
-            obstacle_stop_distance=self.obstacle_stop_distance,
-            obstacle_slow_distance=self.obstacle_slow_distance,
+            obstacle_stop_distance=effective_stop_distance,
+            obstacle_slow_distance=effective_slow_distance,
             measured_yaw_rate=yaw_rate if yaw_rate_valid else None,
             yaw_rate_damping=self.yaw_rate_damping,
             turn_in_place_active=self._turn_in_place_active,
@@ -757,7 +785,7 @@ class PathFollower:
         保证 RL 控制器与地面支撑门持续收到命令。
         """
         with self._command_transaction_lock:
-            if self._publisher is None or Twist is None:
+            if self._publisher is None:
                 return
             now_wall = time.monotonic()
             if self._last_decision_wall is not None:
@@ -1275,12 +1303,19 @@ class PathFollower:
             wall_time=wall_now,
             control_time_source=get_time,
         )
-        if self._publisher is None or Twist is None:
+        if self._publisher is None:
             self._last_emitted_command = emitted
             self._debug_zero_command_reason = resolved_zero_reason
             return
-        msg = Twist()
-        msg.linear.x, msg.linear.y, msg.angular.z = emitted
+        if Twist is not None:
+            msg = Twist()
+            msg.linear.x, msg.linear.y, msg.angular.z = emitted
+        else:
+            from types import SimpleNamespace
+            msg = SimpleNamespace(
+                linear=SimpleNamespace(x=emitted[0], y=emitted[1], z=0.0),
+                angular=SimpleNamespace(x=0.0, y=0.0, z=emitted[2]),
+            )
         try:
             self._publisher.publish(msg)
         except Exception as exc:

@@ -804,6 +804,8 @@ class TakeElevator(NavigationTask):
         self._current_crossing_geometry = None
         self._target_crossing_geometry = None
         self._crossing_blocked_since: float | None = None
+        self._early_call_elevator_started = False
+        self._early_call_elevator_task = None
 
     def tick(self, context: NavigationTaskContext, pose: tuple[float, float, float]) -> str:
         """推进一个乘梯阶段；任一失败都显式返回 FAILED 而不猜测所在楼层。"""
@@ -842,6 +844,16 @@ class TakeElevator(NavigationTask):
             return FAILED
 
         if self.phase == "GO_TO_ELEVATOR_DOOR":
+            if not self._early_call_elevator_started:
+                self._early_call_elevator_started = True
+                try:
+                    self._early_call_elevator_task = client.call_elevator(
+                        self.elevator_id, self.current_floor, True
+                    )
+                except Exception as exc:
+                    if rospy is not None:
+                        rospy.logwarn("[%s] 远距离呼梯预开门发起异常，回退至常规开门: %s", self.name, exc)
+
             if self._navigate_to(context, pose, refresh_wait):
                 self._exit_alignment_count = 0
                 self.phase = "ALIGN_TO_CURRENT_DOOR"
@@ -943,7 +955,14 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         if self.phase == "CALL_ELEVATOR_TO_CURRENT_FLOOR":
-            status = self._run_service(context, lambda: client.call_elevator(self.elevator_id, self.current_floor, False))
+            status = self._run_service(
+                context,
+                lambda: (
+                    self._early_call_elevator_task
+                    if self._early_call_elevator_task is not None
+                    else client.call_elevator(self.elevator_id, self.current_floor, True)
+                ),
+            )
             if status == FAILED:
                 return FAILED
             if status == DONE:
@@ -1081,13 +1100,13 @@ class TakeElevator(NavigationTask):
             status = self._run_service(context, lambda: client.close_door(current_door_id))
             if status == FAILED:
                 return FAILED
+            # 关门期间并行推进轿厢内对准
             aligned = self._tick_target_door_alignment(context, pose, target_wait)
             if aligned and self.failure_reason is not None:
                 return FAILED
-            if status == DONE and aligned:
+            if status == DONE:
+                # 关门完成立即发起升梯，调头在升梯过程中继续并行完成，消除 0 层静止空等
                 self.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
-            elif status == DONE:
-                self.phase = "ALIGN_TO_TARGET_DOOR"
             return RUNNING
 
         if self.phase == "ALIGN_TO_TARGET_DOOR":
@@ -1098,6 +1117,8 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         if self.phase == "CALL_ELEVATOR_TO_TARGET_FLOOR":
+            # 升梯期间在后台继续推进对准目标门
+            self._tick_target_door_alignment(context, pose, target_wait)
             if not self._floor_transition_started:
                 try:
                     context.begin_floor_transition(
@@ -1110,11 +1131,15 @@ class TakeElevator(NavigationTask):
                         rospy.logerr("[%s] 无法锁存楼层过渡：%s", self.name, exc)
                     return FAILED
                 self._floor_transition_started = True
-            status = self._run_service(context, lambda: client.call_elevator(self.elevator_id, self.target_floor, False))
+            status = self._run_service(
+                context,
+                lambda: client.call_elevator(self.elevator_id, self.target_floor, True),
+            )
             if status == FAILED:
                 return FAILED
             if status == DONE:
-                self.phase = "WAIT_FOR_ODOM_STABLE"
+                self._begin_door_open_confirmation(context, target_door_id)
+                self.phase = "WAIT_TARGET_DOOR_OPEN"
                 self._wait_start_time = get_time()
             return RUNNING
 
@@ -1480,6 +1505,8 @@ class TakeElevator(NavigationTask):
             [commit_start, target_xy],
             max_linear=max_linear,
             goal_tolerance=position_tolerance,
+            obstacle_stop_distance=0.15,
+            obstacle_slow_distance=0.30,
             reason="elevator_cabin_cross_path",
         )
         self.cabin_transit_stage = "CROSS"
@@ -1533,6 +1560,16 @@ class TakeElevator(NavigationTask):
                 # 膨胀半径设计，正是为此场景准备。
                 _clear_opened_door_area(context, door_id)
                 self._cabin_transit_position_door_cleared = True
+            if math.hypot(position_xy[0] - pose[0], position_xy[1] - pose[1]) <= position_acceptance:
+                self.cabin_transit_stage = "ALIGN"
+                self._cabin_transit_alignment_count = 0
+                self._log_cabin_transit_stage(
+                    "ALIGN",
+                    pose,
+                    position_xy,
+                    target_xy,
+                )
+                return RUNNING
             status = self._navigate_to_with_status(
                 context,
                 pose,

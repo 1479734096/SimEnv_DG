@@ -231,6 +231,10 @@ class ElevatorCrossingRuntime:
             crossing_yaw if mode == "exit" else crossing_yaw + math.pi
         )
         outward_yaw = math.atan2(math.sin(outward_yaw), math.cos(outward_yaw))
+        closest_axis = round(outward_yaw / (math.pi / 2.0)) * (math.pi / 2.0)
+        closest_axis = math.atan2(math.sin(closest_axis), math.cos(closest_axis))
+        if abs(_angle_diff(outward_yaw, closest_axis)) <= 0.35:
+            outward_yaw = closest_axis
         outward = (math.cos(outward_yaw), math.sin(outward_yaw))
         door_center = (
             float(observation.world_xy[0]),

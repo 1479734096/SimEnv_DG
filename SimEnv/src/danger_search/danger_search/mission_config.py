@@ -931,6 +931,12 @@ class _MissionConfigBuilder:
                 _param("frontier/max_fallback_planning_candidates", 8)
             ),
             "goal_tolerance": float(_param("controller/goal_tolerance", 0.35)),
+            "min_far_expected_gain": float(
+                _param("frontier/min_far_expected_gain", 30.0)
+            ),
+            "far_prune_distance": float(
+                _param("frontier/far_prune_distance", 3.5)
+            ),
         }
         self.frontier_switch_score_margin = float(_param("frontier/switch_score_margin", 2.0))
         self.frontier_current_region_radius = float(_param("frontier/current_region_radius", 1.2))

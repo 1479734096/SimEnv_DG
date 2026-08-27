@@ -534,3 +534,26 @@ Stage15～17 当前结论：
   diff 审计通过；按用户要求未启动当前正在使用的 Gazebo。
 - 详细实现和未验证项见
   [THREE_FLOOR_SEED_MATRIX_TOOL_REPORT.md](reports/THREE_FLOOR_SEED_MATRIX_TOOL_REPORT.md)。
+
+## 16. 2026-08-27 电梯门中轴几何正交化与进出避障容差修复
+
+- `local_semantic_detector.py` 中开门法向改由左右门框点云聚类深度差几何求解，消除机身航向斜角引起的投影偏斜；
+- `elevator_crossing_runtime.py` 将生成的电梯穿越几何法向锁定到曼哈顿主轴（$\pm 0.35\text{ rad}$ 门限），确保候梯点、轿厢中心与门中心严格共享相同 $Y$ 轴坐标（$Y=2.60$）；
+- 控制器 `PathFollower` 支持为窄道直线任务配置局部避障容差（`stop=0.15m, slow=0.30m`），防止门洞两侧立柱误判刹停。
+- 详情见 [STAGE18_ELEVATOR_AND_SPEED_OPTIMIZATION_REPORT.md](reports/STAGE18_ELEVATOR_AND_SPEED_OPTIMIZATION_REPORT.md)。
+
+## 17. 2026-08-27 远距离异步预呼梯与跨层联动开门流水线
+
+- 机器狗完成探索并触发 `_begin_floor_change` 的第一瞬间，后台立即异步发起 `call_elevator(floor=0, open_doors=True)`；
+- 机器狗在 15~20 秒跑回电梯门口的途中，轿厢与门已提前就位敞开，抵达候梯点时直接雷达确认进厢，单次省下 5~6 秒；
+- 进厢关门后调用 `call_elevator(target_floor, open_doors=True)` 联动开门，并去除 2.0s 固定人工空转，单次升梯省下 4~6 秒；
+- 契约与单元测试全量通过（804 passed in 5.43s）；
+- 详情见 [STAGE19_ELEVATOR_PRE_CALLING_AND_LINKED_TRANSITION_REPORT.md](reports/STAGE19_ELEVATOR_PRE_CALLING_AND_LINKED_TRANSITION_REPORT.md)。
+
+## 18. 2026-08-27 电梯关门即升梯、开门即清障与入梯直接对准极致提速（STAGE20）
+
+- **关门即升梯（升梯与调头并行）**：在 `CLOSE_CURRENT_FLOOR_DOOR` 阶段，关门服务完成瞬间立即发起 `call_elevator(target_floor, open_doors=True)` 升梯，移除原先要求狗在轿厢内调头 180° 完全完成才允许升梯的阻塞等待，将调头平移至升梯途中并行完成，**单次乘梯直接省去 8.7 秒静止空等**；
+- **开门即主动清障（消除 7 秒自清延迟）**：传感器近场确认开门后，立即主动触发 `_clear_opened_door_area` 清除门板残余膨胀栅格，使地图连通性检查第 1 帧直接通过，**彻底消除此前在门外等待激光射线自然冲刷的 7.3 秒原地发呆**；
+- **入梯直接对准进厢（消灭 0.3 米二次折线横移）**：当机器狗抵达门外等待区时，`ENTER_CABIN` 的 `POSITION` 阶段检测到当前已在等待容差范围内直接无缝进入 `ALIGN` 对准与 `CROSS` 直线进门，消灭微距小折线与中间停顿，**再省 3 秒**；
+- **测试验证**：全量单元测试（`804 passed in 5.36s`）100% 通过；
+- 详情见 [STAGE20_ELEVATOR_CLOSING_TRANSITION_AND_ALIGNMENT_SPEEDUP_REPORT.md](reports/STAGE20_ELEVATOR_CLOSING_TRANSITION_AND_ALIGNMENT_SPEEDUP_REPORT.md)。
