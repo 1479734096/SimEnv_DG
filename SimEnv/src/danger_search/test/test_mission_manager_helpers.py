@@ -2460,6 +2460,30 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertAlmostEqual(observation.lateral, 0.05)
         self.assertAlmostEqual(observation.relative_height, 0.22)
 
+    def test_forward_obstacle_ignores_side_doorposts_near_waist(self):
+        """STAGE23 回归：机身侧面腰部/肋部（forward < 0.20m）的门框立柱绝不误判为前向阻挡。"""
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+            obstacle_min_z=0.15,
+            obstacle_max_z=1.4,
+        )
+        # 模拟机器狗在窄门中贴边，门框立柱位于右侧腰部 (forward=0.01m, lateral=0.23m)
+        points = [
+            (0.01, 0.23, 0.50),   # 侧腰立柱
+            (0.10, -0.23, 0.50),  # 左侧腰立柱
+        ]
+        observation = nearest_forward_obstacle_observation(
+            points,
+            (0.0, 0.0, 0.0),
+            floor_index=0,
+            mapper=mapper,
+        )
+        self.assertIsNone(observation)
+
     def test_forward_obstacle_distance_excludes_only_active_door_aperture(self):
         mapper = MultiFloorGridMap(
             resolution=0.1,

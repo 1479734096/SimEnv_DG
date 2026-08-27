@@ -1152,10 +1152,49 @@ class AlignModeTest(unittest.TestCase):
         for _ in range(3):
             follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
         # 消费前模拟 Timer 更新（再步进一次），reason 必须仍为 alignment_done
-        follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
         result = follower.poll_result()
         self.assertEqual(result.status, DONE)
         self.assertEqual(result.reason, "alignment_done")
+
+    def test_begin_heading_alignment_with_max_angular_limit(self):
+        """局部角速度上限测试：传入 max_angular=0.65 时，发布角速度绝对值不超过 0.65 且线速度严格为零。"""
+        from danger_search.navigator import PathFollower
+        follower = PathFollower(cmd_vel_topic="/cmd_vel", max_angular=1.2)
+        published_cmds = []
+        follower._publisher = SimpleNamespace(
+            publish=lambda msg: published_cmds.append((msg.linear.x, msg.linear.y, msg.angular.z))
+        )
+        follower.begin_heading_alignment((0.0, 1.0), max_angular=0.65)
+        # 初始机身朝向 (0, 0, 0)，目标方位 pi/2 (1.57rad)，误差很大
+        # step 1-3: settle
+        for _ in range(3):
+            follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        # step 4: align rotate
+        follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        self.assertGreater(len(published_cmds), 0)
+        for lx, ly, az in published_cmds:
+            self.assertEqual(lx, 0.0)
+            self.assertEqual(ly, 0.0)
+            self.assertLessEqual(abs(az), 0.65 + 1e-6)
+
+    def test_begin_heading_alignment_default_max_angular_preserves_global_limit(self):
+        """未指定局部上限时，对准角速度按全局 max_angular 限幅。"""
+        from danger_search.navigator import PathFollower
+        follower = PathFollower(cmd_vel_topic="/cmd_vel", max_angular=1.2)
+        published_cmds = []
+        follower._publisher = SimpleNamespace(
+            publish=lambda msg: published_cmds.append((msg.linear.x, msg.linear.y, msg.angular.z))
+        )
+        follower.begin_heading_alignment((0.0, 1.0))
+        for _ in range(3):
+            follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        follower.step_align_for_test(self._sample((0.0, 0.0, 0.0), yaw_rate=0.0))
+        self.assertGreater(len(published_cmds), 0)
+        rotate_cmds = [az for _, _, az in published_cmds if abs(az) > 0.0]
+        self.assertGreater(len(rotate_cmds), 0)
+        # 误差 1.57rad * 1.7 = 2.67 -> clamp 到 1.2
+        self.assertAlmostEqual(rotate_cmds[-1], 1.2, places=2)
+
 
 if __name__ == "__main__":
     unittest.main()

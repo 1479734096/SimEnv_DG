@@ -733,6 +733,7 @@ class TakeElevator(NavigationTask):
     _CABIN_TRANSIT_ALIGN_TOLERANCE = 0.10
     _CABIN_TRANSIT_ALIGN_RELEASE_TOLERANCE = 0.15
     _CABIN_TRANSIT_ALIGN_CONFIRMATIONS = 2
+    _CABIN_TRANSIT_DIRECT_ENTRY_HEADING_TOLERANCE = 0.80
     # POSITION/ALIGN 翻转次数上限：栅格量化终点与精确 cabin center 的完成语义
     # 不一致时会出现每 tick 翻转的零速死循环；acceptance 已对齐二者，这里仅作
     # 安全网，避免今后其他语义退化再次形成永久振荡。
@@ -753,6 +754,7 @@ class TakeElevator(NavigationTask):
     _DEFAULT_STUCK_RETRY_LIMIT = 4
     _DEFAULT_WAIT_STANDOFF = 0.8
     _DEFAULT_REFRESH_STANDOFF = 1.2
+    _CABIN_TURN_TIMEOUT = 12.0
 
     def __init__(self, current_floor: int, target_floor: int, elevator_id: str = "elevator_main"):
         current_floor = int(current_floor)
@@ -777,6 +779,8 @@ class TakeElevator(NavigationTask):
         self._cabin_transit_door_clear_refreshed = False
         self._cabin_transit_position_door_cleared = False
         self._cabin_transit_goal_grace = 0
+        self._cabin_turn_completed = False
+        self._cabin_turn_wait_start: float | None = None
         self._exit_backoff_target_xy: tuple[float, float] | None = None
         self._exit_backoff_start_xy: tuple[float, float] | None = None
         self._exit_backoff_direction: tuple[float, float] | None = None
@@ -1097,28 +1101,45 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         if self.phase == "CLOSE_CURRENT_FLOOR_DOOR":
-            status = self._run_service(context, lambda: client.close_door(current_door_id))
+            status = self._run_service(
+                context,
+                lambda: client.close_door(current_door_id),
+                hold_position=False,
+            )
             if status == FAILED:
                 return FAILED
             # 关门期间并行推进轿厢内对准
-            aligned = self._tick_target_door_alignment(context, pose, target_wait)
-            if aligned and self.failure_reason is not None:
-                return FAILED
+            if not self._cabin_turn_completed:
+                aligned = self._tick_target_door_alignment(context, pose, target_wait)
+                if aligned:
+                    if self.failure_reason is not None:
+                        return FAILED
+                    self._cabin_turn_completed = True
             if status == DONE:
                 # 关门完成立即发起升梯，调头在升梯过程中继续并行完成，消除 0 层静止空等
                 self.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
             return RUNNING
 
         if self.phase == "ALIGN_TO_TARGET_DOOR":
-            if self._tick_target_door_alignment(context, pose, target_wait):
-                if self.failure_reason is not None:
-                    return FAILED
+            if not self._cabin_turn_completed:
+                aligned = self._tick_target_door_alignment(context, pose, target_wait)
+                if aligned:
+                    if self.failure_reason is not None:
+                        return FAILED
+                    self._cabin_turn_completed = True
+                    self.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
+            else:
                 self.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
             return RUNNING
 
         if self.phase == "CALL_ELEVATOR_TO_TARGET_FLOOR":
             # 升梯期间在后台继续推进对准目标门
-            self._tick_target_door_alignment(context, pose, target_wait)
+            if not self._cabin_turn_completed:
+                aligned = self._tick_target_door_alignment(context, pose, target_wait)
+                if aligned:
+                    if self.failure_reason is not None:
+                        return FAILED
+                    self._cabin_turn_completed = True
             if not self._floor_transition_started:
                 try:
                     context.begin_floor_transition(
@@ -1134,10 +1155,37 @@ class TakeElevator(NavigationTask):
             status = self._run_service(
                 context,
                 lambda: client.call_elevator(self.elevator_id, self.target_floor, True),
+                hold_position=False,
             )
             if status == FAILED:
                 return FAILED
             if status == DONE:
+                if not self._cabin_turn_completed:
+                    self.phase = "WAIT_CABIN_TURN_COMPLETE"
+                    self._cabin_turn_wait_start = get_time()
+                else:
+                    self._begin_door_open_confirmation(context, target_door_id)
+                    self.phase = "WAIT_TARGET_DOOR_OPEN"
+                    self._wait_start_time = get_time()
+            return RUNNING
+
+        if self.phase == "WAIT_CABIN_TURN_COMPLETE":
+            if not self._cabin_turn_completed:
+                aligned = self._tick_target_door_alignment(context, pose, target_wait)
+                if aligned:
+                    if self.failure_reason is not None:
+                        return FAILED
+                    self._cabin_turn_completed = True
+                elif (
+                    self._cabin_turn_wait_start is not None
+                    and get_time() - self._cabin_turn_wait_start > self._CABIN_TURN_TIMEOUT
+                ):
+                    self.failure_reason = "elevator_cabin_turn_timeout"
+                    context.record_failure(self.failure_reason)
+                    if rospy is not None:
+                        rospy.logerr("[%s] 轿厢内调头超时（>%.1fs）", self.name, self._CABIN_TURN_TIMEOUT)
+                    return FAILED
+            if self._cabin_turn_completed:
                 self._begin_door_open_confirmation(context, target_door_id)
                 self.phase = "WAIT_TARGET_DOOR_OPEN"
                 self._wait_start_time = get_time()
@@ -1430,14 +1478,14 @@ class TakeElevator(NavigationTask):
             if result.reason == "alignment_drift":
                 # 位置漂移：锚点已失效，重新进入对准（重新 SETTLE）。
                 self._exit_alignment_count = 0
-                controller.begin_heading_alignment(target_wait)
+                controller.begin_heading_alignment(target_wait, max_angular=0.65)
                 return False
             self.failure_reason = "elevator_alignment_failed:%s" % (
                 result.reason or "unknown"
             )
             return True
         if result.status == IDLE:
-            controller.begin_heading_alignment(target_wait)
+            controller.begin_heading_alignment(target_wait, max_angular=0.65)
             return False
         return False
 
@@ -1561,6 +1609,24 @@ class TakeElevator(NavigationTask):
                 _clear_opened_door_area(context, door_id)
                 self._cabin_transit_position_door_cleared = True
             if math.hypot(position_xy[0] - pose[0], position_xy[1] - pose[1]) <= position_acceptance:
+                target_yaw = math.atan2(target_xy[1] - pose[1], target_xy[0] - pose[0])
+                heading_err = _angle_wrap(target_yaw - pose[2])
+                if (
+                    mode == "enter"
+                    and abs(heading_err)
+                    <= self._CABIN_TRANSIT_DIRECT_ENTRY_HEADING_TOLERANCE
+                ):
+                    # 历史入厢最大航向误差约 0.788rad；不超过 0.80rad 时直接
+                    # 提交直线进厢，超过阈值仍由 ALIGN 收敛后再跨越。
+                    return self._commit_cabin_cross(
+                        context,
+                        pose,
+                        position_xy,
+                        target_xy,
+                        target_door_id=door_id,
+                        position_tolerance=position_tolerance,
+                        max_linear=max_linear,
+                    )
                 self.cabin_transit_stage = "ALIGN"
                 self._cabin_transit_alignment_count = 0
                 self._log_cabin_transit_stage(
@@ -1577,6 +1643,24 @@ class TakeElevator(NavigationTask):
                 goal_tolerance=position_tolerance,
             )
             if status == DONE:
+                target_yaw = math.atan2(target_xy[1] - pose[1], target_xy[0] - pose[0])
+                heading_err = _angle_wrap(target_yaw - pose[2])
+                if (
+                    mode == "enter"
+                    and abs(heading_err)
+                    <= self._CABIN_TRANSIT_DIRECT_ENTRY_HEADING_TOLERANCE
+                ):
+                    # 历史入厢最大航向误差约 0.788rad；不超过 0.80rad 时直接
+                    # 提交直线进厢，超过阈值仍由 ALIGN 收敛后再跨越。
+                    return self._commit_cabin_cross(
+                        context,
+                        pose,
+                        position_xy,
+                        target_xy,
+                        target_door_id=door_id,
+                        position_tolerance=position_tolerance,
+                        max_linear=max_linear,
+                    )
                 self.cabin_transit_stage = "ALIGN"
                 self._cabin_transit_alignment_count = 0
                 self._log_cabin_transit_stage(
@@ -2447,13 +2531,20 @@ class TakeElevator(NavigationTask):
             }
         )
 
-    def _run_service(self, context: NavigationTaskContext, task_factory) -> str:
+    def _run_service(
+        self,
+        context: NavigationTaskContext,
+        task_factory,
+        *,
+        hold_position: bool = True,
+    ) -> str:
         if self._service_task is None:
             self._service_task = task_factory()
             return RUNNING
 
         if not self._service_task.done():
-            context.controller.stop()
+            if hold_position:
+                context.controller.stop()
             return RUNNING
 
         ok = self._service_task.ok()

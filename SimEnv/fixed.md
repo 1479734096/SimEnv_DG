@@ -557,3 +557,33 @@ Stage15～17 当前结论：
 - **入梯直接对准进厢（消灭 0.3 米二次折线横移）**：当机器狗抵达门外等待区时，`ENTER_CABIN` 的 `POSITION` 阶段检测到当前已在等待容差范围内直接无缝进入 `ALIGN` 对准与 `CROSS` 直线进门，消灭微距小折线与中间停顿，**再省 3 秒**；
 - **测试验证**：全量单元测试（`804 passed in 5.36s`）100% 通过；
 - 详情见 [STAGE20_ELEVATOR_CLOSING_TRANSITION_AND_ALIGNMENT_SPEEDUP_REPORT.md](reports/STAGE20_ELEVATOR_CLOSING_TRANSITION_AND_ALIGNMENT_SPEEDUP_REPORT.md)。
+
+## 19. 2026-08-27 二楼挑空中庭与负障碍防踩空跌落安全闭环（STAGE21）
+
+- **安全门边界保护缺陷修复**：修复 `ground_support_gate.py` 中当机身足迹已脱离支撑区（`current_footprint_supported == False`）时被跳过判断的逻辑漏洞，明确只要探测到支撑边界且观测充分，立即触发安全保护刹停；
+- **扩大前视探测与制动保留余量**：在 `danger_search.yaml` 中将前视探测范围提升至 `minimum_lookahead: 0.60, maximum_lookahead: 1.00`，悬崖制动保留余量从 0.30m 扩大到 0.40m（完全覆盖四足踏步外摆包络）；
+- **测试验证**：全量单元与契约测试（`804 passed in 5.32s`）100% 通过；
+- 详情见 [STAGE21_NEGATIVE_OBSTACLE_AND_DROP_PROTECTION_REPORT.md](reports/STAGE21_NEGATIVE_OBSTACLE_AND_DROP_PROTECTION_REPORT.md)。
+
+## 20. 2026-08-27 电梯入厢直通与轿厢安全调头（STAGE22）
+
+- **入厢快速路径（消灭门前 5.5 秒停顿）**：在 `navigation_tasks.py` 的 `_tick_cabin_transit` 中，`POSITION` 阶段到达门前容差且朝向轿厢航向误差 $\le 0.50\text{ rad}$（约 28.6°）时，在同一 tick 直接提交 `CROSS` 直线进厢，跳过冗余的 `SETTLE`（滑行等待）、`ALIGN`（原地旋转）和 `CONFIRM`（静止确认），**单次进梯再省 5.5 秒**；
+- **轿厢调头柔和原地限速（彻底消除踢墙卡死）**：为 `PathFollower.begin_heading_alignment()` 增加可选局部角速度上限 `max_angular`。轿厢内调头传入 `0.65 rad/s`，调头期间线速度严格为零，死区补偿不超过局部上限，消除四足大摆幅扫墙卡阻，实现 2~3 秒内平稳完成原地调头；
+- **调头完成锁存与先转正后开门确认时序保护**：目标出口调头异步推进并锁存状态；电梯升梯服务先完成时进入专用 `WAIT_CABIN_TURN_COMPLETE` 等待（设置 8 秒确定性上限），机身转正后才启动 8 秒开门确认计时，确保传感器正对二楼门口，根治背向门口导致的开门确认超时；
+- **测试验证**：全量单元与契约测试（`809 passed in 5.20s`）100% 通过；
+- 详情见 [STAGE22_ELEVATOR_ENTRY_AND_CABIN_TURN_REPORT.md](reports/STAGE22_ELEVATOR_ENTRY_AND_CABIN_TURN_REPORT.md)。
+
+## 21. 2026-08-27 窄门侧壁与房间拐角前向避障误判死锁修复（STAGE23）
+
+- **侧向门框误判前向阻挡缺陷根治**：修复 `map_update_runtime.py` 中 `nearest_forward_obstacle_observation` 将机身腰部/肋部侧方（`forward < 0.20m`）的门框立柱误判为正前方碰撞阻挡的几何缺陷。仅检测机头前方（`forward >= 0.20m` 且 `lateral <= 0.22m`）的真实行进障碍，彻底释放 0.85m 标准窄门的通行能力；
+- **消除底层零速死锁**：避免了控制器将侧方门框距离（如 0.235m）误当成前向撞墙距离而强行下发 `linear = 0.0` 刹停的假阳性死锁；
+- **测试验证**：全量单元与契约测试（`810 passed in 6.16s`）100% 通过；
+- 详情见 [STAGE23_NARROW_DOORWAY_SIDE_OBSTACLE_AVOIDANCE_REPORT.md](reports/STAGE23_NARROW_DOORWAY_SIDE_OBSTACLE_AVOIDANCE_REPORT.md)。
+
+## 22. 2026-08-27 电梯调头命令冲突与进厢直通优化（STAGE24）
+
+- **消除关门、升梯期间的零速竞争**：为 `TakeElevator._run_service()` 增加默认开启的 `hold_position` 控制。普通候梯、开门等服务等待仍保持停车；仅 `CLOSE_CURRENT_FLOOR_DOOR` 与 `CALL_ELEVATOR_TO_TARGET_FLOOR` 传入 `False`，避免任务层零速与 10Hz 轿厢 ALIGN 旋转命令交替发布；
+- **进厢直通阈值扩展至 `0.80 rad`**：到达门前位置容差后，航向误差 `<= 0.80 rad` 时同一 tick 直接提交 `CROSS`，超过阈值仍走 `SETTLE/ALIGN/CONFIRM`；不改变路径控制器全局转向契约；
+- **保持已验证的轿厢调头边界**：调头继续严格使用零线速度和 `max_angular=0.65 rad/s`，不提高到缺少安全证据的 `0.85 rad/s`；专职调头等待超时由 8 秒调整为 12 秒，超过后仍以 `elevator_cabin_turn_timeout` 确定性失败；
+- **测试验证**：任务层与控制器定向回归 `139 passed in 0.55s`；全量单元与契约测试 `814 passed in 4.16s`；按用户要求本轮未启动 Gazebo、未复跑 seed `8127`；
+- 详情见 [STAGE24_ELEVATOR_COMMAND_ARBITRATION_AND_DIRECT_ENTRY_REPORT.md](reports/STAGE24_ELEVATOR_COMMAND_ARBITRATION_AND_DIRECT_ENTRY_REPORT.md)。

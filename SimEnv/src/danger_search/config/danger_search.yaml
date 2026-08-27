@@ -289,9 +289,9 @@ ground_support:
   maximum_longitudinal_unknown_gap: 0.10
   minimum_longitudinal_support_ratio: 0.75
   sweep_half_width: 0.435393
-  minimum_lookahead: 0.50
+  minimum_lookahead: 0.60
   # 该前视上限只对当前已验证速度负责；扩速前必须重新验证完整安全包络。
-  maximum_lookahead: 0.80
+  maximum_lookahead: 1.00
   footprint_front_reach: 0.30
   support_band: 0.08
   minimum_drop: 0.30
@@ -312,8 +312,8 @@ ground_support:
   decision_period: 0.25
   rl_receive_delay: 0.009
   required_margin: 0.02
-  # 在停车包络外再保留一个机身步幅余量；连续观测到同一边界后才持久化。
-  boundary_hold_margin: 0.30
+  # 在停车包络外再保留一个机身步幅余量（0.40m覆盖四足外摆包络）；连续观测到同一边界后才持久化。
+  boundary_hold_margin: 0.40
   boundary_persistence_confirmations: 3
   boundary_consistency_radius: 0.20
   release_hysteresis: 0.10

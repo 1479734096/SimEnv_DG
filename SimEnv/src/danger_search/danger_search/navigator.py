@@ -137,6 +137,7 @@ class PathFollower:
     _align_release_samples: int = field(default=3, init=False)
     _align_deadband_omega: float = field(default=0.55, init=False)
     _align_deadband_error: float = field(default=0.10, init=False)
+    _align_max_angular: float | None = field(default=None, init=False)
     _debug_align_yaw_error: float | None = field(default=None, init=False)
     _debug_align_anchor_error: float | None = field(default=None, init=False)
     _keepalive_timer: object | None = field(default=None, init=False)
@@ -419,6 +420,7 @@ class PathFollower:
         self._align_state = "idle"
         self._align_target_xy = None
         self._align_anchor_xy = None
+        self._align_max_angular = None
         self._align_confirm_count = 0
         self._align_settle_samples = 0
         self._turn_in_place_active = False
@@ -505,12 +507,14 @@ class PathFollower:
         anchor_xy: tuple[float, float] | None = None,
         max_anchor_error: float | None = None,
         settle_timeout: float | None = None,
+        max_angular: float | None = None,
     ) -> None:
         """进入固定频率原地对准模式（SETTLE -> ALIGN -> CONFIRM）。
 
         - 对准目标为 ``target_xy`` 相对当前位姿的方位角；
         - ``anchor_xy`` 与 ``max_anchor_error`` 提供位置漂移保护：对准期间
           位姿离开锚点超过半径立即零速并锁存 STUCK(alignment_drift)；
+        - ``max_angular`` 提供可选的局部角速度上限（如轿厢内调头传 0.65rad/s）；
         - 相同目标重复调用幂等：不重置确认计数，任务层可每 tick 调用。
         """
         with self._command_transaction_lock:
@@ -533,12 +537,20 @@ class PathFollower:
                 if max_anchor_error is not None
                 else None
             )
+            parsed_max_angular = (
+                max(0.1, float(max_angular))
+                if max_angular is not None
+                else None
+            )
             if self._align_state != "idle" and self._align_target_xy == target:
-                # 幂等：目标不变时不重置确认/停稳计数。
+                # 幂等：目标不变时不重置确认/停稳计数，但更新局部限制。
+                if parsed_max_angular is not None:
+                    self._align_max_angular = parsed_max_angular
                 return
             self._align_target_xy = target
             self._align_anchor_xy = anchor
             self._align_max_anchor_error = max_error
+            self._align_max_angular = parsed_max_angular
             self._align_confirm_count = 0
             self._align_settle_samples = 0
             self._align_settle_start = get_time()
@@ -559,6 +571,7 @@ class PathFollower:
                 self._align_state = "idle"
                 self._align_target_xy = None
                 self._align_anchor_xy = None
+                self._align_max_angular = None
                 self._align_confirm_count = 0
                 self._align_settle_samples = 0
                 self._publish_locked(0.0, 0.0, zero_reason="alignment_cancelled")
@@ -935,6 +948,7 @@ class PathFollower:
                     self._align_state = "idle"
                     self._align_target_xy = None
                     self._align_anchor_xy = None
+                    self._align_max_angular = None
                     self._tracking_status = DONE
                     self._terminal_pending = True
                     self._terminal_reason = "alignment_done"
@@ -950,15 +964,21 @@ class PathFollower:
         omega = 1.7 * align_error
         if yaw_rate_valid:
             omega -= float(self.yaw_rate_damping) * yaw_rate
-        omega = _clamp(omega, -float(self.max_angular), float(self.max_angular))
+        effective_max = (
+            float(self._align_max_angular)
+            if self._align_max_angular is not None
+            else float(self.max_angular)
+        )
+        omega = _clamp(omega, -effective_max, effective_max)
         if abs(align_error) >= self._align_deadband_error and (
             not yaw_rate_valid or abs(yaw_rate) < 0.05
         ):
             # A1 纯转向在小角速度下存在执行死区：误差超限且实测转速接近
             # 零时，用最小可执行转速兜底，避免持续发布无效命令。
             sign = 1.0 if omega >= 0.0 else -1.0
-            if abs(omega) < self._align_deadband_omega:
-                omega = sign * self._align_deadband_omega
+            deadband = min(self._align_deadband_omega, effective_max)
+            if abs(omega) < deadband:
+                omega = sign * deadband
         self._publish_locked(0.0, omega, zero_reason="alignment_rotate")
         if abs(align_error) <= self._align_deadband_error:
             self._align_state = "confirm"
@@ -980,6 +1000,7 @@ class PathFollower:
         self._align_state = "idle"
         self._align_target_xy = None
         self._align_anchor_xy = None
+        self._align_max_angular = None
         self._tracking_status = STUCK
         self._terminal_pending = True
         self._terminal_reason = reason

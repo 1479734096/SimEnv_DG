@@ -688,10 +688,15 @@ class GroundSupportSafetyGate:
         ) + self.config.boundary_hold_margin
         supported_distance = assessment.supported_distance
         near_supported_boundary = (
-            assessment.current_footprint_supported
-            and assessment.support_boundary_detected
-            and supported_distance is not None
-            and supported_distance <= guard_distance
+            assessment.support_boundary_detected
+            and (
+                (not assessment.current_footprint_supported and assessment.observation_adequate)
+                or (
+                    assessment.current_footprint_supported
+                    and supported_distance is not None
+                    and supported_distance <= guard_distance
+                )
+            )
         )
         if not near_supported_boundary:
             return requested

@@ -218,6 +218,11 @@ class _DoneService:
         return ""
 
 
+class _PendingService:
+    def done(self):
+        return False
+
+
 class _FailedService:
     def __init__(self, message="failed"):
         self._message = message
@@ -1871,8 +1876,8 @@ class TakeElevatorTest(unittest.TestCase):
             controller=controller,
         )
         task = TakeElevator(0, 1)
-        # 朝向已对准目标，避免对准逻辑干扰，聚焦 POSITION/ALIGN 一致性
-        yaw = math.atan2(target_wait[1] - robot[1], target_wait[0] - robot[0])
+        # 朝向存在偏角（>0.80rad），进入常规 ALIGN 流程验证 POSITION/ALIGN 一致性
+        yaw = math.atan2(target_wait[1] - robot[1], target_wait[0] - robot[0]) + 0.81
         pose = (robot[0], robot[1], yaw)
         manager.controller._test_pose = pose
 
@@ -2432,6 +2437,248 @@ class TakeElevatorTest(unittest.TestCase):
         self.assertEqual(task.tick(_task_context(manager), (2.60, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.phase, "CALL_ELEVATOR_TO_TARGET_FLOOR")
         self.assertTrue(manager.controller.align_calls)
+
+    def test_pending_service_holds_position_by_default(self):
+        """STAGE24：普通服务等待仍须停车，保持原有失效安全语义。"""
+        grid = MultiFloorGridMap(resolution=0.1, width=5.0, length=5.0).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        task = TakeElevator(0, 1)
+        task.phase = "OPEN_CURRENT_FLOOR_DOOR"
+        task._service_task = _PendingService()
+
+        self.assertEqual(
+            task.tick(_task_context(manager), (0.85, 2.60, 0.0)),
+            RUNNING,
+        )
+
+        self.assertEqual(manager.controller.stop_reasons, ["stop"])
+
+    def test_pending_close_service_does_not_interrupt_cabin_alignment(self):
+        """STAGE24：关门与调头并行时，服务轮询不得发布竞争零速。"""
+        grid = MultiFloorGridMap(resolution=0.1, width=5.0, length=5.0).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        task = TakeElevator(0, 1)
+        task.phase = "CLOSE_CURRENT_FLOOR_DOOR"
+        task._service_task = _PendingService()
+
+        self.assertEqual(
+            task.tick(_task_context(manager), (2.60, 2.60, 0.0)),
+            RUNNING,
+        )
+
+        self.assertEqual(manager.controller.stop_reasons, [])
+        self.assertEqual(
+            manager.controller.align_calls,
+            [((0.85, 2.60), {"max_angular": 0.65})],
+        )
+
+    def test_pending_floor_service_does_not_interrupt_cabin_alignment(self):
+        """STAGE24：升梯与调头并行时，服务轮询不得发布竞争零速。"""
+        grid = MultiFloorGridMap(resolution=0.1, width=5.0, length=5.0).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        task = TakeElevator(0, 1)
+        task.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
+        task._service_task = _PendingService()
+
+        self.assertEqual(
+            task.tick(_task_context(manager), (2.60, 2.60, 0.0)),
+            RUNNING,
+        )
+
+        self.assertEqual(manager.controller.stop_reasons, [])
+        self.assertEqual(
+            manager.controller.align_calls,
+            [((0.85, 2.60), {"max_angular": 0.65})],
+        )
+
+    def test_cabin_transit_enter_fast_path_accepts_080_boundary(self):
+        """STAGE24：门前航向误差等于 0.80rad 时同 tick 进入 CROSS。"""
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        for gx in range(5, 35):
+            for gy in range(15, 35):
+                grid.set_base_state(gx, gy, FREE)
+        cabin_center = (2.85, 2.15)
+        current_wait = (0.65, 2.15)
+        pose = (0.65, 2.15, -0.80)
+        controller = SimpleNamespace(
+            goal_tolerance=0.15,
+            set_path=MagicMock(),
+            clear_path=MagicMock(),
+            stop=MagicMock(),
+            poll_result=lambda: ControlResult(status=IDLE, reason=None, sequence=1),
+            poll_status=lambda: IDLE,
+            begin_heading_alignment=MagicMock(),
+            end_heading_alignment=MagicMock(),
+        )
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(
+                get_elevator_points=lambda elevator_id, floor: (current_wait, cabin_center),
+                elevator_door_id=lambda floor: "lift_door_0",
+            ),
+            mapper=SimpleNamespace(floor=lambda idx: grid),
+            current_floor=0,
+            controller=controller,
+            elevator_crossing_geometry_enabled=False,
+            elevator_local_crossing_geometry_enabled=False,
+            planning_constraints=None,
+        )
+        task = TakeElevator(0, 1)
+        task.phase = "ENTER_CABIN"
+        status = task._tick_cabin_transit(
+            _task_context(manager),
+            pose,
+            mode="enter",
+            position_xy=current_wait,
+            target_xy=cabin_center,
+            door_id="lift_door_0",
+        )
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.cabin_transit_stage, "CROSS")
+        controller.set_path.assert_called_once()
+        controller.begin_heading_alignment.assert_not_called()
+
+    def test_cabin_transit_enter_above_080_falls_back_to_align(self):
+        """STAGE24：门前航向误差超过 0.80rad 时保留 ALIGN 安全流程。"""
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        cabin_center = (2.85, 2.15)
+        current_wait = (0.65, 2.15)
+        pose = (0.65, 2.15, -0.801)
+        controller = SimpleNamespace(
+            goal_tolerance=0.15,
+            set_path=MagicMock(),
+            clear_path=MagicMock(),
+            stop=MagicMock(),
+            poll_result=lambda: ControlResult(status=IDLE, reason=None, sequence=1),
+            poll_status=lambda: IDLE,
+            begin_heading_alignment=MagicMock(),
+            end_heading_alignment=MagicMock(),
+        )
+        manager = SimpleNamespace(
+            mapper=SimpleNamespace(floor=lambda idx: grid),
+            current_floor=0,
+            controller=controller,
+            planning_constraints=None,
+        )
+        task = TakeElevator(0, 1)
+
+        status = task._tick_cabin_transit(
+            _task_context(manager),
+            pose,
+            mode="enter",
+            position_xy=current_wait,
+            target_xy=cabin_center,
+            door_id="lift_door_0",
+        )
+
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.cabin_transit_stage, "ALIGN")
+        controller.set_path.assert_not_called()
+        controller.begin_heading_alignment.assert_not_called()
+
+    def test_take_elevator_gates_wait_target_door_open_until_cabin_turn_complete(self):
+        """STAGE22: 换层后门控等待门开口必须等待轿厢调头完成，先转正后开门确认。"""
+        grid = MultiFloorGridMap(resolution=0.1, width=6.0, length=6.0).floor(1)
+        for gx in range(0, 60):
+            for gy in range(0, 60):
+                grid.set_base_state(gx, gy, FREE)
+        cabin_center = (2.85, 2.15)
+        target_wait = (0.65, 2.15)
+        pose = (2.85, 2.15, 0.0)
+
+        controller = SimpleNamespace(
+            goal_tolerance=0.15,
+            stop=MagicMock(),
+            clear_path=MagicMock(),
+            poll_result=lambda: ControlResult(status=RUNNING, reason=None, sequence=1),
+            poll_status=lambda: RUNNING,
+            begin_heading_alignment=MagicMock(),
+            end_heading_alignment=MagicMock(),
+        )
+        client = SimpleNamespace(
+            get_elevator_points=lambda elevator_id, floor: (target_wait, cabin_center),
+            elevator_door_id=lambda floor: "lift_door_1",
+            call_elevator=lambda *a: None,
+        )
+        manager = SimpleNamespace(
+            building_client=client,
+            mapper=SimpleNamespace(floor=lambda idx: grid),
+            current_floor=0,
+            controller=controller,
+            begin_floor_transition=MagicMock(),
+            begin_elevator_door_open_confirmation=MagicMock(),
+        )
+        task = TakeElevator(0, 1)
+        task.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
+        task._service_task = _DoneService()
+
+        # 调头未完成时，切入 WAIT_CABIN_TURN_COMPLETE 而不是直接进入 WAIT_TARGET_DOOR_OPEN
+        status = task.tick(_task_context(manager), pose)
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "WAIT_CABIN_TURN_COMPLETE")
+        manager.begin_elevator_door_open_confirmation.assert_not_called()
+
+        # 调头完成后，切入 WAIT_TARGET_DOOR_OPEN 并标记 _cabin_turn_completed
+        controller.poll_result = lambda: ControlResult(status=DONE, reason="alignment_done", sequence=2)
+        status = task.tick(_task_context(manager), pose)
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "WAIT_TARGET_DOOR_OPEN")
+        self.assertTrue(task._cabin_turn_completed)
+
+    def test_take_elevator_cabin_turn_timeout_fails_deterministically(self):
+        """STAGE24：轿厢调头在 12s 边界内继续等待，超过后确定性失败。"""
+        grid = MultiFloorGridMap(resolution=0.1, width=6.0, length=6.0).floor(1)
+        cabin_center = (2.85, 2.15)
+        target_wait = (0.65, 2.15)
+        pose = (2.85, 2.15, 0.0)
+
+        controller = SimpleNamespace(
+            goal_tolerance=0.15,
+            stop=MagicMock(),
+            clear_path=MagicMock(),
+            poll_result=lambda: ControlResult(status=RUNNING, reason=None, sequence=1),
+            poll_status=lambda: RUNNING,
+            begin_heading_alignment=MagicMock(),
+            end_heading_alignment=MagicMock(),
+        )
+        client = SimpleNamespace(
+            get_elevator_points=lambda elevator_id, floor: (target_wait, cabin_center),
+            elevator_door_id=lambda floor: "lift_door_1",
+            call_elevator=lambda *a: None,
+        )
+        manager = SimpleNamespace(
+            building_client=client,
+            mapper=SimpleNamespace(floor=lambda idx: grid),
+            current_floor=0,
+            controller=controller,
+            _record_failure=MagicMock(),
+        )
+        task = TakeElevator(0, 1)
+        task.phase = "WAIT_CABIN_TURN_COMPLETE"
+        task._cabin_turn_wait_start = 100.0
+
+        with patch("danger_search.navigation_tasks.get_time", return_value=112.0):
+            self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
+            self.assertIsNone(task.failure_reason)
+
+        with patch("danger_search.navigation_tasks.get_time", return_value=112.01):
+            self.assertEqual(task.tick(_task_context(manager), pose), FAILED)
+            self.assertEqual(task.failure_reason, "elevator_cabin_turn_timeout")
+            manager._record_failure.assert_called_once_with("elevator_cabin_turn_timeout")
 
     def test_target_door_confirmation_updates_floor_before_exit_mapping(self):
         grid = MultiFloorGridMap(

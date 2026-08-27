@@ -180,7 +180,7 @@ def nearest_forward_obstacle_observation(
         forward = dx * cos_yaw + dy * sin_yaw
         lateral = abs(-dx * sin_yaw + dy * cos_yaw)
         distance = math.hypot(dx, dy)
-        if forward < 0.0 or lateral > 0.25 or distance > max_distance:
+        if forward < 0.20 or lateral > 0.22 or distance > max_distance:
             continue
         if distance < best:
             best = distance
