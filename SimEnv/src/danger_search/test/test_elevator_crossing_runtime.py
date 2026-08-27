@@ -109,6 +109,78 @@ class ElevatorCrossingRuntimeTest(unittest.TestCase):
         self.assertEqual(result.failure, "elevator_open_crossing_geometry_unavailable")
         self.assertIsNone(result.geometry)
 
+    def test_exit_empty_observations_fall_back_after_frame_and_time_thresholds(self):
+        self.config = ElevatorCrossingConfig(
+            exit_empty_fallback_timeout=1.0,
+            exit_empty_fallback_frames=10,
+        )
+        results = [
+            self.observe(
+                10.0 + index * 0.1,
+                float(index + 1),
+                points=[],
+                mode="exit",
+            )
+            for index in range(10)
+        ]
+        self.assertTrue(all(result.status == RUNNING for result in results))
+
+        fallback = self.observe(11.0, 11.0, points=[], mode="exit")
+
+        self.assertEqual(fallback.status, FAILED)
+        self.assertEqual(
+            fallback.failure,
+            "elevator_open_crossing_geometry_not_observed",
+        )
+        self.assertEqual(
+            fallback.diagnostic["event"],
+            "elevator_local_crossing_geometry_early_fallback",
+        )
+        self.assertEqual(fallback.diagnostic["empty_frame_count"], 11)
+
+    def test_entry_does_not_use_exit_empty_observation_early_fallback(self):
+        self.config = ElevatorCrossingConfig(
+            exit_empty_fallback_timeout=1.0,
+            exit_empty_fallback_frames=10,
+        )
+        result = None
+        for index in range(11):
+            result = self.observe(
+                10.0 + index * 0.1,
+                float(index + 1),
+                points=[],
+                mode="enter",
+            )
+
+        self.assertEqual(result.status, RUNNING)
+
+    def test_exit_candidate_resets_consecutive_empty_observation_count(self):
+        self.config = ElevatorCrossingConfig(
+            exit_empty_fallback_timeout=1.0,
+            exit_empty_fallback_frames=6,
+        )
+        for index in range(5):
+            self.observe(
+                10.0 + index * 0.1,
+                float(index + 1),
+                points=[],
+                mode="exit",
+            )
+        candidate = self.observe(10.5, 6.0, mode="exit")
+        self.assertEqual(candidate.status, RUNNING)
+        self.assertEqual(candidate.diagnostic["confirmations"], 1)
+
+        result = None
+        for index in range(5):
+            result = self.observe(
+                11.0 + index * 0.1,
+                float(index + 7),
+                points=[],
+                mode="exit",
+            )
+
+        self.assertEqual(result.status, RUNNING)
+
     def test_context_is_scoped_by_door_and_mode(self):
         self.observe(10.0, 1.0)
         result = self.runtime.observe(

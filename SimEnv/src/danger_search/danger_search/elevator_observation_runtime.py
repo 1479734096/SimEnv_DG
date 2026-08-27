@@ -13,6 +13,7 @@ class ElevatorVisualScanConfig:
     duration: float
     angular_speed: float
     required_rotation: float
+    clockwise: bool = True
 
 
 @dataclass(frozen=True)
@@ -194,10 +195,11 @@ class ElevatorObservationRuntime:
                 reset_detector_diagnostics()
             info_message = (
                 "开始一次全向 RGB-D 电梯门地标扫描：timeout=%.1f angular=%.2f "
-                "required_rotation=%.2f",
+                "required_rotation=%.2f clockwise=%s",
                 config.duration,
                 config.angular_speed,
                 config.required_rotation,
+                config.clockwise,
             )
 
         last_yaw = self.visual_scan_last_yaw
@@ -206,9 +208,13 @@ class ElevatorObservationRuntime:
                 math.sin(float(pose[2]) - float(last_yaw)),
                 math.cos(float(pose[2]) - float(last_yaw)),
             )
-            # 扫描方向固定为正，落脚扰动造成的反向回摆不能抵消已覆盖方位。
-            if yaw_delta > 0.0:
-                self.visual_scan_rotation += yaw_delta
+            # 根据扫描方向累计有效转角，落脚扰动造成的反向回摆不能抵消已覆盖方位。
+            if config.clockwise:
+                if yaw_delta < 0.0:
+                    self.visual_scan_rotation += abs(yaw_delta)
+            else:
+                if yaw_delta > 0.0:
+                    self.visual_scan_rotation += yaw_delta
         self.visual_scan_last_yaw = float(pose[2])
         rotation_complete = (
             float(self.visual_scan_rotation) >= float(config.required_rotation)
@@ -217,7 +223,12 @@ class ElevatorObservationRuntime:
             if int(self.registration.visual_confirmations) > 0:
                 controller.stop(reason="elevator_visual_candidate_confirmation")
             else:
-                controller.rotate_in_place(config.angular_speed)
+                angular_cmd = (
+                    -abs(float(config.angular_speed))
+                    if config.clockwise
+                    else abs(float(config.angular_speed))
+                )
+                controller.rotate_in_place(angular_cmd)
             return ElevatorVisualScanResult(
                 handled=True,
                 clear_exploration_target=clear_target,
@@ -432,7 +443,7 @@ class ElevatorObservationRuntime:
         building_client,
         local_detector,
     ) -> ElevatorDoorConfirmationResult:
-        """确认服务后的 RGB-D 变化或连续 Livox 开口。"""
+        """确认服务后的开口；支持 RGB-D 深度变化与 Livox 点云门洞双通道并联互补。"""
         context = self.door_open_confirmation
         if context is None or context.get("door_id") != door_id:
             self.begin_door_open_confirmation(
@@ -442,41 +453,45 @@ class ElevatorObservationRuntime:
             )
             context = self.door_open_confirmation
         assert context is not None
-        if int(context.get("visual_confirmations", 0)) >= 2:
+        visual_confirmed = int(context.get("visual_confirmations", 0)) >= 2
+        confirmed = bool(visual_confirmed)
+        if (
+            not confirmed
+            and cloud_stamp is not None
+            and cloud_stamp != context.get("last_cloud_stamp")
+        ):
+            context["last_cloud_stamp"] = cloud_stamp
+            door = getattr(building_client, "doors", {}).get(door_id)
+            if door is not None and floor_height is not None:
+                observation_yaw = math.atan2(
+                    door.y - pose[1], door.x - pose[0]
+                )
+                observation = local_detector.detect_opening_ahead(
+                    robot_pose=(pose[0], pose[1], observation_yaw),
+                    floor_index=floor_index,
+                    cloud_points=cloud_points,
+                    floor_height=floor_height,
+                    min_side_height_span=0.25,
+                    min_evidence_points=3,
+                )
+                matches = observation is not None and (
+                    math.hypot(
+                        observation.world_xy[0] - door.x,
+                        observation.world_xy[1] - door.y,
+                    )
+                    <= max(0.45, 2.0 * geometry_tolerance)
+                    and abs(observation.width - door.width) <= 0.50
+                )
+                context["livox_confirmations"] = (
+                    int(context.get("livox_confirmations", 0)) + 1
+                    if matches
+                    else 0
+                )
+        livox_confirmed = int(context.get("livox_confirmations", 0)) >= 2
+        if livox_confirmed:
             confirmed = True
-        else:
-            confirmed = False
-            if (
-                not floor_transition_explicit
-                and cloud_stamp is not None
-                and cloud_stamp != context.get("last_cloud_stamp")
-            ):
-                context["last_cloud_stamp"] = cloud_stamp
-                door = getattr(building_client, "doors", {}).get(door_id)
-                if door is not None and floor_height is not None:
-                    observation_yaw = math.atan2(
-                        door.y - pose[1], door.x - pose[0]
-                    )
-                    observation = local_detector.detect_opening_ahead(
-                        robot_pose=(pose[0], pose[1], observation_yaw),
-                        floor_index=floor_index,
-                        cloud_points=cloud_points,
-                        floor_height=floor_height,
-                    )
-                    matches = observation is not None and (
-                        math.hypot(
-                            observation.world_xy[0] - door.x,
-                            observation.world_xy[1] - door.y,
-                        )
-                        <= max(0.45, 2.0 * geometry_tolerance)
-                        and abs(observation.width - door.width) <= 0.50
-                    )
-                    context["livox_confirmations"] = (
-                        int(context.get("livox_confirmations", 0)) + 1
-                        if matches
-                        else 0
-                    )
-            confirmed = int(context.get("livox_confirmations", 0)) >= 2
+            if not visual_confirmed:
+                context["confirmation_source"] = "livox_registered_opening"
 
         event = None
         if confirmed and not bool(context.get("logged", False)):
@@ -493,7 +508,10 @@ class ElevatorObservationRuntime:
                 ),
                 "dark_fraction": getattr(change, "dark_fraction", None),
                 "deeper_fraction": getattr(change, "deeper_fraction", None),
-                "confirmation_source": context.get("visual_confirmation_source"),
+                "confirmation_source": context.get(
+                    "confirmation_source",
+                    context.get("visual_confirmation_source"),
+                ),
             }
         return ElevatorDoorConfirmationResult(confirmed, event)
 
@@ -516,7 +534,10 @@ class ElevatorObservationRuntime:
                 change, "valid_depth_fraction", None
             ),
             "last_deeper_fraction": getattr(change, "deeper_fraction", None),
-            "confirmation_source": context.get("visual_confirmation_source"),
+            "confirmation_source": context.get(
+                "confirmation_source",
+                context.get("visual_confirmation_source"),
+            ),
         }
         self.door_open_confirmation = None
         return event

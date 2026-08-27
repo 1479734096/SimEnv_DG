@@ -59,7 +59,7 @@ class LocalSemanticDetector:
         opening_min_width: float = 0.65,
         opening_max_width: float = 2.50,
         opening_plane_depth: float = 0.30,
-        opening_min_side_height_span: float = 0.50,
+        opening_min_side_height_span: float = 0.25,
         use_truth_proximity_detector: bool = False,
     ):
         self.max_distance = float(max_distance)
@@ -105,6 +105,8 @@ class LocalSemanticDetector:
         floor_height: float = 2.6,
         minimum_distance: float = 0.15,
         maximum_distance: float | None = None,
+        min_side_height_span: float | None = None,
+        min_evidence_points: int | None = None,
     ) -> OpeningObservation | None:
         """从前方两侧竖直结构之间确认门洞，不依赖门坐标真值。"""
         minimum_distance = float(minimum_distance)
@@ -150,7 +152,17 @@ class LocalSemanticDetector:
             }
         )
         half_depth = max(0.05, self.opening_plane_depth * 0.5)
-        minimum_side_points = max(3, self.min_evidence_points)
+        parsed_min_pts = (
+            int(min_evidence_points)
+            if min_evidence_points is not None
+            else self.min_evidence_points
+        )
+        minimum_side_points = max(1, parsed_min_pts)
+        side_height_threshold = (
+            float(min_side_height_span)
+            if min_side_height_span is not None
+            else self.opening_min_side_height_span
+        )
         observations: list[OpeningObservation] = []
         for distance in candidate_distances:
             plane = [sample for sample in samples if abs(sample[0] - distance) <= half_depth]
@@ -166,7 +178,7 @@ class LocalSemanticDetector:
                 height_span = max(sample[2] for sample in bucket_samples) - min(
                     sample[2] for sample in bucket_samples
                 )
-                if height_span < self.opening_min_side_height_span:
+                if height_span < side_height_threshold:
                     continue
                 vertical_bins.append((bucket * lateral_bin_width, bucket_samples))
             left = [item for item in vertical_bins if item[0] > 0.05]

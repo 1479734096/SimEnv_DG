@@ -587,3 +587,38 @@ Stage15～17 当前结论：
 - **保持已验证的轿厢调头边界**：调头继续严格使用零线速度和 `max_angular=0.65 rad/s`，不提高到缺少安全证据的 `0.85 rad/s`；专职调头等待超时由 8 秒调整为 12 秒，超过后仍以 `elevator_cabin_turn_timeout` 确定性失败；
 - **测试验证**：任务层与控制器定向回归 `139 passed in 0.55s`；全量单元与契约测试 `814 passed in 4.16s`；按用户要求本轮未启动 Gazebo、未复跑 seed `8127`；
 - 详情见 [STAGE24_ELEVATOR_COMMAND_ARBITRATION_AND_DIRECT_ENTRY_REPORT.md](reports/STAGE24_ELEVATOR_COMMAND_ARBITRATION_AND_DIRECT_ENTRY_REPORT.md)。
+
+## 23. 2026-08-27 进门大厅顺时针快速扫描与大门防卡深入（STAGE25）
+
+- **深入大厅开阔中心（彻底消灭摆腿踢门框风险）**：主入口过门轴向深入距离 `post_door_min_distance` 从 `0.9m` 提升至 `1.4m`，过门偏移 `door_pass_offset` 从 `0.5m` 提升至 `0.8m`，使机器狗在充分远离门框与侧墙的大厅中央开阔地执行环视，根治门前近距离旋转导致的踢门卡阻；
+- **顺时针快速环视提速**：`elevator_visual_scan_angular_speed` 从 `0.70 rad/s` 提速至 `0.90 rad/s`，下发负角速度命令实现顺时针旋转，在大厅开阔区域兼顾快速覆盖与 RealSense 门板候选捕捉稳定性；
+- **顺时针转角累计与防抖闭环**：`elevator_observation_runtime.py` 支持顺时针负向航向增量累计，累计满 `5.80 rad` 确定性退出，落脚扰动反弹不干扰累计；保留候选捕获即 `stop()` 停稳确认的防漏检机制；
+- **测试验证**：全量单元与契约测试（`815 passed in 6.01s`）100% 通过；
+- 详情见 [STAGE25_CLOCKWISE_VISUAL_SCAN_AND_ENTRY_CLEARANCE_REPORT.md](reports/STAGE25_CLOCKWISE_VISUAL_SCAN_AND_ENTRY_CLEARANCE_REPORT.md)。
+
+## 24. 2026-08-27 出厢无效观察早退与大门外原路返航（STAGE26）
+
+- **保留首次入场轨迹并绑定连续性作用域**：返航优先继续使用本轮实际入场轨迹的倒序路径；新增楼层、地图 epoch、定位 epoch 与轨迹中心线偏差校验，仅在同一作用域且偏差不超过 `0.35m` 时关闭普通 `UNKNOWN` 临时停车；显式 `DROP`、实时障碍、已有支撑约束和控制器卡滞保护不受影响；
+- **防止旧轨迹跨定位断点复用**：首次采集轨迹时锁定作用域，若入场期间发生定位连续性变化，轨迹直接失效并回退正常返航规划；
+- **缩短出厢无效观察**：目标层开门已确认后，连续 `10` 个新 Livox 点云帧且持续至少 `1.0s` 未观察到开口时，提前降级到已注册门几何；入厢、不稳定候选和显式障碍仍保留原有确认与 `4.0s` 总超时；
+- **测试验证**：相关返航、电梯穿越、任务层回归与全量 Python 测试共 `823 passed`；本阶段未启动 Gazebo，尚未取得修复后的 seed `8127` 运行证据；
+- 详情见 [STAGE26_ENTRY_TRACE_AND_EXIT_FALLBACK_REPORT.md](reports/STAGE26_ENTRY_TRACE_AND_EXIT_FALLBACK_REPORT.md)。
+
+## 25. 2026-08-27 换层 Livox 目标门确认与历史地图复用（STAGE27）
+
+- **修正显式换层点云楼层切片**：换层守卫继续阻止点云写入 Mapper，但不再丢弃合法新帧；点云按 `guard.target_floor` 修正楼层高度后写入现有 `latest_cloud_points`，消除目标门确认读取旧楼层缓存的问题；
+- **所有目标层出口统一使用 Livox**：显式换层期间 RGB-D 只保留诊断作用，不参与放行；复用现有 `detect_opening_ahead()` 与注册门中心、宽度约束，连续两个不同时间戳的新 Livox 帧匹配后确认开口；
+- **保留历史楼层地图**：换层期间不写图、不清图、不推进 map epoch；确认开口后只清理目标电梯门动态条带，随后沿用既有楼层锁存、局部穿越刷新与 STAGE26 降级流程；
+- **KISS 边界**：未新增独立换层缓存、YAML 参数、ROS 接口或额外地图握手状态；
+- **测试验证**：电梯、任务、换层与返航定向回归 `314 passed`，全量 Python 回归 `826 passed`，生产边界审计与补丁格式检查通过；按约定未启动 Gazebo；
+- 详情见 [STAGE27_LIVOX_TARGET_DOOR_CONFIRMATION_REPORT.md](reports/STAGE27_LIVOX_TARGET_DOOR_CONFIRMATION_REPORT.md)。
+
+## 26. 2026-08-27 电梯目标门双通道放行与近距离几何放宽（STAGE28）
+
+- **双通道并联互补放行（OR 逻辑）**：解除 STAGE27 对显式换层出梯时 RGB-D 确认的硬编码阻断。无论进厢还是出厢，只要 RGB-D 深度图连续 2 帧确认开门，或 Livox 激光点云连续 2 帧确认门洞开口，任意通道满足即刻放行（`visual_confirmed or livox_confirmed`），实现双重冗余与毫秒级放行响应；
+- **放宽近距离电梯门立柱几何约束**：将 `local_semantic_detector.py` 中 `detect_opening_ahead` 的单侧门框立柱垂直高度跨度由 `0.50m` 放宽至 `0.25m`，立柱最小点数由 `6` 点放宽至 `3` 点，并支持动态传参覆盖；完美包容轿厢狭窄视角与近距离内壁遮挡，同时保持门关闭时 0% 穿透的绝对物理防误判；
+- **大门近场对准直通过门（彻底消除进门左右摆头）**：在 `navigation_tasks.py` 的 `OpenDoorAndPass` 中，门洞几何刷新后若当前位姿距离 `_wait_point` $\le 0.30\text{m}$，跳过短路段 Pure Pursuit 追踪直接切入 `GO_PASS_POINT`，原地一步正对门后 `_pass_point` 笔直穿过，消除极短距离追踪导致的左右大幅摆头，单次过门再提速 3.5 秒；
+- **日志与确认源审计**：准确记录 `confirmation_source` 为视觉深度来源或 `livox_registered_opening`，保留双通道确认帧数审计；
+- **测试验证**：全量 Python 单元与契约测试 `860 passed in 4.73s` 100% 绿灯通过。
+
+

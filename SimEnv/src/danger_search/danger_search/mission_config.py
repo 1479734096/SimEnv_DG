@@ -243,6 +243,8 @@ _CONFIG_GROUP_FIELDS = {
             "elevator_opening_confirmation_timeout",
             "elevator_local_crossing_geometry_enabled",
             "elevator_local_crossing_timeout",
+            "elevator_exit_empty_fallback_timeout",
+            "elevator_exit_empty_fallback_frames",
             "elevator_local_crossing_confirmations",
             "elevator_local_crossing_confirmation_max_gap",
             "elevator_local_crossing_center_tolerance",
@@ -259,6 +261,7 @@ _CONFIG_GROUP_FIELDS = {
             "elevator_visual_max_width",
             "elevator_visual_min_width",
             "elevator_visual_scan_angular_speed",
+            "elevator_visual_scan_clockwise",
             "elevator_visual_scan_duration",
             "elevator_visual_scan_required_rotation",
             "exit_cabin_backoff_enabled",
@@ -1100,6 +1103,12 @@ class _MissionConfigBuilder:
         self.elevator_local_crossing_timeout = float(
             _param("mission/elevator_local_crossing_timeout", 4.0)
         )
+        self.elevator_exit_empty_fallback_timeout = float(
+            _param("mission/elevator_exit_empty_fallback_timeout", 1.0)
+        )
+        self.elevator_exit_empty_fallback_frames = int(
+            _param("mission/elevator_exit_empty_fallback_frames", 10)
+        )
         self.elevator_local_crossing_confirmations = int(
             _param("mission/elevator_local_crossing_confirmations", 3)
         )
@@ -1140,10 +1149,13 @@ class _MissionConfigBuilder:
             _param("local_semantic/elevator_visual_scan_duration", 18.0)
         )
         self.elevator_visual_scan_angular_speed = float(
-            _param("local_semantic/elevator_visual_scan_angular_speed", 0.70)
+            _param("local_semantic/elevator_visual_scan_angular_speed", 0.90)
         )
         self.elevator_visual_scan_required_rotation = float(
             _param("local_semantic/elevator_visual_scan_required_rotation", 5.80)
+        )
+        self.elevator_visual_scan_clockwise = bool(
+            _param("local_semantic/elevator_visual_scan_clockwise", True)
         )
         self.landmark_drift_config = LandmarkDriftConfig(
             enabled=bool(
@@ -1186,6 +1198,10 @@ class _MissionConfigBuilder:
             and self.elevator_opening_confirmation_timeout > 0.0
             and math.isfinite(self.elevator_local_crossing_timeout)
             and self.elevator_local_crossing_timeout > 0.0
+            and math.isfinite(self.elevator_exit_empty_fallback_timeout)
+            and 0.0 < self.elevator_exit_empty_fallback_timeout
+            <= self.elevator_local_crossing_timeout
+            and self.elevator_exit_empty_fallback_frames > 0
             and self.elevator_local_crossing_confirmations > 0
             and math.isfinite(self.elevator_local_crossing_confirmation_max_gap)
             and 0.0 < self.elevator_local_crossing_confirmation_max_gap

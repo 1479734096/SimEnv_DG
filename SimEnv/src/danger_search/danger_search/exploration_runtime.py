@@ -113,6 +113,12 @@ class FrontierArrivalGainRuntime:
     def cancel(self) -> None:
         self._active = None
 
+    def reset(self) -> None:
+        """清除当前楼层的活动目标和区域收益账本。"""
+        self._context = None
+        self._active = None
+        self._regions = []
+
     def arrive(
         self,
         *,

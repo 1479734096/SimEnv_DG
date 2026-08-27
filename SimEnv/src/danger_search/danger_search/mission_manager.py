@@ -308,6 +308,12 @@ class MissionManager:
         )
         self._elevator_crossing_config = ElevatorCrossingConfig(
             timeout=float(self.elevator_local_crossing_timeout),
+            exit_empty_fallback_timeout=float(
+                self.elevator_exit_empty_fallback_timeout
+            ),
+            exit_empty_fallback_frames=int(
+                self.elevator_exit_empty_fallback_frames
+            ),
             confirmations=int(self.elevator_local_crossing_confirmations),
             confirmation_max_gap=float(
                 self.elevator_local_crossing_confirmation_max_gap
@@ -515,6 +521,7 @@ class MissionManager:
             duration=float(self.elevator_visual_scan_duration),
             angular_speed=float(self.elevator_visual_scan_angular_speed),
             required_rotation=float(self.elevator_visual_scan_required_rotation),
+            clockwise=bool(getattr(self, "elevator_visual_scan_clockwise", True)),
         )
 
     def _elevator_registration_config(self) -> ElevatorRegistrationConfig:
@@ -977,7 +984,18 @@ class MissionManager:
                     self._elevator_success = True
                     self.current_floor = self.current_task.target_floor
                     self.controller.clear_path()
-                    self.floor_start_time = get_time()
+                    self._frontier_arrival_gain.reset()
+                    self.current_frontier = None
+                    self._exploration.last_frontier_target = None
+                    self._exploration.last_frontier_score = None
+                    self._exploration.last_frontier_used_fallback = False
+                    now = get_time()
+                    self._record_elevator_exit_context(
+                        self.current_task,
+                        pose,
+                        now=now,
+                    )
+                    self.floor_start_time = now
                     self._exploration.floor_timeout_logged = False
                 elif isinstance(self.current_task, TakeElevator) and status == FAILED:
                     # 已发起过电梯任务不等于成功；摘要必须记录真实终态。
@@ -1426,8 +1444,24 @@ class MissionManager:
                 )
             elif floor_scoped_updates_blocked:
                 self._record_pose_lookup("cloud", cloud_lookup)
-                # 被门控的 cloud 必须标记为已消费，避免对齐后重放旧帧。
-                self._perception_mapping.discard_cloud(cloud_preparation)
+                guard = self._floor_transition_guard
+                if (
+                    guard is not None
+                    and guard.explicit_transition
+                    and guard.target_floor is not None
+                    and cloud_preparation.status == INPUT_MATCHED
+                ):
+                    # 显式换层仍禁止写图，但保留按目标楼层切片的新 Livox，
+                    # 让目标门确认不再读取运输前的旧楼层点云。
+                    self._perception_mapping.cache_cloud(
+                        cloud_preparation,
+                        floor_index=int(guard.target_floor),
+                        cloud_max_points=self.cloud_max_points,
+                        cloud_stride=self.cloud_stride,
+                    )
+                else:
+                    # 非显式歧义帧只消费不解码，避免对齐后重放旧帧。
+                    self._perception_mapping.discard_cloud(cloud_preparation)
                 self._record_skipped_floor_scoped_update(
                     cloud_stamp=cloud_stamp,
                     estimated_floor=estimated_floor,
@@ -1888,6 +1922,7 @@ class MissionManager:
             enabled = _ground_support_unknown_hold_enabled(
                 self.current_task,
                 configured=configured,
+                trusted_return_trace=self._return_entry_trace_is_trusted(pose),
             )
             if (
                 enabled
@@ -1899,6 +1934,61 @@ class MissionManager:
                 enabled = False
             with _controller_command_transaction(getattr(self, "controller", None)):
                 setter(enabled)
+
+    def _return_entry_trace_is_trusted(
+        self,
+        pose: tuple[float, float, float] | None,
+    ) -> bool:
+        """验证原路返航仍处于本轮已实际通过轨迹的受限作用域。"""
+        runtime = getattr(self, "_return_home", None)
+        scope = getattr(runtime, "entry_trace_scope", None)
+        if scope is None or pose is None:
+            return False
+        if self.state != RETURN_HOME or not getattr(
+            self, "_return_home_main_entrance_crossed", False
+        ):
+            runtime.entry_trace_scope = None
+            self._log_structured(
+                {
+                    "event": "return_home_entry_trace_trust_revoked",
+                    "reason_code": "entry_trace_context_ended",
+                    "maximum_deviation": round(
+                        float(runtime.entry_trace_maximum_observed_deviation), 3
+                    ),
+                }
+            )
+            return False
+        has_path = getattr(self.controller, "has_path", None)
+        path_active = bool(has_path()) if callable(has_path) else False
+        snapshot = getattr(self.controller, "snapshot", None)
+        path_reason = None
+        if callable(snapshot):
+            payload = snapshot()
+            if isinstance(payload, dict):
+                path_reason = payload.get("replan_reason")
+        decision = runtime.evaluate_entry_trace_trust(
+            pose=pose,
+            floor=int(self.current_floor),
+            map_epoch=int(
+                self._ground_support.map_epoch_for_floor(self.current_floor)
+            ),
+            localization_epoch=int(self._ground_support.localization_epoch),
+            path_active=path_active,
+            path_reason=path_reason,
+        )
+        if not decision.active:
+            self._log_structured(
+                {
+                    "event": "return_home_entry_trace_trust_revoked",
+                    "reason_code": decision.reason_code,
+                    "maximum_deviation": (
+                        round(float(decision.maximum_deviation), 3)
+                        if decision.maximum_deviation is not None
+                        else None
+                    ),
+                }
+            )
+        return decision.active
 
     # ------------------------------------------------------------------
     # 方案 C：全局时间预算与楼层/返航决策层
@@ -2737,6 +2827,46 @@ class MissionManager:
             )
         return context
 
+    def _record_elevator_exit_context(
+        self,
+        task: TakeElevator,
+        pose: tuple[float, float, float],
+        *,
+        now: float,
+    ) -> bool:
+        """用目标楼层已注册电梯门记录离厢后的临时前沿上下文。"""
+        try:
+            door_id = str(self.building_client.elevator_door_id(task.target_floor))
+        except (AttributeError, TypeError, ValueError) as exc:
+            MissionReportingRuntime.logwarn(
+                "电梯任务完成但目标楼层门 ID 无效，无法建立离厢前沿上下文：%s",
+                exc,
+            )
+            return False
+        doors = getattr(self.building_client, "doors", {})
+        door = doors.get(door_id) if isinstance(doors, dict) else None
+        if (
+            door is None
+            or getattr(door, "kind", None) != "elevator"
+            or int(getattr(door, "floor_index", -1)) != int(task.target_floor)
+        ):
+            MissionReportingRuntime.logwarn(
+                "电梯任务完成但目标门缺少已注册传感器几何：door_id=%s floor=%d",
+                door_id,
+                int(task.target_floor),
+            )
+            return False
+        yaw = float(door.yaw)
+        return self._door_navigation.record_passage(
+            door_id=door_id,
+            door_xy=(float(door.x), float(door.y)),
+            pass_vector=(math.cos(yaw), math.sin(yaw)),
+            pose=pose,
+            now=now,
+            transition_duration=self.door_transition_duration,
+            context_duration=self.post_door_context_max_duration,
+        )
+
     def _permanent_door_context_parameters(self) -> tuple[float, float, float]:
         door_width = 0.0
         doors = getattr(getattr(self, "building_client", None), "doors", {})
@@ -2996,6 +3126,7 @@ class MissionManager:
             target_text = f"({frontier.centroid[0]:.2f}, {frontier.centroid[1]:.2f})"
             score = frontier.score
             path_len = path_length(path) if path else 0.0
+            side = self._door_navigation.side_label(frontier.centroid)
             if isinstance(wait_point, tuple) and isinstance(pass_point, tuple):
                 side = self._door_navigation.classify_goal_side(
                     wait_point, pass_point, frontier.centroid
@@ -3244,18 +3375,22 @@ class MissionManager:
     ) -> bool:
         guard = self._floor_transition_guard
         mapper = self.mapper
+        explicit_transition = bool(
+            guard is not None and guard.explicit_transition
+        )
+        observation_floor = int(self.current_floor)
+        if explicit_transition and guard.target_floor is not None:
+            observation_floor = int(guard.target_floor)
         result = self._elevator_observation.confirm_door_open(
             door_id=door_id,
             pose=pose,
             cloud_stamp=self._map_runtime.last_cloud_stamp,
             cloud_points=self._map_runtime.latest_cloud_points,
-            floor_index=self.current_floor,
+            floor_index=observation_floor,
             floor_height=(
                 float(mapper.floor_height) if mapper is not None else None
             ),
-            floor_transition_explicit=bool(
-                guard is not None and guard.explicit_transition
-            ),
+            floor_transition_explicit=explicit_transition,
             geometry_tolerance=self.initial_entry_geometry_tolerance,
             building_client=self.building_client,
             local_detector=self.local_detector,
@@ -3659,7 +3794,37 @@ class MissionManager:
                     reverse_trace = None
             if reverse_trace is not None:
                 self._return_home.entry_trace_attempted = True
-                self.controller.set_path(reverse_trace, reason="return_home_entry_trace_path")
+                if (
+                    not getattr(self._entry, "trace_scope_valid", True)
+                    or getattr(self._entry, "trace_floor", None) is None
+                    or getattr(self._entry, "trace_map_epoch", None) is None
+                    or getattr(self._entry, "trace_localization_epoch", None) is None
+                ):
+                    reverse_trace = None
+            if reverse_trace is not None:
+                with _controller_command_transaction(self.controller):
+                    self.controller.set_path(
+                        reverse_trace,
+                        reason="return_home_entry_trace_path",
+                    )
+                    scope = self._return_home.activate_entry_trace(
+                        tuple(reverse_trace),
+                        floor=int(self.current_floor),
+                        map_epoch=int(self._entry.trace_map_epoch),
+                        localization_epoch=int(self._entry.trace_localization_epoch),
+                        maximum_deviation=0.35,
+                    )
+                    self._sync_ground_support_task_context(pose)
+                self._log_structured(
+                    {
+                        "event": "return_home_entry_trace_trust_activated",
+                        "floor": scope.floor,
+                        "map_epoch": scope.map_epoch,
+                        "localization_epoch": scope.localization_epoch,
+                        "maximum_deviation": scope.maximum_deviation,
+                        "waypoint_count": len(scope.path),
+                    }
+                )
                 MissionReportingRuntime.loginfo(
                     "主入口外复用本轮已实际通过的入场轨迹返航：waypoints=%d",
                     len(reverse_trace),
@@ -3893,6 +4058,20 @@ class MissionManager:
             or self.current_task is not None
             or self.state != EXPLORE_FLOOR
         ):
+            return
+        floor = int(self.current_floor)
+        map_epoch = int(self._ground_support.map_epoch_for_floor(floor))
+        localization_epoch = int(self._ground_support.localization_epoch)
+        if self._entry.trace_floor is None:
+            self._entry.trace_floor = floor
+            self._entry.trace_map_epoch = map_epoch
+            self._entry.trace_localization_epoch = localization_epoch
+        elif (
+            floor != self._entry.trace_floor
+            or map_epoch != self._entry.trace_map_epoch
+            or localization_epoch != self._entry.trace_localization_epoch
+        ):
+            self._entry.trace_scope_valid = False
             return
         point = (float(pose[0]), float(pose[1]))
         trace = self._entry.trace
@@ -4422,7 +4601,12 @@ def _pose_sample_from_values(*, stamp: float, pose, xyz) -> PoseSample:
     )
 
 
-def _ground_support_unknown_hold_enabled(task, *, configured: bool = True) -> bool:
+def _ground_support_unknown_hold_enabled(
+    task,
+    *,
+    configured: bool = True,
+    trusted_return_trace: bool = False,
+) -> bool:
     """返回当前任务是否启用 UNKNOWN 临时停车；显式 DROP 不受此值影响。"""
     if not configured:
         return False
@@ -4435,7 +4619,11 @@ def _ground_support_unknown_hold_enabled(task, *, configured: bool = True) -> bo
         and getattr(task, "phase", None) == "GO_PASS_POINT"
         and bool(getattr(task, "opening_sensor_confirmed", False))
     )
-    return not (controlled_elevator_threshold or controlled_open_door_threshold)
+    return not (
+        controlled_elevator_threshold
+        or controlled_open_door_threshold
+        or bool(trusted_return_trace)
+    )
 
 
 def _controller_command_transaction(controller):

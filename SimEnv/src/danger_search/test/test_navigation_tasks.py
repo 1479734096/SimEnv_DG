@@ -267,7 +267,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
             path_queries.append(True)
             if len(path_queries) == 1:
                 return ((0.0, -0.8), (0.0, 0.8), (0.0, 1.8))
-            return ((0.3, -0.8), (0.3, 0.8), (0.3, 1.8))
+            return ((0.5, -0.8), (0.5, 0.8), (0.5, 1.8))
 
         task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
         task.phase = "CALL_OPEN"
@@ -295,10 +295,51 @@ class OpenDoorAndPassTest(unittest.TestCase):
         self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
 
         self.assertEqual(task.phase, "GO_REFRESHED_WAIT_POINT")
-        self.assertEqual(task.wait_point, (0.3, -0.8))
-        self.assertEqual(task.pass_point, (0.3, 0.8))
+        self.assertEqual(task.wait_point, (0.5, -0.8))
+        self.assertEqual(task.pass_point, (0.5, 0.8))
         self.assertEqual(stopped, ["door_opening_refresh"])
         self.assertIn("door_opening_geometry_refreshed", cleared)
+
+    def test_open_door_refreshes_geometry_and_skips_wait_point_when_close(self):
+        stopped = []
+        cleared = []
+        path_queries = []
+        refresh_results = iter((RUNNING, DONE))
+
+        def path_points(*args, **kwargs):
+            path_queries.append(True)
+            if len(path_queries) == 1:
+                return ((0.0, -0.8), (0.0, 0.8), (0.0, 1.8))
+            return ((0.1, -0.8), (0.1, 0.8), (0.1, 1.8))
+
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "CALL_OPEN"
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(
+                get_door_path_points=path_points,
+                open_door=lambda door_id: _DoneService(),
+            ),
+            refresh_open_door_geometry=lambda door_id, pose: next(refresh_results),
+            clear_opened_door_area=lambda door_id: cleared.append(door_id),
+            controller=SimpleNamespace(
+                goal_tolerance=0.25,
+                stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
+                clear_path=lambda **kwargs: cleared.append(kwargs.get("reason")),
+            ),
+        )
+        pose = (0.0, -0.8, math.pi / 2.0)
+
+        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
+        self.assertEqual(task.phase, "GO_OPEN_WAIT_POINT")
+        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
+        self.assertEqual(task.phase, "REFRESH_OPENING")
+        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
+
+        self.assertEqual(task.phase, "GO_PASS_POINT")
+        self.assertEqual(task.wait_point, (0.1, -0.8))
+        self.assertEqual(task.pass_point, (0.1, 0.8))
 
     def test_open_door_service_failure_returns_failed(self):
         failures = []
@@ -1226,6 +1267,40 @@ class TakeElevatorTest(unittest.TestCase):
 
         self.assertEqual(status, FAILED)
         self.assertEqual(task.failure_reason, "elevator_cabin_center_offset_exceeded")
+
+    def test_target_empty_geometry_early_fallback_keeps_exit_alignment(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 1
+        manager.elevator_local_crossing_geometry_enabled = True
+        manager.refresh_elevator_crossing_geometry = lambda **_kwargs: (
+            ElevatorCrossingResult(
+                FAILED,
+                failure="elevator_open_crossing_geometry_not_observed",
+                diagnostic={
+                    "event": "elevator_local_crossing_geometry_early_fallback"
+                },
+            )
+        )
+        task = TakeElevator(0, 1)
+        task.phase = "REFRESH_TARGET_OPEN_CROSSING"
+        cabin_pose = (2.60, 2.60, math.pi / 2.0)
+
+        self.assertEqual(task.tick(_task_context(manager), cabin_pose), RUNNING)
+        self.assertEqual(task.phase, "EXIT_CABIN")
+        self.assertIsNone(task._target_crossing_geometry)
+
+        self.assertEqual(task.tick(_task_context(manager), cabin_pose), RUNNING)
+        self.assertEqual(task.cabin_transit_stage, "ALIGN")
+        self.assertEqual(task.tick(_task_context(manager), cabin_pose), RUNNING)
+        self.assertTrue(manager.controller.align_calls)
+        self.assertEqual(manager.controller.paths, [])
 
     def test_live_crossing_corridor_block_is_bounded(self):
         grid = MultiFloorGridMap(

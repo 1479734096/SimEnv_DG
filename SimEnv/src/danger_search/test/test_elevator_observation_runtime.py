@@ -72,7 +72,7 @@ class ElevatorObservationRuntimeTest(unittest.TestCase):
         self.assertEqual(result.structured_event["result"], "landmark_found")
         self.assertIn(("stop", "elevator_visual_landmark_found"), self.calls)
 
-    def test_visual_confirmation_does_not_require_livox_dependencies(self):
+    def test_current_floor_visual_confirmation_does_not_require_livox_dependencies(self):
         self.runtime.door_open_confirmation = {
             "door_id": "lift_0",
             "baseline": None,
@@ -97,7 +97,7 @@ class ElevatorObservationRuntimeTest(unittest.TestCase):
             cloud_points=(),
             floor_index=0,
             floor_height=None,
-            floor_transition_explicit=True,
+            floor_transition_explicit=False,
             geometry_tolerance=0.25,
             building_client=client,
             local_detector=local_detector,
@@ -108,6 +108,92 @@ class ElevatorObservationRuntimeTest(unittest.TestCase):
             result.structured_event["event"],
             "elevator_door_open_sensor_confirmed",
         )
+
+    def test_explicit_transition_requires_two_livox_opening_frames(self):
+        self.runtime.door_open_confirmation = {
+            "door_id": "lift_1",
+            "baseline": None,
+            "last_image_stamp": None,
+            "visual_confirmations": 0,
+            "last_visual_change": None,
+            "last_cloud_stamp": None,
+            "livox_confirmations": 0,
+            "logged": False,
+        }
+        client = SimpleNamespace(
+            doors={
+                "lift_1": SimpleNamespace(x=1.0, y=0.0, width=1.4),
+            }
+        )
+        observations = []
+        local_detector = SimpleNamespace(
+            detect_opening_ahead=lambda **kwargs: observations.append(kwargs)
+            or SimpleNamespace(world_xy=(1.0, 0.0), width=1.4)
+        )
+
+        first = self.runtime.confirm_door_open(
+            door_id="lift_1",
+            pose=(2.4, 0.0, 0.0),
+            cloud_stamp=3.0,
+            cloud_points=((1.0, 0.0, 3.1),),
+            floor_index=1,
+            floor_height=2.6,
+            floor_transition_explicit=True,
+            geometry_tolerance=0.25,
+            building_client=client,
+            local_detector=local_detector,
+        )
+        second = self.runtime.confirm_door_open(
+            door_id="lift_1",
+            pose=(2.4, 0.0, 0.0),
+            cloud_stamp=4.0,
+            cloud_points=((1.0, 0.0, 3.1),),
+            floor_index=1,
+            floor_height=2.6,
+            floor_transition_explicit=True,
+            geometry_tolerance=0.25,
+            building_client=client,
+            local_detector=local_detector,
+        )
+
+        self.assertFalse(first.confirmed)
+        self.assertTrue(second.confirmed)
+        self.assertEqual([item["floor_index"] for item in observations], [1, 1])
+        self.assertEqual(
+            second.structured_event["confirmation_source"],
+            "livox_registered_opening",
+        )
+
+    def test_explicit_transition_visual_confirmation_allows_immediate_pass(self):
+        self.runtime.door_open_confirmation = {
+            "door_id": "lift_1",
+            "baseline": None,
+            "last_image_stamp": 2.0,
+            "visual_confirmations": 2,
+            "last_visual_change": None,
+            "last_cloud_stamp": None,
+            "livox_confirmations": 0,
+            "logged": False,
+        }
+        client = SimpleNamespace(
+            doors={
+                "lift_1": SimpleNamespace(x=1.0, y=0.0, width=1.4),
+            }
+        )
+        local_detector = SimpleNamespace(detect_opening_ahead=lambda **kwargs: None)
+        result = self.runtime.confirm_door_open(
+            door_id="lift_1",
+            pose=(2.4, 0.0, 0.0),
+            cloud_stamp=3.0,
+            cloud_points=(),
+            floor_index=1,
+            floor_height=2.6,
+            floor_transition_explicit=True,
+            geometry_tolerance=0.25,
+            building_client=client,
+            local_detector=local_detector,
+        )
+        self.assertTrue(result.confirmed)
 
 
 if __name__ == "__main__":

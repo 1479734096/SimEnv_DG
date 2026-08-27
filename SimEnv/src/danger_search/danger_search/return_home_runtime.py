@@ -45,9 +45,27 @@ class ReturnHomePlanPoll:
     planner_error: str | None = None
 
 
+@dataclass(frozen=True)
+class TrustedEntryTraceScope:
+    path: tuple[tuple[float, float], ...]
+    floor: int
+    map_epoch: int
+    localization_epoch: int
+    maximum_deviation: float
+
+
+@dataclass(frozen=True)
+class EntryTraceTrustDecision:
+    active: bool
+    reason_code: str
+    maximum_deviation: float | None = None
+
+
 @dataclass
 class ReturnHomeRuntime:
     entry_trace_attempted: bool = False
+    entry_trace_scope: TrustedEntryTraceScope | None = None
+    entry_trace_maximum_observed_deviation: float = 0.0
     next_plan_time: float = 0.0
     planner: object | None = None
     reason: str | None = None
@@ -65,6 +83,8 @@ class ReturnHomeRuntime:
     planner_constraint_revision: int = 0
 
     def reset_feedback(self) -> None:
+        self.entry_trace_scope = None
+        self.entry_trace_maximum_observed_deviation = 0.0
         self.stuck_anchor = None
         self.stuck_count = 0
         self.failed_segments.clear()
@@ -74,6 +94,92 @@ class ReturnHomeRuntime:
         self.retreat_target = None
         self.retreat_deadline = 0.0
         self.retreat_anchor = None
+
+    def activate_entry_trace(
+        self,
+        path,
+        *,
+        floor: int,
+        map_epoch: int,
+        localization_epoch: int,
+        maximum_deviation: float,
+    ) -> TrustedEntryTraceScope:
+        """冻结本轮已实际通过的入场轨迹及其连续性作用域。"""
+        parsed = tuple(
+            (float(point[0]), float(point[1]))
+            for point in path
+        )
+        deviation = float(maximum_deviation)
+        if (
+            len(parsed) < 2
+            or not all(math.isfinite(value) for point in parsed for value in point)
+            or not math.isfinite(deviation)
+            or deviation <= 0.0
+            or int(map_epoch) <= 0
+            or int(localization_epoch) <= 0
+        ):
+            raise ValueError("返航入场轨迹及其连续性作用域必须有效")
+        scope = TrustedEntryTraceScope(
+            path=parsed,
+            floor=int(floor),
+            map_epoch=int(map_epoch),
+            localization_epoch=int(localization_epoch),
+            maximum_deviation=deviation,
+        )
+        self.entry_trace_scope = scope
+        self.entry_trace_maximum_observed_deviation = 0.0
+        return scope
+
+    def evaluate_entry_trace_trust(
+        self,
+        *,
+        pose: tuple[float, float, float],
+        floor: int,
+        map_epoch: int,
+        localization_epoch: int,
+        path_active: bool,
+        path_reason: str | None,
+    ) -> EntryTraceTrustDecision:
+        """仅在同一连续性作用域且机器人仍贴近原轨迹时保留信任。"""
+        scope = self.entry_trace_scope
+        if scope is None:
+            return EntryTraceTrustDecision(False, "entry_trace_inactive")
+        reason = None
+        if not path_active:
+            reason = "entry_trace_path_inactive"
+        elif path_reason is not None and path_reason != "return_home_entry_trace_path":
+            reason = "entry_trace_path_replaced"
+        elif int(floor) != scope.floor:
+            reason = "entry_trace_floor_changed"
+        elif int(map_epoch) != scope.map_epoch:
+            reason = "entry_trace_map_epoch_changed"
+        elif int(localization_epoch) != scope.localization_epoch:
+            reason = "entry_trace_localization_epoch_changed"
+        if reason is not None:
+            self.entry_trace_scope = None
+            return EntryTraceTrustDecision(
+                False,
+                reason,
+                maximum_deviation=self.entry_trace_maximum_observed_deviation,
+            )
+
+        deviation = _distance_to_polyline((float(pose[0]), float(pose[1])), scope.path)
+        self.entry_trace_maximum_observed_deviation = max(
+            self.entry_trace_maximum_observed_deviation,
+            deviation,
+        )
+        if not math.isfinite(deviation) or deviation > scope.maximum_deviation:
+            self.entry_trace_scope = None
+            return EntryTraceTrustDecision(
+                False,
+                "entry_trace_deviation_exceeded",
+                maximum_deviation=self.entry_trace_maximum_observed_deviation,
+            )
+        return EntryTraceTrustDecision(
+            True,
+            "entry_trace_trusted",
+            maximum_deviation=self.entry_trace_maximum_observed_deviation,
+        )
 
     def clear_stuck_if_departed(
         self,
@@ -328,3 +434,33 @@ class ReturnHomeRuntime:
 
     def abort_retreat(self) -> None:
         self.retreat_target = None
+
+
+def _distance_to_polyline(
+    point: tuple[float, float],
+    polyline: tuple[tuple[float, float], ...],
+) -> float:
+    """返回点到折线最近距离；退化线段按端点处理。"""
+    best = math.inf
+    px, py = point
+    for start, end in zip(polyline, polyline[1:]):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length_squared = dx * dx + dy * dy
+        if length_squared <= 1e-12:
+            distance = math.hypot(px - start[0], py - start[1])
+        else:
+            ratio = min(
+                1.0,
+                max(
+                    0.0,
+                    ((px - start[0]) * dx + (py - start[1]) * dy)
+                    / length_squared,
+                ),
+            )
+            distance = math.hypot(
+                px - (start[0] + ratio * dx),
+                py - (start[1] + ratio * dy),
+            )
+        best = min(best, distance)
+    return best

@@ -343,6 +343,44 @@ class MapUpdateRuntimeTest(unittest.TestCase):
 
 
 class PerceptionMappingRuntimeTest(unittest.TestCase):
+    def test_cloud_cache_updates_existing_points_without_mapping(self):
+        consumed = []
+        perception = SimpleNamespace(
+            read_cloud_xyz=lambda *_args, **_kwargs: [(0.4, 0.0, 0.4)],
+            consume_cloud=consumed.append,
+        )
+        map_runtime = SimpleNamespace(
+            last_cloud_stamp=None,
+            latest_cloud_points=[(9.0, 9.0, 9.0)],
+        )
+        runtime = PerceptionMappingRuntime(
+            perception=perception,
+            map_runtime=map_runtime,
+            floor_coordinates=FloorCoordinateModel("floor_local", 2.6),
+            pose_provider=None,
+        )
+        sample = SimpleNamespace(
+            xyz=(0.0, 0.0, 0.3),
+            xy_yaw=(0.0, 0.0, 0.0),
+        )
+        preparation = CloudPreparation(
+            INPUT_MATCHED,
+            CloudInput(object(), 7, 1.0),
+            SimpleNamespace(sample=sample),
+            sample,
+        )
+
+        runtime.cache_cloud(
+            preparation,
+            floor_index=1,
+            cloud_max_points=100,
+            cloud_stride=1,
+        )
+
+        self.assertEqual(consumed, [7])
+        self.assertEqual(map_runtime.last_cloud_stamp, 1.0)
+        self.assertEqual(map_runtime.latest_cloud_points, [(0.4, 0.0, 3.0)])
+
     def test_cloud_commit_owns_decode_cursor_and_derived_obstacle_state(self):
         consumed = []
         perception = SimpleNamespace(

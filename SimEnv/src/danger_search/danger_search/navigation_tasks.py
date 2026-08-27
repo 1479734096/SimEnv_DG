@@ -251,7 +251,14 @@ class OpenDoorAndPass(NavigationTask):
             self._pass_path_started = False
             self._pass_align_start_time = None
             self._pass_alignment_done = False
-            self.phase = "GO_REFRESHED_WAIT_POINT"
+            wait_distance = math.hypot(
+                self._wait_point[0] - pose[0],
+                self._wait_point[1] - pose[1],
+            )
+            if wait_distance <= 0.30:
+                self.phase = "GO_PASS_POINT"
+            else:
+                self.phase = "GO_REFRESHED_WAIT_POINT"
             return RUNNING
 
         if self.phase == "GO_REFRESHED_WAIT_POINT":

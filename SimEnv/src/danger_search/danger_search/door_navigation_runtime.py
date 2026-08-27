@@ -139,26 +139,89 @@ class DoorNavigationRuntime:
         )
         pass_x = task.pass_point[0] - center[0]
         pass_y = task.pass_point[1] - center[1]
-        norm = math.hypot(pass_x, pass_y)
-        self.last_pass_vector = (
-            (pass_x / norm, pass_y / norm) if norm > 1e-6 else None
-        )
-        self.last_door_id = str(task.door_id)
-        self.last_door_xy = center
-        self.completion_pose = tuple(float(value) for value in pose)
-        self.opening_sensor_confirmed = bool(
-            getattr(task, "opening_sensor_confirmed", False)
-        )
-        self.transition_until = float(now) + float(transition_duration)
-        self.context_until = float(now) + max(
-            float(transition_duration),
-            float(context_duration),
-        )
+        if not self.record_passage(
+            door_id=task.door_id,
+            door_xy=center,
+            pass_vector=(pass_x, pass_y),
+            pose=pose,
+            now=now,
+            transition_duration=transition_duration,
+            context_duration=context_duration,
+            opening_sensor_confirmed=bool(
+                getattr(task, "opening_sensor_confirmed", False)
+            ),
+        ):
+            self.frontier_debug = None
+            return False
         self.frontier_debug = {
             "door_id": task.door_id,
             "wait_point": task.wait_point,
             "pass_point": task.pass_point,
             "commit_point": task.commit_point,
+            "completion_pose": self.completion_pose,
+        }
+        return True
+
+    def record_passage(
+        self,
+        *,
+        door_id: str,
+        door_xy: tuple[float, float],
+        pass_vector: tuple[float, float],
+        pose: tuple[float, float, float],
+        now: float,
+        transition_duration: float,
+        context_duration: float,
+        opening_sensor_confirmed: bool = False,
+    ) -> bool:
+        """记录传感器已确认门几何对应的一次完整通过。"""
+        try:
+            resolved_door_id = str(door_id).strip()
+            center = (float(door_xy[0]), float(door_xy[1]))
+            direction = (float(pass_vector[0]), float(pass_vector[1]))
+            completion_pose = tuple(float(value) for value in pose)
+            resolved_now = float(now)
+            resolved_transition = float(transition_duration)
+            resolved_context = float(context_duration)
+        except (IndexError, TypeError, ValueError):
+            return False
+        if (
+            not resolved_door_id
+            or len(completion_pose) != 3
+            or not all(
+                math.isfinite(value)
+                for value in (
+                    *center,
+                    *direction,
+                    *completion_pose,
+                    resolved_now,
+                    resolved_transition,
+                    resolved_context,
+                )
+            )
+            or resolved_transition < 0.0
+            or resolved_context < 0.0
+        ):
+            return False
+        norm = math.hypot(direction[0], direction[1])
+        if norm <= 1e-6:
+            return False
+
+        self.last_door_id = resolved_door_id
+        self.last_door_xy = center
+        self.last_pass_vector = (direction[0] / norm, direction[1] / norm)
+        self.completion_pose = completion_pose
+        self.opening_sensor_confirmed = bool(opening_sensor_confirmed)
+        self.transition_until = resolved_now + resolved_transition
+        self.context_until = resolved_now + max(
+            resolved_transition,
+            resolved_context,
+        )
+        self.frontier_debug = {
+            "door_id": resolved_door_id,
+            "wait_point": None,
+            "pass_point": None,
+            "commit_point": None,
             "completion_pose": self.completion_pose,
         }
         return True

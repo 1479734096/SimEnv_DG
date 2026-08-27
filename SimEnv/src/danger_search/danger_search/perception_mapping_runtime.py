@@ -52,6 +52,28 @@ class PerceptionMappingRuntime:
         self.perception.consume_cloud(cloud_input.generation)
         self.map_runtime.last_cloud_stamp = cloud_input.stamp
 
+    def cache_cloud(
+        self,
+        preparation: CloudPreparation,
+        *,
+        floor_index: int,
+        cloud_max_points: int,
+        cloud_stride: int,
+    ) -> None:
+        """更新现有点云缓存但不写地图，供显式换层期间的目标门观测使用。"""
+        if preparation.status != INPUT_MATCHED or preparation.cloud_input is None:
+            raise ValueError("只有已匹配点云可更新感知缓存")
+        cloud_input = preparation.cloud_input
+        points = self.perception.read_cloud_xyz(
+            cloud_input,
+            max_points=int(cloud_max_points),
+            stride=int(cloud_stride),
+        )
+        points = self.floor_coordinates.logical_points(points, int(floor_index))
+        self.perception.consume_cloud(cloud_input.generation)
+        self.map_runtime.last_cloud_stamp = cloud_input.stamp
+        self.map_runtime.latest_cloud_points = list(points)
+
     def commit_cloud(
         self,
         preparation: CloudPreparation,

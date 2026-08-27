@@ -90,6 +90,25 @@ def test_fallback_and_context_change_do_not_leak_arrival_accounting():
     assert changed.cooldown_center is None
 
 
+def test_reset_clears_active_target_and_floor_region_ledger():
+    runtime = FrontierArrivalGainRuntime()
+    _arrive(runtime, target=(1.0, 1.0), baseline=100, known=105)
+    runtime.begin(
+        floor=0,
+        map_epoch=1,
+        target=(2.0, 2.0),
+        known_cells=105,
+        expected_gain=80.0,
+        is_real_frontier=True,
+    )
+
+    runtime.reset()
+
+    assert runtime._context is None
+    assert runtime._active is None
+    assert runtime._regions == []
+
+
 def test_last_floor_timeout_low_progress_returns_even_with_many_frontiers():
     decision = decide_exploration_budget(
         ExplorationBudgetInput(

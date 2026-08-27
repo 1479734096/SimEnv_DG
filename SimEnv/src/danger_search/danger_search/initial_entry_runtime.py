@@ -73,6 +73,10 @@ class InitialEntryRuntime:
     retry_count: int = 0
     service_task: object | None = None
     trace: list[tuple[float, float]] = field(default_factory=list)
+    trace_floor: int | None = None
+    trace_map_epoch: int | None = None
+    trace_localization_epoch: int | None = None
+    trace_scope_valid: bool = True
     clearance_target: tuple[float, float] | None = None
     clearance_door_id: str | None = None
     clearance_path_started: bool = False

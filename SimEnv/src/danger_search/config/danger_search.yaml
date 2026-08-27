@@ -57,7 +57,7 @@ mission:
   # 走廊主方向最小已知范围，0 表示关闭；方向由 probe_yaw 判断。
   min_corridor_progress_distance: 0.0
   # 主入口过门后先沿门轴推进到该距离，确保机身完全离开门框；普通门仍只用于前沿偏置。
-  post_door_min_distance: 0.9
+  post_door_min_distance: 1.4
   post_door_min_known_area: 5.0
   home_tolerance: 1.0
   # 返航局部层已确认首段不可执行时，有限次否决同一路径；耗尽后显式失败，禁止活锁。
@@ -71,6 +71,9 @@ mission:
   # 开门确认后以当前 Livox 连续重测本次穿越轴，吸收定位平移漂移；不改写注册地图。
   elevator_local_crossing_geometry_enabled: true
   elevator_local_crossing_timeout: 4.0
+  # 目标层开门已确认后，连续空观测无需耗尽总超时；候选不稳定仍保留 4s 收敛窗口。
+  elevator_exit_empty_fallback_timeout: 1.0
+  elevator_exit_empty_fallback_frames: 10
   elevator_local_crossing_confirmations: 3
   elevator_local_crossing_confirmation_max_gap: 0.5
   elevator_local_crossing_center_tolerance: 0.15
@@ -97,7 +100,7 @@ mission:
   initial_entry_opening_max_distance: 1.50
   initial_entry_geometry_tolerance: 0.3
   # 过门后先深入到门后，避免刚过门就把 frontier 选择权交回门口。
-  door_pass_offset: 0.5
+  door_pass_offset: 0.8
   # 服务开门后用近场点云重新对准门洞；跨门段限速，减少横向定位误差积累。
   door_pass_max_linear: 0.44
   # 越过门面后的轴向离门段需要克服门槛接触，但仍低于普通探索速度。
@@ -409,8 +412,10 @@ local_semantic:
   # 进入主入口并建立足够安全已知区后只执行一次，约覆盖一整圈；发现后立即结束。
   # 命令角速度不等于四足机体的实际 yaw 速度；按定位累计转角闭环，时间仅兜底。
   elevator_visual_scan_duration: 18.0
-  elevator_visual_scan_angular_speed: 0.70
+  elevator_visual_scan_angular_speed: 0.90
   elevator_visual_scan_required_rotation: 5.80
+  # 顺时针（CW）快速旋转环视大厅
+  elevator_visual_scan_clockwise: true
   # 第 14.3 层只读诊断：冻结首次 RGB-D 电梯门板地标并记录跨层残差。
   # 正式默认关闭；结果只允许在任务结束后由独立真值评估，不能改变当轮行为。
   landmark_drift_diagnostic_enabled: false

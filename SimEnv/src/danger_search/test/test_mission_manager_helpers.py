@@ -36,7 +36,7 @@ from danger_search.floor_transition_runtime import (
     FloorCoordinateModel,
     FloorTransitionRuntime,
 )
-from danger_search.frontier import FloorTerminationEvidence
+from danger_search.frontier import FloorTerminationEvidence, Frontier
 from danger_search.elevator_observation_runtime import ElevatorObservationRuntime
 from danger_search.exploration_runtime import (
     ExplorationBudgetInput,
@@ -713,6 +713,150 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertEqual(failures, ["换层任务失败"])
         self.assertEqual(transitions[0][0], RETURN_HOME)
 
+    def test_successful_elevator_exit_records_context_and_clears_old_frontier_state(self):
+        manager = _make_test_manager()
+        manager.state = CHANGE_FLOOR
+        manager.max_runtime = 100.0
+        manager.current_floor = 0
+        manager.return_after_floor_change = False
+        manager.door_transition_duration = 1.5
+        manager.post_door_context_max_duration = 8.0
+        manager.post_door_min_known_area = 0.0
+        manager.building_client.set_public_features(
+            door_ids={"lift_door_0", "lift_door_1"},
+            elevators={"elevator_main": {0, 1}},
+            elevator_door_ids_by_floor={
+                0: ["lift_door_0"],
+                1: ["lift_door_1"],
+            },
+        )
+        manager.building_client.doors["lift_door_1"] = DoorInfo(
+            door_id="lift_door_1",
+            kind="elevator",
+            floor_index=1,
+            x=1.0,
+            y=2.6,
+            yaw=math.pi,
+            width=1.4,
+        )
+        manager.current_frontier = Frontier(
+            cells=((1, 1),),
+            centroid=(3.05, 2.05),
+            information_gain=10.0,
+            score=13.48,
+        )
+        manager._exploration.last_frontier_target = (3.05, 2.05)
+        manager._exploration.last_frontier_score = 13.48
+        manager._exploration.last_frontier_used_fallback = True
+        manager._frontier_arrival_gain.begin(
+            floor=0,
+            map_epoch=1,
+            target=(3.05, 2.05),
+            known_cells=100,
+            expected_gain=1708.0,
+            is_real_frontier=True,
+        )
+        task = TakeElevator(0, 1)
+        task.tick = lambda _context, _pose: DONE
+        manager.current_task = task
+        manager.navigation_task_context = lambda: object()
+        clear_reasons = []
+        manager.controller = SimpleNamespace(
+            stop=lambda **_kwargs: None,
+            clear_path=lambda reason=None: clear_reasons.append(reason),
+        )
+        manager._perception_runtime.sensor_buffer = SimpleNamespace(
+            snapshot=lambda: SimpleNamespace()
+        )
+        manager.pose_provider = SimpleNamespace(
+            latest=lambda: mission_manager_module.PoseSample(
+                stamp=100.0,
+                xyz=(0.87, 2.70, 0.3),
+                quaternion_xyzw=(0.0, 0.0, 1.0, 0.0),
+                linear_xyz=(0.0, 0.0, 0.0),
+                angular_xyz=(0.0, 0.0, 0.0),
+            )
+        )
+        manager._publish_status = lambda: None
+        manager._elapsed = lambda: 1.0
+        manager._apply_localization_progress_decision = lambda _sample: True
+        manager._update_pose_progress = lambda _pose: None
+        manager._record_initial_entry_trace_pose = lambda _pose: None
+        manager._record_floor_navigation_trace_pose = lambda _pose: None
+        manager._sync_ground_support_task_context = lambda _pose: None
+        manager._ground_support.observe_odometry = lambda *_args: None
+        manager._update_mapping_and_detection = lambda *_args: None
+        manager._handle_ground_support_control = lambda _pose: False
+        manager._transition_state = lambda *_args, **_kwargs: None
+
+        with patch.object(mission_manager_module, "get_time", return_value=100.0):
+            manager.tick()
+
+        self.assertEqual(manager.current_floor, 1)
+        self.assertEqual(manager._door_navigation.last_door_id, "lift_door_1")
+        self.assertEqual(manager._door_navigation.last_door_xy, (1.0, 2.6))
+        self.assertAlmostEqual(manager._door_navigation.last_pass_vector[0], -1.0)
+        self.assertAlmostEqual(manager._door_navigation.last_pass_vector[1], 0.0)
+        self.assertEqual(manager._door_navigation.completion_pose, (0.87, 2.7, math.pi))
+        self.assertEqual(manager._door_navigation.transition_until, 101.5)
+        self.assertEqual(manager._door_navigation.context_until, 108.0)
+        self.assertFalse(manager._door_navigation.opening_sensor_confirmed)
+        self.assertIsNone(manager.current_frontier)
+        self.assertIsNone(manager._exploration.last_frontier_target)
+        self.assertIsNone(manager._exploration.last_frontier_score)
+        self.assertFalse(manager._exploration.last_frontier_used_fallback)
+        self.assertIsNone(manager._frontier_arrival_gain._context)
+        self.assertIsNone(manager._frontier_arrival_gain._active)
+        self.assertEqual(manager._frontier_arrival_gain._regions, [])
+        self.assertEqual(clear_reasons, [None])
+
+        with patch.object(mission_manager_module, "get_time", return_value=100.5):
+            context = manager._frontier_selection_context((0.87, 2.70, math.pi))
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context.door_id, "lift_door_1")
+        cabin_adjustment, cabin_filtered, cabin_penalty = (
+            manager.explorer._selection_context_effect((1.5, 2.6), context)
+        )
+        lobby_adjustment, lobby_filtered, lobby_penalty = (
+            manager.explorer._selection_context_effect((0.0, 2.6), context)
+        )
+        self.assertTrue(cabin_filtered)
+        self.assertEqual(cabin_adjustment, 0.0)
+        self.assertIsNone(cabin_penalty)
+        self.assertFalse(lobby_filtered)
+        self.assertGreater(lobby_adjustment, 0.0)
+        self.assertEqual(lobby_penalty, 0.0)
+
+        with patch.object(mission_manager_module, "get_time", return_value=108.1):
+            self.assertIsNone(
+                manager._frontier_selection_context((0.87, 2.70, math.pi))
+            )
+
+    def test_elevator_exit_context_does_not_disable_unknown_support_hold(self):
+        values = []
+        manager = _make_test_manager()
+        manager.ground_support_params = {"unknown_support_hold_enabled": True}
+        manager._ground_support.gate = SimpleNamespace(
+            set_unknown_support_hold_enabled=values.append
+        )
+        manager.current_task = None
+        manager._door_navigation.record_passage(
+            door_id="lift_door_1",
+            door_xy=(1.0, 2.6),
+            pass_vector=(-1.0, 0.0),
+            pose=(0.87, 2.70, math.pi),
+            now=100.0,
+            transition_duration=1.5,
+            context_duration=8.0,
+        )
+        manager._post_door_context_satisfied = lambda _pose: False
+
+        with patch.object(mission_manager_module, "get_time", return_value=100.5):
+            manager._sync_ground_support_task_context((0.87, 2.70, math.pi))
+
+        self.assertEqual(values, [True])
+
     def test_max_runtime_does_not_abort_active_return_home_closure(self):
         """720 秒只结束探索预算，已启动的返航收尾必须允许继续。"""
         manager = _make_test_manager()
@@ -888,6 +1032,13 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertTrue(
             mission_manager_module._ground_support_unknown_hold_enabled(door_task)
         )
+
+        self.assertFalse(
+            mission_manager_module._ground_support_unknown_hold_enabled(
+                None,
+                trusted_return_trace=True,
+            )
+        )
         door_task.mark_opening_sensor_confirmed()
         self.assertFalse(
             mission_manager_module._ground_support_unknown_hold_enabled(door_task)
@@ -958,6 +1109,41 @@ class MissionManagerHelperTest(unittest.TestCase):
             manager._sync_ground_support_task_context((0.0, 0.0, 0.0))
 
         self.assertEqual(values, [True])
+
+    def test_sync_ground_support_context_limits_return_trace_trust_to_scope(self):
+        values = []
+        diagnostics = []
+        manager = _make_test_manager()
+        manager.state = RETURN_HOME
+        manager.current_floor = 0
+        manager.current_task = None
+        manager._return_home_main_entrance_crossed = True
+        manager.ground_support_params = {"unknown_support_hold_enabled": True}
+        manager._ground_support.gate = SimpleNamespace(
+            set_unknown_support_hold_enabled=values.append
+        )
+        manager.controller = SimpleNamespace(
+            has_path=lambda: True,
+            snapshot=lambda: {"replan_reason": "return_home_entry_trace_path"},
+        )
+        manager._log_structured = diagnostics.append
+        manager._return_home.activate_entry_trace(
+            ((0.0, -1.0), (0.0, -3.2)),
+            floor=0,
+            map_epoch=1,
+            localization_epoch=1,
+            maximum_deviation=0.35,
+        )
+
+        manager._sync_ground_support_task_context((0.2, -2.0, 0.0))
+        manager._sync_ground_support_task_context((0.4, -2.0, 0.0))
+
+        self.assertEqual(values, [False, True])
+        self.assertIsNone(manager._return_home.entry_trace_scope)
+        self.assertEqual(
+            diagnostics[-1]["reason_code"],
+            "entry_trace_deviation_exceeded",
+        )
 
     def test_ground_support_data_age_does_not_double_count_nominal_decision_cycle(self):
         self.assertAlmostEqual(
@@ -2791,7 +2977,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             (2.4, 2.6, 0.39),
         )
         self.assertIsNotNone(manager._floor_transition_guard)
-        self.assertEqual(reads, [])
+        self.assertEqual(reads, [True])
 
         append_pose(3.0)
         clock[0] = 1.1
@@ -2803,7 +2989,7 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         self.assertIsNone(manager._floor_transition_guard)
         self.assertEqual(manager.current_floor, 1)
-        self.assertEqual(reads, [True])
+        self.assertEqual(reads, [True, True])
         self.assertEqual(len(map_updates), 1)
         self.assertEqual(map_updates[0]["floor_index"], 1)
         self.assertEqual(map_updates[0]["robot_xyz"], (2.4, 2.6, 2.99))
@@ -2863,13 +3049,16 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertEqual(len(observed_poses), 1)
         self.assertAlmostEqual(abs(observed_poses[0][2]), math.pi)
 
-    def test_target_elevator_opening_does_not_reuse_livox_during_transition(self):
+    def test_target_elevator_opening_uses_target_floor_livox_during_transition(self):
         manager = _make_test_manager()
         manager.current_floor = 0
         manager.initial_entry_geometry_tolerance = 0.25
         manager._map_runtime.last_cloud_stamp = 2.0
         manager._map_runtime.latest_cloud_points = [(1.0, 0.0, 0.5)]
-        manager._floor_transition_runtime._guard = SimpleNamespace(explicit_transition=True)
+        manager._floor_transition_runtime._guard = SimpleNamespace(
+            explicit_transition=True,
+            target_floor=1,
+        )
         manager._elevator_observation.door_open_confirmation = {
             "door_id": "elevator_floor_1",
             "baseline": None,
@@ -2893,7 +3082,8 @@ class MissionManagerHelperTest(unittest.TestCase):
         )
         observations = []
         manager._map_runtime.local_detector = SimpleNamespace(
-            detect_opening_ahead=lambda **kwargs: observations.append(kwargs) or None
+            detect_opening_ahead=lambda **kwargs: observations.append(kwargs)
+            or SimpleNamespace(world_xy=(1.0, 0.0), width=1.4)
         )
 
         self.assertFalse(
@@ -2902,15 +3092,25 @@ class MissionManagerHelperTest(unittest.TestCase):
                 (2.4, 0.0, 0.0),
             )
         )
-        self.assertEqual(observations, [])
+        manager._map_runtime.last_cloud_stamp = 3.0
+        self.assertTrue(
+            manager.confirm_elevator_door_open(
+                "elevator_floor_1",
+                (2.4, 0.0, 0.0),
+            )
+        )
+        self.assertEqual([item["floor_index"] for item in observations], [1, 1])
 
-    def test_target_elevator_opening_uses_registered_rgbd_plane_without_baseline(self):
+    def test_target_elevator_opening_uses_rgbd_and_livox_dual_channel_during_transition(self):
         manager = _make_test_manager()
         manager.current_floor = 0
         manager.initial_entry_geometry_tolerance = 0.25
         manager._map_runtime.last_cloud_stamp = 2.0
         manager._map_runtime.latest_cloud_points = [(1.0, 0.0, 0.5)]
-        manager._floor_transition_runtime._guard = SimpleNamespace(explicit_transition=True)
+        manager._floor_transition_runtime._guard = SimpleNamespace(
+            explicit_transition=True,
+            target_floor=1,
+        )
         manager._elevator_observation.door_open_confirmation = {
             "door_id": "elevator_floor_1",
             "baseline": None,
@@ -2938,11 +3138,11 @@ class MissionManagerHelperTest(unittest.TestCase):
                 or DoorOpeningChange(True, 0.0, 1.0, 1.0)
             )
         )
+        livox_calls = []
         manager._map_runtime.local_detector = SimpleNamespace(
-            detect_opening_ahead=lambda **kwargs: self.fail(
-                "楼层过渡期间不应读取旧 Livox 点云"
-            )
+            detect_opening_ahead=lambda **kwargs: livox_calls.append(kwargs) or None
         )
+        manager._map_runtime.mapper = SimpleNamespace(floor_height=2.6)
         manager._log_structured = lambda payload: None
         bundle = SimpleNamespace(
             rgb_msg=object(),
@@ -2967,6 +3167,28 @@ class MissionManagerHelperTest(unittest.TestCase):
                 (2.4, 0.0, 0.0),
             )
         )
+
+    def test_explicit_floor_transition_caches_target_floor_cloud_without_mapping(self):
+        manager, _clock, _diagnostics, reads, map_updates, obstacle_updates = (
+            self._make_floor_transition_manager()
+        )
+        manager._floor_coordinates = FloorCoordinateModel("floor_local", 2.6)
+        manager.begin_floor_transition(
+            source_floor=0,
+            target_floor=1,
+            phase="CALL_ELEVATOR_TO_TARGET_FLOOR",
+        )
+
+        manager._update_mapping_and_detection(
+            self._mapping_snapshot(cloud_stamp=1.0, odom_stamp=1.0),
+            (0.0, 0.0, 0.0),
+            (0.0, 0.0, 0.39),
+        )
+
+        self.assertEqual(reads, [True])
+        self.assertEqual(manager._map_runtime.latest_cloud_points, [(0.8, 0.0, 3.1)])
+        self.assertEqual(map_updates, [])
+        self.assertEqual(obstacle_updates, [])
 
     def test_floor_transition_latch_timeout_stops_and_writes_failure(self):
         manager, clock, diagnostics, reads, map_updates, obstacle_updates = (
@@ -5064,6 +5286,108 @@ class MissionManagerHelperTest(unittest.TestCase):
             3,
         )
 
+    def test_stage25_clockwise_visual_scan_and_accumulation(self):
+        """STAGE25：顺时针快速扫描下发负角速度，并正确累计顺时针（负向）转角。"""
+        manager = _make_test_manager()
+        manager._map_runtime.rgbd_door_detector = SimpleNamespace(
+            diagnostics=lambda: {
+                "frames": 5,
+                "last": {"rejected_panel_width": 1},
+                "cumulative": {"rejected_panel_width": 3},
+                "last_observation_count": 0,
+            }
+        )
+        manager.current_floor = 0
+        manager.current_task = None
+        manager._elevator_observation.visual_scan_started = False
+        manager._elevator_observation.visual_scan_completed = False
+        manager._elevator_observation.visual_scan_until = 0.0
+        manager._elevator_observation.visual_scan_last_yaw = None
+        manager._elevator_observation.visual_scan_rotation = 0.0
+        manager.elevator_visual_scan_duration = 18.0
+        manager.elevator_visual_scan_angular_speed = 0.90
+        manager.elevator_visual_scan_required_rotation = 5.80
+        manager.elevator_visual_scan_clockwise = True
+        manager._door_navigation.last_door_id = "main"
+        manager._door_navigation.last_door_xy = (0.0, 0.0)
+        manager._post_door_context_satisfied = lambda pose: True
+        manager._elevator_observation.visual_prepare_task = SimpleNamespace(
+            done=lambda: True,
+            ok=lambda: True,
+        )
+        elevator = PublicElevatorFeature(
+            elevator_id="lift",
+            current_floor=0,
+            served_floors=frozenset({0, 1}),
+        )
+        manager.building_features = SimpleNamespace(
+            elevator_features={"lift": elevator},
+            doors={
+                "main": PublicDoorFeature("main", "main_entrance", 0, True)
+            },
+        )
+        manager.building_client = SimpleNamespace(elevators={})
+        manager._elevator_observation.registration.latest_rgbd_door_observations = []
+        manager._elevator_observation.registration.visual_candidate = None
+        manager._elevator_observation.registration.visual_confirmations = 0
+        diagnostics = []
+        manager._log_structured = diagnostics.append
+        calls = []
+        manager.controller = SimpleNamespace(
+            clear_path=lambda reason=None: calls.append(("clear", reason)),
+            rotate_in_place=lambda speed: calls.append(("rotate", speed)),
+            stop=lambda reason=None: calls.append(("stop", reason)),
+            poll_status=lambda: "RUNNING",
+        )
+
+        def tick(now, yaw):
+            return manager._elevator_observation.tick_visual_scan(
+                now=now,
+                pose=(0.0, 1.4, yaw),
+                current_floor=manager.current_floor,
+                current_task_present=manager.current_task is not None,
+                building_features=manager.building_features,
+                building_client=manager.building_client,
+                rgbd_detector=manager.rgbd_door_detector,
+                controller=manager.controller,
+                last_door_id=manager._door_navigation.last_door_id,
+                last_door_xy=manager._door_navigation.last_door_xy,
+                post_door_context_satisfied=True,
+                config=manager._elevator_visual_scan_config(),
+            )
+
+        # 第 1 帧：启动扫描，下发负角速度 -0.90 rad/s
+        res1 = tick(10.0, 2.0)
+        self.assertTrue(res1.handled)
+        self.assertEqual(calls[-1], ("rotate", -0.90))
+        self.assertAlmostEqual(manager._elevator_observation.visual_scan_rotation, 0.0)
+
+        # 第 2 帧：顺时针旋转 2.0 rad（yaw 从 2.0 降到 0.0，delta = -2.0）
+        res2 = tick(11.0, 0.0)
+        self.assertTrue(res2.handled)
+        self.assertEqual(calls[-1], ("rotate", -0.90))
+        self.assertAlmostEqual(manager._elevator_observation.visual_scan_rotation, 2.0)
+
+        # 第 3 帧：反向扰动（yaw 从 0.0 上升到 0.2），不计入累计
+        res3 = tick(11.5, 0.2)
+        self.assertTrue(res3.handled)
+        self.assertAlmostEqual(manager._elevator_observation.visual_scan_rotation, 2.0)
+
+        # 第 4 帧：顺时针旋转至 -2.0（yaw 从 0.2 降到 -2.0，delta = -2.2）
+        res4 = tick(12.5, -2.0)
+        self.assertTrue(res4.handled)
+        self.assertAlmostEqual(manager._elevator_observation.visual_scan_rotation, 4.2)
+
+        # 第 5 帧：顺时针跨越 -pi 转到 2.5（delta = 2.5 - (-2.0) - 2pi = -1.7831853）
+        res5 = tick(14.0, 2.5)
+        self.assertTrue(res5.handled)
+        self.assertGreater(manager._elevator_observation.visual_scan_rotation, 5.80)
+
+        # 第 6 帧：超时或转角完成退出
+        res6 = tick(28.1, 2.5)
+        self.assertFalse(res6.handled)
+        self.assertTrue(manager._elevator_observation.visual_scan_completed)
+
     def test_public_door_ids_require_building_service_connection(self):
         self.assertTrue(
             mission_manager_module._building_services_required(
@@ -5728,6 +6052,24 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager._record_initial_entry_trace_pose((0.0, -2.5, math.pi / 2.0))
 
         self.assertEqual(manager._entry.trace, [(0.0, -3.2), (0.0, -2.9)])
+        self.assertTrue(manager._entry.trace_scope_valid)
+        self.assertEqual(manager._entry.trace_floor, 0)
+        self.assertEqual(manager._entry.trace_map_epoch, 1)
+        self.assertEqual(manager._entry.trace_localization_epoch, 1)
+
+    def test_initial_entry_trace_scope_is_invalidated_by_continuity_change(self):
+        manager = _make_test_manager()
+        manager.state = EXPLORE_FLOOR
+        manager.current_task = None
+        manager._entry.origin_pose = (0.0, -3.2, math.pi / 2.0)
+        manager._entry.completed = False
+        manager._entry.trace = [(0.0, -3.2)]
+
+        manager._record_initial_entry_trace_pose((0.0, -2.9, math.pi / 2.0))
+        manager._ground_support.localization_epoch = 2
+        manager._record_initial_entry_trace_pose((0.0, -2.6, math.pi / 2.0))
+
+        self.assertFalse(manager._entry.trace_scope_valid)
 
     def test_initial_entry_realigns_locked_heading_between_forward_segments(self):
         rotations = []
@@ -5765,6 +6107,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         paths = []
         manager = _make_test_manager()
         manager.home_pose = (0.0, -3.2, math.pi / 2.0)
+        manager.state = RETURN_HOME
         manager.current_floor = 0
         manager.max_floor = 1
         manager.home_tolerance = 0.7
@@ -5778,6 +6121,10 @@ class MissionManagerHelperTest(unittest.TestCase):
             (0.01, -2.4),
             (0.03, -1.1),
         ]
+        manager._entry.trace_floor = 0
+        manager._entry.trace_map_epoch = 1
+        manager._entry.trace_localization_epoch = 1
+        manager._entry.trace_scope_valid = True
         manager.building_client = SimpleNamespace(doors={})
         manager.controller = SimpleNamespace(
             has_path=lambda: False,
@@ -5797,6 +6144,7 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertEqual(paths[0][0], (0.0, -0.8))
         self.assertEqual(paths[0][-1], (0.0, -3.2))
         self.assertEqual(paths[0][1:-1], [(0.03, -1.1), (0.01, -2.4), (0.02, -2.8)])
+        self.assertIsNotNone(manager._return_home.entry_trace_scope)
 
     def test_door_navigation_accepts_visible_dynamic_candidate(self):
         manager = _make_test_manager()

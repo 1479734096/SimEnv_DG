@@ -19,6 +19,8 @@ def _angle_diff(a: float, b: float) -> float:
 @dataclass(frozen=True)
 class ElevatorCrossingConfig:
     timeout: float = 4.0
+    exit_empty_fallback_timeout: float = 1.0
+    exit_empty_fallback_frames: int = 10
     confirmations: int = 3
     confirmation_max_gap: float = 0.5
     center_tolerance: float = 0.15
@@ -32,6 +34,7 @@ class ElevatorCrossingConfig:
     def __post_init__(self) -> None:
         values = (
             self.timeout,
+            self.exit_empty_fallback_timeout,
             self.confirmation_max_gap,
             self.center_tolerance,
             self.width_tolerance,
@@ -44,6 +47,8 @@ class ElevatorCrossingConfig:
         if (
             not all(math.isfinite(value) and value > 0.0 for value in values)
             or self.confirmations <= 0
+            or self.exit_empty_fallback_frames <= 0
+            or self.exit_empty_fallback_timeout > self.timeout
             or self.confirmation_max_gap > self.timeout
             or self.yaw_search_step > 2.0 * self.yaw_search_half_range
         ):
@@ -88,6 +93,7 @@ class ElevatorCrossingRuntime:
         self._last_confirmation_time: float | None = None
         self._candidate = None
         self._confirmations = 0
+        self._empty_observation_count = 0
 
     def observe(
         self,
@@ -173,6 +179,30 @@ class ElevatorCrossingRuntime:
             self._candidate = None
             self._confirmations = 0
             self._last_confirmation_time = None
+            if mode == "exit":
+                self._empty_observation_count += 1
+            elapsed = now - self._started_at
+            if (
+                mode == "exit"
+                and self._empty_observation_count
+                >= config.exit_empty_fallback_frames
+                and elapsed >= config.exit_empty_fallback_timeout
+            ):
+                event = {
+                    "event": "elevator_local_crossing_geometry_early_fallback",
+                    "door_id": str(door_id),
+                    "mode": mode,
+                    "reason": "opening_not_observed",
+                    "empty_frame_count": int(self._empty_observation_count),
+                    "elapsed": round(elapsed, 3),
+                    "cloud_stamp": float(cloud_stamp),
+                }
+                self.reset()
+                return ElevatorCrossingResult(
+                    FAILED,
+                    failure="elevator_open_crossing_geometry_not_observed",
+                    diagnostic=event,
+                )
             return ElevatorCrossingResult(
                 RUNNING,
                 diagnostic={
@@ -180,10 +210,12 @@ class ElevatorCrossingRuntime:
                     "door_id": str(door_id),
                     "mode": mode,
                     "reason": "opening_not_observed",
+                    "empty_frame_count": int(self._empty_observation_count),
                     "cloud_stamp": float(cloud_stamp),
                 },
             )
 
+        self._empty_observation_count = 0
         observation = min(
             observations,
             key=lambda item: (

@@ -110,6 +110,74 @@ class ReturnHomeRuntimeTest(unittest.TestCase):
         self.assertEqual(result.status, "stale")
         self.assertIsNone(runtime.planner)
 
+    def test_entry_trace_trust_requires_same_scope_and_stays_near_polyline(self):
+        runtime = ReturnHomeRuntime()
+        runtime.activate_entry_trace(
+            ((0.0, -1.0), (0.0, -2.0), (0.0, -3.0)),
+            floor=0,
+            map_epoch=4,
+            localization_epoch=7,
+            maximum_deviation=0.35,
+        )
+
+        accepted = runtime.evaluate_entry_trace_trust(
+            pose=(0.20, -2.2, 0.0),
+            floor=0,
+            map_epoch=4,
+            localization_epoch=7,
+            path_active=True,
+            path_reason="return_home_entry_trace_path",
+        )
+
+        self.assertTrue(accepted.active)
+        self.assertEqual(accepted.reason_code, "entry_trace_trusted")
+        self.assertAlmostEqual(accepted.maximum_deviation, 0.20)
+
+        rejected = runtime.evaluate_entry_trace_trust(
+            pose=(0.36, -2.2, 0.0),
+            floor=0,
+            map_epoch=4,
+            localization_epoch=7,
+            path_active=True,
+            path_reason="return_home_entry_trace_path",
+        )
+
+        self.assertFalse(rejected.active)
+        self.assertEqual(rejected.reason_code, "entry_trace_deviation_exceeded")
+        self.assertIsNone(runtime.entry_trace_scope)
+
+    def test_entry_trace_trust_is_revoked_by_path_or_epoch_change(self):
+        for changes, reason in (
+            ({"path_active": False}, "entry_trace_path_inactive"),
+            ({"path_reason": "return_home_planned_path"}, "entry_trace_path_replaced"),
+            ({"floor": 1}, "entry_trace_floor_changed"),
+            ({"map_epoch": 5}, "entry_trace_map_epoch_changed"),
+            ({"localization_epoch": 8}, "entry_trace_localization_epoch_changed"),
+        ):
+            runtime = ReturnHomeRuntime()
+            runtime.activate_entry_trace(
+                ((0.0, -1.0), (0.0, -3.0)),
+                floor=0,
+                map_epoch=4,
+                localization_epoch=7,
+                maximum_deviation=0.35,
+            )
+            arguments = {
+                "pose": (0.0, -2.0, 0.0),
+                "floor": 0,
+                "map_epoch": 4,
+                "localization_epoch": 7,
+                "path_active": True,
+                "path_reason": "return_home_entry_trace_path",
+            }
+            arguments.update(changes)
+
+            decision = runtime.evaluate_entry_trace_trust(**arguments)
+
+            self.assertFalse(decision.active)
+            self.assertEqual(decision.reason_code, reason)
+            self.assertIsNone(runtime.entry_trace_scope)
+
 
 if __name__ == "__main__":
     unittest.main()
