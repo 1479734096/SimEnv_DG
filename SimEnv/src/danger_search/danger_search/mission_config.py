@@ -483,11 +483,12 @@ class _MissionConfigBuilder:
             max_floor=self.max_floor,
             runtime_by_floor=runtime_by_floor,
         )
-        self.floor_timeout = float(_param("mission/floor_timeout", 180.0))
+        default_floor_timeout = 300.0 if self.max_floor == 1 else 240.0
+        self.floor_timeout = float(_param("mission/floor_timeout", default_floor_timeout))
         self.last_floor_uses_global_budget = bool(
             _param("mission/last_floor_uses_global_budget", True)
         )
-        self.min_floor_explore_time = float(_param("mission/min_floor_explore_time", 20.0))
+        self.min_floor_explore_time = float(_param("mission/min_floor_explore_time", 45.0))
 
         # 方案 C：全局时间预算参数
         self.return_safety_buffer = float(_param("mission/return_safety_buffer", 30.0))
@@ -551,13 +552,16 @@ class _MissionConfigBuilder:
             raise ValueError("电梯导航超时和规划/卡住重试上限必须为有限正值")
         self.elevator_planning_retry_limit = raw_elevator_planning_retry_limit
         self.elevator_stuck_retry_limit = raw_elevator_stuck_retry_limit
-        self.explore_coverage_ratio = float(_param("mission/explore_coverage_ratio", 0.82))
+        default_coverage = 0.80 if self.max_floor == 1 else 0.65
+        self.explore_coverage_ratio = float(
+            _param("mission/explore_coverage_ratio", default_coverage)
+        )
         self.no_frontier_scan_duration = float(_param("mission/no_frontier_scan_duration", 8.0))
         self.no_frontier_rotation_min_clearance = float(
             _param("mission/no_frontier_rotation_min_clearance", 0.40)
         )
         self.no_frontier_retreat_max_distance = float(
-            _param("mission/no_frontier_retreat_max_distance", 2.0)
+            _param("mission/no_frontier_retreat_max_distance", 0.8)
         )
         self.no_frontier_retreat_clearance_margin = float(
             _param("mission/no_frontier_retreat_clearance_margin", 0.10)
@@ -743,7 +747,8 @@ class _MissionConfigBuilder:
                 "ground_support/stop_distance_table",
                 [
                     [0.60, 0.09337727739487302],
-                    [0.651, 0.10195826367975175],
+                    [0.80, 0.15200000000000000],
+                    [1.00, 0.23000000000000000],
                 ],
             )
         )
@@ -935,18 +940,18 @@ class _MissionConfigBuilder:
             "controller/exit_first_max_linear",
         )
         self.controller_params = {
-            "max_linear": float(_param("controller/max_linear", 0.60)),
+            "max_linear": float(_param("controller/max_linear", 0.65)),
             "max_lateral": float(_param("controller/max_lateral", 0.25)),
-            "max_angular": float(_param("controller/max_angular", 1.2)),
+            "max_angular": float(_param("controller/max_angular", 1.20)),
             "min_linear_fraction": float(_param("controller/min_linear_fraction", 0.35)),
             "goal_tolerance": float(_param("controller/goal_tolerance", 0.35)),
             "waypoint_tolerance": float(_param("controller/waypoint_tolerance", 0.25)),
             "corner_tolerance": float(_param("controller/corner_tolerance", 0.15)),
             "pure_pursuit_lookahead": float(_param("controller/pure_pursuit_lookahead", 0.45)),
-            "reverse_speed": float(_param("controller/reverse_speed", -0.15)),
+            "reverse_speed": float(_param("controller/reverse_speed", -0.35)),
             "recover_duration": float(_param("controller/recover_duration", 0.5)),
             "recover_turn_duration": float(_param("controller/recover_turn_duration", 1.0)),
-            "recover_angular_speed": float(_param("controller/recover_angular_speed", 0.55)),
+            "recover_angular_speed": float(_param("controller/recover_angular_speed", 0.70)),
             "command_keepalive_period": float(
                 _param("controller/command_keepalive_period", 0.1)
             ),
@@ -956,7 +961,7 @@ class _MissionConfigBuilder:
                 _param("controller/turn_in_place_heading", 0.70)
             ),
             "turn_in_place_rate": float(
-                _param("controller/turn_in_place_rate", 0.45)
+                _param("controller/turn_in_place_rate", 0.65)
             ),
             "turn_release_heading": float(
                 _param("controller/turn_release_heading", 0.20)

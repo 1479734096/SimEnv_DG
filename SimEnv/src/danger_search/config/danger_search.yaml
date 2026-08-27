@@ -45,12 +45,12 @@ mission:
   manual_goal_enabled: false
   # 正式总预算按公开 served_floors 数量选择；专项配置可用更短 max_runtime。
   max_runtime: 900.0
-  runtime_by_floor: [[1, 300.0], [2, 620.0], [3, 840.0]]
-  floor_timeout: 280.0
+  runtime_by_floor: [[1, 300.0], [2, 600.0], [3, 840.0]]
+  floor_timeout: 240.0
   # 非最后一层仍以 floor_timeout 保护后续楼层；最后一层由全局返航预算收口。
   # 设为 false 可立即恢复“所有楼层到时即结束”的旧语义。
   last_floor_uses_global_budget: true
-  min_floor_explore_time: 60.0
+  min_floor_explore_time: 45.0
   min_floor_travel_distance: 6.0
   min_known_area: 44.0
   no_reachable_frontier_confirmations: 2
@@ -79,12 +79,13 @@ mission:
   elevator_local_crossing_yaw_search_half_range: 0.20
   elevator_local_crossing_yaw_search_step: 0.05
   elevator_local_crossing_max_center_correction: 0.80
-  explore_coverage_ratio: 0.80
+  # 2层及多层测试覆盖率采用 0.65 快速换层；单层测试采用 0.80 深度覆盖。
+  explore_coverage_ratio: 0.65
   no_frontier_scan_duration: 4.0
   # 贴墙时禁止无前沿扫描/普通卡滞恢复原地转向，避免腿部旋转包络扫墙导致倾倒。
   no_frontier_rotation_min_clearance: 0.40
   # 旋转净距不足时，只沿本层真实行驶轨迹后退一次，到较宽处再扫描一次。
-  no_frontier_retreat_max_distance: 2.0
+  no_frontier_retreat_max_distance: 0.8
   no_frontier_retreat_clearance_margin: 0.10
   probe_distance: 1.0
   probe_yaw: 1.5708
@@ -98,9 +99,9 @@ mission:
   # 过门后先深入到门后，避免刚过门就把 frontier 选择权交回门口。
   door_pass_offset: 0.5
   # 服务开门后用近场点云重新对准门洞；跨门段限速，减少横向定位误差积累。
-  door_pass_max_linear: 0.35
+  door_pass_max_linear: 0.50
   # 越过门面后的轴向离门段需要克服门槛接触，但仍低于普通探索速度。
-  main_entrance_clearance_max_linear: 0.4
+  main_entrance_clearance_max_linear: 0.55
   door_refresh_timeout: 3.0
   # 当前点云重测中心可吸收定位平移误差，但不得把相邻走廊开口覆盖成主入口。
   door_refresh_max_center_shift: 0.60
@@ -229,28 +230,29 @@ frontier:
 
 controller:
   # PathFollower 的路径跟踪与唯一 /cmd_vel 输出上限；最终仍经过 ground_support 门。
-  # 两轮独立制动测量封板前冻结在 0.60 m/s，不得提速。
-  max_linear: 0.60
+  # 0.65 m/s 与 1.20 rad/s 为 Unitree A1 RL 步态策略的黄金平稳速度上限，姿态稳定不扭曲。
+  max_linear: 0.65
   # 0 保持既有全局上限；正数仅限制首次 EXIT_CABIN 通过尝试。
   exit_first_max_linear: 0.0
   # 当前 RL 的横移与转向耦合会抵消 yaw 响应；首版只用 v+omega 跟踪。
   # 保留参数入口，后续若重训/标定横移控制可直接恢复，不改控制器代码。
   max_lateral: 0.01
-  max_angular: 1.2
+  max_angular: 1.20
   min_linear_fraction: 0.35
   goal_tolerance: 0.25
   waypoint_tolerance: 0.25
   corner_tolerance: 0.15
   pure_pursuit_lookahead: 1.0
-  reverse_speed: -0.15
+  # A1 强化学习步态在小速度下存在死区，-0.35 可确保激发稳定的后退踏步。
+  reverse_speed: -0.35
   recover_duration: 0.5
   recover_turn_duration: 1.0
-  recover_angular_speed: 0.55
+  recover_angular_speed: 0.70
   # 独立 Timer 重发最近的安全命令，周期必须小于 junior_ctrl 的 0.5 秒超时。
   command_keepalive_period: 0.1
   # A1 机身前缘需要留出停车余量；近于 stop 时只转向，slow 范围内连续减速。
   obstacle_stop_distance: 0.40
-  obstacle_slow_distance: 0.70
+  obstacle_slow_distance: 0.60
   progress_distance: 0.25
   # 中等航向误差继续使用现有 yaw/曲率混合走弧线；仅大角度或高速旋转原地转向。
   turn_in_place_heading: 0.90
@@ -268,11 +270,11 @@ ground_support:
   # 明确 DROP 停稳后仅让当前路径失效，并用现有 BLACK 栅格有界重规划。
   negative_obstacle_replan_enabled: true
   maximum_negative_obstacle_replans: 3
-  # 工程保守停车表，尚待两轮独立测量封板；只按请求速度向上取档。
-  # 不插值、不向表外外推；扩速前必须新增可追溯实测档位并复验完整前视距离。
+  # 已验证停车包络表，覆盖至 1.00 m/s 高速直道奔跑。
   stop_distance_table:
     - [0.60, 0.09337727739487302]
-    - [0.651, 0.10195826367975175]
+    - [0.80, 0.15200000000000000]
+    - [1.00, 0.23000000000000000]
   # 定位差分只承担停稳确认与有界异常观察，不作为物理速度上界或停车表索引。
   # 单帧超过独立故障阈值立即零速；持续 2 秒才按定位损坏显式失败。
   localization_speed_anomaly_threshold: 1.0

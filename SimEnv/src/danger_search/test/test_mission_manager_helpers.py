@@ -714,10 +714,10 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertEqual(transitions[0][0], RETURN_HOME)
 
     def test_max_runtime_does_not_abort_active_return_home_closure(self):
-        """620 秒只结束探索预算，已启动的返航收尾必须允许继续。"""
+        """720 秒只结束探索预算，已启动的返航收尾必须允许继续。"""
         manager = _make_test_manager()
         manager.state = RETURN_HOME
-        manager.max_runtime = 620.0
+        manager.max_runtime = 720.0
         manager._return_home_started = True
         manager._timeout_triggered = False
         manager._mission_success_eligible = True
@@ -6459,13 +6459,13 @@ class MissionManagerHelperTest(unittest.TestCase):
         manager.probe_yaw = 0.0
         manager._max_home_distance = 0.0
         manager._map_runtime.mapper = MultiFloorGridMap(
-            resolution=0.5, width=20.0, length=20.0, origin_x=-10.0, origin_y=-10.0,
+            resolution=0.1, width=20.0, length=20.0, origin_x=-10.0, origin_y=-10.0,
         )
         grid = manager.mapper.floor(0)
         for gx in range(grid.size_x):
             for gy in range(grid.size_y):
                 grid.mark_free(gx, gy)
-        manager._floor_navigation_traces = {0: [(-1.0, 0.0), (0.0, 0.0)]}
+        manager._floor_navigation_traces = {0: [(-0.6, 0.0), (0.0, 0.0)]}
         manager.current_frontier = SimpleNamespace(centroid=(0.4, 0.0))
         manager.explorer = SimpleNamespace(
             extract_frontiers=lambda g: [],
@@ -6513,7 +6513,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             manager._tick_explore((0.0, 0.0, 0.0))
 
         self.assertEqual(manager._exploration.no_frontier_escape_state, "moving")
-        self.assertEqual(manager._exploration.no_frontier_escape_target, (-1.0, 0.0))
+        self.assertEqual(manager._exploration.no_frontier_escape_target, (-0.6, 0.0))
         event_names = [e.get("event") for e in events]
         self.assertIn("no_frontier_retreat_started", event_names)
 
@@ -7795,6 +7795,25 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
         self.assertEqual(manager._exploration.no_frontier_escape_state, "scan_once")
         self.assertIsNone(manager._exploration.no_frontier_escape_target)
         self.assertEqual(events[-1]["event"], "no_frontier_retreat_completed")
+
+    def test_no_frontier_retreat_stalled_fast_aborts(self):
+        """倒车超过 2.5 秒但实际位移不足 0.05m 时，应立即触发 retreat_stalled 快速熔断。"""
+        manager = self._make_explore_manager(frontiers_list=[])
+        manager._exploration.no_frontier_escape_state = "moving"
+        manager._exploration.no_frontier_escape_target = (0.0, 0.0)
+        manager._exploration.no_frontier_escape_deadline = 30.0
+        manager._exploration.no_frontier_escape_start_time = 10.0
+        manager._exploration.no_frontier_escape_start_pose = (2.0, 0.0, 0.0)
+        manager.controller.reverse_straight = lambda **kwargs: True
+
+        # 2.6 秒过去，位置几乎没变 (2.001, 0.0, 0.0) -> 位移 0.001m < 0.05m
+        result = manager._exploration.tick_no_frontier_escape_motion(
+            now=12.6,
+            pose=(2.001, 0.0, 0.0),
+            controller=manager.controller,
+            current_floor=manager.current_floor,
+        )
+        self.assertEqual(manager._exploration.no_frontier_escape_state, "exhausted")
 
     def test_nearest_radial_obstacle_distance_filters_height_and_self_returns(self):
         from danger_search.mapper import MultiFloorGridMap

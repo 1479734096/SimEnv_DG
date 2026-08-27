@@ -35,7 +35,7 @@ def wait_for_localization_ready(
     poll_interval: float = 0.1,
 ) -> bool:
     """等待定位锁存就绪；等待期间不创建任务控制 publisher。"""
-    if rospy is None or Bool is None:
+    if subscriber_factory is None and (rospy is None or Bool is None):
         raise RuntimeError("当前环境没有 ROS Bool 消息，无法等待定位就绪")
     topic = require_internal_input_topic(
         LOCALIZATION_READY_TOPIC,

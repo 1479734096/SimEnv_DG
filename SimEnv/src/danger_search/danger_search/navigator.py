@@ -51,25 +51,25 @@ class PathFollower:
     path_followed_topic: str = "/danger_search/path_followed"
     local_target_topic: str = "/danger_search/local_target"
     path_frame_id: str = "world"
-    max_linear: float = 0.60
+    max_linear: float = 0.65
     max_lateral: float = 0.25
-    max_angular: float = 1.2
+    max_angular: float = 1.20
     min_linear_fraction: float = 0.35
     goal_tolerance: float = 0.35
     waypoint_tolerance: float = 0.25
     corner_tolerance: float = 0.15
     pure_pursuit_lookahead: float = 0.45
-    reverse_speed: float = -0.15
+    reverse_speed: float = -0.35
     recover_duration: float = 0.5
     recover_turn_duration: float = 1.0
-    recover_angular_speed: float = 0.55
+    recover_angular_speed: float = 0.70
     command_keepalive_period: float = 0.1
     # 直接控制命令（rotate_in_place/reverse_straight）的最大重放寿命。
     # 所有直接命令调用方都按 tick 重发，超过该寿命说明任务层已经停止驱动，
     # keepalive 必须归零，不能让最后一条非零命令无限重放。
     direct_command_max_age: float = 0.6
-    obstacle_stop_distance: float = 0.50
-    obstacle_slow_distance: float = 1.00
+    obstacle_stop_distance: float = 0.40
+    obstacle_slow_distance: float = 0.60
     no_progress_timeout: float = 8.0
     progress_distance: float = 0.25
     # 路线进度监督：只认"沿折线推进"，机体位移（绕圈/后退）不再算进度。

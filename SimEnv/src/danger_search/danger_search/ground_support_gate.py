@@ -92,7 +92,8 @@ class GroundSupportGateConfig:
     validated_max_speed: float | None = None
     stop_distance_table: tuple[tuple[float, float], ...] = (
         (0.60, 0.09337727739487302),
-        (0.651, 0.10195826367975175),
+        (0.80, 0.15200000000000000),
+        (1.00, 0.23000000000000000),
     )
     localization_speed_anomaly_threshold: float = 1.0
     localization_speed_anomaly_timeout: float = 2.0

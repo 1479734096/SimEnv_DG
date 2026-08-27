@@ -350,6 +350,8 @@ class ExplorationRuntime:
     no_frontier_escape_state: str = "idle"
     no_frontier_escape_target: tuple[float, float] | None = None
     no_frontier_escape_deadline: float = 0.0
+    no_frontier_escape_start_time: float = 0.0
+    no_frontier_escape_start_pose: tuple[float, float, float] | None = None
     floor_timeout_logged: bool = False
     probe_attempt: int = 0
     last_frontier_target: tuple[float, float] | None = None
@@ -365,6 +367,8 @@ class ExplorationRuntime:
         self.no_frontier_escape_state = "idle"
         self.no_frontier_escape_target = None
         self.no_frontier_escape_deadline = 0.0
+        self.no_frontier_escape_start_time = 0.0
+        self.no_frontier_escape_start_pose = None
 
     @staticmethod
     def rotation_clearance_is_safe(
@@ -529,12 +533,18 @@ class ExplorationRuntime:
 
         self.no_frontier_escape_state = "moving"
         self.no_frontier_escape_target = selected_target
-        reverse_speed = abs(float(getattr(controller, "reverse_speed", -0.15)))
+        self.no_frontier_escape_start_time = now
+        self.no_frontier_escape_start_pose = (
+            float(pose[0]),
+            float(pose[1]),
+            float(pose[2]),
+        )
+        reverse_speed = abs(float(getattr(controller, "reverse_speed", -0.35)))
         retreat_distance = math.hypot(
             selected_target[0] - pose[0], selected_target[1] - pose[1]
         )
         self.no_frontier_escape_deadline = now + max(
-            4.0, retreat_distance / max(0.05, reverse_speed) + 2.0
+            3.0, retreat_distance / max(0.05, reverse_speed) + 1.5
         )
         self.no_frontier_scan_until = 0.0
         self.last_no_frontier_signature = None
@@ -571,6 +581,8 @@ class ExplorationRuntime:
             self.no_frontier_escape_state = "scan_once"
             self.no_frontier_escape_target = None
             self.no_frontier_escape_deadline = 0.0
+            self.no_frontier_escape_start_time = 0.0
+            self.no_frontier_escape_start_pose = None
             self.no_frontier_scan_until = 0.0
             self.last_no_frontier_signature = None
             controller.stop(reason="no_frontier_retreat_completed")
@@ -583,6 +595,20 @@ class ExplorationRuntime:
                     },
                 )
             )
+        if (
+            self.no_frontier_escape_start_pose is not None
+            and now - self.no_frontier_escape_start_time >= 2.5
+        ):
+            moved = math.hypot(
+                pose[0] - self.no_frontier_escape_start_pose[0],
+                pose[1] - self.no_frontier_escape_start_pose[1],
+            )
+            if moved < 0.05:
+                return self._exhaust_no_frontier_escape(
+                    controller=controller,
+                    current_floor=current_floor,
+                    reason="retreat_stalled",
+                )
         if now >= self.no_frontier_escape_deadline:
             return self._exhaust_no_frontier_escape(
                 controller=controller,
