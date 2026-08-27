@@ -6437,9 +6437,85 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertTrue(grid.is_traversable(*grid.world_to_grid(0.0, 0.0)))
         self.assertTrue(astar_plan(grid, (0.0, 0.0), (2.0, 0.0)).reached)
         self.assertEqual(recover_calls, [])
-        self.assertEqual(stop_reasons, ["unsafe_recover_rotation_blocked"])
+        self.assertEqual(stop_reasons, ["unsafe_recover_rotation_blocked", "no_frontier_retreat_unavailable"])
         self.assertEqual(events[0]["event"], "unsafe_rotation_blocked")
         self.assertEqual(events[0]["source"], "stuck_recovery")
+
+    def test_stuck_with_trace_initiates_retreat(self):
+        """贴墙旋转不安全卡住时，若存在安全历史轨迹应直接启动直线后退脱困。"""
+        events: list[dict] = []
+        manager = _make_test_manager()
+        manager.current_floor = 0
+        manager.manual_mode = False
+        manager.start_time = 0.0
+        manager.floor_start_time = 0.0
+        manager.floor_timeout = 1000.0
+        manager.min_floor_explore_time = 0.0
+        manager.min_floor_travel_distance = 0.0
+        manager.min_known_area = 0.0
+        manager.explore_coverage_ratio = 0.0
+        manager.no_reachable_frontier_confirmations = 1
+        manager.min_corridor_progress_distance = 0.0
+        manager.probe_yaw = 0.0
+        manager._max_home_distance = 0.0
+        manager._map_runtime.mapper = MultiFloorGridMap(
+            resolution=0.5, width=20.0, length=20.0, origin_x=-10.0, origin_y=-10.0,
+        )
+        grid = manager.mapper.floor(0)
+        for gx in range(grid.size_x):
+            for gy in range(grid.size_y):
+                grid.mark_free(gx, gy)
+        manager._floor_navigation_traces = {0: [(-1.0, 0.0), (0.0, 0.0)]}
+        manager.current_frontier = SimpleNamespace(centroid=(0.4, 0.0))
+        manager.explorer = SimpleNamespace(
+            extract_frontiers=lambda g: [],
+            record_stuck_failure=lambda g, xy: None,
+            door_front_half_plane_radius=1.5,
+            door_front_half_plane_penalty=6.0,
+        )
+        manager._map_runtime.local_detector = SimpleNamespace(
+            max_distance=3.0,
+            detect_controllable_door=lambda **kw: None,
+        )
+        manager.building_client = SimpleNamespace(
+            is_elevator_door=lambda door_id: False,
+            door_service_ready=lambda: True,
+            controllable_doors=lambda **kw: [],
+        )
+        manager.controller = SimpleNamespace(
+            has_path=lambda: True,
+            poll_status=lambda: STUCK,
+            recover=lambda: None,
+            clear_path=lambda: None,
+            stop=lambda *a, **k: None,
+            reverse_speed=-0.15,
+        )
+        manager._door_navigation.approach_blacklist = {}
+        manager.door_transition_hold_distance = 2.5
+        manager.post_door_min_distance = 0.0
+        manager.post_door_min_known_area = 0.0
+        manager._door_navigation.last_door_xy = None
+        manager._door_navigation.last_pass_vector = None
+        manager._door_navigation.transition_until = 0.0
+        manager.main_entrance_xy = None
+        manager.main_entrance_pass_vector = None
+        manager.frontier_current_region_radius = 1.2
+        manager.frontier_switch_score_margin = 2.0
+        manager._door_navigation.frontier_debug = None
+        manager._map_runtime.latest_cloud_points = []
+        manager.no_frontier_rotation_min_clearance = 0.40
+        manager._map_runtime.nearest_radial_obstacle_distance = 0.30
+        manager._exploration.no_frontier_rotation_blocked_logged = False
+        manager._log_structured = events.append
+        with patch.object(mission_manager_module, "MissionReportingRuntime", SimpleNamespace(
+            loginfo=lambda *a, **k: None, logwarn=lambda *a, **k: None,
+        )), patch.object(mission_manager_module, "get_time", return_value=10.0):
+            manager._tick_explore((0.0, 0.0, 0.0))
+
+        self.assertEqual(manager._exploration.no_frontier_escape_state, "moving")
+        self.assertEqual(manager._exploration.no_frontier_escape_target, (-1.0, 0.0))
+        event_names = [e.get("event") for e in events]
+        self.assertIn("no_frontier_retreat_started", event_names)
 
     def test_main_entrance_failure_keeps_entrance_unset(self):
         """主入口过门失败后，main_entrance_xy/pass_vector 必须保持未设置。"""

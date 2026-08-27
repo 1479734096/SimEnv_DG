@@ -2599,7 +2599,26 @@ class MissionManager:
                 # STUCK 已经过进度超时确认，临时排除目标附近候选；只改规划黑名单，
                 # 不把远处拐角写成永久地图障碍。
                 self.explorer.record_stuck_failure(grid, self.current_frontier.centroid)
-            self._recover_with_rotation_clearance("stuck_recovery")
+            if self._rotation_clearance_is_safe():
+                self.controller.recover()
+            else:
+                self._log_rotation_clearance_blocked("stuck_recovery")
+                self.controller.stop(reason="unsafe_recover_rotation_blocked")
+                retreat_result = self._exploration._start_no_frontier_retreat(
+                    now=get_time(),
+                    pose=pose,
+                    grid=grid,
+                    navigation_trace=list(
+                        self._floor_navigation_traces.get(
+                            int(self.current_floor), ()
+                        )
+                    ),
+                    controller=self.controller,
+                    current_floor=self.current_floor,
+                    config=self._no_frontier_recovery_config(),
+                    planning_constraints=self._planning_constraints(),
+                )
+                self._apply_exploration_runtime_result(retreat_result)
             self.current_frontier = None
             self._exploration.last_frontier_target = None
             self._exploration.last_frontier_score = None

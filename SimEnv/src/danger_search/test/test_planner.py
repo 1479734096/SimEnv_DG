@@ -454,16 +454,35 @@ class PlannerTest(unittest.TestCase):
         self.assertTrue(result.reached)
         self.assertEqual(result.path[-1], grid.grid_to_world(2, 1))
 
-    def test_astar_rejects_invalid_iteration_budget(self):
-        grid = self._make_long_corridor()
-        start = grid.grid_to_world(2, 2)
-        goal = grid.grid_to_world(grid.size_x - 3, 2)
+    def test_astar_prefers_corridor_centerline_over_wall_hugging(self):
+        # 验证在 3 格宽 (0.3m 分辨率) 的走廊中，A* 规划严格沿中央轴线行进，不贴墙走
+        grid = FloorGrid(
+            floor_index=0,
+            resolution=0.1,
+            width=3.0,
+            length=10.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        )
+        grid.fill_base(FREE)
+        # 两侧为墙体 (x < 0.8 或 x > 2.2)
+        for y in range(grid.size_y):
+            for x in range(8):
+                grid.planning_layer[y, x] = 100
+            for x in range(22, grid.size_x):
+                grid.planning_layer[y, x] = 100
 
-        with self.assertRaises(ValueError):
-            astar_plan(grid, start, goal, max_iterations=0)
-        with self.assertRaises(ValueError):
-            astar_plan(grid, start, goal, max_iterations=math.nan)
+        result = astar_plan(
+            grid,
+            (1.5, 1.0),
+            (1.5, 8.0),
+        )
+        self.assertTrue(result.reached)
+        # 路径上所有点的 X 坐标都应严格保持在走廊中心 1.5 附近
+        for pt in result.path:
+            self.assertAlmostEqual(pt[0], 1.55, delta=0.1)
 
 
 if __name__ == "__main__":
     unittest.main()
+

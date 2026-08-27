@@ -906,6 +906,9 @@ class _MissionConfigBuilder:
             "information_gain_weight": float(_param("frontier/information_gain_weight", 2.0)),
             "path_cost_weight": float(_param("frontier/path_cost_weight", 1.0)),
             "yaw_cost_weight": float(_param("frontier/yaw_cost_weight", 0.3)),
+            "forward_alignment_weight": float(
+                _param("frontier/forward_alignment_weight", 0.8)
+            ),
             "revisit_penalty_weight": float(_param("frontier/revisit_penalty_weight", 2.0)),
             "frontier_obstacle_clearance": float(_param("frontier/frontier_obstacle_clearance", 0.25)),
             "frontier_unknown_standoff": float(_param("frontier/frontier_unknown_standoff", 0.20)),

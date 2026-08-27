@@ -1349,6 +1349,40 @@ class MultiFloorMapperTest(unittest.TestCase):
         self.assertEqual(grid.occ_cores, {})
         self.assertEqual(grid.negative_cluster_records, {})
 
+    def test_high_hit_beyond_clear_range_is_low_candidate_and_within_is_high_hard(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=30.0,
+            length=30.0,
+            origin_x=-15.0,
+            origin_y=-15.0,
+            point_free_clear_max_range=8.0,
+            raycast_max_range=15.0,
+            obstacle_inflation_radius=0.0,
+        )
+        grid = mapper.floor(0)
+        # 近距 (5m <= 8m): 高回波 (Z_rel=0.6m) 记为 HIGH_HARD
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[(5.0, 0.0, 0.6)],
+            cloud_generation=1,
+        )
+        near_cell = grid.world_to_grid(5.0, 0.0)
+        self.assertEqual(grid.occ_cores[near_cell].kind, "HIGH_HARD")
+        self.assertEqual(grid.data[near_cell[1], near_cell[0]], OCC)
+
+        # 远距 (10m > 8m): 高回波 (Z_rel=0.6m) 记为 LOW_CANDIDATE
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.6),
+            points=[(10.0, 0.0, 0.6)],
+            cloud_generation=2,
+        )
+        far_cell = grid.world_to_grid(10.0, 0.0)
+        self.assertEqual(grid.occ_cores[far_cell].kind, "LOW_CANDIDATE")
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -158,6 +158,7 @@ class FrontierExplorer:
         information_gain_weight: float = 2.0,
         path_cost_weight: float = 1.0,
         yaw_cost_weight: float = 0.3,
+        forward_alignment_weight: float = 0.0,
         revisit_penalty_weight: float = 2.0,
         frontier_obstacle_clearance: float = 0.25,
         frontier_unknown_standoff: float = 0.20,
@@ -178,6 +179,7 @@ class FrontierExplorer:
         self.information_gain_weight = float(information_gain_weight)
         self.path_cost_weight = float(path_cost_weight)
         self.yaw_cost_weight = float(yaw_cost_weight)
+        self.forward_alignment_weight = float(forward_alignment_weight)
         self.revisit_penalty_weight = float(revisit_penalty_weight)
         self.frontier_obstacle_clearance = float(frontier_obstacle_clearance)
         self.frontier_unknown_standoff = float(frontier_unknown_standoff)
@@ -195,6 +197,7 @@ class FrontierExplorer:
             self.information_gain_weight,
             self.path_cost_weight,
             self.yaw_cost_weight,
+            self.forward_alignment_weight,
             self.revisit_penalty_weight,
             self.frontier_obstacle_clearance,
             self.frontier_unknown_standoff,
@@ -1022,11 +1025,14 @@ class FrontierExplorer:
             if expected_unknown_gain is None
             else float(expected_unknown_gain)
         )
+        forward_alignment = math.cos(target_yaw - robot_pose[2])
+        forward_bonus = self.forward_alignment_weight * max(0.0, forward_alignment)
         return (
             self.information_gain_weight * math.sqrt(max(0.0, gain))
             - self.path_cost_weight * cost
             - self.yaw_cost_weight * yaw_cost
             - self.revisit_penalty_weight * revisit_penalty
+            + forward_bonus
         )
 
     def _optimistic_score(
@@ -1052,12 +1058,15 @@ class FrontierExplorer:
             if expected_unknown_gain is None
             else float(expected_unknown_gain)
         )
+        forward_alignment = math.cos(target_yaw - robot_pose[2])
+        forward_bonus = self.forward_alignment_weight * max(0.0, forward_alignment)
         return (
             self.information_gain_weight
             * math.sqrt(max(0.0, gain))
             - self.path_cost_weight * distance
             - self.yaw_cost_weight * yaw_cost
             - self.revisit_penalty_weight * revisit_penalty
+            + forward_bonus
             + context_adjustment
         )
 

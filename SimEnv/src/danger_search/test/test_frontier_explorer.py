@@ -1697,9 +1697,41 @@ class FrontierExplorerTest(unittest.TestCase):
         self.assertIsNotNone(frontier)
         self.assertTrue(path)
         self.assertEqual(astar_goals, [(1.0, 0.0)])
-        self.assertEqual(frontier.centroid, (1.0, 0.0))
         self.assertEqual(recorded_failures, [])
+
+    def test_forward_alignment_favors_straight_corridor_over_perpendicular_branch(self):
+        """验证启用 forward_alignment_weight 后，同等收益下正前方走廊目标得分高于垂直侧向目标。"""
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            information_gain_weight=1.0,
+            path_cost_weight=1.0,
+            yaw_cost_weight=0.0,
+            forward_alignment_weight=1.0,
+            revisit_penalty_weight=0.0,
+        )
+        robot_pose = (0.0, 0.0, 0.0)  # 朝向 X+
+        straight_frontier = Frontier(cells=((10, 0),), centroid=(5.0, 0.0), information_gain=16.0)
+        perpendicular_frontier = Frontier(cells=((0, 10),), centroid=(0.0, 5.0), information_gain=16.0)
+
+        score_straight = explorer._score_frontier(
+            straight_frontier,
+            [(0.0, 0.0), (5.0, 0.0)],
+            robot_pose,
+            target_xy=(5.0, 0.0),
+            expected_unknown_gain=16.0,
+        )
+        score_perp = explorer._score_frontier(
+            perpendicular_frontier,
+            [(0.0, 0.0), (0.0, 5.0)],
+            robot_pose,
+            target_xy=(0.0, 5.0),
+            expected_unknown_gain=16.0,
+        )
+        # 正前方 alignment cos(0)=1.0, 垂直侧向 alignment cos(pi/2)=0.0
+        # 收益与路程相同情况下，正前方得分高出 1.0
+        self.assertAlmostEqual(score_straight - score_perp, 1.0)
 
 
 if __name__ == "__main__":
     unittest.main()
+

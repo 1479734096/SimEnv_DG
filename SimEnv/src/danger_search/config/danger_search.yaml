@@ -207,6 +207,7 @@ frontier:
   information_gain_weight: 0.5
   path_cost_weight: 3.0
   yaw_cost_weight: 0.2
+  forward_alignment_weight: 0.8
   revisit_penalty_weight: 2.0
   # frontier 目标优先落在更安全的 free cell，不贴障碍和 unknown 边缘。
   frontier_obstacle_clearance: 0.25

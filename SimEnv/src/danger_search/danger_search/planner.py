@@ -401,6 +401,21 @@ def astar_plan(
             return PlanResult(status=UNREACHABLE, reason_code="goal_region_blocked")
         goal = nearest
 
+    # 离墙安全净距代价场（平滑路径并引导沿通道中轴线前进）
+    clearance_field = None
+    try:
+        from scipy.ndimage import distance_transform_edt
+
+        distances = distance_transform_edt(traversable) * float(grid.resolution)
+        safe_clearance = 0.60
+        near_wall = (distances < safe_clearance) & traversable
+        clearance_field = np.zeros_like(traversable, dtype=np.float32)
+        clearance_field[near_wall] = (
+            0.35 * ((safe_clearance - distances[near_wall]) / safe_clearance) ** 2
+        )
+    except Exception:
+        clearance_field = None
+
     # 单个状态化 A* 同时处理普通路径和起点约束退出；所有出口共享同一预算。
     size_y, size_x = traversable.shape
     start_escaped = not escape.required
@@ -482,6 +497,8 @@ def astar_plan(
             if neighbor_state in closed_set:
                 continue
             step_cost = DIAGONAL_COST if dx != 0 and dy != 0 else 1.0
+            if clearance_field is not None and next_escaped:
+                step_cost *= (1.0 + float(clearance_field[ny, nx]))
             new_cost = cost_so_far[current_state] + step_cost
             if neighbor_state not in cost_so_far or new_cost < cost_so_far[neighbor_state]:
                 cost_so_far[neighbor_state] = new_cost

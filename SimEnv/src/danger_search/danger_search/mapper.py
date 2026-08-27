@@ -813,7 +813,7 @@ class MultiFloorGridMap:
         obstacle_max_z: float = 1.40,
         obstacle_inflation_radius: float = 0.25,
         raycast_max_range: float = 12.0,
-        point_free_clear_max_range: float = 1.5,
+        point_free_clear_max_range: float = 8.0,
         visited_radius: float = 0.45,
         free_clear_enabled: bool = True,
         free_clear_max_range: float = 8.0,
@@ -1079,7 +1079,13 @@ class MultiFloorGridMap:
                             continue
                         kind = LOW_CANDIDATE
                     else:
-                        kind = HIGH_HARD
+                        if (
+                            self.point_free_clear_max_range > 0.0
+                            and _distance > self.point_free_clear_max_range
+                        ):
+                            kind = LOW_CANDIDATE
+                        else:
+                            kind = HIGH_HARD
                     grid.record_obstacle_observation(
                         px,
                         py,
