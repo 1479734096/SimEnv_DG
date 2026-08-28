@@ -312,6 +312,62 @@ rviz -d src/danger_search/config/elevator_baseline.rviz
 本地几何确认事件、CROSS 结果和离线 RMSE/P95/最大/末端误差；启动成功不等于闭环成功，
 人工中止不记算法失败。
 
+正式 launch 与 `run_elevator_gui_test.sh` 的定位点云量程默认值均为 `15.0m`。
+上述 `8.0m` 只是历史 A/B 对照的显式覆盖；若仍需复现，必须在命令行明确设置
+`ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=8.0`，不得再作为专项 runner 的隐式默认。
+
+### STAGE33 双锚点与电梯重试验收
+
+当前正式配置必须保持以下基线：`max_linear=0.75m/s`、
+`boundary_hold_margin=0.40m`、`async_planning_enabled=false`、
+`opportunistic_replan_period=0.0`、`localization_max_range=15.0m`。电梯开口首次确认、重试
+次数、重试窗口和新帧屏障分别为 `15.0s`、`1`、`10.0s`、`0.5s`。运行前先核对有效参数，
+不能用提高速度、缩小防坠余量或把量程降到历史 `8.0m` 的方式补偿时间。
+
+按用户当前安排，完整仿真由人工执行。两层 0→1→0→主入口返航的推荐命令如下；证据目录
+必须是不存在或为空的新目录：
+
+```bash
+SEED=8127 GUI=true ELEVATOR_TEST_FLOOR_COUNT=2 \
+ELEVATOR_TEST_FLOOR_TIMEOUT=280 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
+ELEVATOR_TEST_MAX_RUNTIME=620 ELEVATOR_TEST_WALL_TIMEOUT=10800 \
+ELEVATOR_TEST_FULL_CYCLE=1 ELEVATOR_TEST_RECORD_DRIFT=1 \
+ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0 \
+ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map \
+ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0 \
+ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false \
+ELEVATOR_TEST_LOG_DIR=/tmp/danger_search_stage33_seed8127 \
+tools/sim/run_elevator_gui_test.sh
+```
+
+`ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1` 只让独立 rosbag 记录离线评估输入，不允许生产节点
+订阅或读取真值。若本轮只验证行为而不需要漂移评分，可设为 `0`。
+
+运行结束后先检查结构化事件：
+
+```bash
+rg 'sparse_landmark_anchor_frozen|sparse_landmark_relocalization_evaluated|sparse_landmark_correction_applied|elevator_door_open_sensor_confirmed|elevator_door_confirmation_retry_started|elevator_door_confirmation_retry_exhausted|elevator_local_crossing_geometry_confirmed' \
+  /tmp/danger_search_stage33_seed8127/mission.log
+```
+
+验收口径如下：
+
+- 开局必须分别出现 `landmark_id=main_entrance` 与 `landmark_id=elevator` 的锚点冻结事件；
+  缺任一锚点都不能宣称双锚点闭环已验证。
+- 到源层电梯和返航主入口时应出现重定位评估。状态为 `no_correction_needed` 是合法成功；
+  状态为 `accepted` 时还必须出现同序号的 `sparse_landmark_correction_applied` 回执。
+  质量门拒绝不应注入，不能为了制造 applied 事件降低阈值。
+- 源层和目标层都必须先出现开口传感器确认，再出现对应的本地穿越几何确认和 CROSS 成功；
+  服务 accepted、轿厢到层或地图条带清理都不能代替开口证据。
+- 只有首次 `15s` 超时才应出现 `elevator_door_confirmation_retry_started`，同一门最多一次。
+  源层重试后应重新呼梯、重新开门并复核锚点；目标层重试期间机器人必须保持在轿厢内。
+  出现 `elevator_door_confirmation_retry_exhausted` 时本轮应明确记失败，不能继续盲穿。
+- 最终必须完成 0→1→0、穿出主入口、回到出生点并写出结果；仅到达 1 层不算完整闭环。
+
+专项 runner 会在证据目录生成 `TEST_SUMMARY.txt`、`mission.log`、`auto.log`、诊断 bag 和可选
+漂移统计。阶段报告需记录 seed、Git SHA、有效参数、仿真/墙钟时长、状态转换、结果、清理
+情况与未验证风险。
+
 ### 8m 人工中止轮与后续复现口径
 
 `seed8127_g3_old_crossing_full_max8_20260814_r1` 虽按完整闭环参数启动，但在任务 elapsed

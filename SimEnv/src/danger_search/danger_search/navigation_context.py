@@ -42,6 +42,12 @@ class NavigationTaskContext:
     elevator_approach_trace_candidates_fn: Callable[..., object]
     plan_path_fn: Callable[..., object]
     segment_is_traversable_fn: Callable[..., bool]
+    elevator_async_target_door_close_enabled: bool = True
+    relocalize_landmark_fn: Callable[..., object] | None = None
+    latest_cloud_stamp_fn: Callable[[], float | None] | None = None
+    elevator_opening_confirmation_retry_limit: int = 1
+    elevator_opening_confirmation_retry_timeout: float = 10.0
+    elevator_opening_confirmation_sensor_refresh: float = 0.5
 
     def clear_opened_door_area(self, door_id: str) -> None:
         self.clear_opened_door_area_fn(door_id)
@@ -99,3 +105,11 @@ class NavigationTaskContext:
 
     def segment_is_traversable(self, *args, **kwargs) -> bool:
         return bool(self.segment_is_traversable_fn(*args, **kwargs))
+
+    def relocalize_landmark(self, *args, **kwargs):
+        if self.relocalize_landmark_fn is None:
+            return None
+        return self.relocalize_landmark_fn(*args, **kwargs)
+
+    def latest_cloud_stamp(self) -> float | None:
+        return self.latest_cloud_stamp_fn() if self.latest_cloud_stamp_fn else None

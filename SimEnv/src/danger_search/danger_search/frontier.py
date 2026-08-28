@@ -243,6 +243,56 @@ class FrontierExplorer:
         self._last_optimistic_score_cache: dict[
             tuple[Frontier, tuple[float, float]], float
         ] = {}
+        self._structured_logging_enabled = True
+
+    def planning_copy(self) -> "FrontierExplorer":
+        """创建仅供后台规划使用的独立副本。
+
+        后台线程可以更新自己的候选缓存和失败计数，但不得持有实时 Explorer 的
+        可变字典。结构化日志也由主线程在结果通过作用域校验后统一提交。
+        """
+        clone = FrontierExplorer(
+            min_cluster_size=self.min_cluster_size,
+            blacklist_ttl=self.blacklist_ttl,
+            fail_limit=self.fail_limit,
+            stuck_blacklist_radius=self.stuck_blacklist_radius,
+            information_gain_weight=self.information_gain_weight,
+            path_cost_weight=self.path_cost_weight,
+            yaw_cost_weight=self.yaw_cost_weight,
+            forward_alignment_weight=self.forward_alignment_weight,
+            revisit_penalty_weight=self.revisit_penalty_weight,
+            frontier_obstacle_clearance=self.frontier_obstacle_clearance,
+            frontier_unknown_standoff=self.frontier_unknown_standoff,
+            frontier_min_information_gain=self.frontier_min_information_gain,
+            expected_gain_radius=self.expected_gain_radius,
+            door_front_half_plane_penalty=self.door_front_half_plane_penalty,
+            door_front_half_plane_radius=self.door_front_half_plane_radius,
+            door_preferred_direction_bonus=self.door_preferred_direction_bonus,
+            max_planning_candidates=self.max_planning_candidates,
+            max_goal_candidates_per_frontier=self.max_goal_candidates_per_frontier,
+            max_fallback_planning_candidates=self.max_fallback_planning_candidates,
+            goal_tolerance=self.goal_tolerance,
+            min_far_expected_gain=self.min_far_expected_gain,
+            far_prune_distance=self.far_prune_distance,
+        )
+        clone._blacklist = dict(self._blacklist)
+        clone._fail_counts = dict(self._fail_counts)
+        clone._structured_logging_enabled = False
+        return clone
+
+    def apply_planning_failure_deltas(
+        self,
+        deltas: tuple[tuple[tuple[int, int], int], ...],
+    ) -> None:
+        """在主线程合并一次有效普通规划产生的失败增量。"""
+        for cell, increment in deltas:
+            parsed = (int(cell[0]), int(cell[1]))
+            amount = max(0, int(increment))
+            if amount <= 0:
+                continue
+            self._fail_counts[parsed] = self._fail_counts.get(parsed, 0) + amount
+            if self._fail_counts[parsed] >= self.fail_limit:
+                self.blacklist_cell(parsed)
 
     def select_frontier(
         self,
@@ -462,6 +512,9 @@ class FrontierExplorer:
                     # 落点在 controller goal_tolerance 内：不算失败、不拉黑、不屏蔽 cluster。
                     # 跳过此 frontier，继续尝试其他 frontier。
                     inside_tolerance_count += 1
+                elif candidate_debug.rejection_reason == "far_small_pocket_pruned":
+                    # 远距离小前沿剪枝：正常策略跳过，不计入失败拉黑。
+                    pass
                 else:
                     unreachable_count += 1
                     self.record_failure(grid, frontier.centroid)
@@ -876,6 +929,15 @@ class FrontierExplorer:
 
     def blacklist_cell(self, cell: tuple[int, int]) -> None:
         self._blacklist[cell] = get_time() + self.blacklist_ttl
+
+    def is_blacklisted(
+        self,
+        grid: FloorGrid,
+        world_xy: tuple[float, float],
+    ) -> bool:
+        """主线程提交异步候选前查询当前有效黑名单。"""
+        self._expire_blacklist()
+        return self._is_blacklisted(grid, world_xy)
 
     def _is_blacklisted(self, grid: FloorGrid, world_xy: tuple[float, float]) -> bool:
         cell = grid.world_to_grid(world_xy[0], world_xy[1])
@@ -1425,6 +1487,7 @@ class FrontierExplorer:
         saw_budget_exhausted = False
         saw_unreachable = False
         saw_inside_tolerance = False
+        saw_far_pruned = False
         path_attempt_count = 0
         blacklisted_target_count = 0
         debug_position = candidates[0]
@@ -1460,6 +1523,19 @@ class FrontierExplorer:
                 continue
             if _world_distance(target_xy, robot_xy) <= self.goal_tolerance:
                 saw_inside_tolerance = True
+                continue
+            gain = (
+                expected_gain_cache[target_xy]
+                if target_xy in expected_gain_cache
+                else self._expected_unknown_gain(grid, frontier, target_xy)
+            )
+            if (
+                self.far_prune_distance > 0.0
+                and self.min_far_expected_gain > 0.0
+                and _world_distance(target_xy, robot_xy) > self.far_prune_distance
+                and gain < self.min_far_expected_gain
+            ):
+                saw_far_pruned = True
                 continue
             if (
                 not exhaustive_goal_candidates
@@ -1545,6 +1621,15 @@ class FrontierExplorer:
             and not saw_budget_exhausted
             and not saw_unreachable
         )
+        far_pruned_only = (
+            saw_far_pruned
+            and not blacklisted_only
+            and not context_filtered_only
+            and not saw_budget_exhausted
+            and not saw_unreachable
+            and not saw_inside_tolerance
+            and not saw_path_attempt
+        )
         if last_path_position is not None:
             debug_position = last_path_position
             debug_context_adjustment = last_path_context_adjustment
@@ -1558,6 +1643,10 @@ class FrontierExplorer:
                 "door_context_path_gate" if saw_context_path_skip else "door_context_hard_filter"
             )
             reachability_result = "context_filtered"
+            blacklist_status = "partial" if blacklisted_target_count else "not_blacklisted"
+        elif far_pruned_only:
+            rejection_reason = "far_small_pocket_pruned"
+            reachability_result = "far_small_pocket_pruned"
             blacklist_status = "partial" if blacklisted_target_count else "not_blacklisted"
         elif saw_budget_exhausted:
             rejection_reason = "planning_budget_exhausted"
@@ -1916,7 +2005,7 @@ class FrontierExplorer:
         debug: FrontierSelectionDebug,
     ) -> None:
         self.last_selection_debug = debug
-        if rospy is None:
+        if rospy is None or not self._structured_logging_enabled:
             return
         payload = {
             "event": "frontier_selection",

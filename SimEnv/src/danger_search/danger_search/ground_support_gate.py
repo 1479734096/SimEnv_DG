@@ -508,12 +508,22 @@ class GroundSupportSafetyGate:
                 control_time=control_time,
             )
         elif self.state in _TEMPORARY_HOLDS and elapsed >= self.config.observation_hold_timeout:
-            if self._pending_failure_witness is None:
-                # 观察期结束仍未捕获任何支撑失败边界（boundary/drop 证据均缺失）：
-                # 数据陈旧/观测不充分不是"支撑失败证据"，直接解除临时 hold 继续，
-                # 不能 SAFETY_BLOCKED 使任务失败。明确 DROP 由 _fresh_drop_blocks
-                # 独立锁存停车（true_drop_stop），不经过本分支。
+            assessment = self._assessment
+            has_real_drop = (
+                assessment is not None
+                and (
+                    bool(assessment.drop_confirmed)
+                    or bool(assessment.drop_intersects_sweep)
+                    or bool(assessment.drop_clusters)
+                )
+            )
+            if not has_real_drop:
+                # 观察期结束且无任何真跌落/负障碍证据（drop_confirmed 缺失）：
+                # 激光未扫全的平地盲区不是"支撑失败证据"，直接解除临时 hold 恢复直行，
+                # 不误报 SUPPORT_PATH_UNAVAILABLE，防止在平地走廊打假禁行逼迫 A* 绕 Z 弯。
+                # 明确 DROP 由 _fresh_drop_blocks 独立锁存停车（true_drop_stop）。
                 self._leave_temporary_hold(wall_time, control_time)
+                self._pending_failure_witness = None
                 self.observation_hold_release_without_witness_count += 1
             else:
                 self._enter_state(
@@ -1004,6 +1014,7 @@ class GroundSupportSafetyGate:
         self._temporary_hold_command = None
         self._temporary_hold_pose_yaw = None
         self._temporary_hold_context_id = None
+        self._pending_failure_witness = None
         self._reset_boundary_candidate()
 
     def _begin_temporary_hold_context(

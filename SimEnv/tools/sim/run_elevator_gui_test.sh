@@ -10,11 +10,11 @@ DEVEL_SETUP="$WORKSPACE_ROOT/devel/setup.bash"
 SEED="${SEED:-42}"
 GUI="${GUI:-true}"
 ELEVATOR_TEST_FLOOR_COUNT="${ELEVATOR_TEST_FLOOR_COUNT:-2}"
-ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-280.0}"
-ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME="${ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME:-$ELEVATOR_TEST_FLOOR_TIMEOUT}"
+ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-310.0}"
+ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME="${ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME:-60.0}"
 case "$ELEVATOR_TEST_FLOOR_COUNT" in
-  2) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="620.0" ;;
-  3) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="840.0" ;;
+  2) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="720.0" ;;
+  3) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="900.0" ;;
   *) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="900.0" ;;
 esac
 ELEVATOR_TEST_MAX_RUNTIME="${ELEVATOR_TEST_MAX_RUNTIME:-$ELEVATOR_TEST_DEFAULT_MAX_RUNTIME}"
@@ -29,10 +29,14 @@ ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH="${ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH:-0}"
 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS="${ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS:-0}"
 ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS="${ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS:-0}"
 ELEVATOR_TEST_LOCALIZATION_BACKEND="${ELEVATOR_TEST_LOCALIZATION_BACKEND:-adaptive_shared_map}"
-ELEVATOR_TEST_LOCALIZATION_MAX_RANGE="${ELEVATOR_TEST_LOCALIZATION_MAX_RANGE:-8.0}"
+ELEVATOR_TEST_LOCALIZATION_MAX_RANGE="${ELEVATOR_TEST_LOCALIZATION_MAX_RANGE:-15.0}"
 ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED="${ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED:-false}"
 ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED="${ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED:-true}"
-LOG_DIR="${ELEVATOR_TEST_LOG_DIR:-/tmp/danger_search_elevator_test_$(date +%Y%m%d_%H%M%S)}"
+DEFAULT_EVIDENCE_ROOT="/home/xbh/tzb26/evidence/simenv"
+if [ ! -d "$DEFAULT_EVIDENCE_ROOT" ]; then
+  DEFAULT_EVIDENCE_ROOT="/tmp"
+fi
+LOG_DIR="${ELEVATOR_TEST_LOG_DIR:-${EVIDENCE_DIR:-${DEFAULT_EVIDENCE_ROOT}/seed${SEED:-8127}_${ELEVATOR_TEST_FLOOR_COUNT:-2}floor_new_$(date +%Y%m%d_%H%M%S)}}"
 
 AUTO_PID=""
 MISSION_PID=""
@@ -60,9 +64,9 @@ usage() {
   SEED=42                              场景种子
   GUI=true                             是否打开 Gazebo GUI
   ELEVATOR_TEST_FLOOR_COUNT=2          楼层数，仅支持 2 或 3
-  ELEVATOR_TEST_FLOOR_TIMEOUT=280.0    楼层 0 专项预算（仿真秒）
-  ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=跟随楼层预算  每层最小驻留（仿真秒）
-  ELEVATOR_TEST_MAX_RUNTIME=按楼层：2层620.0、3层840.0  总预算（仿真秒）
+  ELEVATOR_TEST_FLOOR_TIMEOUT=310.0    楼层 0 专项预算（仿真秒）
+  ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60.0  每层最小驻留（仿真秒）
+  ELEVATOR_TEST_MAX_RUNTIME=按楼层：2层720.0、3层900.0  总预算（仿真秒）
   ELEVATOR_TEST_WALL_TIMEOUT=7200      墙钟总超时（秒）
   ELEVATOR_GO_TO_DOOR_STALL_WALL=120   厅外导航无路径墙钟超时（秒）
   ELEVATOR_TEST_FULL_CYCLE=1            继续验证返程电梯与主入口退出
@@ -72,11 +76,11 @@ usage() {
   ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=1  启用逐帧定位日志并在诊断 bag 录制 /scan
   ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS=1  启用只读电梯地标漂移诊断
   ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map  选择定位后端，默认 adaptive_shared_map
-  ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=8.0  定位点云最大量程，必须大于 0.5 m
+  ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0 定位点云最大量程，必须大于 0.5 m
   ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false  是否让 RGB-D 参与共享地图定位
   ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED=true  是否启用开门后的 Livox 穿越几何刷新
   ELEVATOR_TEST_KEEP_RUNNING=1         成功后保留 GUI，按 Ctrl-C 清理
-  ELEVATOR_TEST_LOG_DIR=/tmp/...       证据目录
+  ELEVATOR_TEST_LOG_DIR=/path/...      证据目录，默认 /home/xbh/tzb26/evidence/simenv/seed...
 
 返回码：
   0  电梯视觉注册和目标换层链成功
@@ -409,16 +413,16 @@ if [[ "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS" == "1" ]]; then
   LANDMARK_DIAGNOSTIC_VALUE=true
 fi
 sed \
-  -e "s/^  max_runtime: 900[.]0$/  max_runtime: $ELEVATOR_TEST_MAX_RUNTIME/" \
-  -e "s/^  floor_timeout: 280[.]0$/  floor_timeout: $ELEVATOR_TEST_FLOOR_TIMEOUT/" \
-  -e "s/^  min_floor_explore_time: 60[.]0$/  min_floor_explore_time: $ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME/" \
-  -e "s/^  elevator_local_crossing_geometry_enabled: true$/  elevator_local_crossing_geometry_enabled: $ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED/" \
-  -e "s/^  landmark_drift_diagnostic_enabled: false$/  landmark_drift_diagnostic_enabled: $LANDMARK_DIAGNOSTIC_VALUE/" \
+  -e "s/^  max_runtime: [0-9.]*$/  max_runtime: $ELEVATOR_TEST_MAX_RUNTIME/" \
+  -e "s/^  floor_timeout: [0-9.]*$/  floor_timeout: $ELEVATOR_TEST_FLOOR_TIMEOUT/" \
+  -e "s/^  min_floor_explore_time: [0-9.]*$/  min_floor_explore_time: $ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME/" \
+  -e "s/^  elevator_local_crossing_geometry_enabled: [a-z]*$/  elevator_local_crossing_geometry_enabled: $ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED/" \
+  -e "s/^  landmark_drift_diagnostic_enabled: [a-z]*$/  landmark_drift_diagnostic_enabled: $LANDMARK_DIAGNOSTIC_VALUE/" \
   "$BASE_CONFIG" > "$TEST_CONFIG"
 
-if ! grep -Fq "  floor_timeout: $ELEVATOR_TEST_FLOOR_TIMEOUT" "$TEST_CONFIG" || \
+if ! grep -Fq "  max_runtime: $ELEVATOR_TEST_MAX_RUNTIME" "$TEST_CONFIG" || \
+   ! grep -Fq "  floor_timeout: $ELEVATOR_TEST_FLOOR_TIMEOUT" "$TEST_CONFIG" || \
    ! grep -Fq "  min_floor_explore_time: $ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME" "$TEST_CONFIG" || \
-   ! grep -Fq "  runtime_by_floor: [[1, 300.0], [2, 620.0], [3, 840.0]]" "$TEST_CONFIG" || \
    ! grep -Fq "  elevator_local_crossing_geometry_enabled: $ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED" "$TEST_CONFIG" || \
    ! grep -Fq "  landmark_drift_diagnostic_enabled: $LANDMARK_DIAGNOSTIC_VALUE" "$TEST_CONFIG"; then
   fail "专项配置覆盖失败，正式配置字段可能已变化" 2

@@ -38,6 +38,21 @@ STUCK = "stuck"
 IDLE = "idle"
 
 
+@dataclass(frozen=True)
+class PathProgressSnapshot:
+    """任务规划使用的线程安全路径进度，不依赖诊断字典。"""
+
+    active: bool
+    remaining_distance: float | None
+    final_goal: tuple[float, float] | None
+    final_heading: float | None
+    path_reason: str | None
+    status: str
+    status_sequence: int
+    path_generation: int
+    terminal_pending: bool
+
+
 @dataclass
 class PathFollower:
     """维护一条活动路径并以非阻塞 tick 产生速度指令。
@@ -55,6 +70,7 @@ class PathFollower:
     max_lateral: float = 0.25
     max_angular: float = 1.2
     min_linear_fraction: float = 0.35
+    arc_turn_min_linear_fraction: float = 0.0
     goal_tolerance: float = 0.35
     waypoint_tolerance: float = 0.25
     corner_tolerance: float = 0.15
@@ -101,12 +117,15 @@ class PathFollower:
     _last_yaw_time: float | None = field(default=None, init=False)
     _debug_yaw_rate: float | None = field(default=None, init=False)
     _debug_route_progress: float | None = field(default=None, init=False)
+    _route_remaining: float | None = field(default=None, init=False)
+    _path_reason: str | None = field(default=None, init=False)
     _debug_turn_in_place: bool = field(default=False, init=False)
     _pose_provider: object | None = field(default=None, init=False)
     _tracking_status: str = field(default="IDLE", init=False)
     _terminal_pending: bool = field(default=False, init=False)
     _terminal_reason: str | None = field(default=None, init=False)
     _status_sequence: int = field(default=0, init=False)
+    _path_generation: int = field(default=0, init=False)
     _turn_in_place_active: bool = field(default=False, init=False)
     _turn_release_count: int = field(default=0, init=False)
     _control_decision_count: int = field(default=0, init=False)
@@ -224,6 +243,8 @@ class PathFollower:
             not all(math.isfinite(float(value)) and float(value) >= 0.0 for value in nonnegative)
             or not math.isfinite(float(self.min_linear_fraction))
             or not 0.0 <= float(self.min_linear_fraction) <= 1.0
+            or not math.isfinite(float(self.arc_turn_min_linear_fraction))
+            or not 0.0 <= float(self.arc_turn_min_linear_fraction) <= 1.0
             or not math.isfinite(float(self.reverse_speed))
             or float(self.reverse_speed) > 0.0
             or self.goal_tolerance <= 0.0
@@ -327,6 +348,8 @@ class PathFollower:
         # 显示一条从未生效的 reason。校验失败路径的归因由 stop("invalid_path")
         # 经 _debug_zero_command_reason 记录。
         self._debug_replan_reason = str(reason)
+        self._path_reason = str(reason)
+        self._route_remaining = None
         self._recover_phase = "idle"
         self._recover_until = 0.0
         self._waypoint_index = 0
@@ -342,6 +365,7 @@ class PathFollower:
         self._terminal_pending = False
         self._terminal_reason = None
         self._status_sequence += 1
+        self._path_generation += 1
         self._path_max_linear = (
             max(0.0, float(max_linear)) if max_linear is not None else None
         )
@@ -368,6 +392,29 @@ class PathFollower:
     def has_path(self) -> bool:
         # 恢复/对准阶段由控制器自行完成，避免上层在转向尚未结束时同步重规划。
         return bool(self._path) or self._recover_phase != "idle" or self._align_state != "idle"
+
+    def planning_progress_snapshot(self) -> PathProgressSnapshot:
+        """返回提前规划所需的最小生产状态。"""
+        with self._command_transaction_lock:
+            final_goal = tuple(self._path[-1]) if self._path else None
+            final_heading = None
+            if len(self._path) >= 2:
+                for start, end in reversed(list(zip(self._path, self._path[1:]))):
+                    dx, dy = end[0] - start[0], end[1] - start[1]
+                    if math.hypot(dx, dy) > 1e-6:
+                        final_heading = math.atan2(dy, dx)
+                        break
+            return PathProgressSnapshot(
+                active=bool(self._path),
+                remaining_distance=self._route_remaining,
+                final_goal=final_goal,
+                final_heading=final_heading,
+                path_reason=self._path_reason,
+                status=self._tracking_status,
+                status_sequence=self._status_sequence,
+                path_generation=self._path_generation,
+                terminal_pending=self._terminal_pending,
+            )
 
     def current_segment(
         self,
@@ -426,6 +473,9 @@ class PathFollower:
         self._turn_in_place_active = False
         self._turn_release_count = 0
         self._tracking_status = "IDLE"
+        self._path_generation += 1
+        self._route_remaining = None
+        self._path_reason = None
         self._debug_replan_reason = str(reason)
         self._publish_path_diagnostics()
         self._stop_locked(reason=reason)
@@ -701,6 +751,7 @@ class PathFollower:
             return DONE
 
         route_remaining = self._remaining_path_distance(x, y)
+        self._route_remaining = float(route_remaining)
         self._debug_route_progress = round(route_remaining, 3)
         waypoint_advanced = (
             self._waypoint_index != self._last_progress_waypoint_index
@@ -741,7 +792,7 @@ class PathFollower:
         if self._path_max_lateral is not None:
             lateral_limit = min(lateral_limit, max(0.0, float(self._path_max_lateral)))
 
-        # 转向滞回：进入立即、退出需连续 3 个新鲜样本满足释放条件；
+        # 转向滞回：进入立即、退出需连续配置数量的新鲜样本满足释放条件；
         # yaw_rate 缺失/过期时禁止退出转向状态。
         abs_error = abs(yaw_error)
         if not self._turn_in_place_active:
@@ -779,12 +830,14 @@ class PathFollower:
             max_lateral=lateral_limit,
             max_angular=self.max_angular,
             min_linear_fraction=self.min_linear_fraction,
+            arc_turn_min_linear_fraction=self.arc_turn_min_linear_fraction,
             path_curvature=self._debug_path_curvature,
             nearest_obstacle_distance=self._nearest_obstacle_distance,
             obstacle_stop_distance=effective_stop_distance,
             obstacle_slow_distance=effective_slow_distance,
             measured_yaw_rate=yaw_rate if yaw_rate_valid else None,
             yaw_rate_damping=self.yaw_rate_damping,
+            turn_in_place_heading=self.turn_in_place_heading,
             turn_in_place_active=self._turn_in_place_active,
         )
         self._debug_turn_in_place = self._turn_in_place_active
@@ -1724,6 +1777,7 @@ def compute_tracking_command(
     max_lateral: float = 0.30,
     max_angular: float,
     min_linear_fraction: float = 0.25,
+    arc_turn_min_linear_fraction: float = 0.0,
     path_curvature: float | None = None,
     nearest_obstacle_distance: float | None = None,
     obstacle_stop_distance: float = 0.50,
@@ -1758,11 +1812,20 @@ def compute_tracking_command(
         if abs(angular) < deadband_omega:
             angular = sign * deadband_omega
     min_fraction = _clamp(float(min_linear_fraction), 0.0, 1.0)
+    arc_min_fraction = _clamp(
+        float(arc_turn_min_linear_fraction),
+        0.0,
+        1.0,
+    )
     abs_error = abs(yaw_error)
     normalized_error = min(1.0, abs_error / (math.pi / 2.0))
     yaw_scale = (1.0 - normalized_error) ** 2
     if abs_error <= 0.15:
         yaw_scale = max(min_fraction, yaw_scale)
+    elif abs_error < max(0.15, float(turn_in_place_heading)):
+        # 中等偏角仍允许 A1 以 v+omega 走弧线；这只是航向缩放下限，
+        # 后续曲率、前向障碍和最终地面支撑门仍可继续降速直至停车。
+        yaw_scale = max(arc_min_fraction, yaw_scale)
     elif abs_error >= math.pi / 2.0:
         # 保留极低爬行量以兼容不能响应纯角速度的 RL 控制器。
         yaw_scale = min(0.05, min_fraction)

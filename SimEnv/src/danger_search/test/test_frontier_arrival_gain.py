@@ -161,3 +161,30 @@ def test_last_floor_timeout_with_normal_gain_keeps_global_budget():
 
     assert decision.action == "CONTINUE"
     assert decision.reason_code == "last_floor_uses_global_budget"
+
+
+def test_compute_danger_approach_pose():
+    from danger_search.exploration_runtime import compute_danger_approach_pose
+    from danger_search.mapper import MultiFloorGridMap
+
+    grid = MultiFloorGridMap(
+        resolution=0.1,
+        width=10.0,
+        length=10.0,
+        origin_x=-5.0,
+        origin_y=-5.0,
+    ).floor(0)
+    grid.planning_layer[:, :] = 0  # FREE
+
+    # 机器人位于 (0.0, 0.0, 0.0)，红球位于 (0.0, 3.0)
+    # standoff_distance = 1.3，期望停靠在 (0.0, 1.7)，朝向 math.pi/2 (对准红球)
+    approach = compute_danger_approach_pose(
+        grid,
+        robot_pose=(0.0, 0.0, 0.0),
+        sphere_xy=(0.0, 3.0),
+        standoff_distance=1.3,
+    )
+    assert approach is not None
+    assert abs(approach[0] - 0.0) < 1e-3
+    assert abs(approach[1] - 1.7) < 1e-3
+    assert abs(approach[2] - 1.5707963) < 1e-3

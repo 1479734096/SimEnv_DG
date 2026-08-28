@@ -70,7 +70,7 @@ localization_diagnostics=1
 从工作区根目录执行：
 
 ```bash
-cd /home/xbh/tzb26/codeDG_rebuild
+cd /home/xbh/tzb26/codeDG/SimEnv
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
 ss -ltnp | rg ':11311\b' || true

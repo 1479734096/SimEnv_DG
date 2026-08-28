@@ -1,15 +1,16 @@
 # SimEnv 未完成问题与后续分层计划
 
-最后更新：2026-07-29
+最后更新：2026-08-28
 
 本文只保留未完成问题、执行顺序和验收门槛。已完成机制、失败尝试、数值证据和历史原因
-见 [fixed.md](fixed.md) 及 `../codeDG_rebuild/reports/`。
+见 [fixed.md](fixed.md) 及 `reports/`。
 
 ## 1. 当前检查点
 
 - 单层和双层 `0→1→0→home` 已完成多轮闭环。
 - 三层定向上行 `0→1→2` 已通过，完整 `0→1→2→0→home` 尚未通过。
-- 正式地面支撑门保持开启；`controller.max_linear=0.60 m/s` 是当前未封板阶段的冻结基线，不是永久速度上限。
+- 正式地面支撑门保持开启；`controller.max_linear=0.75 m/s` 是当前硬上限，
+  `boundary_hold_margin=0.40 m`，且前沿探索固定使用同步规划。未获得新安全证据前不得提速或缩小防坠边距。
 - 请求速度已成为停车表和 guard 的唯一索引；定位差分速度只用于三帧停稳确认和`1.0 m/s、2.0 s` 有界异常观察。
 - Stage17 已按用户明确决策完成工程验收，正式定位默认切换为 `adaptive_shared_map`；
   `rgbd_livox` 保留为显式回退，运行中禁止按任务阶段或离线真值动态切换。
@@ -27,6 +28,15 @@
 
 ## 2. 当前未完成边界
 
+- STAGE33 已完成主入口/0 层电梯稀疏静态锚点、定位与 Adaptive Shared Map
+  原子平移、电梯开口一次有界重试，以及正式/专项 runner `15.0 m` 默认量程。
+  静态测试与构建已通过，但按用户要求未运行 Gazebo 定向或完整闭环，不得宣称运行时效果已验证。
+- 下一次 `0→1→0→home` 闭环必须检查 `sparse_landmark_anchor_frozen`、
+  `sparse_landmark_relocalization_evaluated`、`sparse_landmark_correction_applied`、
+  `elevator_door_confirmation_retry_started/exhausted` 事件，并确认目标层显式开门、新 Livox 帧屏障和回执 epoch 均生效。
+- 官方文件哈希检查当前有 6 个不一致项：`docs/doors-and-elevator.md` 是本轮开始前已有的
+  暂存修改，其余 5 项已存在于 HEAD。按保护规则，在单独裁决前不能把当前工作树作为
+  合规迁移阶段提交或创建 `migration-layer-33` 标签。
 - 控制发送事务、传感器时间/frame 契约、内部话题精确白名单和正式启动确认继续保留；
   原 `ControlledSupportPermit` 及 publish generation 丢弃评估机制已因真实运行阻塞撤销。
 - 同 seed 三轮中一轮完成 `0→1→0→home`，一轮在返回电梯目标刷新后 A* 不可达，一轮受

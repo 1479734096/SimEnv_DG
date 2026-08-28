@@ -37,6 +37,13 @@ from danger_search.floor_transition_runtime import (
     FloorTransitionRuntime,
 )
 from danger_search.frontier import FloorTerminationEvidence, Frontier
+from danger_search.frontier_planning_runtime import (
+    MODE_NORMAL,
+    MODE_OPPORTUNISTIC,
+    MODE_PREFETCH,
+    FrontierPlanScope,
+    FrontierPlanningRuntime,
+)
 from danger_search.elevator_observation_runtime import ElevatorObservationRuntime
 from danger_search.exploration_runtime import (
     ExplorationBudgetInput,
@@ -73,6 +80,7 @@ from danger_search.mapper import (
     FREE,
     NEGATIVE,
     OCC,
+    UNKNOWN,
     VISITED,
     MultiFloorGridMap,
     NegativeClusterRecord,
@@ -93,7 +101,7 @@ from danger_search.mission_manager import (
 )
 from danger_search.mission_manager import MissionManager
 from danger_search.navigation_tasks import DONE, RUNNING, OpenDoorAndPass, TakeElevator, FAILED
-from danger_search.navigator import IDLE, STUCK
+from danger_search.navigator import IDLE, STUCK, PathProgressSnapshot
 from danger_search.planner import PlanResult, BUDGET_EXHAUSTED, astar_plan
 from danger_search.sensor_buffer import SensorBuffer
 from danger_search.return_home_planner import (
@@ -129,6 +137,8 @@ def _install_runtime_owners(manager):
     manager._floor_transition_runtime = FloorTransitionRuntime()
     manager._elevator_observation = ElevatorObservationRuntime()
     manager._exploration = ExplorationRuntime()
+    # 大量状态机单测验证既有同步分支；异步行为由专门用例显式开启。
+    manager.async_frontier_planning_enabled = False
     manager._return_home = ReturnHomeRuntime()
     manager._entry = InitialEntryRuntime()
     manager._perception_mapping = PerceptionMappingRuntime(
@@ -620,6 +630,94 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertEqual(
             manager._ground_support_gate.config.odometry_linear_deadband,
             0.05,
+        )
+
+    def test_async_frontier_planning_defaults_and_time_validation(self):
+        config = load_mission_config(
+            lambda name, default=None: (
+                "diagnostic" if name == "runtime/profile" else default
+            )
+        )
+        self.assertTrue(config.values["async_frontier_planning_enabled"])
+        self.assertEqual(config.values["opportunistic_replan_period"], 3.0)
+        self.assertEqual(config.values["frontier_preplan_min_lead"], 0.5)
+        self.assertEqual(config.values["frontier_preplan_max_lead"], 3.0)
+
+        def invalid_parameter(name, default=None):
+            if name == "runtime/profile":
+                return "diagnostic"
+            if name == "frontier/preplan_min_lead":
+                return 4.0
+            if name == "frontier/preplan_max_lead":
+                return 3.0
+            return default
+
+        with self.assertRaisesRegex(ValueError, "异步前沿规划时间参数无效"):
+            load_mission_config(invalid_parameter)
+
+    def test_async_frontier_scope_rejects_terminal_opportunity_but_keeps_prefetch(self):
+        manager = _make_test_manager()
+        manager.state = EXPLORE_FLOOR
+        manager.current_floor = 0
+        manager.current_task = None
+        manager._exploration.last_frontier_target = (2.0, 0.0)
+        constraints = manager._planning_constraints()
+        common = dict(
+            request_id=1,
+            floor=0,
+            map_epoch=manager._frontier_gain_map_epoch(),
+            localization_epoch=manager._ground_support.localization_epoch,
+            constraint_revision=getattr(constraints, "revision", 0),
+            path_sequence=7,
+            active_target=(2.0, 0.0),
+        )
+        running = PathProgressSnapshot(
+            True, 1.0, (2.0, 0.0), 0.0, "frontier_selected_path",
+            RUNNING, 9, 7, False,
+        )
+        terminal = PathProgressSnapshot(
+            True, 0.0, (2.0, 0.0), 0.0, "frontier_selected_path",
+            DONE, 10, 7, True,
+        )
+
+        self.assertTrue(
+            manager._frontier_plan_scope_current(
+                FrontierPlanScope(mode=MODE_OPPORTUNISTIC, **common), running
+            )
+        )
+        self.assertFalse(
+            manager._frontier_plan_scope_current(
+                FrontierPlanScope(mode=MODE_OPPORTUNISTIC, **common), terminal
+            )
+        )
+        self.assertTrue(
+            manager._frontier_plan_scope_current(
+                FrontierPlanScope(mode=MODE_PREFETCH, **common), terminal
+            )
+        )
+
+        idle_stopped = PathProgressSnapshot(
+            False, 0.0, None, 0.0, None,
+            "IDLE", 11, 7, False,
+        )
+        idle_terminal_pending = PathProgressSnapshot(
+            False, 0.0, None, 0.0, "main_entrance_clearance_completed",
+            "IDLE", 12, 7, True,
+        )
+        self.assertTrue(
+            manager._frontier_plan_scope_current(
+                FrontierPlanScope(mode=MODE_NORMAL, **common), idle_stopped
+            )
+        )
+        self.assertTrue(
+            manager._frontier_plan_scope_current(
+                FrontierPlanScope(mode=MODE_NORMAL, **common), idle_terminal_pending
+            )
+        )
+        self.assertFalse(
+            manager._frontier_plan_scope_current(
+                FrontierPlanScope(mode=MODE_NORMAL, **common), running
+            )
         )
 
     def test_external_sensor_topic_cannot_use_output_channel(self):
@@ -7616,6 +7714,131 @@ class ProgressMonitorDiagnosticOnlyTest(unittest.TestCase):
         # 尽管 filter_frontiers 返回空，select_frontier 仍被调用并选中 frontier
         self.assertIsNotNone(manager.current_frontier)
         self.assertEqual(manager.current_frontier.centroid, (5.0, 0.0))
+
+    def test_normal_frontier_astar_runs_in_background_before_install(self):
+        frontier = Frontier(cells=(), centroid=(3.0, 0.0), information_gain=0.0)
+        manager = self._make_explore_manager(frontiers_list=[frontier])
+        manager.async_frontier_planning_enabled = True
+        manager._frontier_planning = FrontierPlanningRuntime(
+            timeout=5.0,
+            preplan_min_lead=0.5,
+            preplan_max_lead=3.0,
+            opportunistic_period=3.0,
+        )
+        manager._frontier_plan_request_id = 0
+        manager._frontier_plan_timeout_logged = False
+        manager._prefetched_frontier_plan = None
+        worker = SimpleNamespace(
+            _fail_counts={},
+            last_selection_debug=None,
+            select_frontier=lambda *args, **kwargs: (
+                frontier,
+                [(0.0, 0.0), (3.0, 0.0)],
+            ),
+        )
+        manager.explorer.planning_copy = lambda: worker
+        manager.explorer.apply_planning_failure_deltas = lambda deltas: None
+        manager.explorer.is_blacklisted = lambda grid, target: False
+        installed = []
+        manager.controller.planning_progress_snapshot = lambda: PathProgressSnapshot(
+            active=False,
+            remaining_distance=None,
+            final_goal=None,
+            final_heading=None,
+            path_reason=None,
+            status=IDLE,
+            status_sequence=0,
+            path_generation=0,
+            terminal_pending=False,
+        )
+        manager.controller.set_path = lambda path, **kwargs: installed.append(
+            (list(path), kwargs.get("reason"))
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "MissionReportingRuntime",
+            SimpleNamespace(
+                loginfo=lambda *args, **kwargs: None,
+                logwarn=lambda *args, **kwargs: None,
+            ),
+        ), patch.object(mission_manager_module, "get_time", return_value=10.0):
+            manager._tick_explore((0.0, 0.0, 0.0))
+            self.assertEqual(installed, [])
+            deadline = time.monotonic() + 1.0
+            while not installed and time.monotonic() < deadline:
+                time.sleep(0.001)
+                manager._tick_explore((0.0, 0.0, 0.0))
+
+        self.assertEqual(installed[0][1], "frontier_selected_path")
+
+    def test_ready_prefetch_is_installed_when_old_frontier_reports_done(self):
+        old = Frontier(cells=((24, 20),), centroid=(2.0, 0.0), information_gain=5.0)
+        new = Frontier(cells=((30, 20),), centroid=(5.0, 0.0), information_gain=8.0)
+        manager = self._make_explore_manager(frontiers_list=[old, new])
+        manager.async_frontier_planning_enabled = True
+        manager.current_frontier = old
+        manager._exploration.last_frontier_target = old.centroid
+        manager._exploration.last_frontier_score = 1.0
+        manager._frontier_planning = FrontierPlanningRuntime(
+            timeout=5.0,
+            preplan_min_lead=0.5,
+            preplan_max_lead=3.0,
+            opportunistic_period=3.0,
+        )
+        manager._frontier_planning.route_eta = lambda remaining: 0.1
+        manager._frontier_plan_request_id = 0
+        manager._frontier_plan_timeout_logged = False
+        manager._prefetched_frontier_plan = None
+        worker = SimpleNamespace(
+            _fail_counts={},
+            last_selection_debug=None,
+            select_frontier=lambda *args, **kwargs: (
+                new,
+                [(2.0, 0.0), (5.0, 0.0)],
+            ),
+        )
+        manager.explorer.planning_copy = lambda: worker
+        manager.explorer.is_blacklisted = lambda grid, target: False
+        manager.explorer.apply_planning_failure_deltas = lambda deltas: None
+        # 让新候选在实时地图上仍保有未知邻域。
+        grid = manager.mapper.floor(0)
+        grid.set_base_state(30, 21, UNKNOWN)
+        installed = []
+        statuses = [RUNNING, DONE]
+        manager.controller.has_path = lambda: True
+        manager.controller.planning_progress_snapshot = lambda: PathProgressSnapshot(
+            active=True,
+            remaining_distance=0.1,
+            final_goal=(2.0, 0.0),
+            final_heading=0.0,
+            path_reason="frontier_selected_path",
+            status=RUNNING,
+            status_sequence=1,
+            path_generation=1,
+            terminal_pending=False,
+        )
+        manager.controller.poll_status = lambda: statuses.pop(0)
+        manager.controller.set_path = lambda path, **kwargs: installed.append(
+            (list(path), kwargs.get("reason"))
+        )
+
+        with patch.object(
+            mission_manager_module,
+            "MissionReportingRuntime",
+            SimpleNamespace(
+                loginfo=lambda *args, **kwargs: None,
+                logwarn=lambda *args, **kwargs: None,
+            ),
+        ), patch.object(mission_manager_module, "get_time", return_value=10.0):
+            manager._tick_explore((2.0, 0.0, 0.0))
+            deadline = time.monotonic() + 1.0
+            while not installed and time.monotonic() < deadline:
+                time.sleep(0.001)
+                manager._tick_explore((2.0, 0.0, 0.0))
+
+        self.assertEqual(installed[0][1], "frontier_prefetched_path")
+        self.assertEqual(manager.current_frontier, new)
 
     def test_active_path_skips_unused_frontier_extraction_before_soft_budget(self):
         manager = self._make_explore_manager()

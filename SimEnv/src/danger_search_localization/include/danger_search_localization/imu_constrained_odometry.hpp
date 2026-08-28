@@ -486,6 +486,25 @@ class ImuConstrainedOdometry {
     return last_translation_;
   }
 
+  /// 将当前局部地图和最后提交位姿作为一个事务平移到同一 world 坐标。
+  bool TranslatePlanar(const Eigen::Vector2d &correction) {
+    if (!initialized_ || !correction.allFinite()) {
+      return false;
+    }
+    PointMap translated;
+    translated.reserve(map_points_.size());
+    for (const auto &item : map_points_) {
+      Eigen::Vector3d point = item.second;
+      point.head<2>() += correction;
+      translated.try_emplace(KeyFor(point, config_.map_voxel_size), point);
+    }
+    map_points_ = std::move(translated);
+    last_translation_.head<2>() += correction;
+    ++map_generation_;
+    RebuildSearchIndex();
+    return true;
+  }
+
  private:
   struct GridKey {
     int x;
@@ -640,6 +659,10 @@ class ImuConstrainedOdometry {
         ++item;
       }
     }
+    RebuildSearchIndex();
+  }
+
+  void RebuildSearchIndex() {
     search_points_.clear();
     search_points_.reserve(map_points_.size());
     search_cloud_->clear();

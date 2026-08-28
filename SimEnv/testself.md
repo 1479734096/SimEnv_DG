@@ -2,7 +2,7 @@
 
 ## 1. 测试前准备
 
-cd /home/xbh/tzb26/codeDG_rebuild
+cd /home/xbh/tzb26/codeDG/SimEnv
 
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
@@ -15,17 +15,21 @@ ss -ltnp | rg ':11311\b' || true
 
 catkin_make --pkg danger_search danger_search_localization -j4
 
-Python 回归：
+Python 回归测试：
 
-python3 -m pytest src/danger_search/test -q
+PYTHONPATH=/opt/ros/noetic/lib/python3/dist-packages:src/danger_search \
+pytest -o cache_dir=/tmp/.pytest_cache src/danger_search/test/
 
 ## 2. 启动常用测试
 
-### 两层快速上行
+### 方式一：一键自动化测试（推荐，runner 自动交互与监控）
+
+#### 两层快速上行
 
 只验证入口、电梯注册和 0→1：
 
-EVIDENCE_DIR=/tmp/elevator_seed42_up
+```bash
+EVIDENCE_DIR="/home/xbh/tzb26/evidence/simenv/elevator_seed42_up_$(date +%Y%m%d_%H%M%S)"
 
 SEED=42 \
 GUI=true \
@@ -36,113 +40,98 @@ ELEVATOR_TEST_MAX_RUNTIME=180 \
 ELEVATOR_TEST_FULL_CYCLE=0 \
 ELEVATOR_TEST_LOG_DIR="$EVIDENCE_DIR" \
 tools/sim/run_elevator_gui_test.sh
+```
 
-### 两层完整往返
+#### 当前固定验收：seed=8127 两层全周期闭环（STAGE33 标准验收）
 
-验证 0→1→0→home：
+目标：`进门 → 0 层探索与危险源识别 → 0→1 → 1 层探索与危险源识别 → 1→0 → 出门 → 原路返航回起点 → 写出 detected_danger.json → success`。
+专项 runner 会通过 FIFO 自动发送 `2`（站立）和 `6`（RL `/cmd_vel`），并在日志确认控制器就绪后才启动正式任务。
 
-EVIDENCE_DIR=/tmp/elevator_seed6946_full
+**推荐标准测试命令（证据持久化至 `/home/xbh/tzb26/evidence/simenv/`）**：
 
-SEED=6946 \
+```bash
+EVIDENCE_DIR="/home/xbh/tzb26/evidence/simenv/seed8127_2floor_new_$(date +%Y%m%d_%H%M%S)"
+
+SEED=8127 \
 GUI=true \
 ELEVATOR_TEST_FLOOR_COUNT=2 \
-ELEVATOR_TEST_FLOOR_TIMEOUT=33 \
-ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=5 \
-ELEVATOR_TEST_MAX_RUNTIME=180 \
-ELEVATOR_TEST_FULL_CYCLE=1 \
-ELEVATOR_TEST_LOG_DIR="$EVIDENCE_DIR" \
-tools/sim/run_elevator_gui_test.sh
-
-### 当前阶段：seed=8127 两层长时闭环
-
-这是当前“建图语义与任务编排”阶段的唯一固定验收命令，目标是
-`进门 → 0 层探索 → 0→1 → 1 层探索 → 1→0 → 出门 → 回起点 → success`。
-必须通过 `tools/sim/run_elevator_gui_test.sh` 启动。不要直接后台运行
-`auto.sh`：专项 runner 会通过 FIFO 自动发送 `2`（站立）和 `6`（RL `/cmd_vel`），
-并在日志确认控制器就绪后才启动正式任务，不需要 tmux、expect 或手工按键。
-
-先创建新的、空的证据目录：
-
-```bash
-RUN_DIR="$(mktemp -d /tmp/seed8127_closed_loop_XXXXXXXX)"
-```
-
-正式命令：
-
-```bash
-SEED=8127 \
-GUI=false \
-ELEVATOR_TEST_FLOOR_COUNT=2 \
-ELEVATOR_TEST_FLOOR_TIMEOUT=280 \
-ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
-ELEVATOR_TEST_MAX_RUNTIME=620 \
-ELEVATOR_TEST_WALL_TIMEOUT=9000 \
-ELEVATOR_GO_TO_DOOR_STALL_WALL=1200 \
+ELEVATOR_TEST_FLOOR_TIMEOUT=280.0 \
+ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60.0 \
+ELEVATOR_TEST_MAX_RUNTIME=620.0 \
 ELEVATOR_TEST_FULL_CYCLE=1 \
 ELEVATOR_TEST_RECORD_DRIFT=1 \
-ELEVATOR_TEST_RECORD_RGBD=0 \
-ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=0 \
-ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=1 \
-ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS=0 \
-ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map \
-ELEVATOR_TEST_KEEP_RUNNING=0 \
-ELEVATOR_TEST_LOG_DIR="$RUN_DIR" \
+ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 \
+ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0 \
+ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false \
+ELEVATOR_TEST_LOG_DIR="$EVIDENCE_DIR" \
 tools/sim/run_elevator_gui_test.sh
 ```
 
-运行硬门：
+**单行复制即用**：
 
-- `auto.log` 依次出现关节反馈就绪、fixed stand、`Entered RL /cmd_vel mode.`；
-- `mission.log` 出现新的正式任务状态；
-- `elevator_diagnostic.bag.active` 持续增长，结束后 `rosbag info` 必须含 `/scan`，
-  频率约为 10 Hz 且覆盖任务时段；
-- 运行图审计确认 `/cmd_vel` 只有 `/danger_search` publisher，生产节点无 truth、
-  `/Odometry_gazebo` 或禁用文件输入。
+```bash
+EVIDENCE_DIR="/home/xbh/tzb26/evidence/simenv/seed8127_2floor_new_$(date +%Y%m%d_%H%M%S)" && SEED=8127 GUI=true ELEVATOR_TEST_FLOOR_COUNT=2 ELEVATOR_TEST_FLOOR_TIMEOUT=280.0 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60.0 ELEVATOR_TEST_MAX_RUNTIME=620.0 ELEVATOR_TEST_FULL_CYCLE=1 ELEVATOR_TEST_RECORD_DRIFT=1 ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0 ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false ELEVATOR_TEST_LOG_DIR="$EVIDENCE_DIR" tools/sim/run_elevator_gui_test.sh
+```
 
-出现任务显式失败、进程退出或 runner 终局时立即收尾；确定性算法失败不追加 seed、
-不现场改代码。基础设施启动失败清理后最多用完全相同配置重试一次。
+双锚点、开口重试和返航闭环的结构化事件验收口径见
+[`docs/team/RUNBOOK.md`](docs/team/RUNBOOK.md) 的“STAGE33 双锚点与电梯重试验收”。
 
-本次最新实测（2026-08-06）证据目录为
-`/tmp/seed8127_closed_loop_0Q1At51C`：控制器和任务启动正常，电梯视觉注册成功，
-但 `TakeElevator(0->1)` 的 `GO_TO_ELEVATOR_DOOR`/`TRACE_APPROACH` 连续 A* 不可达，
-未形成二层闭环；这是算法失败，不是启动失败。该目录保留 `mission.log`、`auto.log`、
-`scan_bag_info.txt`、`mission_timing.json`、`key_events.log` 和 `evidence.sha256`。
-
-本轮地图生命周期复测时还必须检查以下结构化字段：
-
-- `MapperDebugSnapshot` 的 `low_candidate_core_count`、
-  `low_confirmed_core_count`、`hard_core_count`、`low_core_removed_count`；
-- `elevator_navigation_plan.reason_code` 与 `blocker`，区分
-  `start_cell_obstacle_core`、`start_obstacle_owner_scope_mismatch`、
-  `obstacle_inflation_escape_unreachable`、`start_cell_planning_veto` 和普通
-  `open_set_exhausted`；
-- 若起点处于派生 OCC，确认路径只通过认证退出前缀离开，退出后没有重入，也没有
-  修改正式 `FloorGrid`；
-- 单帧 `LOW_CANDIDATE` 不得表现为 OCC，只有不同代次和不同观测位姿确认后才允许
-  晋升；严格射线反证撤销后应恢复原基础状态。
-
-### 三层完整闭环
+#### 三层完整闭环
 
 验证 0→1→2→0→home：
 
-EVIDENCE_DIR=/tmp/elevator_seed8127_three_floor
+```bash
+EVIDENCE_DIR="/home/xbh/tzb26/evidence/simenv/elevator_seed8127_three_floor_$(date +%Y%m%d_%H%M%S)"
 
 SEED=8127 \
 GUI=true \
 ELEVATOR_TEST_FLOOR_COUNT=3 \
-ELEVATOR_TEST_FLOOR_TIMEOUT=280 \
-ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
-ELEVATOR_TEST_MAX_RUNTIME=840 \
+ELEVATOR_TEST_FLOOR_TIMEOUT=330.0 \
+ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60.0 \
+ELEVATOR_TEST_MAX_RUNTIME=840.0 \
 ELEVATOR_TEST_FULL_CYCLE=1 \
 ELEVATOR_TEST_WALL_TIMEOUT=1800 \
 ELEVATOR_TEST_LOG_DIR="$EVIDENCE_DIR" \
 tools/sim/run_elevator_gui_test.sh
+```
+
+---
+
+### 方式二：赛方原生 auto.sh 双终端测试（手动/分布式调试）
+
+#### 终端 1：启动仿真环境与物理底盘
+```bash
+cd /home/xbh/tzb26/codeDG/SimEnv
+source /opt/ros/noetic/setup.bash
+source devel/setup.bash
+
+# 启动 2 层仿真场景；正式生产链不需要发布真值
+SEED=8127 FLOOR_COUNT=2 GUI=true ENABLE_GROUND_TRUTH=0 ./auto.sh
+```
+> **终端 1 键盘操作**：
+> 1. Gazebo 机器人加载后，输入 **`2`** 并回车（进入 fixed stand 站立姿态）；
+> 2. 站立平稳后，输入 **`6`** 并回车（进入 RL `/cmd_vel` 控制模式）。
+
+#### 终端 2：启动自主搜索算法
+```bash
+cd /home/xbh/tzb26/codeDG/SimEnv
+source /opt/ros/noetic/setup.bash
+source devel/setup.bash
+
+# 启动参赛核心算法节点
+roslaunch danger_search danger_search.launch \
+  controller_ready_ack:=true \
+  localization_max_range:=15.0 \
+  adaptive_rgbd_localization_enabled:=false
+```
+
+---
 
 证据目录必须不存在或为空。不要重复使用旧目录。
 
 ## 3. 需要定位诊断时
 
-EVIDENCE_DIR=/tmp/elevator_seed8127_diagnostic
+EVIDENCE_DIR="/home/xbh/tzb26/evidence/simenv/elevator_seed8127_diagnostic_$(date +%Y%m%d_%H%M%S)"
 
 SEED=8127 \
 GUI=true \
@@ -160,9 +149,9 @@ tools/sim/run_elevator_gui_test.sh
 
 ## 4. 运行时怎么看日志
 
-另开终端，设置同一个目录：
+另开终端，设置同一个目录（以实际生成的 EVIDENCE_DIR 为准）：
 
-EVIDENCE_DIR=/tmp/elevator_seed8127_diagnostic
+EVIDENCE_DIR="/home/xbh/tzb26/evidence/simenv/seed8127_2floor_new_xxx"
 
 看启动、Gazebo 和控制器：
 
@@ -393,4 +382,4 @@ ss -ltnp | rg ':11311\b' || true
 读取 `mission.log` 的最后一个算法事件，区分“确定性算法失败后中止”和“未到失败点的
 基础设施中止”。
 
-完整工具说明已写在 codeDG_rebuild/tools/usetools.md:1。
+完整工具说明已写在 tools/usetools.md。

@@ -21,6 +21,7 @@ from danger_search.perception_runtime import PerceptionRuntime
 from danger_search.perception_mapping_runtime import PerceptionMappingRuntime
 from danger_search.pose_provider import PoseProvider
 from danger_search.progress_monitor import ProgressMonitor
+from danger_search.sparse_landmark_relocalizer import SparseLandmarkRelocalizer
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class MissionRuntimeComponents:
     """
 
     landmark_drift_monitor: LandmarkDriftMonitor
+    landmark_relocalizer: SparseLandmarkRelocalizer
     reporting: MissionReportingRuntime
     perception: PerceptionRuntime
     pose_provider: PoseProvider
@@ -63,6 +65,9 @@ class MissionRuntimeComponents:
         landmark_drift_monitor = LandmarkDriftMonitor(
             localization_config["landmark_drift_config"]
         )
+        landmark_relocalizer = SparseLandmarkRelocalizer(
+            localization_config["sparse_relocalization_config"]
+        )
         reporting = MissionReportingRuntime(
             result_file=output["result_file"],
             mission_summary_file=output["mission_summary_file"],
@@ -76,7 +81,13 @@ class MissionRuntimeComponents:
             depth_topic=topics["depth_topic"],
             camera_info_topic=topics["camera_info_topic"],
         )
-        pose_provider = PoseProvider(topics["localization_odom_topic"])
+        pose_provider = PoseProvider(
+            topics["localization_odom_topic"],
+            correction_request_topic=topics[
+                "localization_correction_request_topic"
+            ],
+            correction_state_topic=topics["localization_correction_state_topic"],
+        )
         localization = LocalizationRuntime(
             pose_provider,
             stale_minimum=localization_config["localization_stale_minimum"],
@@ -152,6 +163,7 @@ class MissionRuntimeComponents:
         )
         return cls(
             landmark_drift_monitor=landmark_drift_monitor,
+            landmark_relocalizer=landmark_relocalizer,
             reporting=reporting,
             perception=perception,
             pose_provider=pose_provider,

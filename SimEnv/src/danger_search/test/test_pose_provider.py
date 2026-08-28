@@ -80,6 +80,27 @@ class PoseProviderTest(unittest.TestCase):
         self.assertEqual(provider.continuity_epoch, 3)
         self.assertEqual([item.stamp for item in provider._samples], [1.0])
 
+    def test_correction_ack_advances_epoch_and_discards_old_coordinate_samples(self):
+        provider = PoseProvider("/danger_search/localization/odom", max_samples=8)
+        for stamp in (1.0, 2.0, 3.0):
+            provider._on_odometry(_odometry(stamp))
+        message = SimpleNamespace(
+            header=SimpleNamespace(
+                seq=7,
+                frame_id="world",
+                stamp=SimpleNamespace(to_sec=lambda: 2.5),
+            ),
+            vector=_vector(x=0.3, y=-0.2),
+        )
+
+        provider._on_correction_state(message)
+
+        self.assertEqual(provider.continuity_epoch, 2)
+        self.assertEqual(provider.correction_ack(7), (0.3, -0.2, 2.5))
+        self.assertEqual([item.stamp for item in provider._samples], [3.0])
+        provider._on_correction_state(message)
+        self.assertEqual(provider.continuity_epoch, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -73,6 +73,7 @@ INTERNAL_INPUT_TOPICS = frozenset(
         "/danger_search/localization/cloud_registered",
         "/danger_search/localization/health",
         "/danger_search/localization/ready",
+        "/danger_search/localization/correction_state",
     }
 )
 
@@ -83,6 +84,7 @@ INTERNAL_OUTPUT_TOPICS = frozenset(
         "/danger_search/path_raw",
         "/danger_search/path_followed",
         "/danger_search/local_target",
+        "/danger_search/localization/correction_request",
     }
 )
 

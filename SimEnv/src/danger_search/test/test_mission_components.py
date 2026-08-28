@@ -41,6 +41,7 @@ def _injected_components():
     perception = SimpleNamespace(sensor_buffer=SimpleNamespace())
     return MissionRuntimeComponents(
         landmark_drift_monitor=SimpleNamespace(),
+        landmark_relocalizer=SimpleNamespace(),
         reporting=SimpleNamespace(),
         perception=perception,
         pose_provider=None,

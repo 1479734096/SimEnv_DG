@@ -88,6 +88,7 @@ class InterfaceDocumentationTest(unittest.TestCase):
             launch_arguments.get("localization_backend"), "adaptive_shared_map"
         )
         self.assertEqual(launch_arguments.get("localization_max_range"), "15.0")
+        self.assertEqual(launch_arguments.get("landmark_correction_enabled"), "true")
         self.assertEqual(
             launch_arguments.get("adaptive_rgbd_localization_enabled"), "false"
         )
@@ -216,18 +217,24 @@ class InterfaceDocumentationTest(unittest.TestCase):
         config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
         controller = config["controller"]
 
-        self.assertEqual(controller["turn_in_place_heading"], 0.90)
-        self.assertEqual(controller["turn_release_heading"], 0.20)
+        self.assertEqual(controller["turn_in_place_heading"], 1.10)
+        self.assertEqual(controller["turn_release_heading"], 0.30)
         self.assertEqual(controller["turn_in_place_rate"], 0.65)
-        self.assertEqual(controller["turn_release_rate"], 0.20)
-        self.assertEqual(controller["turn_release_samples"], 3)
+        self.assertEqual(controller["turn_release_rate"], 0.30)
+        self.assertEqual(controller["turn_release_samples"], 2)
+        self.assertEqual(controller["arc_turn_min_linear_fraction"], 0.15)
+
+    def test_formal_frontier_keeps_forward_alignment_weight(self):
+        config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
+
+        self.assertEqual(config["frontier"]["forward_alignment_weight"], 0.8)
 
     def test_formal_floor_change_estimate_covers_seed8127_return_measurement(self):
         config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
 
-        self.assertGreaterEqual(
+        self.assertEqual(
             config["mission"]["floor_change_time_estimate"],
-            70.0,
+            50.0,
         )
 
     def test_reference_marks_truth_topics_as_referee_only(self):

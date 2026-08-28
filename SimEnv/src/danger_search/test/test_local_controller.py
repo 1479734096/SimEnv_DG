@@ -15,6 +15,23 @@ from danger_search.navigator import PathFollower, compute_tracking_command, RUNN
 
 
 class LocalControllerTest(unittest.TestCase):
+    def test_planning_progress_snapshot_is_production_state_not_debug_dictionary(self):
+        follower = PathFollower(cmd_vel_topic="/cmd_vel")
+        follower.set_path(
+            [(0.0, 0.0), (1.0, 0.0), (2.0, 1.0)],
+            reason="frontier_selected_path",
+        )
+        follower.tick((0.0, 0.0, 0.0))
+
+        snapshot = follower.planning_progress_snapshot()
+
+        self.assertTrue(snapshot.active)
+        self.assertGreater(snapshot.remaining_distance, 0.0)
+        self.assertEqual(snapshot.final_goal, (2.0, 1.0))
+        self.assertAlmostEqual(snapshot.final_heading, math.pi / 4.0)
+        self.assertEqual(snapshot.path_reason, "frontier_selected_path")
+        self.assertFalse(snapshot.terminal_pending)
+
     def test_control_and_diagnostic_topics_are_direction_checked(self):
         with self.assertRaises(ValueError):
             PathFollower(cmd_vel_topic="/scan")
@@ -26,6 +43,11 @@ class LocalControllerTest(unittest.TestCase):
             PathFollower(cmd_vel_topic="/cmd_vel", max_linear=math.nan)
         with self.assertRaises(ValueError):
             PathFollower(cmd_vel_topic="/cmd_vel", obstacle_slow_distance=0.4)
+        with self.assertRaises(ValueError):
+            PathFollower(
+                cmd_vel_topic="/cmd_vel",
+                arc_turn_min_linear_fraction=-0.1,
+            )
 
     def test_large_yaw_error_enters_turn_in_place(self):
         # 大航向误差（86°）超过先对准阈值：禁止前进与侧移，只输出转向。
@@ -212,6 +234,51 @@ class LocalControllerTest(unittest.TestCase):
 
         self.assertGreater(abs(angular), 0.99)
         self.assertLessEqual(linear_x, 0.24)
+
+    def test_balanced_arc_floor_keeps_large_non_terminal_turn_moving(self):
+        positive, _, _ = compute_tracking_command(
+            1.09,
+            max_linear=0.80,
+            max_lateral=0.01,
+            max_angular=1.2,
+            arc_turn_min_linear_fraction=0.15,
+            turn_in_place_heading=1.10,
+        )
+        negative, _, _ = compute_tracking_command(
+            -1.09,
+            max_linear=0.80,
+            max_lateral=0.01,
+            max_angular=1.2,
+            arc_turn_min_linear_fraction=0.15,
+            turn_in_place_heading=1.10,
+        )
+
+        self.assertAlmostEqual(positive, 0.12)
+        self.assertAlmostEqual(negative, positive)
+
+    def test_arc_floor_never_overrides_curvature_or_obstacle_safety(self):
+        curved, _, _ = compute_tracking_command(
+            1.09,
+            max_linear=0.80,
+            max_angular=1.2,
+            arc_turn_min_linear_fraction=0.15,
+            turn_in_place_heading=1.10,
+            path_curvature=10.0,
+        )
+        blocked, _, angular = compute_tracking_command(
+            1.09,
+            max_linear=0.80,
+            max_angular=1.2,
+            arc_turn_min_linear_fraction=0.15,
+            turn_in_place_heading=1.10,
+            nearest_obstacle_distance=0.40,
+            obstacle_stop_distance=0.40,
+            obstacle_slow_distance=0.60,
+        )
+
+        self.assertLess(curved, 0.12)
+        self.assertEqual(blocked, 0.0)
+        self.assertGreater(angular, 0.0)
 
     def test_curvature_and_forward_obstacle_jointly_limit_speed(self):
         straight, _, _ = compute_tracking_command(
@@ -960,6 +1027,45 @@ class FixedFrequencyControllerTest(unittest.TestCase):
         )
         self.assertTrue(heading_follower._turn_in_place_active)
         self.assertEqual(heading_follower.requested_command_snapshot()[0], 0.0)
+
+    def test_balanced_profile_expands_arc_and_releases_after_two_fresh_samples(self):
+        follower = PathFollower(
+            cmd_vel_topic="/cmd_vel",
+            turn_in_place_heading=1.10,
+            turn_in_place_rate=0.65,
+            turn_release_heading=0.30,
+            turn_release_rate=0.30,
+            turn_release_samples=2,
+            arc_turn_min_linear_fraction=0.15,
+        )
+        follower.set_path([(0.0, 0.0), (10.0, 0.0)])
+
+        follower.step_once_for_test(
+            self._sample((0.0, 0.0, -1.00), yaw_rate=0.10)
+        )
+        self.assertFalse(follower._turn_in_place_active)
+        self.assertGreaterEqual(follower.requested_command_snapshot()[0], 0.12)
+
+        follower.step_once_for_test(
+            self._sample((0.0, 0.0, -1.12), yaw_rate=0.10)
+        )
+        self.assertTrue(follower._turn_in_place_active)
+        self.assertEqual(follower.requested_command_snapshot()[0], 0.0)
+
+        follower.step_once_for_test(
+            self._sample((0.0, 0.0, -0.25), yaw_rate=0.20)
+        )
+        self.assertTrue(follower._turn_in_place_active)
+        follower.step_once_for_test(
+            self._sample((0.0, 0.0, -0.25), yaw_rate=math.nan)
+        )
+        self.assertTrue(follower._turn_in_place_active)
+        for _ in range(2):
+            follower.step_once_for_test(
+                self._sample((0.0, 0.0, -0.25), yaw_rate=0.20)
+            )
+        self.assertFalse(follower._turn_in_place_active)
+        self.assertGreater(follower.requested_command_snapshot()[0], 0.0)
 
     def test_pose_stale_publishes_zero_and_freezes_stuck(self):
         # pose 过期：立即零速，且不触发 STUCK（冻结进度计时）。

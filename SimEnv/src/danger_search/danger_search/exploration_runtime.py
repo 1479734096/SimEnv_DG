@@ -754,3 +754,48 @@ class ExplorationRuntime:
                 int(last["confirmed_dangers"]) - int(first["confirmed_dangers"])
             ) / elapsed,
         }
+
+
+def compute_danger_approach_pose(
+    grid: FloorGrid,
+    robot_pose: tuple[float, float, float],
+    sphere_xy: tuple[float, float],
+    standoff_distance: float = 1.3,
+) -> tuple[float, float, float] | None:
+    """计算前往远距离危险源近场核验的合法安全停靠位姿 (x, y, yaw)。"""
+    rx, ry, _ = robot_pose
+    sx, sy = sphere_xy
+    dx = sx - rx
+    dy = sy - ry
+    dist = math.hypot(dx, dy)
+    if dist <= standoff_distance or not math.isfinite(dist) or dist <= 1e-3:
+        return None
+
+    # 沿机器人到红球方向，在距红球 standoff_distance 处停机
+    ratio = (dist - standoff_distance) / dist
+    target_x = rx + dx * ratio
+    target_y = ry + dy * ratio
+    target_yaw = math.atan2(dy, dx)
+
+    # 校验栅格地图合法性与可通行性
+    target_cell = grid.world_to_grid(target_x, target_y)
+    if target_cell is None:
+        return None
+    cell_val = grid.data[target_cell[1], target_cell[0]]
+    if cell_val not in (FREE, VISITED):
+        best_pos = None
+        min_d = float("inf")
+        for ox in (-0.2, 0.0, 0.2):
+            for oy in (-0.2, 0.0, 0.2):
+                cx, cy = target_x + ox, target_y + oy
+                c_cell = grid.world_to_grid(cx, cy)
+                if c_cell is not None and grid.data[c_cell[1], c_cell[0]] in (FREE, VISITED):
+                    d_cur = math.hypot(cx - rx, cy - ry)
+                    if d_cur < min_d:
+                        min_d = d_cur
+                        best_pos = (cx, cy)
+        if best_pos is None:
+            return None
+        target_x, target_y = best_pos
+
+    return (float(target_x), float(target_y), float(target_yaw))

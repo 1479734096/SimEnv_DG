@@ -144,6 +144,20 @@ def _task_context(source) -> NavigationTaskContext:
             segment_is_traversable_fn=lambda grid, start, end: not navigation_tasks_module._segment_crosses_blocked_cell(
                 grid, start, end
             ),
+            elevator_async_target_door_close_enabled=bool(
+                getattr(source, "elevator_async_target_door_close_enabled", True)
+            ),
+            relocalize_landmark_fn=getattr(source, "relocalize_landmark", None),
+            latest_cloud_stamp_fn=getattr(source, "latest_cloud_stamp", None),
+            elevator_opening_confirmation_retry_limit=int(
+                getattr(source, "elevator_opening_confirmation_retry_limit", 1)
+            ),
+            elevator_opening_confirmation_retry_timeout=float(
+                getattr(source, "elevator_opening_confirmation_retry_timeout", 10.0)
+            ),
+            elevator_opening_confirmation_sensor_refresh=float(
+                getattr(source, "elevator_opening_confirmation_sensor_refresh", 0.5)
+            ),
         )
 
 
@@ -1085,12 +1099,15 @@ class TakeElevatorTest(unittest.TestCase):
             0: "lift_door_ground",
             1: "lift_door_upper",
         }
+        closed_doors = []
         client = SimpleNamespace(
             get_elevator_points=lambda elevator_id, floor: (
                 (0.85, 2.60),
                 (2.60, 2.60),
             ),
             elevator_door_id=lambda floor: elevator_door_ids[int(floor)],
+            close_door=lambda door_id: closed_doors.append(door_id),
+            closed_doors=closed_doors,
         )
         return SimpleNamespace(
             building_client=client,
@@ -2102,6 +2119,29 @@ class TakeElevatorTest(unittest.TestCase):
         planner.assert_not_called()
 
         status = task.tick(_task_context(manager), (0.98, 2.60, math.pi))
+        self.assertEqual(status, DONE)
+        self.assertEqual(task.phase, "DONE")
+        self.assertEqual(manager.building_client.closed_doors, ["lift_door_upper"])
+
+    def test_exit_cabin_with_sync_door_close_falls_back_to_close_target_floor_door(self):
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        manager.elevator_async_target_door_close_enabled = False
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+        task._cabin_transit_mode = "exit"
+        task.cabin_transit_stage = "CROSS"
+        task._cabin_transit_start_xy = (2.60, 2.60)
+        task._cabin_transit_target_xy = (0.85, 2.60)
+        manager.controller.path_active = True
+
+        status = task.tick(_task_context(manager), (0.98, 2.60, math.pi))
         self.assertEqual(status, RUNNING)
         self.assertEqual(task.phase, "CLOSE_TARGET_FLOOR_DOOR")
 
@@ -2707,11 +2747,11 @@ class TakeElevatorTest(unittest.TestCase):
         self.assertEqual(task.phase, "WAIT_CABIN_TURN_COMPLETE")
         manager.begin_elevator_door_open_confirmation.assert_not_called()
 
-        # 调头完成后，切入 WAIT_TARGET_DOOR_OPEN 并标记 _cabin_turn_completed
+        # 调头完成后，必须先显式调用目标层 open_door，不能把呼梯成功当成开门。
         controller.poll_result = lambda: ControlResult(status=DONE, reason="alignment_done", sequence=2)
         status = task.tick(_task_context(manager), pose)
         self.assertEqual(status, RUNNING)
-        self.assertEqual(task.phase, "WAIT_TARGET_DOOR_OPEN")
+        self.assertEqual(task.phase, "OPEN_TARGET_FLOOR_DOOR")
         self.assertTrue(task._cabin_turn_completed)
 
     def test_take_elevator_cabin_turn_timeout_fails_deterministically(self):
@@ -3011,6 +3051,82 @@ class TakeElevatorTest(unittest.TestCase):
         self.assertEqual(task.phase, "OPEN_CURRENT_FLOOR_DOOR")
         self.assertEqual(open_calls, [])
         self.assertEqual(stop_calls, [True])
+
+    def test_current_door_confirmation_timeout_reanchors_refreshes_and_recalls_once(self):
+        stamps = [20.0]
+        finished = []
+        events = []
+        controller = SimpleNamespace(
+            stop=lambda **_kwargs: None,
+            clear_path=lambda **_kwargs: None,
+        )
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(
+                get_elevator_points=lambda _elevator_id, _floor: ((0.0, 0.0), (0.0, 1.0)),
+                elevator_door_id=lambda floor: f"lift_door_{int(floor)}",
+            ),
+            mapper=SimpleNamespace(floor=lambda _floor: object()),
+            current_floor=0,
+            controller=controller,
+            elevator_opening_confirmation_timeout=15.0,
+            elevator_opening_confirmation_retry_limit=1,
+            elevator_opening_confirmation_retry_timeout=10.0,
+            elevator_opening_confirmation_sensor_refresh=0.5,
+            latest_cloud_stamp=lambda: stamps[-1],
+            relocalize_landmark=lambda *_args: SimpleNamespace(status=DONE, applied=False),
+            confirm_elevator_door_open=lambda *_args: False,
+            finish_elevator_door_open_confirmation=lambda door_id: finished.append(door_id),
+            _log_structured=lambda event: events.append(event),
+        )
+        task = TakeElevator(0, 1)
+        task.phase = "WAIT_CURRENT_DOOR_OPEN"
+        task._wait_start_time = 0.0
+        task._door_confirmation_started.add("lift_door_0")
+
+        with patch("danger_search.navigation_tasks.get_time", return_value=16.0):
+            self.assertEqual(task.tick(_task_context(manager), (0.0, 0.0, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "RETRY_CURRENT_DOOR_SENSOR_REFRESH")
+        self.assertEqual(finished, ["lift_door_0"])
+        self.assertEqual(events[-1]["attempt"], 1)
+
+        stamps.append(20.1)
+        with patch("danger_search.navigation_tasks.get_time", return_value=16.6):
+            self.assertEqual(task.tick(_task_context(manager), (0.0, 0.0, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "RETRY_ALIGN_CURRENT_DOOR")
+        with patch.object(task, "_tick_target_door_alignment", return_value=True):
+            self.assertEqual(task.tick(_task_context(manager), (0.0, 0.0, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
+
+    def test_target_door_retry_stays_in_cabin_and_only_reopens_after_fresh_cloud(self):
+        stamps = [30.0]
+        task = TakeElevator(0, 1)
+        task.phase = "WAIT_TARGET_DOOR_OPEN"
+        task._wait_start_time = 0.0
+        task._door_confirmation_started.add("lift_door_1")
+        manager = SimpleNamespace(
+            building_client=SimpleNamespace(
+                get_elevator_points=lambda _elevator_id, _floor: ((0.0, 0.0), (0.0, 1.0)),
+                elevator_door_id=lambda floor: f"lift_door_{int(floor)}",
+            ),
+            mapper=SimpleNamespace(floor=lambda _floor: object()),
+            current_floor=0,
+            controller=SimpleNamespace(
+                stop=lambda **_kwargs: None,
+                clear_path=lambda **_kwargs: None,
+            ),
+            elevator_opening_confirmation_timeout=15.0,
+            latest_cloud_stamp=lambda: stamps[-1],
+            confirm_elevator_door_open=lambda *_args: False,
+            finish_elevator_door_open_confirmation=lambda _door_id: None,
+        )
+        with patch("danger_search.navigation_tasks.get_time", return_value=16.0):
+            self.assertEqual(task.tick(_task_context(manager), (0.0, 1.0, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "RETRY_TARGET_DOOR_SENSOR_REFRESH")
+
+        stamps.append(30.1)
+        with patch("danger_search.navigation_tasks.get_time", return_value=16.6):
+            self.assertEqual(task.tick(_task_context(manager), (0.0, 1.0, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "OPEN_TARGET_FLOOR_DOOR")
 
 
 class TakeElevatorPhaseExhaustivenessTest(unittest.TestCase):

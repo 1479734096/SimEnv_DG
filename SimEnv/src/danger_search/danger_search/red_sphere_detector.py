@@ -1,6 +1,7 @@
 """基于合法 RGB-D 输入的红色球形危险源检测。
 
-检测链路：HSV 红色分割 -> 轮廓初筛 -> 深度反投影 -> RANSAC 球拟合。
+检测链路：HSV 红色分割 -> 轮廓初筛 -> 深度反投影 -> 已知半径模型提议
+-> 高斯-牛顿几何精炼。
 颜色只用于生成候选，最终必须通过物理半径和三维拟合误差约束，从而拒绝红色
 方块等干扰源。输出仍是单帧候选，必须交给 ``DetectionTracker`` 多帧确认。
 """
@@ -39,7 +40,7 @@ class RedSphereDetector:
     """从同步 RGB-D 图像中检测红球并输出 world/camera 坐标候选。
 
     若正式调用要求 world 变换而对应图像时间戳没有匹配位姿，则直接返回空集合，
-    不用最新位姿代替。随机采样器使用固定种子，使同一输入的 RANSAC 结果可复现。
+    不用最新位姿代替。随机采样器使用固定种子，使同一输入的模型提议结果可复现。
     """
 
     def __init__(
@@ -49,6 +50,7 @@ class RedSphereDetector:
         min_circularity: float = 0.55,
         min_aspect: float = 0.65,
         max_aspect: float = 1.55,
+        target_radius: float = 0.15,
         min_radius: float = 0.10,
         max_radius: float = 0.22,
         max_rmse: float = 0.035,
@@ -62,6 +64,7 @@ class RedSphereDetector:
         self.min_circularity = float(min_circularity)
         self.min_aspect = float(min_aspect)
         self.max_aspect = float(max_aspect)
+        self.target_radius = float(target_radius)
         self.min_radius = float(min_radius)
         self.max_radius = float(max_radius)
         self.max_rmse = float(max_rmse)
@@ -78,6 +81,7 @@ class RedSphereDetector:
                 for value in (
                     self.min_aspect,
                     self.max_aspect,
+                    self.target_radius,
                     self.min_radius,
                     self.max_radius,
                     self.max_rmse,
@@ -221,6 +225,7 @@ class RedSphereDetector:
                 center = _transform_point(matrix, center)
             if not np.all(np.isfinite(center)):
                 continue
+            obs_dist = float(np.linalg.norm(sphere.center))
             confidence = self._score_detection(contour, sphere)
             candidates.append(
                 DetectionCandidate.from_sequence(
@@ -229,6 +234,7 @@ class RedSphereDetector:
                     rmse=sphere.rmse,
                     radius=sphere.radius,
                     stamp=resolved_stamp,
+                    distance=obs_dist,
                 )
             )
         return candidates
@@ -283,22 +289,22 @@ class RedSphereDetector:
         return np.column_stack((x, y, z))
 
     def _fit_sphere_ransac(self, points: np.ndarray) -> SphereFit | None:
-        """用最小样本提出球模型，再以残差内点做最小二乘精炼。"""
+        """用最小样本提出已知半径球模型，再以几何残差内点做高斯-牛顿精炼。"""
         if len(points) < self.ransac_sample_size:
             return None
         best: SphereFit | None = None
         indices = list(range(len(points)))
         for _ in range(self.ransac_iterations):
             sample_indices = self._rng.sample(indices, self.ransac_sample_size)
-            fit = _fit_sphere_least_squares(points[sample_indices])
+            fit = _fit_sphere_geometric(points[sample_indices], self.target_radius)
             if fit is None:
                 continue
             distances = np.linalg.norm(points - fit.center, axis=1)
-            residuals = np.abs(distances - fit.radius)
-            inliers = points[residuals <= max(self.max_rmse * 2.0, 0.05)]
+            residuals = np.abs(distances - self.target_radius)
+            inliers = points[residuals <= max(self.max_rmse * 2.0, 0.04)]
             if len(inliers) < self.ransac_sample_size:
                 continue
-            refined = _fit_sphere_least_squares(inliers)
+            refined = _fit_sphere_geometric(inliers, self.target_radius)
             if refined is None:
                 continue
             if best is None or (refined.inlier_count, -refined.rmse) > (best.inlier_count, -best.rmse):
@@ -320,7 +326,67 @@ class RedSphereDetector:
         radius_error = abs(sphere.radius - radius_center) / max(radius_center, 1e-6)
         rmse_score = max(0.0, 1.0 - sphere.rmse / max(self.max_rmse, 1e-6))
         score = 0.45 * min(circularity, 1.0) + 0.35 * rmse_score + 0.20 * max(0.0, 1.0 - radius_error)
+        dist = float(np.linalg.norm(sphere.center))
+        if dist > 4.0:
+            dist_factor = max(0.2, 1.0 - (dist - 4.0) / 4.0)
+            score *= dist_factor
         return float(max(0.0, min(1.0, score)))
+
+
+def _fit_sphere_geometric(
+    points: np.ndarray,
+    target_radius: float = 0.15,
+    max_iterations: int = 15,
+    tolerance: float = 1e-4,
+) -> SphereFit | None:
+    """使用高斯-牛顿法对单侧球冠进行已知半径的非线性几何拟合。"""
+    if len(points) < 4:
+        return None
+    pts = np.asarray(points, dtype=float)
+    if not np.all(np.isfinite(pts)):
+        return None
+
+    # 1. 计算点云质心并沿视线射线方向向后偏移 R 作为物理初值
+    centroid = np.mean(pts, axis=0)
+    norm = float(np.linalg.norm(centroid))
+    ray_dir = centroid / norm if norm > 1e-6 else np.array([0.0, 0.0, 1.0])
+    center = centroid + float(target_radius) * ray_dir
+
+    # 2. 高斯-牛顿迭代最小化几何欧氏残差: ||p_i - c|| - R
+    for _ in range(max_iterations):
+        diffs = pts - center
+        dists = np.linalg.norm(diffs, axis=1)
+        valid = dists > 1e-6
+        if np.count_nonzero(valid) < 4:
+            return None
+        diffs = diffs[valid]
+        dists = dists[valid]
+
+        residuals = dists - float(target_radius)
+        unit_vecs = diffs / dists[:, np.newaxis]
+        j_mat = -unit_vecs
+
+        h_mat = j_mat.T @ j_mat + np.eye(3) * 1e-6
+        g_vec = -j_mat.T @ residuals
+        try:
+            delta = np.linalg.solve(h_mat, g_vec)
+        except np.linalg.LinAlgError:
+            return None
+        center += delta
+        if float(np.linalg.norm(delta)) < tolerance:
+            break
+
+    if not np.all(np.isfinite(center)):
+        return None
+
+    final_residuals = np.linalg.norm(pts - center, axis=1) - float(target_radius)
+    rmse = math.sqrt(float(np.mean(final_residuals * final_residuals)))
+    return SphereFit(
+        center=center.astype(float),
+        radius=float(target_radius),
+        rmse=float(rmse),
+        inlier_count=len(points),
+    )
 
 
 def _fit_sphere_least_squares(points: np.ndarray) -> SphereFit | None:

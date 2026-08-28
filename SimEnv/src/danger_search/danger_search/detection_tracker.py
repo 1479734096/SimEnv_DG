@@ -32,6 +32,7 @@ class DetectionCandidate:
     rmse: float = 0.0
     radius: float | None = None
     stamp: float | None = None
+    distance: float | None = None
 
     def __post_init__(self) -> None:
         if len(self.position) != 3:
@@ -41,6 +42,7 @@ class DetectionCandidate:
         rmse = float(self.rmse)
         radius = None if self.radius is None else float(self.radius)
         stamp = None if self.stamp is None else float(self.stamp)
+        distance = None if self.distance is None else float(self.distance)
         if (
             not all(math.isfinite(value) for value in position)
             or not math.isfinite(confidence)
@@ -51,13 +53,16 @@ class DetectionCandidate:
             and (not math.isfinite(radius) or radius <= 0.0)
             or stamp is not None
             and (not math.isfinite(stamp) or stamp < 0.0)
+            or distance is not None
+            and (not math.isfinite(distance) or distance <= 0.0)
         ):
-            raise ValueError("检测候选的坐标、质量、半径或时间戳无效")
+            raise ValueError("检测候选的坐标、质量、半径、时间戳或距离无效")
         object.__setattr__(self, "position", position)
         object.__setattr__(self, "confidence", confidence)
         object.__setattr__(self, "rmse", rmse)
         object.__setattr__(self, "radius", radius)
         object.__setattr__(self, "stamp", stamp)
+        object.__setattr__(self, "distance", distance)
 
     @classmethod
     def from_sequence(
@@ -67,6 +72,7 @@ class DetectionCandidate:
         rmse: float = 0.0,
         radius: float | None = None,
         stamp: float | None = None,
+        distance: float | None = None,
     ) -> "DetectionCandidate":
         if len(position) != 3:
             raise ValueError(f"检测候选位置必须是三维坐标: {position}")
@@ -76,6 +82,7 @@ class DetectionCandidate:
             rmse=float(rmse),
             radius=None if radius is None else float(radius),
             stamp=None if stamp is None else float(stamp),
+            distance=None if distance is None else float(distance),
         )
 
 
@@ -94,17 +101,38 @@ class Track:
     positions: list[np.ndarray] = field(default_factory=list)
     confidences: list[float] = field(default_factory=list)
     rmses: list[float] = field(default_factory=list)
+    distances: list[float] = field(default_factory=list)
     status: str = TENTATIVE
+    inspected: bool = False
 
     def update(self, candidate: DetectionCandidate, now: float) -> None:
-        """追加一次命中，并用全部历史观测均值更新轨迹位置。"""
+        """追加一次命中，并用距离与误差加权更新轨迹质心位置。"""
         point = np.array(candidate.position, dtype=float)
         self.positions.append(point)
         self.confidences.append(float(candidate.confidence))
         self.rmses.append(float(candidate.rmse))
+        obs_dist = float(candidate.distance) if candidate.distance is not None else 1.0
+        self.distances.append(obs_dist)
         self.hit_times.append(now)
         self.last_seen = now
-        self.mean_position = np.mean(np.vstack(self.positions), axis=0)
+        self.mean_position = self._calculate_weighted_position()
+
+    def _calculate_weighted_position(self) -> np.ndarray:
+        if not self.positions:
+            return self.mean_position
+        weights = []
+        for conf, rmse, dist in zip(self.confidences, self.rmses, self.distances):
+            safe_dist = max(dist, 0.4)
+            safe_rmse = max(rmse, 0.005)
+            safe_conf = max(conf, 0.01)
+            w = safe_conf / ((safe_dist ** 2) * safe_rmse)
+            weights.append(w)
+        weights_arr = np.array(weights, dtype=float)
+        total_w = float(np.sum(weights_arr))
+        if total_w > 0.0 and np.isfinite(total_w):
+            pts = np.vstack(self.positions)
+            return np.sum(pts * weights_arr[:, np.newaxis], axis=0) / total_w
+        return np.mean(np.vstack(self.positions), axis=0)
 
     def recent_hit_count(self, now: float, window: float) -> int:
         cutoff = now - window
@@ -219,6 +247,43 @@ class DetectionTracker:
             if all(_distance(track.mean_position, other.mean_position) > self.nms_radius for other in selected):
                 selected.append(track)
         return [track.mean_position.astype(float).tolist() for track in selected]
+
+    def get_pending_inspection_target(
+        self,
+        robot_xy: tuple[float, float],
+        min_observe_dist: float = 2.0,
+        min_confidence: float = 0.70,
+    ) -> tuple[float, float] | None:
+        """获取尚未走近核验的高质量远距离目标世界平面坐标。"""
+        candidates = []
+        for track in self._tracks:
+            if not track.inspected and track.status in (TENTATIVE, CONFIRMED):
+                dist = math.hypot(
+                    float(track.mean_position[0]) - float(robot_xy[0]),
+                    float(track.mean_position[1]) - float(robot_xy[1]),
+                )
+                if dist >= min_observe_dist and track.average_confidence() >= min_confidence:
+                    candidates.append(
+                        (dist, (float(track.mean_position[0]), float(track.mean_position[1])))
+                    )
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            return candidates[0][1]
+        return None
+
+    def mark_inspected(
+        self,
+        target_xy: tuple[float, float],
+        radius: float = 1.2,
+    ) -> None:
+        """标记目标及其附近轨迹已完成/发起近场核验。"""
+        for track in self._tracks:
+            dist = math.hypot(
+                float(track.mean_position[0]) - float(target_xy[0]),
+                float(track.mean_position[1]) - float(target_xy[1]),
+            )
+            if dist <= radius:
+                track.inspected = True
 
     def _update_one(
         self,

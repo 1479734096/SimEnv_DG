@@ -262,6 +262,26 @@ TEST(ImuConstrainedOdometry, RejectsStaleMapGenerationWithoutMutation) {
   EXPECT_EQ(odometry.map_point_count(), map_points_before);
 }
 
+TEST(ImuConstrainedOdometry, TranslatesPoseAndLocalMapInOneGeneration) {
+  ImuConstrainedOdometry odometry;
+  const auto world_points = MakeAsymmetricStructure();
+  const Eigen::Vector3d initial_translation(0.0, -3.0, 0.35);
+  ASSERT_TRUE(odometry.RegisterFrame(
+      SensorVectors(world_points, initial_translation), initial_translation).accepted);
+  const std::uint64_t generation = odometry.map_generation();
+  const std::size_t point_count = odometry.map_point_count();
+
+  ASSERT_TRUE(odometry.TranslatePlanar(Eigen::Vector2d(0.45, -0.30)));
+
+  EXPECT_EQ(odometry.map_generation(), generation + 1U);
+  // 平移后需按固定 world 体素重建索引，落入同一体素的点可合并；
+  // 这不能改变位姿与地图的同一次原子提交。
+  EXPECT_GE(odometry.map_point_count(), point_count * 4U / 5U);
+  EXPECT_NEAR(odometry.last_committed_translation().x(), 0.45, 1e-12);
+  EXPECT_NEAR(odometry.last_committed_translation().y(), -3.30, 1e-12);
+  EXPECT_NEAR(odometry.last_committed_translation().z(), 0.35, 1e-12);
+}
+
 TEST(ImuConstrainedOdometry, UsesExplicitPublishedPoseForMotionLimit) {
   ImuConstrainedOdometryConfig config;
   config.maximum_correspondence_distance = 0.55;

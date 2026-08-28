@@ -30,7 +30,20 @@ from danger_search.door_observation_runtime import (
 )
 from danger_search.door_navigation_runtime import DoorNavigationRuntime
 from danger_search.navigation_tasks import NavigationTask, TakeElevator, OpenDoorAndPass, NavigateToPose, FAILED
+from danger_search.sparse_landmark_relocalizer import LandmarkRelocalizationOutcome
 from danger_search.frontier import Frontier, FrontierSelectionContext
+from danger_search.frontier_planning_runtime import (
+    MODE_NORMAL,
+    MODE_OPPORTUNISTIC,
+    MODE_PREFETCH,
+    FrontierPlanOutcome,
+    FrontierPlanScope,
+    FrontierPlanningRuntime,
+    compute_frontier_plan,
+    frontier_still_relevant,
+    live_frontier_failure_deltas,
+    rebase_and_validate_frontier_path,
+)
 from danger_search.ground_support_gate import (
     CLEAR as GROUND_SUPPORT_CLEAR,
     DROP_STOPPING,
@@ -59,6 +72,7 @@ from danger_search.planner import (
     astar_plan,
     path_length,
     segment_is_traversable,
+    simplify_path_line_of_sight,
 )
 from danger_search.mapper import (
     BLACK,
@@ -284,6 +298,18 @@ class MissionManager:
         # 绑定长期组件引用，不再知道各组件的构造参数。
         self.config = config or load_mission_config()
         self.config.install(self)
+        self._frontier_planning = FrontierPlanningRuntime(
+            timeout=self.frontier_planning_timeout,
+            preplan_min_lead=self.frontier_preplan_min_lead,
+            preplan_max_lead=self.frontier_preplan_max_lead,
+            opportunistic_period=self.opportunistic_replan_period,
+        )
+        self._frontier_plan_request_id = 0
+        self._prefetched_frontier_plan: tuple[
+            FrontierPlanScope, FrontierPlanOutcome
+        ] | None = None
+        self._frontier_plan_timeout_logged = False
+        self._frontier_plan_timed_out_request_id: int | None = None
         self._entry_config = InitialEntryConfig.from_section(self.config.entry)
         self._door_refresh_config = DoorRefreshConfig(
             timeout=float(self.config.entry["door_refresh_timeout"]),
@@ -341,6 +367,8 @@ class MissionManager:
         )
         self._components = components
         self._landmark_drift_monitor = components.landmark_drift_monitor
+        self._landmark_relocalizer = components.landmark_relocalizer
+        self._landmark_relocalization_operations: dict[str, dict[str, object]] = {}
         self._reporting = components.reporting
         self._perception_runtime = components.perception
         self.pose_provider = components.pose_provider
@@ -430,12 +458,14 @@ class MissionManager:
             planning_constraints=self._planning_constraints(),
             door_pass_max_linear=getattr(self, "door_pass_max_linear", None),
             open_door_geometry_refresh_enabled=True,
-            elevator_geometry_refresh_enabled=False,  # 临时禁用以避免膨胀岛困住
+            elevator_geometry_refresh_enabled=bool(
+                getattr(self, "elevator_geometry_refresh_enabled", True)
+            ),
             elevator_geometry_refresh_standoff=float(
                 getattr(self, "elevator_geometry_refresh_standoff", 1.2)
             ),
             elevator_opening_confirmation_timeout=float(
-                getattr(self, "elevator_opening_confirmation_timeout", 8.0)
+                getattr(self, "elevator_opening_confirmation_timeout", 15.0)
             ),
             elevator_local_crossing_geometry_enabled=bool(
                 getattr(self, "elevator_local_crossing_geometry_enabled", True)
@@ -470,6 +500,20 @@ class MissionManager:
             elevator_approach_trace_candidates_fn=self.elevator_approach_trace_candidates,
             plan_path_fn=self._plan_path,
             segment_is_traversable_fn=self._segment_is_traversable,
+            elevator_async_target_door_close_enabled=bool(
+                getattr(self, "elevator_async_target_door_close_enabled", True)
+            ),
+            relocalize_landmark_fn=self.relocalize_landmark,
+            latest_cloud_stamp_fn=lambda: self._map_runtime.last_cloud_stamp,
+            elevator_opening_confirmation_retry_limit=int(
+                getattr(self, "elevator_opening_confirmation_retry_limit", 1)
+            ),
+            elevator_opening_confirmation_retry_timeout=float(
+                getattr(self, "elevator_opening_confirmation_retry_timeout", 10.0)
+            ),
+            elevator_opening_confirmation_sensor_refresh=float(
+                getattr(self, "elevator_opening_confirmation_sensor_refresh", 0.5)
+            ),
         )
 
     def _planning_constraints(self):
@@ -553,6 +597,154 @@ class MissionManager:
             MissionReportingRuntime.loginfo(*result.info_message)
         for event in result.structured_events:
             self._log_structured(event)
+        if result.registered:
+            try:
+                door_id = self.building_client.elevator_door_id(self.current_floor)
+            except ValueError:
+                return
+            self._freeze_landmark_anchor("elevator", door_id)
+
+    def _current_landmark_frames(self) -> list[tuple[tuple[float, float, float], ...]]:
+        """只返回当前楼层、当前定位连续段内的已配准 Livox 帧。"""
+        epoch = int(getattr(self.pose_provider, "continuity_epoch", 0))
+        return [
+            frame.points
+            for frame in tuple(
+                getattr(self._map_runtime, "recent_cloud_frames", ())
+            )
+            if int(frame.floor) == int(self.current_floor)
+            and int(frame.localization_epoch) == epoch
+        ]
+
+    def _freeze_landmark_anchor(self, landmark_id: str, door_id: str) -> bool:
+        """冻结首次合法静态结构；后续语义门几何不得覆盖。"""
+        relocalizer = getattr(self, "_landmark_relocalizer", None)
+        door = getattr(self.building_client, "doors", {}).get(str(door_id))
+        if relocalizer is None or door is None:
+            return False
+        frames = self._current_landmark_frames()
+        if len(frames) < int(relocalizer.config.required_frames):
+            return False
+        frozen = relocalizer.freeze_anchor(
+            landmark_id,
+            floor=int(door.floor_index),
+            world_xy=(float(door.x), float(door.y)),
+            outward_yaw=float(door.yaw),
+            width=float(door.width),
+            frames=frames,
+            floor_height=float(self.mapper.floor_height),
+        )
+        if frozen:
+            self._log_structured(
+                {
+                    "event": "sparse_landmark_anchor_frozen",
+                    "landmark_id": str(landmark_id),
+                    "door_id": str(door_id),
+                    "floor": int(door.floor_index),
+                    "frame_count": len(frames),
+                }
+            )
+        return bool(frozen)
+
+    def _freeze_available_landmark_anchors(self) -> None:
+        """注册当刻帧数不足时，在后续新点云到达后补冻结一次。"""
+        relocalizer = getattr(self, "_landmark_relocalizer", None)
+        if relocalizer is None:
+            return
+        doors = getattr(self.building_client, "doors", {})
+        if "main_entrance" not in relocalizer.anchors and "main_entrance" in doors:
+            self._freeze_landmark_anchor("main_entrance", "main_entrance")
+        if "elevator" in relocalizer.anchors:
+            return
+        try:
+            door_id = self.building_client.elevator_door_id(self.current_floor)
+        except (AttributeError, ValueError):
+            return
+        if door_id in doors:
+            self._freeze_landmark_anchor("elevator", door_id)
+
+    def relocalize_landmark(
+        self,
+        landmark_id: str,
+        door_id: str,
+        pose: tuple[float, float, float],
+        operation_key: str,
+    ) -> LandmarkRelocalizationOutcome:
+        """在已停车的任务阶段评估锚点，并等待定位节点原子回执。"""
+        del pose  # 匹配输入是与里程计同坐标的已配准点云。
+        key = str(operation_key)
+        landmark = str(landmark_id)
+        if landmark == "main_entrance" and self.state != RETURN_HOME:
+            return LandmarkRelocalizationOutcome(IDLE, reason="context_not_allowed")
+        relocalizer = getattr(self, "_landmark_relocalizer", None)
+        anchor = (
+            getattr(relocalizer, "anchors", {}).get(landmark)
+            if relocalizer is not None
+            else None
+        )
+        if anchor is None or int(anchor.floor) != int(self.current_floor):
+            return LandmarkRelocalizationOutcome(IDLE, reason="anchor_unavailable")
+
+        self.controller.stop(reason=f"landmark_relocalization_{landmark}")
+        operation = self._landmark_relocalization_operations.get(key)
+        now = get_time()
+        if operation is not None and operation.get("sequence") is not None:
+            sequence = int(operation["sequence"])
+            ack = self.pose_provider.correction_ack(sequence)
+            if ack is not None:
+                self._landmark_relocalization_operations.pop(key, None)
+                self.controller.clear_path(reason="landmark_relocalization_applied")
+                self._log_structured(
+                    {
+                        "event": "sparse_landmark_correction_applied",
+                        "landmark_id": landmark,
+                        "door_id": str(door_id),
+                        "sequence": sequence,
+                        "correction_xy": [float(ack[0]), float(ack[1])],
+                    }
+                )
+                return LandmarkRelocalizationOutcome(DONE, applied=True)
+            if now - float(operation["started_at"]) >= relocalizer.config.correction_timeout:
+                self._landmark_relocalization_operations.pop(key, None)
+                return LandmarkRelocalizationOutcome(IDLE, reason="correction_ack_timeout")
+            return LandmarkRelocalizationOutcome(RUNNING)
+
+        evaluation = relocalizer.evaluate(
+            landmark,
+            frames=self._current_landmark_frames(),
+            floor_height=float(self.mapper.floor_height),
+        )
+        self._log_structured(
+            {
+                "event": "sparse_landmark_relocalization_evaluated",
+                "landmark_id": landmark,
+                "door_id": str(door_id),
+                "status": evaluation.status,
+                "correction_xy": evaluation.correction_xy,
+                "overlap": evaluation.overlap,
+                "residual_p70": evaluation.residual_p70,
+                "uniqueness_margin": evaluation.uniqueness_margin,
+                "frame_spread": evaluation.frame_spread,
+                "point_count": evaluation.point_count,
+            }
+        )
+        if evaluation.status == "no_correction_needed":
+            return LandmarkRelocalizationOutcome(DONE)
+        if evaluation.status != "accepted" or evaluation.correction_xy is None:
+            return LandmarkRelocalizationOutcome(IDLE, reason=evaluation.status)
+        sequence = self.pose_provider.request_planar_correction(
+            evaluation.correction_xy,
+            maximum_correction=relocalizer.config.maximum_correction,
+            maximum_linear_speed=relocalizer.config.maximum_linear_speed,
+            maximum_angular_speed=relocalizer.config.maximum_angular_speed,
+        )
+        if sequence is None:
+            return LandmarkRelocalizationOutcome(IDLE, reason="correction_request_rejected")
+        self._landmark_relocalization_operations[key] = {
+            "sequence": int(sequence),
+            "started_at": now,
+        }
+        return LandmarkRelocalizationOutcome(RUNNING)
 
     def _apply_elevator_refresh_result(
         self,
@@ -917,6 +1109,7 @@ class MissionManager:
         self._sync_ground_support_task_context(pose)
         self._ground_support.observe_odometry(self.controller, pose_sample)
         self._update_mapping_and_detection(snapshot, pose, xyz, pose_sample)
+        self._freeze_available_landmark_anchors()
         constraint_update = self._ground_support.apply_confirmed_support(self.mapper)
         if constraint_update.revoked_region_ids:
             self._log_structured(
@@ -1916,7 +2109,7 @@ class MissionManager:
         if callable(setter):
             configured = bool(
                 getattr(self, "ground_support_params", {}).get(
-                    "unknown_support_hold_enabled", True
+                    "unknown_support_hold_enabled", False
                 )
             )
             enabled = _ground_support_unknown_hold_enabled(
@@ -2263,6 +2456,211 @@ class MissionManager:
         )
         return (grid.floor_index, robot_cell, frontier_cells)
 
+    def _start_async_frontier_plan(
+        self,
+        *,
+        mode: str,
+        grid: FloorGrid,
+        pose: tuple[float, float, float],
+        frontiers: list[Frontier],
+        progress_snapshot,
+    ) -> bool:
+        """冻结一次探索规划；后台线程不得接触实时地图或控制器。"""
+        if not self.async_frontier_planning_enabled or self._frontier_planning.busy:
+            return False
+        worker_explorer = self.explorer.planning_copy()
+        grid_snapshot = grid.copy()
+        constraints = self._planning_constraints()
+        selection_context = self._frontier_selection_context(pose)
+        start_pose = tuple(float(value) for value in pose)
+        candidates = list(frontiers)
+        active_target = self._exploration.last_frontier_target
+        if mode == MODE_PREFETCH:
+            if progress_snapshot.final_goal is None:
+                return False
+            start_pose = (
+                float(progress_snapshot.final_goal[0]),
+                float(progress_snapshot.final_goal[1]),
+                float(
+                    pose[2]
+                    if progress_snapshot.final_heading is None
+                    else progress_snapshot.final_heading
+                ),
+            )
+            if active_target is not None:
+                candidates = [
+                    frontier
+                    for frontier in candidates
+                    if math.hypot(
+                        frontier.centroid[0] - active_target[0],
+                        frontier.centroid[1] - active_target[1],
+                    ) > self.frontier_current_region_radius
+                ]
+            if selection_context is not None:
+                selection_context = replace(
+                    selection_context,
+                    current_target=None,
+                    current_score=None,
+                    current_region_radius=0.0,
+                    switch_score_margin=0.0,
+                )
+        self._frontier_plan_request_id += 1
+        scope = FrontierPlanScope(
+            request_id=self._frontier_plan_request_id,
+            mode=mode,
+            floor=int(self.current_floor),
+            map_epoch=self._frontier_gain_map_epoch(),
+            localization_epoch=int(self._ground_support.localization_epoch),
+            constraint_revision=int(getattr(constraints, "revision", 0)),
+            path_sequence=int(progress_snapshot.path_generation),
+            active_target=active_target,
+        )
+        frozen_frontiers = tuple(candidates)
+        self._frontier_planning.start(
+            scope,
+            compute=lambda: compute_frontier_plan(
+                worker_explorer,
+                grid_snapshot,
+                start_pose,
+                frozen_frontiers,
+                selection_context=selection_context,
+                planning_constraints=constraints,
+            ),
+        )
+        self._frontier_plan_timeout_logged = False
+        self._frontier_plan_timed_out_request_id = None
+        if mode == MODE_OPPORTUNISTIC:
+            self._frontier_planning.mark_opportunistic_started(get_time())
+        return True
+
+    def _frontier_plan_scope_current(
+        self,
+        scope: FrontierPlanScope,
+        progress_snapshot,
+    ) -> bool:
+        constraints = self._planning_constraints()
+        if (
+            self.state != EXPLORE_FLOOR
+            or self.current_task is not None
+            or int(self.current_floor) != scope.floor
+            or self._frontier_gain_map_epoch() != scope.map_epoch
+            or int(self._ground_support.localization_epoch) != scope.localization_epoch
+            or int(getattr(constraints, "revision", 0)) != scope.constraint_revision
+            or int(progress_snapshot.path_generation) != scope.path_sequence
+            or self._exploration.last_frontier_target != scope.active_target
+        ):
+            return False
+        if scope.mode == MODE_NORMAL:
+            return not progress_snapshot.active
+        if scope.mode == MODE_OPPORTUNISTIC:
+            return progress_snapshot.active and not progress_snapshot.terminal_pending
+        return progress_snapshot.active or progress_snapshot.terminal_pending
+
+    def _poll_async_frontier_plan(self, progress_snapshot):
+        poll = self._frontier_planning.poll()
+        if poll.status == "timed_out":
+            if not self._frontier_plan_timeout_logged:
+                self._frontier_plan_timeout_logged = True
+                self._frontier_plan_timed_out_request_id = poll.scope.request_id
+                MissionReportingRuntime.logwarn(
+                    "前沿规划超过墙钟 %.1f 秒，隔离迟到结果",
+                    self.frontier_planning_timeout,
+                )
+            return None
+        if poll.status in {"idle", "pending"}:
+            return None
+        self._frontier_plan_timeout_logged = False
+        if poll.status == "late":
+            MissionReportingRuntime.logwarn("丢弃超过墙钟期限的前沿规划结果")
+            return None
+        if poll.status == "error":
+            MissionReportingRuntime.logwarn(
+                "前沿规划线程异常：%s",
+                poll.error,
+            )
+            return None
+        scope = poll.scope
+        outcome = poll.outcome
+        if (
+            scope is None
+            or not isinstance(outcome, FrontierPlanOutcome)
+            or getattr(self, "_frontier_plan_timed_out_request_id", None)
+            == scope.request_id
+            or not self._frontier_plan_scope_current(scope, progress_snapshot)
+        ):
+            MissionReportingRuntime.loginfo("丢弃已过期的异步前沿规划结果")
+            return None
+        self.explorer.last_selection_debug = outcome.debug
+        debug = outcome.debug
+        self._log_structured({
+            "event": "async_frontier_plan",
+            "request_id": scope.request_id,
+            "mode": scope.mode,
+            "floor": scope.floor,
+            "status": outcome.status,
+            "duration": round(float(poll.duration or 0.0), 4),
+            "target": (
+                list(outcome.frontier.centroid)
+                if outcome.frontier is not None else None
+            ),
+            "candidate_count": (
+                int(debug.candidate_count) if debug is not None else 0
+            ),
+            "reachable_count": (
+                int(debug.reachable_count) if debug is not None else 0
+            ),
+            "retained_by_inertia": bool(
+                debug.retained_by_inertia if debug is not None else False
+            ),
+            "constraint_revision": scope.constraint_revision,
+        })
+        return scope, outcome
+
+    def _validated_async_frontier_path(
+        self,
+        grid: FloorGrid,
+        pose: tuple[float, float, float],
+        scope: FrontierPlanScope,
+        outcome: FrontierPlanOutcome,
+    ) -> list[tuple[float, float]] | None:
+        frontier = outcome.frontier
+        if frontier is None or not outcome.path:
+            return None
+        if self.explorer.is_blacklisted(grid, frontier.centroid):
+            return None
+        if scope.mode != MODE_NORMAL and frontier.information_gain <= 0.0:
+            return None
+        if frontier.information_gain > 0.0 and not frontier_still_relevant(grid, frontier):
+            return None
+        return rebase_and_validate_frontier_path(
+            grid,
+            pose,
+            outcome.path,
+            planning_constraints=self._planning_constraints(),
+        )
+
+    def _install_async_frontier_path(
+        self,
+        *,
+        grid: FloorGrid,
+        pose: tuple[float, float, float],
+        frontier: Frontier,
+        path: list[tuple[float, float]],
+        reason: str,
+    ) -> None:
+        """在主线程原子替换探索目标，保持唯一速度出口不变。"""
+        self._frontier_arrival_gain.cancel()
+        self._log_frontier_switch(frontier, path, pose)
+        self.current_frontier = frontier
+        self.controller.set_path(path, reason=reason)
+        self._frontier_planning.reset_route_progress()
+        self._frontier_planning.mark_opportunistic_started(get_time())
+        self._begin_frontier_arrival_gain(grid, frontier)
+        self._exploration.reset_no_frontier_escape()
+        self._exploration.no_frontier_scan_until = 0.0
+        self._exploration.no_reachable_frontier_confirmations = 0
+        self._exploration.probe_attempt = 0
+
     def _tick_explore(self, pose: tuple[float, float, float]) -> None:
         self._explored_floor_ids.add(int(self.current_floor))
         grid = self.mapper.floor(self.current_floor)
@@ -2467,7 +2865,157 @@ class MissionManager:
             )
             return
 
+        async_normal_result = None
+        progress_snapshot = None
+        if self.async_frontier_planning_enabled:
+            progress_snapshot = self.controller.planning_progress_snapshot()
+            self._frontier_planning.observe_route_progress(
+                progress_snapshot.remaining_distance
+                if progress_snapshot.active and not progress_snapshot.terminal_pending
+                else None
+            )
+            completed_plan = self._poll_async_frontier_plan(progress_snapshot)
+            if completed_plan is not None:
+                scope, outcome = completed_plan
+                if scope.mode == MODE_NORMAL:
+                    async_normal_result = completed_plan
+                elif scope.mode == MODE_PREFETCH:
+                    self._prefetched_frontier_plan = completed_plan
+                elif scope.mode == MODE_OPPORTUNISTIC:
+                    candidate_path = self._validated_async_frontier_path(
+                        grid,
+                        pose,
+                        scope,
+                        outcome,
+                    )
+                    frontier = outcome.frontier
+                    previous = self._exploration.last_frontier_target
+                    switched_region = bool(
+                        frontier is not None
+                        and previous is not None
+                        and math.hypot(
+                            frontier.centroid[0] - previous[0],
+                            frontier.centroid[1] - previous[1],
+                        ) > self.frontier_current_region_radius
+                    )
+                    retained = bool(
+                        outcome.debug is not None
+                        and outcome.debug.retained_by_inertia
+                    )
+                    if (
+                        frontier is not None
+                        and candidate_path is not None
+                        and switched_region
+                        and not retained
+                    ):
+                        self._install_async_frontier_path(
+                            grid=grid,
+                            pose=pose,
+                            frontier=frontier,
+                            path=candidate_path,
+                            reason="frontier_opportunistic_replan",
+                        )
+                        path_active = True
+                        progress_snapshot = self.controller.planning_progress_snapshot()
+
+            if (
+                path_active
+                and progress_snapshot is not None
+                and progress_snapshot.active
+                and not progress_snapshot.terminal_pending
+                and self.current_frontier is not None
+                and self._prefetched_frontier_plan is None
+                and progress_snapshot.path_reason in {
+                    "frontier_selected_path",
+                    "frontier_confirmed_path",
+                    "frontier_opportunistic_replan",
+                    "frontier_prefetched_path",
+                }
+                and not self._frontier_planning.busy
+            ):
+                route_eta = self._frontier_planning.route_eta(
+                    progress_snapshot.remaining_distance
+                )
+                if (
+                    route_eta is not None
+                    and route_eta <= self._frontier_planning.preplan_lead()
+                    and self._prefetched_frontier_plan is None
+                ):
+                    active_frontiers = (
+                        frontiers
+                        if budget_needs_frontiers
+                        else self.explorer.extract_frontiers(grid)
+                    )
+                    self._start_async_frontier_plan(
+                        mode=MODE_PREFETCH,
+                        grid=grid,
+                        pose=pose,
+                        frontiers=active_frontiers,
+                        progress_snapshot=progress_snapshot,
+                    )
+                elif self._frontier_planning.opportunistic_due(
+                    now,
+                    route_eta=route_eta,
+                ):
+                    active_frontiers = (
+                        frontiers
+                        if budget_needs_frontiers
+                        else self.explorer.extract_frontiers(grid)
+                    )
+                    self._start_async_frontier_plan(
+                        mode=MODE_OPPORTUNISTIC,
+                        grid=grid,
+                        pose=pose,
+                        frontiers=active_frontiers,
+                        progress_snapshot=progress_snapshot,
+                    )
+
         if not path_active:
+            # 远距离高置信度危险源主动走近核验
+            tracker = getattr(self, "tracker", None)
+            if (
+                tracker is not None
+                and hasattr(tracker, "get_pending_inspection_target")
+                and getattr(self, "danger_approach_verification_enabled", True)
+                and floor_elapsed < self.floor_timeout * float(getattr(self, "floor_finish_time_ratio", 0.75))
+            ):
+                pending_target = tracker.get_pending_inspection_target(
+                    robot_xy=(pose[0], pose[1]),
+                    min_observe_dist=float(getattr(self, "danger_approach_trigger_distance", 2.2)),
+                    min_confidence=0.70,
+                )
+                if pending_target is not None:
+                    from danger_search.exploration_runtime import compute_danger_approach_pose
+
+                    approach_pose = compute_danger_approach_pose(
+                        grid,
+                        pose,
+                        pending_target,
+                        standoff_distance=float(getattr(self, "danger_approach_standoff_distance", 1.3)),
+                    )
+                    if approach_pose is not None:
+                        plan = self._plan_path(
+                            grid,
+                            (pose[0], pose[1]),
+                            (approach_pose[0], approach_pose[1]),
+                        )
+                        if plan is not None and plan.path:
+                            self.controller.set_path(
+                                list(plan.path),
+                                reason="danger_approach_verification",
+                            )
+                            tracker.mark_inspected(pending_target)
+                            MissionReportingRuntime.loginfo(
+                                "发现远距危险源候选，执行近场走近核验：target=(%.2f, %.2f) approach=(%.2f, %.2f, yaw=%.2f)",
+                                pending_target[0],
+                                pending_target[1],
+                                approach_pose[0],
+                                approach_pose[1],
+                                approach_pose[2],
+                            )
+                            return
+                    tracker.mark_inspected(pending_target)
+
             scan_signature = self._frontier_scan_signature(grid, pose, frontiers)
             # 扫描门控：pose 栅格和 frontier 内容均未变时，避免逐 tick A* 空转。
             if self._exploration.no_frontier_scan_until > 0:
@@ -2491,7 +3039,35 @@ class MissionManager:
             selection_context = self._frontier_selection_context(pose)
 
             frontier, path = None, []
-            if frontiers:
+            if self.async_frontier_planning_enabled and frontiers:
+                if async_normal_result is None:
+                    if not self._frontier_planning.busy:
+                        assert progress_snapshot is not None
+                        self._start_async_frontier_plan(
+                            mode=MODE_NORMAL,
+                            grid=grid,
+                            pose=pose,
+                            frontiers=frontiers,
+                            progress_snapshot=progress_snapshot,
+                        )
+                    return
+                normal_scope, normal_outcome = async_normal_result
+                self.explorer.apply_planning_failure_deltas(
+                    live_frontier_failure_deltas(
+                        grid,
+                        normal_outcome.failure_deltas,
+                    )
+                )
+                candidate_path = self._validated_async_frontier_path(
+                    grid,
+                    pose,
+                    normal_scope,
+                    normal_outcome,
+                )
+                if candidate_path is not None:
+                    frontier = normal_outcome.frontier
+                    path = candidate_path
+            elif frontiers:
                 frontier, path = self.explorer.select_frontier(
                     grid,
                     pose,
@@ -2675,12 +3251,29 @@ class MissionManager:
             self._exploration.reset_no_frontier_escape()
             self.current_frontier = frontier
             self.controller.set_path(path, reason="frontier_selected_path")
+            if self.async_frontier_planning_enabled:
+                self._frontier_planning.reset_route_progress()
+                self._frontier_planning.mark_opportunistic_started(get_time())
             self._begin_frontier_arrival_gain(grid, frontier)
             self._exploration.no_frontier_scan_until = 0.0
             self._exploration.no_reachable_frontier_confirmations = 0
             self._exploration.probe_attempt = 0
             MissionReportingRuntime.loginfo("选择前沿：floor=%d score=%.2f target=(%.2f, %.2f)",
                           self.current_floor, frontier.score, frontier.centroid[0], frontier.centroid[1])
+
+        active_async_scope = self._frontier_planning.active_scope
+        if (
+            self.async_frontier_planning_enabled
+            and progress_snapshot is not None
+            and progress_snapshot.terminal_pending
+            and active_async_scope is not None
+            and active_async_scope.mode == MODE_PREFETCH
+            and getattr(self, "_frontier_plan_timed_out_request_id", None)
+            != active_async_scope.request_id
+        ):
+            # 控制器已经锁存 DONE 并持续零速，先等到达前规划返回再消费终态，
+            # 否则 clear_path 会改变路径代次，使合法预规划结果无法归属旧路径。
+            return
 
         status = self.controller.poll_status()
         if status == STUCK:
@@ -2729,6 +3322,24 @@ class MissionManager:
                             radius=1.0,
                         )
             self.current_frontier = None
+            prefetched = self._prefetched_frontier_plan
+            self._prefetched_frontier_plan = None
+            if prefetched is not None:
+                scope, outcome = prefetched
+                candidate_path = self._validated_async_frontier_path(
+                    grid,
+                    pose,
+                    scope,
+                    outcome,
+                )
+                if outcome.frontier is not None and candidate_path is not None:
+                    self._install_async_frontier_path(
+                        grid=grid,
+                        pose=pose,
+                        frontier=outcome.frontier,
+                        path=candidate_path,
+                        reason="frontier_prefetched_path",
+                    )
         elif status == IDLE:
             self._frontier_arrival_gain.cancel()
             self.current_frontier = None
@@ -3214,6 +3825,8 @@ class MissionManager:
         if result.task is not None:
             self.active_door = result.door_id
             self.current_task = result.task
+            if result.door_id is not None:
+                self._freeze_landmark_anchor("main_entrance", result.door_id)
         return bool(result.handled)
 
     def refresh_open_door_geometry(
@@ -3782,6 +4395,11 @@ class MissionManager:
             constraints = self._planning_constraints()
             if reverse_trace is not None and constraints is not None:
                 grid = self.mapper.floor(self.current_floor)
+                reverse_trace = simplify_path_line_of_sight(
+                    grid,
+                    reverse_trace,
+                    constraints=constraints,
+                )
                 if any(
                     not segment_is_traversable(
                         grid,

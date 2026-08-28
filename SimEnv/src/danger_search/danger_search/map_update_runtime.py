@@ -1,6 +1,7 @@
 """正式地图与检测组件的单线程更新边界。"""
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import math
 
@@ -32,6 +33,16 @@ class ImageDetectionResult:
     door_observations: tuple[DoorPanelObservation, ...]
 
 
+@dataclass(frozen=True)
+class RegisteredCloudFrame:
+    """供地标重定位使用的有限历史，不参与地图或任务决策缓存。"""
+
+    stamp: float
+    floor: int
+    localization_epoch: int
+    points: tuple[tuple[float, float, float], ...]
+
+
 class MapUpdateRuntime:
     """拥有 Mapper、检测器和跟踪器；所有写操作由主线程调用。"""
 
@@ -56,6 +67,7 @@ class MapUpdateRuntime:
         self.nearest_radial_obstacle_distance: float | None = None
         self.last_floor_alignment_mismatch_key = None
         self.last_rgbd_pose_lookup_log_time = 0.0
+        self.recent_cloud_frames: deque[RegisteredCloudFrame] = deque(maxlen=6)
         mapper_params = dict(map_params)
         mapper_params["negative_minimum_drop"] = minimum_drop
         self.mapper = MultiFloorGridMap(**mapper_params)
@@ -67,6 +79,37 @@ class MapUpdateRuntime:
             else None
         )
         self.tracker = DetectionTracker(**tracker_params)
+
+    def record_registered_cloud(
+        self,
+        *,
+        stamp: float,
+        floor: int,
+        localization_epoch: int,
+        points,
+    ) -> None:
+        """保存最近少量合法配准帧，定位 epoch 改变后旧帧不会参与匹配。"""
+        value = float(stamp)
+        if not math.isfinite(value) or value <= 0.0:
+            return
+        frozen = tuple(
+            (float(point[0]), float(point[1]), float(point[2])) for point in points
+        )
+        if not frozen:
+            return
+        recent = getattr(self, "recent_cloud_frames", None)
+        if recent is None:
+            # 保留 __new__ 构造的纯边界测试兼容性；生产构造仍在 __init__ 显式创建。
+            recent = deque(maxlen=6)
+            self.recent_cloud_frames = recent
+        recent.append(
+            RegisteredCloudFrame(
+                stamp=value,
+                floor=int(floor),
+                localization_epoch=int(localization_epoch),
+                points=frozen,
+            )
+        )
 
     def update_cloud(
         self,

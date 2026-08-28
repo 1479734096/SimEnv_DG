@@ -135,6 +135,7 @@ class OpenDoorAndPass(NavigationTask):
         self._wait_navigation_failure: str | None = None
         self._wait_navigation_blocked_since: float | None = None
         self._wait_navigation_timeout = 3.0
+        self._landmark_relocalization_attempted = False
 
     @property
     def wait_point(self) -> tuple[float, float] | None:
@@ -181,7 +182,13 @@ class OpenDoorAndPass(NavigationTask):
                 allow_direct_fallback=True,
                 planning_max_iterations=None,
             ):
-                self.phase = "CALL_OPEN"
+                self.phase = (
+                    "RELOCALIZE_MAIN_ENTRANCE"
+                    if self.door_id == "main_entrance"
+                    and not self._landmark_relocalization_attempted
+                    and context.relocalize_landmark_fn is not None
+                    else "CALL_OPEN"
+                )
             elif self._last_navigation_blocked and self._can_open_from_safe_approach(pose):
                 context.controller.stop(reason="door_wait_point_blocked_safe_open")
                 if self._wait_navigation_failure != "safe_open":
@@ -194,6 +201,27 @@ class OpenDoorAndPass(NavigationTask):
                 self.phase = "CALL_OPEN"
             elif self._last_navigation_blocked:
                 return self._handle_wait_navigation_blocked(context)
+            return RUNNING
+
+        if self.phase == "RELOCALIZE_MAIN_ENTRANCE":
+            context.controller.stop(reason="main_entrance_relocalization")
+            outcome = context.relocalize_landmark(
+                "main_entrance",
+                self.door_id,
+                pose,
+                f"{self.name}:main_entrance",
+            )
+            if outcome is not None and getattr(outcome, "status", IDLE) == RUNNING:
+                return RUNNING
+            self._landmark_relocalization_attempted = True
+            if outcome is not None and bool(getattr(outcome, "applied", False)):
+                self._wait_point = None
+                self._pass_point = None
+                self._commit_point = None
+                context.controller.clear_path(reason="main_entrance_relocalized")
+                self.phase = "GO_WAIT_POINT"
+            else:
+                self.phase = "CALL_OPEN"
             return RUNNING
 
         if self.phase == "CALL_OPEN":
@@ -817,6 +845,11 @@ class TakeElevator(NavigationTask):
         self._crossing_blocked_since: float | None = None
         self._early_call_elevator_started = False
         self._early_call_elevator_task = None
+        self._landmark_relocalization_attempted = False
+        self._door_confirmation_retry_counts: dict[str, int] = {}
+        self._retry_sensor_baseline: float | None = None
+        self._retry_sensor_started_at = 0.0
+        self._retry_relocalization_completed = False
 
     def tick(self, context: NavigationTaskContext, pose: tuple[float, float, float]) -> str:
         """推进一个乘梯阶段；任一失败都显式返回 FAILED 而不猜测所在楼层。"""
@@ -861,6 +894,7 @@ class TakeElevator(NavigationTask):
                     self._early_call_elevator_task = client.call_elevator(
                         self.elevator_id, self.current_floor, True
                     )
+                    client.open_door(current_door_id)
                 except Exception as exc:
                     if rospy is not None:
                         rospy.logwarn("[%s] 远距离呼梯预开门发起异常，回退至常规开门: %s", self.name, exc)
@@ -911,6 +945,35 @@ class TakeElevator(NavigationTask):
                 if self.failure_reason is not None:
                     return FAILED
                 self._exit_alignment_count = 0
+                self.phase = (
+                    "RELOCALIZE_CURRENT_ELEVATOR"
+                    if context.relocalize_landmark_fn is not None
+                    else (
+                        "REFRESH_CURRENT_ELEVATOR_GEOMETRY"
+                        if context.elevator_geometry_refresh_enabled
+                        else "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+                    )
+                )
+            return RUNNING
+
+        if self.phase == "RELOCALIZE_CURRENT_ELEVATOR":
+            context.controller.stop(reason="elevator_landmark_relocalization")
+            outcome = context.relocalize_landmark(
+                "elevator",
+                current_door_id,
+                pose,
+                f"{self.name}:elevator",
+            )
+            if outcome is not None and getattr(outcome, "status", IDLE) == RUNNING:
+                return RUNNING
+            self._landmark_relocalization_attempted = True
+            if outcome is not None and bool(getattr(outcome, "applied", False)):
+                self._current_crossing_geometry = None
+                self._target_crossing_geometry = None
+                context.controller.clear_path(reason="elevator_landmark_relocalized")
+                self._reset_navigation_watchdog(clear_failure=True)
+                self.phase = "GO_TO_ELEVATOR_DOOR"
+            else:
                 self.phase = (
                     "REFRESH_CURRENT_ELEVATOR_GEOMETRY"
                     if context.elevator_geometry_refresh_enabled
@@ -994,6 +1057,37 @@ class TakeElevator(NavigationTask):
                 self._wait_start_time = get_time()
             return RUNNING
 
+        if self.phase == "RETRY_CURRENT_DOOR_SENSOR_REFRESH":
+            context.controller.stop(reason="elevator_current_door_retry_refresh")
+            if not self._retry_relocalization_completed:
+                outcome = context.relocalize_landmark(
+                    "elevator",
+                    current_door_id,
+                    pose,
+                    f"{self.name}:current_door_retry",
+                )
+                if outcome is not None and getattr(outcome, "status", IDLE) == RUNNING:
+                    return RUNNING
+                self._retry_relocalization_completed = True
+            if not self._retry_sensor_is_fresh(context):
+                if self._retry_refresh_expired(context):
+                    return self._fail_door_confirmation_exhausted(
+                        context, current_door_id, target=False,
+                        reason="elevator_current_door_retry_sensor_timeout",
+                    )
+                return RUNNING
+            self._exit_alignment_count = 0
+            self.phase = "RETRY_ALIGN_CURRENT_DOOR"
+            return RUNNING
+
+        if self.phase == "RETRY_ALIGN_CURRENT_DOOR":
+            if self._tick_target_door_alignment(context, pose, cabin_center):
+                if self.failure_reason is not None:
+                    return FAILED
+                self._exit_alignment_count = 0
+                self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+            return RUNNING
+
         if self.phase == "WAIT_CURRENT_DOOR_OPEN":
             context.controller.stop()
             if not self._door_opening_is_confirmed(
@@ -1001,14 +1095,16 @@ class TakeElevator(NavigationTask):
                 current_door_id,
                 pose,
             ):
-                if get_time() - self._wait_start_time > context.elevator_opening_confirmation_timeout:
-                    self._finish_door_open_confirmation(context, current_door_id)
-                    if rospy is not None:
-                        rospy.logerr(
-                            "[%s] 当前层电梯门服务完成，但局部传感器未确认注册位置开口",
-                            self.name,
-                        )
-                    return FAILED
+                if get_time() - self._wait_start_time > self._door_confirmation_timeout(
+                    context, current_door_id
+                ):
+                    if self._start_door_confirmation_retry(
+                        context, current_door_id, target=False
+                    ):
+                        return RUNNING
+                    return self._fail_door_confirmation_exhausted(
+                        context, current_door_id, target=False
+                    )
                 return RUNNING
             grid = context.mapper.floor(context.current_floor)
             # 门已由局部传感器确认打开后，轿厢内部仍可能因尚未进入而保持
@@ -1171,9 +1267,7 @@ class TakeElevator(NavigationTask):
                     self.phase = "WAIT_CABIN_TURN_COMPLETE"
                     self._cabin_turn_wait_start = get_time()
                 else:
-                    self._begin_door_open_confirmation(context, target_door_id)
-                    self.phase = "WAIT_TARGET_DOOR_OPEN"
-                    self._wait_start_time = get_time()
+                    self.phase = "OPEN_TARGET_FLOOR_DOOR"
             return RUNNING
 
         if self.phase == "WAIT_CABIN_TURN_COMPLETE":
@@ -1193,9 +1287,7 @@ class TakeElevator(NavigationTask):
                         rospy.logerr("[%s] 轿厢内调头超时（>%.1fs）", self.name, self._CABIN_TURN_TIMEOUT)
                     return FAILED
             if self._cabin_turn_completed:
-                self._begin_door_open_confirmation(context, target_door_id)
-                self.phase = "WAIT_TARGET_DOOR_OPEN"
-                self._wait_start_time = get_time()
+                self.phase = "OPEN_TARGET_FLOOR_DOOR"
             return RUNNING
 
         if self.phase == "WAIT_FOR_ODOM_STABLE":
@@ -1218,6 +1310,19 @@ class TakeElevator(NavigationTask):
                 self._wait_start_time = get_time()
             return RUNNING
 
+        if self.phase == "RETRY_TARGET_DOOR_SENSOR_REFRESH":
+            # 目标层时机器人必须留在轿厢内；只等待新鲜局部观测后重新开门。
+            context.controller.stop(reason="elevator_target_door_retry_refresh")
+            if not self._retry_sensor_is_fresh(context):
+                if self._retry_refresh_expired(context):
+                    return self._fail_door_confirmation_exhausted(
+                        context, target_door_id, target=True,
+                        reason="elevator_target_door_retry_sensor_timeout",
+                    )
+                return RUNNING
+            self.phase = "OPEN_TARGET_FLOOR_DOOR"
+            return RUNNING
+
         if self.phase == "WAIT_TARGET_DOOR_OPEN":
             context.controller.stop(reason="elevator_wait_target_door_open")
             if not self._door_opening_is_confirmed(
@@ -1225,14 +1330,16 @@ class TakeElevator(NavigationTask):
                 target_door_id,
                 pose,
             ):
-                if get_time() - self._wait_start_time > context.elevator_opening_confirmation_timeout:
-                    self._finish_door_open_confirmation(context, target_door_id)
-                    if rospy is not None:
-                        rospy.logerr(
-                            "[%s] 目标层电梯门服务完成，但局部传感器未确认注册位置开口",
-                            self.name,
-                        )
-                    return FAILED
+                if get_time() - self._wait_start_time > self._door_confirmation_timeout(
+                    context, target_door_id
+                ):
+                    if self._start_door_confirmation_retry(
+                        context, target_door_id, target=True
+                    ):
+                        return RUNNING
+                    return self._fail_door_confirmation_exhausted(
+                        context, target_door_id, target=True
+                    )
                 return RUNNING
             if not self._floor_transition_confirmed:
                 try:
@@ -1349,6 +1456,20 @@ class TakeElevator(NavigationTask):
             )
             if status == DONE:
                 self._reset_cabin_transit()
+                if getattr(context, "elevator_async_target_door_close_enabled", True):
+                    try:
+                        client.close_door(target_door_id)
+                    except Exception as exc:
+                        if rospy is not None:
+                            rospy.logwarn(
+                                "[%s] 目标层电梯关门异步请求失败: %s",
+                                self.name,
+                                exc,
+                            )
+                    self._current_crossing_geometry = None
+                    self._target_crossing_geometry = None
+                    self.phase = "DONE"
+                    return DONE
                 self.phase = "CLOSE_TARGET_FLOOR_DOOR"
                 self._retry_count = 0
             elif status == STUCK:
@@ -1437,6 +1558,107 @@ class TakeElevator(NavigationTask):
             return None
         return door_id if door_id in self._door_open_confirmed else None
 
+    def _start_door_confirmation_retry(
+        self,
+        context: NavigationTaskContext,
+        door_id: str,
+        *,
+        target: bool,
+    ) -> bool:
+        count = int(self._door_confirmation_retry_counts.get(door_id, 0))
+        limit = max(0, int(context.elevator_opening_confirmation_retry_limit))
+        if count >= limit:
+            return False
+        self._finish_door_open_confirmation(context, door_id)
+        count += 1
+        self._door_confirmation_retry_counts[door_id] = count
+        self._retry_sensor_baseline = context.latest_cloud_stamp()
+        self._retry_sensor_started_at = get_time()
+        self._retry_relocalization_completed = False
+        self._service_task = None
+        if not target:
+            # 远距离预呼梯任务已完成，重试必须真正重发呼梯。
+            self._early_call_elevator_task = None
+        self.phase = (
+            "RETRY_TARGET_DOOR_SENSOR_REFRESH"
+            if target
+            else "RETRY_CURRENT_DOOR_SENSOR_REFRESH"
+        )
+        context.controller.clear_path(reason="elevator_door_confirmation_retry")
+        context.log_structured(
+            {
+                "event": "elevator_door_confirmation_retry_started",
+                "door_id": str(door_id),
+                "side": "target" if target else "source",
+                "attempt": count,
+                "limit": limit,
+                "sensor_refresh": float(
+                    context.elevator_opening_confirmation_sensor_refresh
+                ),
+                "retry_timeout": float(
+                    context.elevator_opening_confirmation_retry_timeout
+                ),
+            }
+        )
+        return True
+
+    def _retry_sensor_is_fresh(self, context: NavigationTaskContext) -> bool:
+        elapsed = get_time() - self._retry_sensor_started_at
+        if elapsed < float(context.elevator_opening_confirmation_sensor_refresh):
+            return False
+        latest = context.latest_cloud_stamp()
+        if latest is None:
+            return False
+        return self._retry_sensor_baseline is None or latest > self._retry_sensor_baseline
+
+    def _retry_refresh_expired(self, context: NavigationTaskContext) -> bool:
+        return get_time() - self._retry_sensor_started_at > float(
+            context.elevator_opening_confirmation_retry_timeout
+        )
+
+    def _door_confirmation_timeout(
+        self,
+        context: NavigationTaskContext,
+        door_id: str,
+    ) -> float:
+        if self._door_confirmation_retry_counts.get(door_id, 0) > 0:
+            return float(context.elevator_opening_confirmation_retry_timeout)
+        return float(context.elevator_opening_confirmation_timeout)
+
+    def _fail_door_confirmation_exhausted(
+        self,
+        context: NavigationTaskContext,
+        door_id: str,
+        *,
+        target: bool,
+        reason: str | None = None,
+    ) -> str:
+        self._finish_door_open_confirmation(context, door_id)
+        self.failure_reason = reason or (
+            "elevator_target_door_confirmation_exhausted"
+            if target
+            else "elevator_current_door_confirmation_exhausted"
+        )
+        context.record_failure(self.failure_reason)
+        context.log_structured(
+            {
+                "event": "elevator_door_confirmation_retry_exhausted",
+                "door_id": str(door_id),
+                "side": "target" if target else "source",
+                "attempts": int(self._door_confirmation_retry_counts.get(door_id, 0)),
+                "reason": self.failure_reason,
+            }
+        )
+        if rospy is not None:
+            rospy.logerr(
+                "[%s] %s层电梯门局部开口确认重试耗尽: door_id=%s reason=%s",
+                self.name,
+                "目标" if target else "当前",
+                door_id,
+                self.failure_reason,
+            )
+        return FAILED
+
     def _begin_door_open_confirmation(self, context: NavigationTaskContext, door_id: str) -> None:
         if door_id in self._door_confirmation_started:
             return
@@ -1458,9 +1680,9 @@ class TakeElevator(NavigationTask):
         self._finish_door_open_confirmation(context, door_id)
         return True
 
-    @staticmethod
-    def _finish_door_open_confirmation(context: NavigationTaskContext, door_id: str) -> None:
+    def _finish_door_open_confirmation(self, context: NavigationTaskContext, door_id: str) -> None:
         context.finish_elevator_door_open_confirmation(door_id)
+        self._door_confirmation_started.discard(door_id)
 
     def _tick_target_door_alignment(
         self,

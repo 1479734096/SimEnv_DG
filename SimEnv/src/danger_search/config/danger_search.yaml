@@ -11,6 +11,8 @@ topics:
   # /danger_search、/nav 下的话题均为参赛方内部派生数据或诊断输出。
   cmd_vel: /cmd_vel
   localization_odom: /danger_search/localization/odom
+  localization_correction_request: /danger_search/localization/correction_request
+  localization_correction_state: /danger_search/localization/correction_state
   cloud: /danger_search/localization/cloud_registered
   rgb: /real_sense/rgb/image_raw
   depth: /real_sense/depth/image_raw
@@ -37,6 +39,24 @@ localization:
   # Livox 名义 10 Hz；短暂陈旧先停车，持续 3 秒无新定位则显式失败。
   stale_minimum: 0.4
   unavailable_timeout: 3.0
+  # 仅在首次合法 Livox 静态结构关键帧上冻结主入口和 0 层电梯锚点。
+  # 回访时必须连续 3 帧通过重叠、P70 残差、唯一性和静止门控才可注入平移。
+  sparse_relocalization_enabled: true
+  sparse_anchor_radius: 12.0
+  sparse_voxel_size: 0.10
+  sparse_minimum_points: 120
+  sparse_maximum_points: 2400
+  sparse_minimum_correction: 0.08
+  sparse_maximum_correction: 1.20
+  sparse_coarse_step: 0.10
+  sparse_minimum_overlap: 0.55
+  sparse_maximum_residual_p70: 0.18
+  sparse_minimum_uniqueness_margin: 0.08
+  sparse_required_frames: 3
+  sparse_maximum_frame_spread: 0.08
+  sparse_maximum_linear_speed: 0.08
+  sparse_maximum_angular_speed: 0.10
+  sparse_correction_timeout: 2.0
 
 mission:
   # 顶层状态机、单层完成判据、返航预算、过门上下文和任务输出策略。
@@ -45,8 +65,8 @@ mission:
   manual_goal_enabled: false
   # 正式总预算按公开 served_floors 数量选择；专项配置可用更短 max_runtime。
   max_runtime: 900.0
-  runtime_by_floor: [[1, 300.0], [2, 620.0], [3, 840.0]]
-  floor_timeout: 280.0
+  runtime_by_floor: [[1, 500.0], [2, 720.0], [3, 900.0]]
+  floor_timeout: 310.0
   # 非最后一层仍以 floor_timeout 保护后续楼层；最后一层由全局返航预算收口。
   # 设为 false 可立即恢复“所有楼层到时即结束”的旧语义。
   last_floor_uses_global_budget: true
@@ -82,6 +102,8 @@ mission:
   elevator_local_crossing_yaw_search_half_range: 0.20
   elevator_local_crossing_yaw_search_step: 0.05
   elevator_local_crossing_max_center_correction: 0.80
+  # 目标层出厢后是否异步非阻塞关门（出厢后立刻开始探索规划，不阻塞原地等关门）
+  elevator_async_target_door_close_enabled: true
   # 2层及多层测试覆盖率采用 0.65 快速换层；单层测试采用 0.80 深度覆盖。
   explore_coverage_ratio: 0.65
   no_frontier_scan_duration: 4.0
@@ -133,7 +155,7 @@ mission:
   # 返航保守速度估计（m/s），用于估算返航时间
   return_speed_estimate: 0.4
   # 换层基础时间估计（秒）；seed=8127 正式返程实测 1→0 为 69.5 秒。
-  floor_change_time_estimate: 70.0
+  floor_change_time_estimate: 50.0
   # 楼层结束软边界比例：floor_timeout * ratio 后可结合收益考虑结束
   floor_finish_time_ratio: 0.80
   # 探索收益评估窗口（秒）
@@ -148,6 +170,10 @@ mission:
   # 每次 FINISH_FLOOR 决策前先验证电梯等待点 A* 可达；UNKNOWN 阻断时
   # 延后换层继续探索（A* 仍不穿 UNKNOWN），预算不足或硬障碍时显式失败。
   route_check_ratio: 0.75
+  # 远距离高置信度危险源主动走近精测（近场核验）
+  danger_approach_verification_enabled: true
+  danger_approach_trigger_distance: 2.2
+  danger_approach_standoff_distance: 1.3
 
 map:
   # 每层独立 2.5D 栅格；NEGATIVE 只表达传感器确认的动态负障，不编码房间语义。
@@ -226,17 +252,25 @@ frontier:
   # 短期选择惯性：当前区域仍可达时，新目标分数需要至少高出该 margin 才切换。
   switch_score_margin: 3.5
   current_region_radius: 2.0
+  # 保留单后台线程预规划基础设施；正式配置关闭异步规划和机会性重选。
+  async_planning_enabled: false
+  opportunistic_replan_period: 0.0
+  # 实际提前量取最近 20 次规划墙钟耗时 P90 + 0.25s，并限制在此区间。
+  preplan_min_lead: 0.5
+  preplan_max_lead: 3.0
+  # Python 线程无法安全强杀；超时后结果保持隔离并在返回时丢弃。
+  planning_timeout: 5.0
   # 先以可解释的乐观分数缩小精确 A* 集合，避免 Timer 回调长时间阻塞。
   max_planning_candidates: 8
   max_goal_candidates_per_frontier: 2
   max_fallback_planning_candidates: 8
-  # 远距离封闭孤岛前沿剪枝：未知格数<30且距离>3.5m时直接剪枝，防止长途清扫边角碎片
-  min_far_expected_gain: 30.0
+  # 远距离封闭孤岛前沿剪枝：未知格数<10且距离>3.5m时直接剪枝，防止长途清扫边角碎片
+  min_far_expected_gain: 10.0
   far_prune_distance: 3.5
 
 controller:
   # PathFollower 的路径跟踪与唯一 /cmd_vel 输出上限；最终仍经过 ground_support 门。
-  max_linear: 0.80
+  max_linear: 0.75
   # 0 保持既有全局上限；正数仅限制首次 EXIT_CABIN 通过尝试。
   exit_first_max_linear: 0.0
   # 当前 RL 的横移与转向耦合会抵消 yaw 响应；首版只用 v+omega 跟踪。
@@ -244,6 +278,8 @@ controller:
   max_lateral: 0.01
   max_angular: 1.2
   min_linear_fraction: 0.35
+  # 中等偏角弧线跟踪的航向速度下限；曲率、障碍和地面支撑仍可继续压低。
+  arc_turn_min_linear_fraction: 0.15
   goal_tolerance: 0.25
   waypoint_tolerance: 0.25
   corner_tolerance: 0.15
@@ -260,18 +296,18 @@ controller:
   obstacle_slow_distance: 0.60
   progress_distance: 0.25
   # 中等航向误差继续使用现有 yaw/曲率混合走弧线；仅大角度或高速旋转原地转向。
-  turn_in_place_heading: 0.90
+  turn_in_place_heading: 1.10
   turn_in_place_rate: 0.65
-  turn_release_heading: 0.20
-  turn_release_rate: 0.20
-  turn_release_samples: 3
+  turn_release_heading: 0.30
+  turn_release_rate: 0.30
+  turn_release_samples: 2
 
 # 局部地面支撑安全门。正式配置必须开启；只消费未来足迹走廊，不改占据地图。
 ground_support:
   production_gate_enabled: true
-  # UNKNOWN 临时观察停车可独立关闭；门和电梯只按已验证任务上下文局部放行，
-  # 显式低层回波 DROP 始终锁存停车。
-  unknown_support_hold_enabled: true
+  # UNKNOWN 临时观察停车已关闭；平地激光稀疏不触发走走停停，
+  # 显式低层回波 DROP 始终由 _fresh_drop_blocks 独立锁存急刹停车。
+  unknown_support_hold_enabled: false
   # 明确 DROP 停稳后仅让当前路径失效，并用现有 BLACK 栅格有界重规划。
   negative_obstacle_replan_enabled: true
   maximum_negative_obstacle_replans: 3
@@ -321,7 +357,7 @@ ground_support:
   boundary_consistency_radius: 0.20
   release_hysteresis: 0.10
   release_supported_frames: 2
-  observation_hold_timeout: 2.0
+  observation_hold_timeout: 3.0
   # Gate 已输出零速后，/clock 或 odom 完全不推进的单调墙钟故障上限。
   safety_stop_timeout: 3.0
   wall_stall_timeout: 30.0
@@ -342,6 +378,7 @@ detection:
   min_circularity: 0.55
   min_aspect: 0.65
   max_aspect: 1.55
+  target_radius: 0.15
   min_radius: 0.10
   max_radius: 0.22
   max_rmse: 0.035
@@ -402,8 +439,13 @@ local_semantic:
   elevator_visual_min_width: 0.65
   elevator_visual_max_width: 1.80
   elevator_visual_max_distance: 4.0
-  elevator_opening_confirmation_timeout: 8.0
+  elevator_opening_confirmation_timeout: 15.0
+  # 首次确认失败后只允许一次有界重试；必须等到新 Livox 帧。
+  elevator_opening_confirmation_retry_limit: 1
+  elevator_opening_confirmation_retry_timeout: 10.0
+  elevator_opening_confirmation_sensor_refresh: 0.5
   # 呼梯前在当前漂移坐标系内重观测关闭门板；只刷新任务语义几何，不移动地图或 odom。
+  elevator_geometry_refresh_enabled: true
   elevator_geometry_refresh_timeout: 6.0
   # 机身等待点 0.8m 对前置相机过近；刷新时先停在 1.2m，避免门板被视场裁切。
   elevator_geometry_refresh_standoff: 1.2

@@ -22,9 +22,9 @@ class ElevatorRunnerContractTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("ELEVATOR_TEST_FLOOR_COUNT=2", result.stdout)
-        self.assertIn("ELEVATOR_TEST_FLOOR_TIMEOUT=280.0", result.stdout)
+        self.assertIn("ELEVATOR_TEST_FLOOR_TIMEOUT=310.0", result.stdout)
         self.assertIn(
-            "ELEVATOR_TEST_MAX_RUNTIME=按楼层：2层620.0、3层840.0",
+            "ELEVATOR_TEST_MAX_RUNTIME=按楼层：2层720.0、3层900.0",
             result.stdout,
         )
         self.assertIn("ELEVATOR_TEST_WALL_TIMEOUT=7200", result.stdout)
@@ -36,7 +36,7 @@ class ElevatorRunnerContractTest(unittest.TestCase):
         self.assertIn(
             "ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map", result.stdout
         )
-        self.assertIn("ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=8.0", result.stdout)
+        self.assertIn("ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0", result.stdout)
         self.assertIn(
             "ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false", result.stdout
         )
@@ -62,15 +62,15 @@ class ElevatorRunnerContractTest(unittest.TestCase):
         source = RUNNER.read_text(encoding="utf-8")
 
         self.assertIn(
-            'ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-280.0}"',
+            'ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-310.0}"',
             source,
         )
         self.assertIn(
             'ELEVATOR_TEST_WALL_TIMEOUT="${ELEVATOR_TEST_WALL_TIMEOUT:-7200}"',
             source,
         )
-        self.assertIn('2) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="620.0" ;;', source)
-        self.assertIn('3) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="840.0" ;;', source)
+        self.assertIn('2) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="720.0" ;;', source)
+        self.assertIn('3) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="900.0" ;;', source)
         self.assertIn(
             'ELEVATOR_TEST_MAX_RUNTIME="${ELEVATOR_TEST_MAX_RUNTIME:-$ELEVATOR_TEST_DEFAULT_MAX_RUNTIME}"',
             source,
@@ -180,7 +180,7 @@ class ElevatorRunnerContractTest(unittest.TestCase):
         source = RUNNER.read_text(encoding="utf-8")
 
         self.assertIn(
-            'ELEVATOR_TEST_LOCALIZATION_MAX_RANGE="${ELEVATOR_TEST_LOCALIZATION_MAX_RANGE:-8.0}"',
+            'ELEVATOR_TEST_LOCALIZATION_MAX_RANGE="${ELEVATOR_TEST_LOCALIZATION_MAX_RANGE:-15.0}"',
             source,
         )
         self.assertIn(

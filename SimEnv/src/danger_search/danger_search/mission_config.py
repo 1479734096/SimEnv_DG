@@ -26,6 +26,7 @@ from danger_search.interface_policy import (
     require_manual_control_topic,
 )
 from danger_search.landmark_drift_monitor import LandmarkDriftConfig
+from danger_search.sparse_landmark_relocalizer import SparseRelocalizationConfig
 
 
 ParameterGetter = Callable[[str, object], object]
@@ -161,12 +162,17 @@ _CONFIG_GROUP_FIELDS = {
             "tick_wall_stall_timeout",
             "manual_goal_enabled",
             "last_floor_uses_global_budget",
+            "danger_approach_verification_enabled",
+            "danger_approach_trigger_distance",
+            "danger_approach_standoff_distance",
         }
     ),
     "topics": frozenset(
         {
             "cmd_vel_topic",
             "localization_odom_topic",
+            "localization_correction_request_topic",
+            "localization_correction_state_topic",
             "cloud_topic",
             "rgb_topic",
             "depth_topic",
@@ -189,6 +195,7 @@ _CONFIG_GROUP_FIELDS = {
             "localization_vertical_reference",
             "global_frame_id",
             "landmark_drift_config",
+            "sparse_relocalization_config",
         }
     ),
     "mapping": frozenset(
@@ -235,12 +242,16 @@ _CONFIG_GROUP_FIELDS = {
             "floor_change_time_estimate",
             "min_floor_change_remaining_ratio",
             "min_floor_travel_distance",
+            "elevator_geometry_refresh_enabled",
             "elevator_geometry_refresh_max_shift",
             "elevator_geometry_refresh_max_yaw_change",
             "elevator_geometry_refresh_standoff",
             "elevator_geometry_refresh_timeout",
             "elevator_navigation_timeout",
             "elevator_opening_confirmation_timeout",
+            "elevator_opening_confirmation_retry_limit",
+            "elevator_opening_confirmation_retry_timeout",
+            "elevator_opening_confirmation_sensor_refresh",
             "elevator_local_crossing_geometry_enabled",
             "elevator_local_crossing_timeout",
             "elevator_exit_empty_fallback_timeout",
@@ -266,6 +277,7 @@ _CONFIG_GROUP_FIELDS = {
             "elevator_visual_scan_required_rotation",
             "exit_cabin_backoff_enabled",
             "exit_first_max_linear",
+            "elevator_async_target_door_close_enabled",
             "livox_elevator_registration_enabled",
         }
     ),
@@ -278,6 +290,11 @@ _CONFIG_GROUP_FIELDS = {
             "explore_coverage_ratio",
             "frontier_current_region_radius",
             "frontier_switch_score_margin",
+            "async_frontier_planning_enabled",
+            "opportunistic_replan_period",
+            "frontier_preplan_min_lead",
+            "frontier_preplan_max_lead",
+            "frontier_planning_timeout",
             "min_exploration_progress_cells",
             "min_floor_explore_time",
             "min_known_area",
@@ -385,6 +402,20 @@ class _MissionConfigBuilder:
             "topics/localization_odom",
             "/danger_search/localization/odom",
         ), purpose="参赛方定位输出")
+        self.localization_correction_request_topic = require_internal_output_topic(
+            _param(
+                "topics/localization_correction_request",
+                "/danger_search/localization/correction_request",
+            ),
+            purpose="定位平移纠正请求",
+        )
+        self.localization_correction_state_topic = require_internal_input_topic(
+            _param(
+                "topics/localization_correction_state",
+                "/danger_search/localization/correction_state",
+            ),
+            purpose="定位平移纠正回执",
+        )
         self.cloud_topic = require_internal_input_topic(_param(
             "topics/cloud",
             "/danger_search/localization/cloud_registered",
@@ -509,6 +540,15 @@ class _MissionConfigBuilder:
         self.post_door_min_known_area = float(_param("mission/post_door_min_known_area", 8.0))
         self.post_door_min_distance = float(_param("mission/post_door_min_distance", 2.0))
         self.home_tolerance = float(_param("mission/home_tolerance", 0.7))
+        self.danger_approach_verification_enabled = bool(
+            _param("mission/danger_approach_verification_enabled", True)
+        )
+        self.danger_approach_trigger_distance = float(
+            _param("mission/danger_approach_trigger_distance", 2.2)
+        )
+        self.danger_approach_standoff_distance = float(
+            _param("mission/danger_approach_standoff_distance", 1.3)
+        )
         raw_max_stuck_retries = _param("mission/return_home_max_stuck_retries", 4)
         raw_max_candidate_rejects = _param(
             "mission/return_home_max_candidate_rejects", 3
@@ -759,7 +799,7 @@ class _MissionConfigBuilder:
                 _param("ground_support/production_gate_enabled", False)
             ),
             "unknown_support_hold_enabled": bool(
-                _param("ground_support/unknown_support_hold_enabled", True)
+                _param("ground_support/unknown_support_hold_enabled", False)
             ),
             "negative_obstacle_replan_enabled": bool(
                 _param("ground_support/negative_obstacle_replan_enabled", True)
@@ -935,7 +975,7 @@ class _MissionConfigBuilder:
             ),
             "goal_tolerance": float(_param("controller/goal_tolerance", 0.35)),
             "min_far_expected_gain": float(
-                _param("frontier/min_far_expected_gain", 30.0)
+                _param("frontier/min_far_expected_gain", 10.0)
             ),
             "far_prune_distance": float(
                 _param("frontier/far_prune_distance", 3.5)
@@ -943,6 +983,35 @@ class _MissionConfigBuilder:
         }
         self.frontier_switch_score_margin = float(_param("frontier/switch_score_margin", 2.0))
         self.frontier_current_region_radius = float(_param("frontier/current_region_radius", 1.2))
+        self.async_frontier_planning_enabled = bool(
+            _param("frontier/async_planning_enabled", True)
+        )
+        self.opportunistic_replan_period = float(
+            _param("frontier/opportunistic_replan_period", 3.0)
+        )
+        self.frontier_preplan_min_lead = float(
+            _param("frontier/preplan_min_lead", 0.5)
+        )
+        self.frontier_preplan_max_lead = float(
+            _param("frontier/preplan_max_lead", 3.0)
+        )
+        self.frontier_planning_timeout = float(
+            _param("frontier/planning_timeout", 5.0)
+        )
+        if (
+            not math.isfinite(self.opportunistic_replan_period)
+            or self.opportunistic_replan_period < 0.0
+            or not all(
+                math.isfinite(value) and value > 0.0
+                for value in (
+                    self.frontier_preplan_min_lead,
+                    self.frontier_preplan_max_lead,
+                    self.frontier_planning_timeout,
+                )
+            )
+            or self.frontier_preplan_min_lead > self.frontier_preplan_max_lead
+        ):
+            raise ValueError("异步前沿规划时间参数无效")
         self.exit_first_max_linear = _optional_positive_float(
             _param("controller/exit_first_max_linear", None),
             "controller/exit_first_max_linear",
@@ -952,6 +1021,9 @@ class _MissionConfigBuilder:
             "max_lateral": float(_param("controller/max_lateral", 0.25)),
             "max_angular": float(_param("controller/max_angular", 1.2)),
             "min_linear_fraction": float(_param("controller/min_linear_fraction", 0.35)),
+            "arc_turn_min_linear_fraction": float(
+                _param("controller/arc_turn_min_linear_fraction", 0.0)
+            ),
             "goal_tolerance": float(_param("controller/goal_tolerance", 0.35)),
             "waypoint_tolerance": float(_param("controller/waypoint_tolerance", 0.25)),
             "corner_tolerance": float(_param("controller/corner_tolerance", 0.15)),
@@ -1001,6 +1073,7 @@ class _MissionConfigBuilder:
             "min_circularity": float(_param("detection/min_circularity", 0.55)),
             "min_aspect": float(_param("detection/min_aspect", 0.65)),
             "max_aspect": float(_param("detection/max_aspect", 1.55)),
+            "target_radius": float(_param("detection/target_radius", 0.15)),
             "min_radius": float(_param("detection/min_radius", 0.10)),
             "max_radius": float(_param("detection/max_radius", 0.22)),
             "max_rmse": float(_param("detection/max_rmse", 0.035)),
@@ -1095,10 +1168,22 @@ class _MissionConfigBuilder:
             _param("local_semantic/elevator_visual_max_distance", 4.0)
         )
         self.elevator_opening_confirmation_timeout = float(
-            _param("local_semantic/elevator_opening_confirmation_timeout", 8.0)
+            _param("local_semantic/elevator_opening_confirmation_timeout", 15.0)
+        )
+        self.elevator_opening_confirmation_retry_limit = int(
+            _param("local_semantic/elevator_opening_confirmation_retry_limit", 1)
+        )
+        self.elevator_opening_confirmation_retry_timeout = float(
+            _param("local_semantic/elevator_opening_confirmation_retry_timeout", 10.0)
+        )
+        self.elevator_opening_confirmation_sensor_refresh = float(
+            _param("local_semantic/elevator_opening_confirmation_sensor_refresh", 0.5)
         )
         self.elevator_local_crossing_geometry_enabled = bool(
             _param("mission/elevator_local_crossing_geometry_enabled", True)
+        )
+        self.elevator_async_target_door_close_enabled = bool(
+            _param("mission/elevator_async_target_door_close_enabled", True)
         )
         self.elevator_local_crossing_timeout = float(
             _param("mission/elevator_local_crossing_timeout", 4.0)
@@ -1132,6 +1217,9 @@ class _MissionConfigBuilder:
         )
         self.elevator_local_crossing_max_center_correction = float(
             _param("mission/elevator_local_crossing_max_center_correction", 0.80)
+        )
+        self.elevator_geometry_refresh_enabled = bool(
+            _param("local_semantic/elevator_geometry_refresh_enabled", True)
         )
         self.elevator_geometry_refresh_timeout = float(
             _param("local_semantic/elevator_geometry_refresh_timeout", 6.0)
@@ -1186,6 +1274,42 @@ class _MissionConfigBuilder:
                 _param("local_semantic/landmark_drift_maximum_residual_spread", 0.15)
             ),
         )
+        self.sparse_relocalization_config = SparseRelocalizationConfig(
+            enabled=bool(_param("localization/sparse_relocalization_enabled", True)),
+            anchor_radius=float(_param("localization/sparse_anchor_radius", 12.0)),
+            voxel_size=float(_param("localization/sparse_voxel_size", 0.10)),
+            minimum_points=int(_param("localization/sparse_minimum_points", 120)),
+            maximum_points=int(_param("localization/sparse_maximum_points", 2400)),
+            minimum_correction=float(
+                _param("localization/sparse_minimum_correction", 0.08)
+            ),
+            maximum_correction=float(
+                _param("localization/sparse_maximum_correction", 1.20)
+            ),
+            coarse_step=float(_param("localization/sparse_coarse_step", 0.10)),
+            minimum_overlap=float(
+                _param("localization/sparse_minimum_overlap", 0.55)
+            ),
+            maximum_residual_p70=float(
+                _param("localization/sparse_maximum_residual_p70", 0.18)
+            ),
+            minimum_uniqueness_margin=float(
+                _param("localization/sparse_minimum_uniqueness_margin", 0.08)
+            ),
+            required_frames=int(_param("localization/sparse_required_frames", 3)),
+            maximum_frame_spread=float(
+                _param("localization/sparse_maximum_frame_spread", 0.08)
+            ),
+            maximum_linear_speed=float(
+                _param("localization/sparse_maximum_linear_speed", 0.08)
+            ),
+            maximum_angular_speed=float(
+                _param("localization/sparse_maximum_angular_speed", 0.10)
+            ),
+            correction_timeout=float(
+                _param("localization/sparse_correction_timeout", 2.0)
+            ),
+        )
         if not (
             math.isfinite(self.elevator_visual_min_width)
             and math.isfinite(self.elevator_visual_max_width)
@@ -1196,6 +1320,12 @@ class _MissionConfigBuilder:
             and 0.0 < self.elevator_visual_min_width < self.elevator_visual_max_width
             and self.elevator_visual_max_distance > 0.0
             and self.elevator_opening_confirmation_timeout > 0.0
+            and self.elevator_opening_confirmation_retry_limit in (0, 1, 2)
+            and math.isfinite(self.elevator_opening_confirmation_retry_timeout)
+            and self.elevator_opening_confirmation_retry_timeout > 0.0
+            and math.isfinite(self.elevator_opening_confirmation_sensor_refresh)
+            and 0.0 < self.elevator_opening_confirmation_sensor_refresh
+            <= self.elevator_opening_confirmation_retry_timeout
             and math.isfinite(self.elevator_local_crossing_timeout)
             and self.elevator_local_crossing_timeout > 0.0
             and math.isfinite(self.elevator_exit_empty_fallback_timeout)

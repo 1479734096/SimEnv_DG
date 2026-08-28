@@ -33,6 +33,7 @@
 #include <danger_search_localization/velocity_transform.hpp>
 #include <geometry_msgs/TransformStamped.h>
 #include <geometry_msgs/Twist.h>
+#include <geometry_msgs/Vector3Stamped.h>
 #include <nav_msgs/Odometry.h>
 #include <ros/package.h>
 #include <ros/ros.h>
@@ -273,6 +274,11 @@ class ScanLocalizationNode {
     double shared_map_max_source_divergence = 0.05;
     double shared_map_max_map_commit_difference = 0.05;
     bool diagnostic_frame_details = false;
+    bool landmark_correction_enabled = false;
+    double landmark_correction_maximum = 1.20;
+    double landmark_correction_command_speed = 0.02;
+    double landmark_correction_angular_speed = 0.10;
+    double landmark_correction_maximum_age = 1.0;
     std::string depth_cloud_topic = "/real_sense/depth/points";
     std::string raw_cloud_frame = "laser_livox";
     std::string imu_frame = "imu_link";
@@ -375,6 +381,21 @@ class ScanLocalizationNode {
                       shared_map_max_map_commit_difference);
     private_nh_.param("diagnostic_frame_details", diagnostic_frame_details,
                       diagnostic_frame_details);
+    private_nh_.param("landmark_correction_enabled",
+                      landmark_correction_enabled,
+                      landmark_correction_enabled);
+    private_nh_.param("landmark_correction_maximum",
+                      landmark_correction_maximum,
+                      landmark_correction_maximum);
+    private_nh_.param("landmark_correction_command_speed",
+                      landmark_correction_command_speed,
+                      landmark_correction_command_speed);
+    private_nh_.param("landmark_correction_angular_speed",
+                      landmark_correction_angular_speed,
+                      landmark_correction_angular_speed);
+    private_nh_.param("landmark_correction_maximum_age",
+                      landmark_correction_maximum_age,
+                      landmark_correction_maximum_age);
     private_nh_.param("depth_cloud_topic", depth_cloud_topic,
                       depth_cloud_topic);
     private_nh_.param("raw_cloud_frame", raw_cloud_frame, raw_cloud_frame);
@@ -457,6 +478,20 @@ class ScanLocalizationNode {
     use_adaptive_shared_map_ =
         localization_backend == "adaptive_shared_map";
     use_rgbd_livox_ = localization_backend == "rgbd_livox";
+    if (landmark_correction_enabled && !use_adaptive_shared_map_) {
+      throw std::runtime_error(
+          "地标平移纠正仅支持正式 adaptive_shared_map 后端");
+    }
+    if (!std::isfinite(landmark_correction_maximum) ||
+        !std::isfinite(landmark_correction_command_speed) ||
+        !std::isfinite(landmark_correction_angular_speed) ||
+        !std::isfinite(landmark_correction_maximum_age) ||
+        landmark_correction_maximum <= 0.0 ||
+        landmark_correction_command_speed < 0.0 ||
+        landmark_correction_angular_speed <= 0.0 ||
+        landmark_correction_maximum_age <= 0.0) {
+      throw std::runtime_error("地标平移纠正参数无效");
+    }
     adaptive_rgbd_localization_enabled_ =
         use_adaptive_shared_map_ && adaptive_rgbd_localization_enabled;
     const bool requires_imu =
@@ -525,6 +560,11 @@ class ScanLocalizationNode {
         diagnostic_large_translation_threshold;
     diagnostic_summary_period_ = diagnostic_summary_period;
     diagnostic_frame_details_ = diagnostic_frame_details;
+    landmark_correction_enabled_ = landmark_correction_enabled;
+    landmark_correction_maximum_ = landmark_correction_maximum;
+    landmark_correction_command_speed_ = landmark_correction_command_speed;
+    landmark_correction_angular_speed_ = landmark_correction_angular_speed;
+    landmark_correction_maximum_age_ = landmark_correction_maximum_age;
     stance_health_enabled_ = stance_health_enabled;
     danger_search_localization::StanceInitializationConfig stance_config;
     stance_config.minimum_base_height = initialization_min_base_height;
@@ -584,6 +624,13 @@ class ScanLocalizationNode {
         "/danger_search/localization/ready", 1, true);
     health_publisher_ = nh_.advertise<std_msgs::Bool>(
         "/danger_search/localization/health", 1, true);
+    if (landmark_correction_enabled_) {
+      correction_state_publisher_ = nh_.advertise<geometry_msgs::Vector3Stamped>(
+          "/danger_search/localization/correction_state", 4);
+      correction_subscriber_ = nh_.subscribe(
+          "/danger_search/localization/correction_request", 2,
+          &ScanLocalizationNode::OnLandmarkCorrection, this);
+    }
     std_msgs::Bool not_ready;
     not_ready.data = false;
     ready_publisher_.publish(not_ready);
@@ -624,6 +671,92 @@ class ScanLocalizationNode {
     ros::Time stamp;
     Eigen::Vector2d base_velocity;
   };
+
+  void OnLandmarkCorrection(
+      const geometry_msgs::Vector3Stamped::ConstPtr &message) {
+    if (!landmark_correction_enabled_ || message == nullptr) {
+      return;
+    }
+    const Eigen::Vector2d correction(message->vector.x, message->vector.y);
+    const double correction_norm = correction.norm();
+    const ros::Time now = ros::Time::now();
+    const double age = now.toSec() - message->header.stamp.toSec();
+    if (message->header.seq == 0 || message->header.frame_id != "world" ||
+        message->header.stamp.isZero() || !correction.allFinite() ||
+        !std::isfinite(message->vector.z) || std::abs(message->vector.z) > 1e-9 ||
+        !std::isfinite(age) || age < 0.0 ||
+        age > landmark_correction_maximum_age_ || correction_norm <= 0.0 ||
+        correction_norm > landmark_correction_maximum_) {
+      ROS_ERROR(
+          "拒绝非法或过期的地标平移纠正请求：seq=%u norm=%.3f age=%.3f",
+          message->header.seq, correction_norm, age);
+      return;
+    }
+
+    std::lock_guard<std::mutex> shared_lock(shared_map_mutex_);
+    if (message->header.seq <= last_landmark_correction_sequence_ ||
+        !world_frame_initialized_ || !adaptive_pose_initialized_ ||
+        imu_odometry_ == nullptr || !imu_odometry_->initialized()) {
+      ROS_ERROR("拒绝未初始化或重复的地标平移纠正请求：seq=%u last=%u",
+                message->header.seq, last_landmark_correction_sequence_);
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> command_lock(command_mutex_);
+      if (command_samples_.empty() ||
+          now.toSec() - command_samples_.back().stamp.toSec() > 0.5 ||
+          command_samples_.back().base_velocity.norm() >
+              landmark_correction_command_speed_) {
+        ROS_ERROR(
+            "拒绝非静止状态的地标平移纠正请求：seq=%u command_unstable=1",
+            message->header.seq);
+        return;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> imu_lock(imu_mutex_);
+      if (imu_samples_.empty() ||
+          now.toSec() - imu_samples_.back().stamp.toSec() > 0.2 ||
+          imu_samples_.back().angular_velocity.norm() >
+              landmark_correction_angular_speed_) {
+        ROS_ERROR(
+            "拒绝角速度未稳定的地标平移纠正请求：seq=%u imu_unstable=1",
+            message->header.seq);
+        return;
+      }
+    }
+    if (!imu_odometry_->TranslatePlanar(correction)) {
+      ROS_ERROR("地标平移纠正事务失败：seq=%u", message->header.seq);
+      return;
+    }
+
+    adaptive_base_translation_.head<2>() += correction;
+    initial_world_base_translation_.head<2>() += correction;
+    adaptive_depth_proposal_ = {};
+    adaptive_depth_proposal_stamp_ = ros::Time();
+    consecutive_livox_only_veto_count_ = 0;
+    velocity_estimator_.Reset();
+    {
+      std::lock_guard<std::mutex> command_lock(command_mutex_);
+      command_samples_.clear();
+    }
+    last_landmark_correction_sequence_ = message->header.seq;
+
+    geometry_msgs::Vector3Stamped applied;
+    applied.header.seq = message->header.seq;
+    applied.header.stamp = now;
+    applied.header.frame_id = "world";
+    applied.vector.x = correction.x();
+    applied.vector.y = correction.y();
+    applied.vector.z = 0.0;
+    correction_state_publisher_.publish(applied);
+    ROS_WARN(
+        "已原子应用地标平移纠正：seq=%u correction=(%.3f, %.3f) "
+        "position=(%.3f, %.3f) generation=%lu",
+        message->header.seq, correction.x(), correction.y(),
+        adaptive_base_translation_.x(), adaptive_base_translation_.y(),
+        static_cast<unsigned long>(imu_odometry_->map_generation()));
+  }
 
   void OnCommand(const geometry_msgs::Twist::ConstPtr &message) {
     // 缓存本算法已经发出的机体系平移命令，按时间积分后仅作为配准初值；
@@ -2103,10 +2236,12 @@ class ScanLocalizationNode {
   ros::Subscriber imu_subscriber_;
   ros::Subscriber depth_subscriber_;
   ros::Subscriber command_subscriber_;
+  ros::Subscriber correction_subscriber_;
   ros::Publisher odom_publisher_;
   ros::Publisher cloud_publisher_;
   ros::Publisher ready_publisher_;
   ros::Publisher health_publisher_;
+  ros::Publisher correction_state_publisher_;
   kiss_icp::pipeline::KissICP odometry_;
   std::unique_ptr<danger_search_localization::ImuConstrainedOdometry>
       imu_odometry_;
@@ -2149,6 +2284,12 @@ class ScanLocalizationNode {
   double diagnostic_large_translation_threshold_ = 0.08;
   double diagnostic_summary_period_ = 2.0;
   bool diagnostic_frame_details_ = false;
+  bool landmark_correction_enabled_ = false;
+  double landmark_correction_maximum_ = 1.20;
+  double landmark_correction_command_speed_ = 0.02;
+  double landmark_correction_angular_speed_ = 0.10;
+  double landmark_correction_maximum_age_ = 1.0;
+  std::uint32_t last_landmark_correction_sequence_ = 0;
   double depth_freshness_seconds_ = 0.35;
   PlanarRegistrationDiagnosticStats depth_registration_diagnostics_;
   PlanarRegistrationDiagnosticStats livox_registration_diagnostics_;

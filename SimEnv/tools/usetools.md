@@ -1,10 +1,10 @@
 # tools 使用手册
 
-本文介绍 `codeDG_rebuild/tools/` 中现有工具的用途、输入、典型命令、输出和安全边界。
+本文介绍 `tools/` 中现有工具的用途、输入、典型命令、输出和安全边界。
 所有命令默认从工作区根目录执行：
 
 ```bash
-cd /home/xbh/tzb26/codeDG_rebuild
+cd /home/xbh/tzb26/codeDG/SimEnv
 source /opt/ros/noetic/setup.bash
 source devel/setup.bash
 ```
@@ -85,7 +85,8 @@ bash tools/sim/run_elevator_gui_test.sh --help
 ```
 
 runner 使用正式定位和正式 `MissionManager`，只通过证据目录中的临时 YAML 调整专项
-预算。正式配置文件不会被覆盖。
+预算。正式配置文件不会被覆盖。测试证据默认统一保存到 `/home/xbh/tzb26/evidence/simenv/`
+目录下（若目录不存在则自动回退至 `/tmp/`）。
 
 ### 3.2 两层定向上行
 
@@ -99,7 +100,6 @@ ELEVATOR_TEST_FLOOR_TIMEOUT=33 \
 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=5 \
 ELEVATOR_TEST_MAX_RUNTIME=180 \
 ELEVATOR_TEST_FULL_CYCLE=0 \
-ELEVATOR_TEST_LOG_DIR=/tmp/elevator_seed42_up \
 tools/sim/run_elevator_gui_test.sh
 ```
 
@@ -112,11 +112,10 @@ tools/sim/run_elevator_gui_test.sh
 SEED=6946 \
 GUI=true \
 ELEVATOR_TEST_FLOOR_COUNT=2 \
-ELEVATOR_TEST_FLOOR_TIMEOUT=33 \
-ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=5 \
-ELEVATOR_TEST_MAX_RUNTIME=180 \
+ELEVATOR_TEST_FLOOR_TIMEOUT=310.0 \
+ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60.0 \
+ELEVATOR_TEST_MAX_RUNTIME=720.0 \
 ELEVATOR_TEST_FULL_CYCLE=1 \
-ELEVATOR_TEST_LOG_DIR=/tmp/elevator_seed6946_full \
 tools/sim/run_elevator_gui_test.sh
 ```
 
@@ -130,12 +129,11 @@ tools/sim/run_elevator_gui_test.sh
 SEED=8127 \
 GUI=true \
 ELEVATOR_TEST_FLOOR_COUNT=3 \
-ELEVATOR_TEST_FLOOR_TIMEOUT=280 \
-ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
-ELEVATOR_TEST_MAX_RUNTIME=840 \
+ELEVATOR_TEST_FLOOR_TIMEOUT=310.0 \
+ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60.0 \
+ELEVATOR_TEST_MAX_RUNTIME=900.0 \
 ELEVATOR_TEST_FULL_CYCLE=1 \
-ELEVATOR_TEST_WALL_TIMEOUT=1800 \
-ELEVATOR_TEST_LOG_DIR=/tmp/elevator_seed8127_three_floor \
+ELEVATOR_TEST_WALL_TIMEOUT=10800 \
 tools/sim/run_elevator_gui_test.sh
 ```
 
@@ -146,13 +144,12 @@ tools/sim/run_elevator_gui_test.sh
 ```bash
 SEED=8127 \
 GUI=true \
-ELEVATOR_TEST_FLOOR_COUNT=3 \
+ELEVATOR_TEST_FLOOR_COUNT=2 \
 ELEVATOR_TEST_FULL_CYCLE=1 \
 ELEVATOR_TEST_RECORD_DRIFT=1 \
 ELEVATOR_TEST_RECORD_RGBD=1 \
 ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 \
 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=1 \
-ELEVATOR_TEST_LOG_DIR=/tmp/elevator_seed8127_diagnostic \
 tools/sim/run_elevator_gui_test.sh
 ```
 
@@ -240,7 +237,7 @@ python3 tools/offline/check_production_boundary.py
 
 ```bash
 python3 tools/offline/check_production_boundary.py \
-  --workspace /home/xbh/tzb26/codeDG_rebuild
+  --workspace /home/xbh/tzb26/codeDG/SimEnv
 ```
 
 输出“参赛 Python/离线边界审计通过。”且返回 `0` 表示通过；发现生产安装、import 或

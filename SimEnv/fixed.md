@@ -1,6 +1,6 @@
 # SimEnv 已完成与历史归档
 
-最后更新：2026-07-29
+最后更新：2026-08-28
 
 本文归档已经完成的机制、有效验证和历史失败结论。尚未完成的事项只维护在 [fix.md](fix.md)。
 
@@ -55,7 +55,7 @@
 - 危险源结果为正确 2、漏报 4、虚警 0，只作为早期基线。
 - 第 10.3 层又完成两轮固定 `seed=42`、300 秒完整单层闭环，覆盖启动、主入口、探索、检测、预算返航和结果写出。
 
-证据：`../codeDG_rebuild/reports/STAGE10_3_REPORT.md`。
+证据：`reports/STAGE10_3_REPORT.md`。
 
 ## 5. 主入口与门任务
 
@@ -87,7 +87,7 @@
 - `/tmp/stage12_elevator_start_retreat_round1_20260723`：`167.514 s` 正常完成。
 - `/tmp/stage12_elevator_start_retreat_round2_20260723`：`169.616 s` 正常完成。
 
-证据：`../codeDG_rebuild/reports/STAGE11_REPORT.md`、`../codeDG_rebuild/reports/STAGE12_ELEVATOR_START_RETREAT_REPORT.md`、`../codeDG_rebuild/reports/STAGE13_3_ELEVATOR_CROSSING_REPORT.md` 及上述运行目录。
+证据：`reports/STAGE11_REPORT.md`、`reports/STAGE12_ELEVATOR_START_RETREAT_REPORT.md`、`reports/STAGE13_3_ELEVATOR_CROSSING_REPORT.md` 及上述运行目录。
 
 ## 7. 地图、负障与恢复机制
 
@@ -161,13 +161,13 @@ Stage15～17 当前结论：
   误差为 `0.2529 m`，所以统计矩阵不能晋级。用户明确接受该残余风险后，Stage17 按工程
   验收通过并将 `adaptive_shared_map` 切为正式默认；不得表述为冻结矩阵通过。
 
-证据：`../codeDG_rebuild/reports/STAGE12_M0_REPORT.md`、
-`../codeDG_rebuild/reports/STAGE12_M2_REPORT.md`、
-`../codeDG_rebuild/reports/STAGE12_M3_DIAGNOSTIC_REPORT.md`、
-`../codeDG_rebuild/reports/STAGE12_M6_GICP_ROTATION_DIAGNOSTIC_CHECKPOINT.md`、
-`../codeDG_rebuild/reports/STAGE12_M6_HIDDEN_ROTATION_REJECTION.md`、
-`../codeDG_rebuild/reports/STAGE15_REPORT.md`、`../codeDG_rebuild/reports/STAGE16_REPORT.md`
-和 `../codeDG_rebuild/reports/STAGE17_REPORT.md`。
+证据：`reports/STAGE12_M0_REPORT.md`、
+`reports/STAGE12_M2_REPORT.md`、
+`reports/STAGE12_M3_DIAGNOSTIC_REPORT.md`、
+`reports/STAGE12_M6_GICP_ROTATION_DIAGNOSTIC_CHECKPOINT.md`、
+`reports/STAGE12_M6_HIDDEN_ROTATION_REJECTION.md`、
+`reports/STAGE15_REPORT.md`、`reports/STAGE16_REPORT.md`
+和 `reports/STAGE17_REPORT.md`。
 
 ## 9. 历史失败检查点
 
@@ -621,4 +621,61 @@ Stage15～17 当前结论：
 - **日志与确认源审计**：准确记录 `confirmation_source` 为视觉深度来源或 `livox_registered_opening`，保留双通道确认帧数审计；
 - **测试验证**：全量 Python 单元与契约测试 `860 passed in 4.73s` 100% 绿灯通过。
 
+## 27. 2026-08-28 出电梯关门异步化与极速放行（STAGE28.1）
 
+- **出厢即放行（Fire-and-Forget）**：在 `TakeElevator` 状态机中，机器狗完成目标楼层出厢跨越（`EXIT_CABIN`）到达厅外安全点后，触发后台 Daemon 线程异步请求 `/set_door_state` 关门，主状态机不再下发 `controller.stop()` 阻塞等待，瞬间返回 `DONE`；
+- **探索无缝衔接**：`MissionManager` 瞬间切入 `EXPLORE_FLOOR` 启动 Frontier 前沿评估与 A* 路径规划，消除原同步关门导致的 2.5~3.3 秒原地发呆等待（双楼层提速 ~6s，三楼层提速 ~10s）；
+- **安全与兼容**：依托 STAGE28 建立的 `target_crossing_geometry` 防回头半平面约束防倒退撞门，并新增 `elevator_async_target_door_close_enabled`（默认 `true`）支持平滑回退；
+- **测试验证**：全量 Python 单元测试 `864 passed in 5.07s` 全部绿灯通过，生产边界审计通过；
+- 详情见 [STAGE28_1_ASYNC_ELEVATOR_DOOR_CLOSE_REPORT.md](reports/STAGE28_1_ASYNC_ELEVATOR_DOOR_CLOSE_REPORT.md)。
+
+## 28. 2026-08-28 电梯门前语义几何刷新与远距离危险源主动走近核验（STAGE29）
+
+- **电梯门前语义几何刷新（`elevator_geometry_refresh_enabled`）**：在电梯门前 `1.2m`
+  远视点连续重观测关闭门板，只刷新当次 `TakeElevator` 使用的等待点、门轴和乘梯几何。
+  本阶段不修改 odom、定位地图、轨迹或危险源坐标；真正的定位/共享图平移纠偏在 STAGE33 实现。
+- **远距离危险源主动走近核验（Active Danger Approach Verification）**：
+  - `DetectionTracker` 增加 `inspected` 状态管理与 `get_pending_inspection_target()`、`mark_inspected()` 接口；
+  - `exploration_runtime.py` 实现 `compute_danger_approach_pose()`，计算距目标 1.3m 且正对红球的安全自由停靠航向点；
+  - `MissionManager` 在路径空闲且楼层时间预算充裕时优先插入走近路径（`reason="danger_approach_verification"`）；
+  - 走近过程中相机自动采集多帧近距离点云拟合，并按观测距离、拟合 RMSE 和置信度加权；
+    单元测试证明调度与融合逻辑成立，但本轮尚无 Gazebo 证据证明全场误差稳定达到厘米级；
+- **配置与参数暴露**：在 `mission_config.py` 和 `danger_search.yaml` 中新增 `danger_approach_verification_enabled`、`danger_approach_trigger_distance`（2.2m）和 `danger_approach_standoff_distance`（1.3m）；
+- **测试验证**：全量 826 项单元与契约测试 100% 绿灯通过，新增 `set_path` 归因与几何停靠点测试；
+- 详情见 [STAGE29_ELEVATOR_REFRESH_AND_DANGER_APPROACH_REPORT.md](reports/STAGE29_ELEVATOR_REFRESH_AND_DANGER_APPROACH_REPORT.md)。
+
+## 29. 2026-08-28 探索前沿异步规划（STAGE30，已在 STAGE32 回退）
+
+- **前沿规划异步化与提前量预规划**：实现单后台规划线程，支持普通前沿、机会性重选（3.0s）与到达前动态提前量预规划（Prefetch），避免到点停车等待；
+- 详情见 [STAGE30_ASYNC_FRONTIER_PLANNING_REPORT.md](reports/STAGE30_ASYNC_FRONTIER_PLANNING_REPORT.md)。
+
+## 30. 2026-08-28 平衡弧线转弯与航向速度下限（STAGE31）
+
+- **弧线转弯平衡**：将原地转向触发阈值放宽至 `turn_in_place_heading = 1.10`，释放阈值 `turn_release_heading = 0.30`，并引入 `arc_turn_min_linear_fraction: 0.15`，允许中等偏角平滑过弯；
+- 详情见 [STAGE31_BALANCED_ARC_TURN_REPORT.md](reports/STAGE31_BALANCED_ARC_TURN_REPORT.md)。
+
+## 31. 2026-08-28 探索前沿规划回退同步模式（STAGE32）
+
+- **回退背景与根因**：
+  1. 异步规划消除了到点停稳，机器狗在 $0.80\,\text{m/s}$ 高速奔跑中，Livox 点云动态更新在狭窄走廊/转角处偶发触发 $2.0\,\text{s}$ 的 `OBSERVATION_HOLD` 超时，导致 `GroundSupportGate` 频繁触发 `ground_support_path_unavailable` 截断正在执行的路径，引发机器人被迫在相邻前沿间来回横跳；
+  2. 高速奔跑与大幅弧线转弯引起机身 Pitch 颠簸（$3^\circ \sim 5^\circ$），平整地面点云在坐标转换中被虚假抬高至 $z \ge 0.20\,\text{m} \sim 0.40\,\text{m}$，生成大量硬障碍物核心（`hard_core_count > 4000`）并自我固化；
+  3. 经典同步单次规划模式下，机器狗每到一个目标点完全刹停零速 $300 \sim 500\,\text{ms}$，在静止水平姿态下雷达充分积累点云并完成激光射线深度洗地（Raycast Free Clear），地面支撑覆盖率 100% 满格，彻底消除运动中的虚假障碍和路径被动掐断问题。
+- **配置变更**：在 `danger_search.yaml` 中将 `async_planning_enabled` 设为 `false`，完全关闭后台规划线程、行进中换道与到达前预规划；
+- **测试验证**：全量单元与契约测试 `857 passed in 6.29s` 全部绿灯通过，生产边界审计通过；
+- 详情见 [STAGE32_ROLLBACK_ASYNC_FRONTIER_PLANNING_REPORT.md](reports/STAGE32_ROLLBACK_ASYNC_FRONTIER_PLANNING_REPORT.md)。
+
+## 32. 2026-08-28 当前提交候选收口与稀疏地标纠偏（STAGE33）
+
+- **红球几何定位**：使用公开半径 `R=0.15m` 的高斯-牛顿非线性几何拟合，替代单侧球冠代数球拟合；跟踪器按观测距离、RMSE 和置信度加权，远距离高质量候选可触发一次近场核验。
+- **无效前沿剪枝**：距离大于 `3.5m` 且预期收益小于 `30` 格的小前沿，在 A* 落点解析时仍保持剪枝，不再重新激活；不计入不可达失败或黑名单。
+- **正式运动与规划基线**：`max_linear=0.75m/s`、`boundary_hold_margin=0.40m`、
+  `async_planning_enabled=false`、`opportunistic_replan_period=0.0`；异步规划框架仅作为默认关闭的可回退实现保留。
+- **双静态锚点**：首次合法注册时冻结主入口和 0 层电梯周边 Livox 静态结构；复访只用当前楼层、当前定位 epoch 的连续三帧。
+- **原子平移注入**：候选必须通过点数、重叠率、P70 残差、唯一性、帧间离散、静止和 `1.20m` 上界门控；C++ 定位节点同步平移位姿与 Adaptive Shared Map，回执后切换 `PoseProvider` epoch。
+- **电梯开口弹性**：首次确认超时 `15s`，只允许一次 `10s` 重试；重试前必须等待至少 `0.5s` 后的新 Livox 帧。源层重新复核/对准/呼梯/开门，目标层留在轿厢内只重开门。
+- **量程统一**：正式 launch 和 `run_elevator_gui_test.sh` 默认使用 `15.0m`；`8.0m` 只保留为显式历史 A/B 覆盖。
+- **验证**：全仓 Python `893 passed`；定位包 `catkin_test_results` 汇总
+  `158 tests, 0 failures`；生产边界审计和 `git diff --check` 通过。按用户要求未运行 Gazebo 定向或完整闭环，运行时效果仍属待验证。
+- **未关闭的阶段门**：`sha256sum -c OFFICIAL_FILES.sha256` 仍有 6 个历史不一致项；本轮未覆盖
+  受保护文件，因此当前候选尚不能创建迁移阶段提交或标签。
+- 详情见 [STAGE33_SPARSE_LANDMARK_RELOCALIZATION_REPORT.md](reports/STAGE33_SPARSE_LANDMARK_RELOCALIZATION_REPORT.md)。

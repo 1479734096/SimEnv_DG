@@ -73,6 +73,14 @@ class PerceptionMappingRuntime:
         self.perception.consume_cloud(cloud_input.generation)
         self.map_runtime.last_cloud_stamp = cloud_input.stamp
         self.map_runtime.latest_cloud_points = list(points)
+        record = getattr(self.map_runtime, "record_registered_cloud", None)
+        if callable(record):
+            record(
+                stamp=float(cloud_input.stamp),
+                floor=int(floor_index),
+                localization_epoch=0,
+                points=points,
+            )
 
     def commit_cloud(
         self,
@@ -111,6 +119,14 @@ class PerceptionMappingRuntime:
             opened_door_exclusion=opened_door_exclusion,
         )
         self.map_runtime.latest_cloud_points = list(result.points)
+        record = getattr(self.map_runtime, "record_registered_cloud", None)
+        if callable(record):
+            record(
+                stamp=float(cloud_input.stamp),
+                floor=int(floor_index),
+                localization_epoch=int(localization_epoch),
+                points=result.points,
+            )
         self.map_runtime.nearest_forward_obstacle = result.forward_obstacle
         self.map_runtime.nearest_radial_obstacle_distance = (
             result.radial_obstacle_distance

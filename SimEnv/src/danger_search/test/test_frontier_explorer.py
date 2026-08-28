@@ -22,6 +22,17 @@ from danger_search.planner import (
 
 
 class FrontierExplorerTest(unittest.TestCase):
+    def test_live_blacklist_query_expires_old_entry(self):
+        grid = FloorGrid(0, 1.0, 3.0, 3.0, 0.0, 0.0)
+        target = grid.grid_to_world(1, 1)
+        explorer = FrontierExplorer(min_cluster_size=1)
+        explorer._blacklist[(1, 1)] = 5.0
+
+        with patch("danger_search.frontier.get_time", return_value=4.0):
+            self.assertTrue(explorer.is_blacklisted(grid, target))
+        with patch("danger_search.frontier.get_time", return_value=6.0):
+            self.assertFalse(explorer.is_blacklisted(grid, target))
+
     def test_formal_reachable_but_support_blocked_is_reported_without_astar_loop(self):
         grid = FloorGrid(
             floor_index=0, resolution=1.0, width=7.0, length=3.0,
@@ -1805,6 +1816,42 @@ class FrontierExplorerTest(unittest.TestCase):
         self.assertEqual(best_target, far_target)
         self.assertGreater(best_score, -math.inf)
         self.assertIn(far_target, scores)
+
+    def test_select_frontier_prunes_far_small_pocket_end_to_end(self):
+        """验证端到端 select_frontier 会彻底跳过远距离小前沿，不作为有效前沿选择。"""
+        grid = FloorGrid(
+            floor_index=0, resolution=0.1, width=10.0, length=10.0,
+            origin_x=0.0, origin_y=0.0,
+        )
+        for gy in range(1, 90):
+            for gx in range(1, 90):
+                grid.mark_free(gx, gy)
+        robot_pose = (0.5, 0.5, 0.0)
+        # 远距离小前沿 (距离 5.0m, 期望收益 10 < 30)
+        far_target = (5.5, 0.5)
+        far_frontier = Frontier(cells=((55, 5),), centroid=far_target, information_gain=10.0)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            min_far_expected_gain=30.0,
+            far_prune_distance=3.5,
+        )
+        explorer._candidate_targets_for_frontier = lambda *_args: [far_target]
+        explorer._expected_unknown_gain = lambda *_args: 10.0
+
+        selected, _path = explorer.select_frontier(
+            grid, robot_pose, None, frontiers=[far_frontier]
+        )
+        # 真实前沿被剪枝跳过，未被作为真实前沿选中
+        if selected is not None:
+            self.assertEqual(selected.information_gain, 0.0)
+            self.assertTrue(explorer.last_selection_debug.used_fallback)
+        self.assertIn(
+            "far_small_pocket_pruned",
+            {
+                candidate.rejection_reason
+                for candidate in explorer.last_selection_debug.candidates
+            },
+        )
 
 
 if __name__ == "__main__":

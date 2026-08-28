@@ -999,6 +999,91 @@ class GroundSupportSafetyGateTest(unittest.TestCase):
         self.assertEqual(gate.state, CLEAR)
         self.assertEqual(gate.observation_hold_release_without_witness_count, 1)
 
+    def test_observation_hold_timeout_with_boundary_but_no_drop_evidence_resumes_clear(self):
+        gate = GroundSupportSafetyGate(_config(observation_hold_timeout=2.0))
+        gate.update_assessment(
+            _assessment(
+                supported_distance=0.10,
+                received_control_time=10.0,
+            )
+        )
+        gate.filter_command(
+            (0.20, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.0,
+            control_time=10.0,
+        )
+        self.assertEqual(gate.state, OBSERVATION_HOLD)
+        command, context_id = gate.support_sweep_context_snapshot((0.0, 0.0, 0.0))
+
+        gate.update_assessment(
+            _assessment(
+                stamp=10.1,
+                received_wall_time=100.1,
+                received_control_time=10.1,
+                supported_distance=0.10,
+                support_boundary_detected=True,
+                support_boundary_cells=((10, 10), (10, 11)),
+                drop_confirmed=False,
+                drop_intersects_sweep=False,
+                hold_context_id=context_id,
+                support_command=command,
+                support_lookahead_distance=0.2,
+                cloud_generation=1,
+                map_epoch=1,
+                localization_epoch=1,
+            )
+        )
+        self.assertIsNotNone(gate._pending_failure_witness)
+
+        # 模拟超时到达 2 秒
+        gate.check_control_timeout(12.01, wall_time=102.1)
+
+        # 无真跌落证据：直接放行恢复 CLEAR，witness 清空，不打硬禁行
+        self.assertEqual(gate.state, CLEAR)
+        self.assertEqual(gate.observation_hold_release_without_witness_count, 1)
+        self.assertIsNone(gate._pending_failure_witness)
+
+    def test_observation_hold_timeout_with_real_drop_evidence_triggers_path_unavailable(self):
+        gate = GroundSupportSafetyGate(_config(observation_hold_timeout=2.0))
+        gate.update_assessment(
+            _assessment(
+                supported_distance=0.10,
+                received_control_time=10.0,
+            )
+        )
+        gate.filter_command(
+            (0.20, 0.0, 0.0),
+            pose_yaw=0.0,
+            wall_time=100.0,
+            control_time=10.0,
+        )
+        self.assertEqual(gate.state, OBSERVATION_HOLD)
+        command, context_id = gate.support_sweep_context_snapshot((0.0, 0.0, 0.0))
+
+        # 在观察期内更新出明确的真断崖证据
+        gate.update_assessment(
+            _assessment(
+                stamp=10.1,
+                received_wall_time=100.1,
+                received_control_time=10.1,
+                supported_distance=0.10,
+                support_boundary_detected=True,
+                support_boundary_cells=((10, 10), (10, 11)),
+                drop_confirmed=True,
+                drop_intersects_sweep=True,
+                hold_context_id=context_id,
+                support_command=command,
+            )
+        )
+
+        # 模拟超时到达 2 秒
+        gate.check_control_timeout(12.01, wall_time=102.1)
+
+        # 有真跌落证据：准确上报 SUPPORT_PATH_UNAVAILABLE
+        self.assertEqual(gate.state, SUPPORT_PATH_UNAVAILABLE)
+        self.assertEqual(gate.reason_code, "ground_support_path_unavailable")
+
     def test_wall_progress_alone_does_not_expire_observation_hold(self):
         gate = GroundSupportSafetyGate(_config(observation_hold_timeout=2.0))
         gate.update_assessment(_assessment(supported_distance=0.10, received_control_time=10.0))
@@ -1130,6 +1215,10 @@ def test_hold_freezes_complete_failure_witness_until_matching_ack():
             supported_distance=0.10,
             support_boundary_detected=False,
             support_boundary_cells=(),
+            drop_confirmed=True,
+            drop_intersects_sweep=True,
+            hold_context_id=context_id,
+            support_command=command,
         )
     )
     gate.check_control_timeout(12.01, wall_time=100.2)

@@ -17,13 +17,18 @@ from typing import Iterable
 
 import numpy as np
 
-from danger_search.interface_policy import require_internal_input_topic
+from danger_search.interface_policy import (
+    require_internal_input_topic,
+    require_internal_output_topic,
+)
 
 try:
     import rospy
+    from geometry_msgs.msg import Vector3Stamped
     from nav_msgs.msg import Odometry
 except ImportError:  # pragma: no cover - 离线测试环境
     rospy = None
+    Vector3Stamped = None
     Odometry = None
 
 
@@ -95,7 +100,14 @@ class PoseProvider:
     执行计算，避免长时间占用回调锁。历史长度有上限，防止长任务持续增长内存。
     """
 
-    def __init__(self, odom_topic: str, *, max_samples: int = 256):
+    def __init__(
+        self,
+        odom_topic: str,
+        *,
+        correction_request_topic: str = "/danger_search/localization/correction_request",
+        correction_state_topic: str = "/danger_search/localization/correction_state",
+        max_samples: int = 256,
+    ):
         self.odom_topic = require_internal_input_topic(
             odom_topic,
             purpose="统一位姿入口",
@@ -103,6 +115,18 @@ class PoseProvider:
         self._lock = Lock()
         self._samples: deque[PoseSample] = deque(maxlen=max(2, int(max_samples)))
         self._subscriber = None
+        self._correction_publisher = None
+        self._correction_subscriber = None
+        self._correction_request_topic = require_internal_output_topic(
+            correction_request_topic,
+            purpose="定位平移纠正请求",
+        )
+        self._correction_state_topic = require_internal_input_topic(
+            correction_state_topic,
+            purpose="定位平移纠正回执",
+        )
+        self._next_correction_sequence = 1
+        self._correction_acks: dict[int, tuple[float, float, float]] = {}
         self._frame_identity: tuple[str, str] | None = None
         self._continuity_epoch = 1
 
@@ -113,9 +137,75 @@ class PoseProvider:
 
     def start(self) -> None:
         """建立内部里程计订阅；构造对象本身不会产生 ROS 副作用。"""
-        if rospy is None or Odometry is None:
+        if rospy is None or Odometry is None or Vector3Stamped is None:
             raise RuntimeError("当前环境没有 rospy，无法启动 PoseProvider")
         self._subscriber = rospy.Subscriber(self.odom_topic, Odometry, self._on_odometry, queue_size=16)
+        self._correction_publisher = rospy.Publisher(
+            self._correction_request_topic,
+            Vector3Stamped,
+            queue_size=1,
+        )
+        self._correction_subscriber = rospy.Subscriber(
+            self._correction_state_topic,
+            Vector3Stamped,
+            self._on_correction_state,
+            queue_size=4,
+        )
+
+    def request_planar_correction(
+        self,
+        correction_xy: tuple[float, float],
+        *,
+        maximum_correction: float,
+        maximum_linear_speed: float,
+        maximum_angular_speed: float,
+    ) -> int | None:
+        """机器人静止时发布一次有序纠正请求；不满足门控则拒绝。"""
+        try:
+            dx, dy = (float(correction_xy[0]), float(correction_xy[1]))
+            maximum = float(maximum_correction)
+            linear_limit = float(maximum_linear_speed)
+            angular_limit = float(maximum_angular_speed)
+        except (IndexError, TypeError, ValueError):
+            return None
+        if (
+            not all(
+                np.isfinite(value)
+                for value in (dx, dy, maximum, linear_limit, angular_limit)
+            )
+            or maximum <= 0.0
+            or linear_limit <= 0.0
+            or angular_limit <= 0.0
+            or float(np.hypot(dx, dy)) <= 0.0
+            or float(np.hypot(dx, dy)) > maximum
+        ):
+            return None
+        sample = self.latest()
+        if (
+            sample is None
+            or sample.planar_speed > linear_limit
+            or sample.angular_speed > angular_limit
+            or self._correction_publisher is None
+            or Vector3Stamped is None
+            or rospy is None
+        ):
+            return None
+        with self._lock:
+            sequence = self._next_correction_sequence
+            self._next_correction_sequence += 1
+        message = Vector3Stamped()
+        message.header.seq = int(sequence)
+        message.header.stamp = rospy.Time.now()
+        message.header.frame_id = "world"
+        message.vector.x = dx
+        message.vector.y = dy
+        message.vector.z = 0.0
+        self._correction_publisher.publish(message)
+        return sequence
+
+    def correction_ack(self, sequence: int) -> tuple[float, float, float] | None:
+        with self._lock:
+            return self._correction_acks.get(int(sequence))
 
     def latest(self) -> PoseSample | None:
         """返回最新定位快照；尚未收到里程计时返回 ``None``。"""
@@ -253,6 +343,32 @@ class PoseProvider:
                 self._continuity_epoch += 1
                 self._samples.clear()
             self._samples.append(sample)
+
+    def _on_correction_state(self, message) -> None:
+        """收到定位节点事务回执后切换连续性 epoch 并丢弃旧坐标样本。"""
+        if message is None or str(getattr(message.header, "frame_id", "")) != "world":
+            return
+        sequence = int(getattr(message.header, "seq", 0))
+        stamp = _stamp_seconds(message)
+        values = (
+            float(getattr(message.vector, "x", float("nan"))),
+            float(getattr(message.vector, "y", float("nan"))),
+        )
+        if sequence <= 0 or stamp is None or not np.all(np.isfinite(values)):
+            return
+        with self._lock:
+            if sequence in self._correction_acks:
+                return
+            self._correction_acks[sequence] = (values[0], values[1], stamp)
+            self._continuity_epoch += 1
+            self._samples = deque(
+                (sample for sample in self._samples if sample.stamp > stamp),
+                maxlen=self._samples.maxlen,
+            )
+            if len(self._correction_acks) > 16:
+                oldest = sorted(self._correction_acks)[:-16]
+                for old_sequence in oldest:
+                    self._correction_acks.pop(old_sequence, None)
 
 
 def _stamp_seconds(message) -> float | None:

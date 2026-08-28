@@ -611,7 +611,7 @@ class PathInstallAttributionTest(unittest.TestCase):
         callsites = [
             site for site in _collect_write_callsites() if site["method"] == "set_path"
         ]
-        self.assertEqual(len(callsites), 14, "set_path 调用点数量变化，需复核归因覆盖")
+        self.assertEqual(len(callsites), 16, "set_path 调用点数量变化，需复核归因覆盖")
         unattributed = [
             (site["file"], site["line"])
             for site in callsites
@@ -620,10 +620,10 @@ class PathInstallAttributionTest(unittest.TestCase):
         self.assertEqual(unattributed, [], f"set_path 出现无归因调用点：{unattributed}")
 
     def test_set_path_reasons_are_distinct_per_callsite(self):
-        """14 处调用点的 reason 必须互不相同。
+        """15 个静态 reason 必须互不相同。
 
-        复用同一个 code 会让“哪个状态机装的路径”重新变得不可区分，
-        等于把刚补上的归因again 抹平。
+        另一个异步前沿统一安装入口使用显式动态 reason；静态调用点若复用同一
+        code，会让“哪个状态机装的路径”重新变得不可区分。
         """
         literals = [
             site["literal"]
@@ -632,7 +632,7 @@ class PathInstallAttributionTest(unittest.TestCase):
         ]
         duplicates = sorted({code for code in literals if literals.count(code) > 1})
         self.assertEqual(duplicates, [], f"set_path 出现重复 reason code：{duplicates}")
-        self.assertEqual(len(literals), 14)
+        self.assertEqual(len(literals), 15)
 
 
 class CrossLayerPrivateAccessTest(unittest.TestCase):
