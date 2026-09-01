@@ -166,6 +166,10 @@ _CONFIG_GROUP_FIELDS = {
             "danger_approach_verification_enabled",
             "danger_approach_trigger_distance",
             "danger_approach_standoff_distance",
+            "danger_approach_max_anchor_error",
+            "danger_verification_timeout",
+            "danger_verification_min_hits",
+            "danger_inspection_retry_cooldown",
         }
     ),
     "topics": frozenset(
@@ -551,6 +555,37 @@ class _MissionConfigBuilder:
         self.danger_approach_standoff_distance = float(
             _param("mission/danger_approach_standoff_distance", 1.3)
         )
+        self.danger_approach_max_anchor_error = float(
+            _param("mission/danger_approach_max_anchor_error", 0.5)
+        )
+        self.danger_verification_timeout = float(
+            _param("mission/danger_verification_timeout", 5.0)
+        )
+        raw_danger_verification_min_hits = _param(
+            "mission/danger_verification_min_hits", 2
+        )
+        self.danger_inspection_retry_cooldown = float(
+            _param("mission/danger_inspection_retry_cooldown", 5.0)
+        )
+        if (
+            not math.isfinite(self.danger_approach_trigger_distance)
+            or not math.isfinite(self.danger_approach_standoff_distance)
+            or self.danger_approach_trigger_distance <= 0.0
+            or self.danger_approach_standoff_distance <= 0.0
+            or self.danger_approach_trigger_distance
+            <= self.danger_approach_standoff_distance
+            or not math.isfinite(self.danger_approach_max_anchor_error)
+            or self.danger_approach_max_anchor_error <= 0.0
+            or not math.isfinite(self.danger_verification_timeout)
+            or self.danger_verification_timeout <= 0.0
+            or isinstance(raw_danger_verification_min_hits, bool)
+            or not isinstance(raw_danger_verification_min_hits, int)
+            or raw_danger_verification_min_hits <= 0
+            or not math.isfinite(self.danger_inspection_retry_cooldown)
+            or self.danger_inspection_retry_cooldown < 0.0
+        ):
+            raise ValueError("危险源接近与近场核验参数必须为有限有效值")
+        self.danger_verification_min_hits = raw_danger_verification_min_hits
         raw_max_stuck_retries = _param("mission/return_home_max_stuck_retries", 4)
         raw_max_candidate_rejects = _param(
             "mission/return_home_max_candidate_rejects", 3
@@ -1332,6 +1367,12 @@ class _MissionConfigBuilder:
             coarse_step=float(_param("localization/entrance_geometry_coarse_step", 0.05)),
             maximum_residual_p70=float(_param("localization/entrance_geometry_maximum_residual_p70", 0.12)),
             minimum_uniqueness_margin=float(_param("localization/entrance_geometry_minimum_uniqueness_margin", 0.04)),
+            maximum_yaw_correction=float(_param("localization/entrance_geometry_maximum_yaw_correction", 0.12)),
+            yaw_coarse_step=float(_param("localization/entrance_geometry_yaw_coarse_step", 0.02)),
+            maximum_yaw_spread=float(_param("localization/entrance_geometry_maximum_yaw_spread", 0.03)),
+            minimum_yaw_correction=float(_param("localization/entrance_geometry_minimum_yaw_correction", 0.01)),
+            minimum_residual_improvement=float(_param("localization/entrance_geometry_minimum_residual_improvement", 0.03)),
+            minimum_side_points=int(_param("localization/entrance_geometry_minimum_side_points", 16)),
             timeout=float(_param("localization/entrance_geometry_timeout", 3.0)),
             maximum_frame_age=float(_param("localization/entrance_geometry_maximum_frame_age", 1.0)),
             maximum_linear_speed=float(_param("localization/entrance_geometry_maximum_linear_speed", 0.08)),

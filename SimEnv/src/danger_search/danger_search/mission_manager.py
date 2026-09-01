@@ -136,6 +136,7 @@ from danger_search.exploration_runtime import (
     ExplorationRuntimeResult,
     ExplorationRuntime,
     NoFrontierRecoveryConfig,
+    compute_danger_approach_pose,
     decide_exploration_budget,
 )
 from danger_search.return_home_runtime import ReturnHomeRuntime
@@ -182,6 +183,20 @@ LOCALIZATION_HEALTH_TOPIC = "/danger_search/localization/health"
 EXPLORATION_COMPLETE_RETURN_REASONS = frozenset(
     {"floor_completion_ready", "floor_completion_ready_return_home"}
 )
+DANGER_INSPECTION_IDLE = "IDLE"
+DANGER_INSPECTION_APPROACHING = "APPROACHING"
+DANGER_INSPECTION_ALIGNING = "ALIGNING"
+DANGER_INSPECTION_VERIFYING = "VERIFYING"
+DANGER_INSPECTION_PATH_REASON = "danger_approach_verification"
+DANGER_PREEMPTIBLE_PATH_REASONS = frozenset(
+    {
+        "frontier_selected_path",
+        "frontier_confirmed_path",
+        "frontier_opportunistic_replan",
+        "frontier_prefetched_path",
+        "probe_unknown_space_path",
+    }
+)
 
 
 def _return_reason_indicates_exploration_complete(reason: str | None) -> bool:
@@ -202,6 +217,36 @@ class FloorExitCertificate:
     effective_reachable_count: int
     region_ids: tuple[str, ...]
     valid: bool
+
+
+@dataclass
+class DangerInspectionContext:
+    """一次危险源主动核验的主线程状态。"""
+
+    phase: str = DANGER_INSPECTION_IDLE
+    track_id: int | None = None
+    target_xy: tuple[float, float] | None = None
+    approach_xy: tuple[float, float] | None = None
+    started_at: float = 0.0
+    verification_started_at: float = 0.0
+    path_generation: int | None = None
+
+    def reset(self) -> None:
+        self.phase = DANGER_INSPECTION_IDLE
+        self.track_id = None
+        self.target_xy = None
+        self.approach_xy = None
+        self.started_at = 0.0
+        self.verification_started_at = 0.0
+        self.path_generation = None
+
+
+@dataclass(frozen=True)
+class DangerInspectionArbitration:
+    """危险源仲裁结果；pending 表示本轮不能抢占但不能先结束楼层。"""
+
+    handled: bool = False
+    pending: bool = False
 
 
 class MissionManager:
@@ -228,6 +273,8 @@ class MissionManager:
         self.target_floor: int | None = None
         self.return_after_floor_change = False
         self.current_frontier: Frontier | None = None
+        self._danger_inspection = DangerInspectionContext()
+        self._danger_defer_last_log_time = -math.inf
         self._service_task = None
         self._change_phase: str | None = None
         self._exploration = ExplorationRuntime()
@@ -318,6 +365,7 @@ class MissionManager:
         self._entrance_geometry_corrector = EntranceGeometryCorrector(
             self.config.localization["entrance_geometry_config"]
         )
+        self._entrance_geometry_logged_phases: set[str] = set()
         self._door_refresh_config = DoorRefreshConfig(
             timeout=float(self.config.entry["door_refresh_timeout"]),
             maximum_center_shift=float(
@@ -555,7 +603,7 @@ class MissionManager:
         phase: str,
         pose: tuple[float, float, float],
     ) -> EntranceCorrectionOutcome:
-        """在开局或主入口过门前执行一次固定几何 XY 纠偏。"""
+        """在开局或主入口过门前执行一次固定几何 SE(2) 纠偏。"""
         corrector = getattr(self, "_entrance_geometry_corrector", None)
         if corrector is None or getattr(self, "pose_provider", None) is None:
             return EntranceCorrectionOutcome("done", reason="disabled")
@@ -572,7 +620,12 @@ class MissionManager:
             robot_floor=int(self.current_floor),
         )
         evaluation = corrector.last_evaluations.get(str(phase))
-        if evaluation is not None and outcome.status == "done":
+        if (
+            evaluation is not None
+            and outcome.status == "done"
+            and str(phase) not in self._entrance_geometry_logged_phases
+        ):
+            self._entrance_geometry_logged_phases.add(str(phase))
             self._log_structured(
                 {
                     "event": "entrance_geometry_correction_evaluated",
@@ -580,9 +633,15 @@ class MissionManager:
                     "status": evaluation.status,
                     "correction_xy": evaluation.correction_xy,
                     "correction_norm": evaluation.correction_norm,
+                    "correction_yaw": evaluation.correction_yaw,
                     "residual_p70": evaluation.residual_p70,
+                    "translation_only_residual_p70": evaluation.translation_only_residual_p70,
+                    "residual_improvement": evaluation.residual_improvement,
                     "uniqueness_margin": evaluation.uniqueness_margin,
                     "frame_spread": evaluation.frame_spread,
+                    "yaw_spread": evaluation.yaw_spread,
+                    "left_support": evaluation.left_support,
+                    "right_support": evaluation.right_support,
                     "point_count": evaluation.point_count,
                     "outcome_reason": outcome.reason,
                 }
@@ -593,6 +652,7 @@ class MissionManager:
                     "event": "entrance_geometry_correction_applied",
                     "phase": str(phase),
                     "correction_xy": outcome.correction_xy,
+                    "correction_yaw": outcome.correction_yaw,
                     "correction_epoch": int(self.pose_provider.continuity_epoch),
                 }
             )
@@ -605,7 +665,9 @@ class MissionManager:
             "match_unavailable",
             "correction_exceeded",
             "frame_spread_exceeded",
+            "yaw_spread_exceeded",
             "residual_too_high",
+            "yaw_not_supported",
             "ambiguous",
         }:
             self._log_structured(
@@ -2364,10 +2426,17 @@ class MissionManager:
         self,
         pose: tuple[float, float, float] | None = None,
     ) -> None:
-        """受控门槛及其短暂离门阶段只关闭 UNKNOWN hold，显式 DROP 保持生效。"""
+        """同步电梯 CROSS 的支撑边界豁免和普通 UNKNOWN hold 策略。"""
         gate = getattr(self, "_ground_support_gate", None)
+        crossing_setter = getattr(gate, "set_controlled_elevator_crossing", None)
         setter = getattr(gate, "set_unknown_support_hold_enabled", None)
-        if callable(setter):
+        controlled_crossing = (
+            isinstance(self.current_task, TakeElevator)
+            and getattr(self.current_task, "phase", None)
+            in {"ENTER_CABIN", "EXIT_CABIN"}
+            and getattr(self.current_task, "cabin_transit_stage", None) == "CROSS"
+        )
+        if callable(crossing_setter) or callable(setter):
             configured = bool(
                 getattr(self, "ground_support_params", {}).get(
                     "unknown_support_hold_enabled", False
@@ -2387,7 +2456,10 @@ class MissionManager:
             ):
                 enabled = False
             with _controller_command_transaction(getattr(self, "controller", None)):
-                setter(enabled)
+                if callable(crossing_setter):
+                    crossing_setter(controlled_crossing)
+                if callable(setter):
+                    setter(enabled)
 
     def _return_entry_trace_is_trusted(
         self,
@@ -2919,8 +2991,334 @@ class MissionManager:
         self._begin_frontier_arrival_gain(grid, frontier)
         self._exploration.reset_no_frontier_escape()
         self._exploration.no_frontier_scan_until = 0.0
+        self._exploration.last_no_frontier_signature = None
         self._exploration.no_reachable_frontier_confirmations = 0
         self._exploration.probe_attempt = 0
+
+    def _danger_path_can_be_preempted(self) -> bool:
+        """只允许抢占普通探索路径，不打断恢复、对准或终态锁存。"""
+        planning = self.controller.planning_progress_snapshot()
+        if planning.terminal_pending:
+            return False
+        tracking_snapshot = getattr(self.controller, "tracking_debug_snapshot", None)
+        controller_mode = None
+        if callable(tracking_snapshot):
+            snapshot = tracking_snapshot()
+            if isinstance(snapshot, dict):
+                controller_mode = snapshot.get("controller_mode")
+        if controller_mode in {"RECOVER", "ALIGN"}:
+            return False
+        if planning.active:
+            return planning.path_reason in DANGER_PREEMPTIBLE_PATH_REASONS
+        return not self.controller.has_path()
+
+    def _clear_frontier_intent_for_danger(self) -> None:
+        """清除被危险源抢占的前沿意图，避免核验后复用过期路线。"""
+        self._frontier_arrival_gain.cancel()
+        self.current_frontier = None
+        self._exploration.last_frontier_target = None
+        self._exploration.last_frontier_score = None
+        self._exploration.last_frontier_used_fallback = False
+        self._exploration.reset_no_frontier_escape()
+        self._exploration.no_frontier_scan_until = 0.0
+        self._exploration.no_reachable_frontier_confirmations = 0
+        self._exploration.probe_attempt = 0
+        self._prefetched_frontier_plan = None
+        self._frontier_planning.reset_route_progress()
+        self._frontier_plan_timeout_logged = False
+
+    def _pending_danger_inspection_target(self, pose: tuple[float, float, float]):
+        tracker = getattr(self, "tracker", None)
+        selector = getattr(tracker, "select_pending_inspection_target", None)
+        if not callable(selector):
+            return None
+
+        minimum_confidence = max(
+            0.70,
+            float(getattr(tracker, "min_confidence", 0.70)),
+        )
+        return selector(
+            robot_xy=(float(pose[0]), float(pose[1])),
+            now=get_time(),
+            min_observe_dist=float(
+                getattr(self, "danger_approach_trigger_distance", 2.2)
+            ),
+            min_confidence=minimum_confidence,
+            floor_filter=self._danger_track_is_current_floor,
+        )
+
+    def _danger_track_is_current_floor(self, track) -> bool:
+        try:
+            return (
+                int(self.mapper.estimate_floor_from_z(float(track.mean_position[2])))
+                == int(self.current_floor)
+            )
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return False
+
+    def _start_danger_inspection(
+        self,
+        target,
+        approach_pose: tuple[float, float, float],
+        plan,
+        now: float,
+    ) -> bool:
+        tracker = getattr(self, "tracker", None)
+        marker = getattr(tracker, "mark_inspection_started", None)
+        track_id = getattr(target, "track_id", None)
+        if not callable(marker) or track_id is None:
+            return False
+        if not marker(int(track_id)):
+            return False
+        try:
+            self._clear_frontier_intent_for_danger()
+            self.controller.set_path(
+                list(plan.path),
+                reason=DANGER_INSPECTION_PATH_REASON,
+            )
+        except Exception:
+            failed = getattr(tracker, "mark_inspection_failed", None)
+            if callable(failed):
+                failed(
+                    int(track_id),
+                    cooldown=float(
+                        getattr(self, "danger_inspection_retry_cooldown", 5.0)
+                    ),
+                    now=now,
+                )
+            raise
+
+        progress = self.controller.planning_progress_snapshot()
+        target_position = tuple(float(value) for value in target.position)
+        self._danger_inspection.phase = DANGER_INSPECTION_APPROACHING
+        self._danger_inspection.track_id = int(track_id)
+        self._danger_inspection.target_xy = (
+            target_position[0],
+            target_position[1],
+        )
+        self._danger_inspection.approach_xy = (
+            float(approach_pose[0]),
+            float(approach_pose[1]),
+        )
+        self._danger_inspection.started_at = float(now)
+        self._danger_inspection.path_generation = int(progress.path_generation)
+        MissionReportingRuntime.loginfo(
+            "发现当前楼层确认危险源，抢占普通探索路径执行近场核验："
+            "track_id=%d target=(%.2f, %.2f) approach=(%.2f, %.2f)",
+            int(track_id),
+            target_position[0],
+            target_position[1],
+            approach_pose[0],
+            approach_pose[1],
+        )
+        return True
+
+    def _fail_danger_inspection(self, reason: str, now: float) -> None:
+        context = self._danger_inspection
+        tracker = getattr(self, "tracker", None)
+        failed = getattr(tracker, "mark_inspection_failed", None)
+        if callable(failed) and context.track_id is not None:
+            failed(
+                int(context.track_id),
+                cooldown=float(
+                    getattr(self, "danger_inspection_retry_cooldown", 5.0)
+                ),
+                now=now,
+            )
+        if context.phase == DANGER_INSPECTION_ALIGNING:
+            end_alignment = getattr(self.controller, "end_heading_alignment", None)
+            if callable(end_alignment):
+                end_alignment()
+        elif self.controller.has_path():
+            self.controller.clear_path(reason="danger_inspection_failed")
+        MissionReportingRuntime.logwarn(
+            "危险源近场核验失败，目标进入重试冷却：track_id=%s reason=%s",
+            context.track_id,
+            reason,
+        )
+        context.reset()
+
+    def _tick_active_danger_inspection(
+        self,
+        pose: tuple[float, float, float],
+        now: float,
+    ) -> bool:
+        context = self._danger_inspection
+        tracker = getattr(self, "tracker", None)
+        if context.phase == DANGER_INSPECTION_APPROACHING:
+            result = self.controller.poll_result()
+            if result.status == RUNNING:
+                progress = self.controller.planning_progress_snapshot()
+                tracking_snapshot = getattr(
+                    self.controller, "tracking_debug_snapshot", None
+                )
+                controller_mode = None
+                if callable(tracking_snapshot):
+                    snapshot = tracking_snapshot()
+                    if isinstance(snapshot, dict):
+                        controller_mode = snapshot.get("controller_mode")
+                if (
+                    context.path_generation is not None
+                    and int(progress.path_generation) != int(context.path_generation)
+                ) or progress.path_reason != DANGER_INSPECTION_PATH_REASON or controller_mode in {
+                    "RECOVER",
+                    "ALIGN",
+                }:
+                    self._fail_danger_inspection("approach_path_replaced", now)
+                    return True
+                return True
+            if result.status == DONE:
+                if context.target_xy is None or context.approach_xy is None:
+                    self._fail_danger_inspection("approach_context_missing", now)
+                    return True
+                self.controller.begin_heading_alignment(
+                    context.target_xy,
+                    anchor_xy=context.approach_xy,
+                    max_anchor_error=float(
+                        getattr(self, "danger_approach_max_anchor_error", 0.5)
+                    ),
+                )
+                context.phase = DANGER_INSPECTION_ALIGNING
+                return True
+            self._fail_danger_inspection(
+                result.reason or "approach_%s" % result.status.lower(),
+                now,
+            )
+            return True
+
+        if context.phase == DANGER_INSPECTION_ALIGNING:
+            result = self.controller.poll_result()
+            if result.status == RUNNING:
+                return True
+            if result.status == DONE:
+                context.phase = DANGER_INSPECTION_VERIFYING
+                context.verification_started_at = float(now)
+                self.controller.stop(reason="danger_verification_hold")
+                return True
+            self._fail_danger_inspection(
+                result.reason or "alignment_%s" % result.status.lower(),
+                now,
+            )
+            return True
+
+        if context.phase == DANGER_INSPECTION_VERIFYING:
+            self.controller.stop(reason="danger_verification_hold")
+            evidence = getattr(tracker, "has_verification_evidence", None)
+            near_approach = (
+                context.approach_xy is not None
+                and math.hypot(
+                    float(pose[0]) - context.approach_xy[0],
+                    float(pose[1]) - context.approach_xy[1],
+                )
+                <= float(getattr(self, "danger_approach_max_anchor_error", 0.5))
+            )
+            if (
+                callable(evidence)
+                and context.track_id is not None
+                and near_approach
+                and evidence(
+                    int(context.track_id),
+                    since=context.verification_started_at,
+                    now=now,
+                    min_hits=int(
+                        getattr(self, "danger_verification_min_hits", 2)
+                    ),
+                )
+            ):
+                verified = getattr(tracker, "mark_inspection_verified", None)
+                verified_ok = False
+                if callable(verified):
+                    verified_ok = bool(
+                        verified(
+                            int(context.track_id),
+                            floor_filter=self._danger_track_is_current_floor,
+                        )
+                    )
+                if not verified_ok:
+                    self._fail_danger_inspection(
+                        "verification_target_invalid", now
+                    )
+                    return True
+                MissionReportingRuntime.loginfo(
+                    "危险源近场核验完成：track_id=%d",
+                    int(context.track_id),
+                )
+                context.reset()
+                return True
+            if (
+                now - context.verification_started_at
+                >= float(getattr(self, "danger_verification_timeout", 5.0))
+            ):
+                self._fail_danger_inspection("verification_timeout", now)
+            return True
+
+        context.reset()
+        return True
+
+    def _arbitrate_danger_inspection(
+        self,
+        *,
+        pose: tuple[float, float, float],
+        grid: FloorGrid,
+        now: float,
+        mission_elapsed: float,
+        return_time: float | None,
+    ) -> DangerInspectionArbitration:
+        """在普通预算和前沿决策前仲裁危险源核验。"""
+        if self._danger_inspection.phase != DANGER_INSPECTION_IDLE:
+            return DangerInspectionArbitration(
+                handled=self._tick_active_danger_inspection(pose, now),
+            )
+        if (
+            not getattr(self, "danger_approach_verification_enabled", True)
+            or self.state != EXPLORE_FLOOR
+            or self.current_task is not None
+            or getattr(self, "_return_home_started", False)
+            or self.home_pose is None
+            or mission_elapsed + float(self.return_safety_buffer) >= self.max_runtime
+        ):
+            return DangerInspectionArbitration()
+
+        target = self._pending_danger_inspection_target(pose)
+        if target is None:
+            return DangerInspectionArbitration()
+        effective_return_time = return_time
+        if effective_return_time is None:
+            effective_return_time = self._estimate_return_time(pose)
+        if (
+            not math.isfinite(float(effective_return_time))
+            or mission_elapsed
+            + float(effective_return_time)
+            + float(self.return_safety_buffer)
+            >= self.max_runtime
+        ):
+            return DangerInspectionArbitration()
+        target_xy = (float(target.position[0]), float(target.position[1]))
+        approach_pose = compute_danger_approach_pose(
+            grid,
+            pose,
+            target_xy,
+            standoff_distance=float(
+                getattr(self, "danger_approach_standoff_distance", 1.3)
+            ),
+        )
+        if approach_pose is None:
+            return DangerInspectionArbitration()
+        plan = self._plan_path(
+            grid,
+            (pose[0], pose[1]),
+            (approach_pose[0], approach_pose[1]),
+        )
+        if (
+            plan is None
+            or not bool(getattr(plan, "reached", False))
+            or not getattr(plan, "path", None)
+        ):
+            return DangerInspectionArbitration()
+        if not self._danger_path_can_be_preempted():
+            return DangerInspectionArbitration(pending=True)
+        started = self._start_danger_inspection(target, approach_pose, plan, now)
+        return DangerInspectionArbitration(handled=started)
 
     def _tick_explore(self, pose: tuple[float, float, float]) -> None:
         self._explored_floor_ids.add(int(self.current_floor))
@@ -2941,6 +3339,8 @@ class MissionManager:
             self.current_floor == 0
             and self.current_task is None
             and getattr(self, "runtime_profile", "formal") == "formal"
+            and not bool(getattr(self._entry, "completed", False))
+            and getattr(self._entry, "origin_pose", None) is None
         ):
             correction = self.correct_entrance_geometry("startup", pose)
             if correction.status == "running" or correction.applied:
@@ -2997,6 +3397,20 @@ class MissionManager:
         floor_elapsed = now - self.floor_start_time
         mission_elapsed = self._elapsed()
         path_active = self.controller.has_path()
+        return_time = (
+            self._estimate_return_time(pose)
+            if floor_elapsed >= self.min_floor_explore_time
+            else None
+        )
+        danger_arbitration = self._arbitrate_danger_inspection(
+            pose=pose,
+            grid=grid,
+            now=now,
+            mission_elapsed=mission_elapsed,
+            return_time=return_time,
+        )
+        if danger_arbitration.handled:
+            return
         # 有效路径执行期间，frontier 只在楼层软预算开始依赖其数量后才有用途。
         # 普通移动阶段跳过全图提取，避免 10 Hz 主循环被无用计算阻塞；路径为空时
         # 仍使用当前地图立即重提取，不缓存旧候选。
@@ -3015,7 +3429,7 @@ class MissionManager:
         # 方案 C：全局时间预算决策
         if floor_elapsed >= self.min_floor_explore_time:
             progress = self._recent_progress(self.exploration_progress_window)
-            return_time = self._estimate_return_time(pose)
+            assert return_time is not None
             next_floor_change_time = (
                 self._estimate_floor_change_time(self.current_floor + 1, pose)
                 if self.current_floor + 1 < self.max_floor
@@ -3044,6 +3458,22 @@ class MissionManager:
             )
             action, reason_code = decision.action, decision.reason_code
             if action != "CONTINUE":
+                danger_defers_budget = (
+                    danger_arbitration.pending
+                    and action in {"FINISH_FLOOR", "RETURN_HOME"}
+                    and reason_code != "mission_insufficient_time_for_return"
+                )
+                if danger_defers_budget:
+                    last_defer = getattr(self, "_danger_defer_last_log_time", -math.inf)
+                    if now - last_defer >= 5.0:
+                        MissionReportingRuntime.loginfo(
+                            "存在可核验危险源但控制器当前不可抢占，暂缓预算动作："
+                            "action=%s reason=%s",
+                            action,
+                            reason_code,
+                        )
+                        self._danger_defer_last_log_time = now
+                    return
                 # 避免相邻 tick 反复切换导致状态循环
                 last_decision = self._exploration.last_budget_decision
                 last_action, last_reason = last_decision or (None, None)
@@ -3061,7 +3491,7 @@ class MissionManager:
                         "mission_elapsed": round(mission_elapsed, 2),
                         "max_runtime": getattr(self, "max_runtime", 840.0),
                         "floor_timeout": getattr(self, "floor_timeout", 180.0),
-                        "return_time_estimate": round(self._estimate_return_time(pose), 2),
+                        "return_time_estimate": round(float(return_time), 2),
                         "frontier_count": len(frontiers),
                     })
                     self._log_structured(diagnostic)
@@ -3084,6 +3514,7 @@ class MissionManager:
                         self._finish_current_floor(
                             reason_code=reason_code,
                             call_site="MissionManager._tick_explore:budget_decision",
+                            danger_pending=danger_arbitration.pending,
                         )
                         return
 
@@ -3240,51 +3671,6 @@ class MissionManager:
                     )
 
         if not path_active:
-            # 远距离高置信度危险源主动走近核验
-            tracker = getattr(self, "tracker", None)
-            if (
-                tracker is not None
-                and hasattr(tracker, "get_pending_inspection_target")
-                and getattr(self, "danger_approach_verification_enabled", True)
-                and floor_elapsed < self.floor_timeout * float(getattr(self, "floor_finish_time_ratio", 0.75))
-            ):
-                pending_target = tracker.get_pending_inspection_target(
-                    robot_xy=(pose[0], pose[1]),
-                    min_observe_dist=float(getattr(self, "danger_approach_trigger_distance", 2.2)),
-                    min_confidence=0.70,
-                )
-                if pending_target is not None:
-                    from danger_search.exploration_runtime import compute_danger_approach_pose
-
-                    approach_pose = compute_danger_approach_pose(
-                        grid,
-                        pose,
-                        pending_target,
-                        standoff_distance=float(getattr(self, "danger_approach_standoff_distance", 1.3)),
-                    )
-                    if approach_pose is not None:
-                        plan = self._plan_path(
-                            grid,
-                            (pose[0], pose[1]),
-                            (approach_pose[0], approach_pose[1]),
-                        )
-                        if plan is not None and plan.path:
-                            self.controller.set_path(
-                                list(plan.path),
-                                reason="danger_approach_verification",
-                            )
-                            tracker.mark_inspected(pending_target)
-                            MissionReportingRuntime.loginfo(
-                                "发现远距危险源候选，执行近场走近核验：target=(%.2f, %.2f) approach=(%.2f, %.2f, yaw=%.2f)",
-                                pending_target[0],
-                                pending_target[1],
-                                approach_pose[0],
-                                approach_pose[1],
-                                approach_pose[2],
-                            )
-                            return
-                    tracker.mark_inspected(pending_target)
-
             scan_signature = self._frontier_scan_signature(grid, pose, frontiers)
             # 扫描门控：pose 栅格和 frontier 内容均未变时，避免逐 tick A* 空转。
             if self._exploration.no_frontier_scan_until > 0:
@@ -3491,6 +3877,7 @@ class MissionManager:
                         self._finish_current_floor(
                             reason_code="no_frontier_escape_exhausted",
                             call_site="MissionManager._tick_explore:no_frontier_escape",
+                            danger_pending=danger_arbitration.pending,
                         )
                         return
                     self._exploration.no_reachable_frontier_confirmations += 1
@@ -3498,6 +3885,7 @@ class MissionManager:
                         self._finish_current_floor(
                             reason_code="floor_completion_ready",
                             call_site="MissionManager._tick_explore:completion_ready",
+                            danger_pending=danger_arbitration.pending,
                         )
                     else:
                         MissionReportingRuntime.loginfo(
@@ -4352,7 +4740,15 @@ class MissionManager:
         *,
         reason_code: str = "floor_finished",
         call_site: str = "MissionManager._finish_current_floor",
+        danger_pending: bool = False,
     ) -> None:
+        if danger_pending:
+            MissionReportingRuntime.loginfo(
+                "存在可核验危险源，暂缓结束当前楼层：floor=%d reason=%s",
+                self.current_floor,
+                reason_code,
+            )
+            return
         self._frontier_arrival_gain.cancel()
         self._record_floor_exit_certificate(reason_code)
         no_frontier_count = self._exploration.no_reachable_frontier_confirmations
@@ -5260,6 +5656,26 @@ class MissionManager:
         锁存写出原因，避免旧路径或后续 shutdown 覆盖真实终态。
         """
         old_state = getattr(self, "state", None)
+        danger_context = getattr(self, "_danger_inspection", None)
+        if (
+            new_state != EXPLORE_FLOOR
+            and danger_context is not None
+            and danger_context.phase != DANGER_INSPECTION_IDLE
+        ):
+            tracker = getattr(self, "tracker", None)
+            failed = getattr(tracker, "mark_inspection_failed", None)
+            if callable(failed) and danger_context.track_id is not None:
+                failed(
+                    int(danger_context.track_id),
+                    cooldown=float(
+                        getattr(self, "danger_inspection_retry_cooldown", 5.0)
+                    ),
+                    now=get_time(),
+                )
+            clear_path = getattr(getattr(self, "controller", None), "clear_path", None)
+            if callable(clear_path):
+                clear_path(reason="danger_inspection_state_exit")
+            danger_context.reset()
         entering_return_home = new_state == RETURN_HOME and old_state != RETURN_HOME
         if entering_return_home:
             # 旧状态留下的后台结果基于旧地图/旧目标，不能在新返航周期复用。
@@ -5340,6 +5756,35 @@ class MissionManager:
             "current_task": task_name,
             "current_task_phase": getattr(current_task, "phase", None) if current_task is not None else None,
             "current_frontier": current_frontier,
+            "danger_inspection": {
+                "phase": getattr(
+                    getattr(self, "_danger_inspection", None),
+                    "phase",
+                    DANGER_INSPECTION_IDLE,
+                ),
+                "track_id": getattr(
+                    getattr(self, "_danger_inspection", None),
+                    "track_id",
+                    None,
+                ),
+                "target": (
+                    [
+                        round(float(value), 3)
+                        for value in getattr(
+                            getattr(self, "_danger_inspection", None),
+                            "target_xy",
+                            None,
+                        )
+                    ]
+                    if getattr(
+                        getattr(self, "_danger_inspection", None),
+                        "target_xy",
+                        None,
+                    )
+                    is not None
+                    else None
+                ),
+            },
             "last_reachable_frontier_count": reachable_count,
             "has_reachable_frontier": reachable_count > 0 if reachable_count is not None else None,
             "no_reachable_frontier_confirmations": self._exploration.no_reachable_frontier_confirmations,

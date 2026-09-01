@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import numpy as np
 from .time_utils import get_time
@@ -129,6 +129,23 @@ class Track:
             translated_positions.append(translated)
         self.positions = translated_positions
 
+    def transform_planar(self, dx: float, dy: float, yaw: float) -> None:
+        """将轨迹观测整体变换到新的世界系平面坐标。"""
+        cosine = math.cos(float(yaw))
+        sine = math.sin(float(yaw))
+        rotation = np.asarray(((cosine, -sine), (sine, cosine)), dtype=float)
+        offset = np.asarray((float(dx), float(dy)), dtype=float)
+        if not np.all(np.isfinite(rotation)) or not np.all(np.isfinite(offset)):
+            raise ValueError("检测轨迹 SE(2) 变换量必须为有限数")
+
+        def transform(position: np.ndarray) -> np.ndarray:
+            result = np.array(position, dtype=float, copy=True)
+            result[:2] = rotation @ result[:2] + offset
+            return result
+
+        self.mean_position = transform(self.mean_position)
+        self.positions = [transform(position) for position in self.positions]
+
     def _effective_indices(self) -> list[int]:
         """获取用于质心和方差计算的最优近场子集索引。
 
@@ -188,6 +205,16 @@ class Track:
         if not self.rmses:
             return 0.0
         return float(sum(self.rmses) / len(self.rmses))
+
+
+@dataclass(frozen=True)
+class InspectionTarget:
+    """供任务仲裁使用的危险源核验目标快照。"""
+
+    track_id: int
+    position: tuple[float, float, float]
+    confidence: float
+    last_seen: float
 
 
 class DetectionTracker:
@@ -256,6 +283,8 @@ class DetectionTracker:
         self._tracks: list[Track] = []
         self._next_track_id = 1
         self._last_update_time: float | None = None
+        self._inspection_in_progress: set[int] = set()
+        self._inspection_retry_after: dict[int, float] = {}
 
     @property
     def tracks(self) -> list[Track]:
@@ -382,6 +411,15 @@ class DetectionTracker:
             track.translate_planar(offset_x, offset_y)
         return len(self._tracks)
 
+    def transform_planar(self, dx: float, dy: float, yaw: float) -> int:
+        """原子变换全部历史轨迹，保持输出与后续观测同坐标。"""
+        values = (float(dx), float(dy), float(yaw))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("检测轨迹 SE(2) 变换量必须为有限数")
+        for track in self._tracks:
+            track.transform_planar(*values)
+        return len(self._tracks)
+
     def get_pending_inspection_target(
         self,
         robot_xy: tuple[float, float],
@@ -405,12 +443,140 @@ class DetectionTracker:
             return candidates[0][1]
         return None
 
+    def select_pending_inspection_target(
+        self,
+        robot_xy: tuple[float, float],
+        *,
+        now: float | None = None,
+        min_observe_dist: float = 2.0,
+        min_confidence: float = 0.70,
+        floor_filter: Callable[[Track], bool] | None = None,
+    ) -> InspectionTarget | None:
+        """选择可抢占探索路径的当前楼层确认危险源。
+
+        普通 ``get_pending_inspection_target`` 保留旧语义供兼容调用；主动抢占
+        必须额外要求确认、未过期、未在核验中且通过楼层过滤，避免旧楼层或
+        单帧候选反复打断探索。
+        """
+        timestamp = float(now if now is not None else get_time())
+        if not math.isfinite(timestamp):
+            raise ValueError("危险源核验查询时间必须是有限数")
+        if self._last_update_time is not None and timestamp < self._last_update_time:
+            raise ValueError("危险源核验查询时间不能早于最后观测")
+        self._refresh_status(timestamp)
+
+        candidates: list[tuple[float, float, Track]] = []
+        for track in self._tracks:
+            if (
+                track.status != CONFIRMED
+                or track.inspected
+                or track.track_id in self._inspection_in_progress
+                or timestamp < self._inspection_retry_after.get(track.track_id, -math.inf)
+                or timestamp - track.last_seen > self.stale_after
+            ):
+                continue
+            if floor_filter is not None and not floor_filter(track):
+                continue
+            distance = math.hypot(
+                float(track.mean_position[0]) - float(robot_xy[0]),
+                float(track.mean_position[1]) - float(robot_xy[1]),
+            )
+            confidence = track.average_confidence()
+            if distance < float(min_observe_dist) or confidence < float(min_confidence):
+                continue
+            candidates.append((distance, -confidence, track))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1], item[2].track_id))
+        _, _, track = candidates[0]
+        return InspectionTarget(
+            track_id=int(track.track_id),
+            position=tuple(float(value) for value in track.mean_position),
+            confidence=float(track.average_confidence()),
+            last_seen=float(track.last_seen),
+        )
+
+    def mark_inspection_started(self, track_id: int) -> bool:
+        """记录已成功装载接近路径，但不把目标标记为已核验。"""
+        parsed_id = int(track_id)
+        track = next((item for item in self._tracks if item.track_id == parsed_id), None)
+        if track is None or track.inspected:
+            return False
+        self._inspection_in_progress.add(parsed_id)
+        return True
+
+    def mark_inspection_verified(
+        self,
+        track_id: int,
+        *,
+        radius: float = 1.2,
+        floor_filter: Callable[[Track], bool] | None = None,
+    ) -> bool:
+        """在近场证据成立后标记目标及其邻近重复轨迹已核验。"""
+        parsed_id = int(track_id)
+        target = next((item for item in self._tracks if item.track_id == parsed_id), None)
+        if target is None:
+            self._inspection_in_progress.discard(parsed_id)
+            return False
+        if floor_filter is not None and not floor_filter(target):
+            self._inspection_in_progress.discard(parsed_id)
+            return False
+        target_xy = (float(target.mean_position[0]), float(target.mean_position[1]))
+        for track in self._tracks:
+            distance = math.hypot(
+                float(track.mean_position[0]) - target_xy[0],
+                float(track.mean_position[1]) - target_xy[1],
+            )
+            if distance <= float(radius):
+                if floor_filter is not None and not floor_filter(track):
+                    continue
+                track.inspected = True
+                self._inspection_in_progress.discard(int(track.track_id))
+                self._inspection_retry_after.pop(int(track.track_id), None)
+        self._inspection_in_progress.discard(parsed_id)
+        self._inspection_retry_after.pop(parsed_id, None)
+        return True
+
+    def mark_inspection_failed(
+        self,
+        track_id: int,
+        *,
+        cooldown: float = 5.0,
+        now: float | None = None,
+    ) -> None:
+        """释放进行中标记并短暂冷却失败目标，允许地图更新后重试。"""
+        parsed_id = int(track_id)
+        timestamp = float(now if now is not None else get_time())
+        if not math.isfinite(timestamp) or not math.isfinite(float(cooldown)):
+            raise ValueError("危险源核验失败冷却参数必须为有限数")
+        self._inspection_in_progress.discard(parsed_id)
+        self._inspection_retry_after[parsed_id] = timestamp + max(0.0, float(cooldown))
+
+    def has_verification_evidence(
+        self,
+        track_id: int,
+        *,
+        since: float,
+        now: float | None = None,
+        min_hits: int = 2,
+    ) -> bool:
+        """确认目标在核验阶段仍有足够的新鲜多帧观测。"""
+        timestamp = float(now if now is not None else get_time())
+        track = next((item for item in self._tracks if item.track_id == int(track_id)), None)
+        if track is None or track.status != CONFIRMED or track.inspected:
+            return False
+        if timestamp - track.last_seen > self.stale_after:
+            return False
+        fresh_hits = sum(1 for hit_time in track.hit_times if float(hit_time) >= float(since))
+        return fresh_hits >= max(1, int(min_hits))
+
     def mark_inspected(
         self,
         target_xy: tuple[float, float],
         radius: float = 1.2,
     ) -> None:
-        """标记目标及其附近轨迹已完成/发起近场核验。"""
+        """兼容旧调用；新流程应在核验成功后使用 ``mark_inspection_verified``。"""
         for track in self._tracks:
             dist = math.hypot(
                 float(track.mean_position[0]) - float(target_xy[0]),
