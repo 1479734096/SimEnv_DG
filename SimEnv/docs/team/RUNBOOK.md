@@ -350,6 +350,15 @@ rg 'sparse_landmark_anchor_frozen|sparse_landmark_relocalization_evaluated|spars
   /tmp/danger_search_stage33_seed8127/mission.log
 ```
 
+入口定位专项验收：另外检查 `entrance_geometry_correction_evaluated`、
+`entrance_geometry_correction_applied` 和 `entrance_geometry_correction_degraded`。
+`phase=startup` 与 `phase=before_pass` 都必须在 3 秒内给出 `accepted`、
+`no_correction_needed` 或明确降级原因；若为 `accepted`，必须有纠偏回执、连续性 epoch
+变化和路径清除。任何一轮都不得出现超过 3 秒持续等待、重复请求或无回执继续运动。
+同时记录纠偏前后合法 pose 的 XY、门前最近障碍距离、实际 `/cmd_vel`、足端支撑状态和路径首段，
+用这些证据区分初始定位偏差、门区误障碍与运动接触问题。固定入口合同不随室内 seed 变化，
+不要把 `team_scene_info.json` 或离线真值加入运行链。
+
 验收口径如下：
 
 - 开局必须分别出现 `landmark_id=main_entrance` 与 `landmark_id=elevator` 的锚点冻结事件；

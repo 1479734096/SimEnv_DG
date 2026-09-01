@@ -26,6 +26,7 @@ from danger_search.interface_policy import (
     require_manual_control_topic,
 )
 from danger_search.landmark_drift_monitor import LandmarkDriftConfig
+from danger_search.entrance_geometry_corrector import EntranceGeometryConfig
 from danger_search.sparse_landmark_relocalizer import SparseRelocalizationConfig
 
 
@@ -196,6 +197,7 @@ _CONFIG_GROUP_FIELDS = {
             "global_frame_id",
             "landmark_drift_config",
             "sparse_relocalization_config",
+            "entrance_geometry_config",
         }
     ),
     "mapping": frozenset(
@@ -1313,6 +1315,27 @@ class _MissionConfigBuilder:
             correction_timeout=float(
                 _param("localization/sparse_correction_timeout", 2.0)
             ),
+        )
+        self.entrance_geometry_config = EntranceGeometryConfig(
+            enabled=bool(_param("localization/entrance_geometry_enabled", True)),
+            center_x=float(_param("localization/entrance_geometry_center_x", 0.0)),
+            wall_y=float(_param("localization/entrance_geometry_wall_y", 0.09)),
+            opening_width=float(_param("localization/entrance_geometry_opening_width", 2.0)),
+            wall_half_length=float(_param("localization/entrance_geometry_wall_half_length", 5.51)),
+            wall_thickness=float(_param("localization/entrance_geometry_wall_thickness", 0.18)),
+            voxel_size=float(_param("localization/entrance_geometry_voxel_size", 0.08)),
+            minimum_points=int(_param("localization/entrance_geometry_minimum_points", 80)),
+            required_frames=int(_param("localization/entrance_geometry_required_frames", 3)),
+            maximum_frame_spread=float(_param("localization/entrance_geometry_maximum_frame_spread", 0.08)),
+            minimum_correction=float(_param("localization/entrance_geometry_minimum_correction", 0.08)),
+            maximum_correction=float(_param("localization/entrance_geometry_maximum_correction", 0.50)),
+            coarse_step=float(_param("localization/entrance_geometry_coarse_step", 0.05)),
+            maximum_residual_p70=float(_param("localization/entrance_geometry_maximum_residual_p70", 0.12)),
+            minimum_uniqueness_margin=float(_param("localization/entrance_geometry_minimum_uniqueness_margin", 0.04)),
+            timeout=float(_param("localization/entrance_geometry_timeout", 3.0)),
+            maximum_frame_age=float(_param("localization/entrance_geometry_maximum_frame_age", 1.0)),
+            maximum_linear_speed=float(_param("localization/entrance_geometry_maximum_linear_speed", 0.08)),
+            maximum_angular_speed=float(_param("localization/entrance_geometry_maximum_angular_speed", 0.10)),
         )
         if not (
             math.isfinite(self.elevator_visual_min_width)

@@ -48,6 +48,7 @@ class NavigationTaskContext:
     elevator_opening_confirmation_retry_limit: int = 1
     elevator_opening_confirmation_retry_timeout: float = 10.0
     elevator_opening_confirmation_sensor_refresh: float = 0.5
+    entrance_geometry_correction_fn: Callable[..., object] | None = None
 
     def clear_opened_door_area(self, door_id: str) -> None:
         self.clear_opened_door_area_fn(door_id)
@@ -113,3 +114,9 @@ class NavigationTaskContext:
 
     def latest_cloud_stamp(self) -> float | None:
         return self.latest_cloud_stamp_fn() if self.latest_cloud_stamp_fn else None
+
+    def correct_entrance_geometry(self, *args, **kwargs):
+        """请求固定主入口几何纠偏；未接入时保持任务兼容。"""
+        if self.entrance_geometry_correction_fn is None:
+            return None
+        return self.entrance_geometry_correction_fn(*args, **kwargs)

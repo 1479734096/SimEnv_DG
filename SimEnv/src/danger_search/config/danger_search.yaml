@@ -57,6 +57,26 @@ localization:
   sparse_maximum_linear_speed: 0.08
   sparse_maximum_angular_speed: 0.10
   sparse_correction_timeout: 2.0
+  # 固定主入口合同：只用于入口外墙点云的有界 XY 纠偏，不读取生成场景文件。
+  entrance_geometry_enabled: true
+  entrance_geometry_center_x: 0.0
+  entrance_geometry_wall_y: 0.09
+  entrance_geometry_opening_width: 2.0
+  entrance_geometry_wall_half_length: 5.51
+  entrance_geometry_wall_thickness: 0.18
+  entrance_geometry_voxel_size: 0.08
+  entrance_geometry_minimum_points: 80
+  entrance_geometry_required_frames: 3
+  entrance_geometry_maximum_frame_spread: 0.08
+  entrance_geometry_minimum_correction: 0.08
+  entrance_geometry_maximum_correction: 0.50
+  entrance_geometry_coarse_step: 0.05
+  entrance_geometry_maximum_residual_p70: 0.12
+  entrance_geometry_minimum_uniqueness_margin: 0.04
+  entrance_geometry_timeout: 3.0
+  entrance_geometry_maximum_frame_age: 1.0
+  entrance_geometry_maximum_linear_speed: 0.08
+  entrance_geometry_maximum_angular_speed: 0.10
 
 mission:
   # 顶层状态机、单层完成判据、返航预算、过门上下文和任务输出策略。
@@ -234,8 +254,8 @@ frontier:
   stuck_blacklist_radius: 1.0
   no_progress_timeout: 6.0
   # 平方根收益保留高价值远目标机会，同时提高路程代价以形成收益兼顾的广度优先。
-  information_gain_weight: 0.5
-  path_cost_weight: 3.0
+  information_gain_weight: 0.39
+  path_cost_weight: 3.2
   # 完整诊断轮在 omega=1.2rad/s 的路径转向中翻倒；提高首段和累计转角代价，
   # 让路径多出约半米时仍优先选择更连续的走廊方向。
   yaw_cost_weight: 0.4

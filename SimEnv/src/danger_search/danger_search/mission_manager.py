@@ -87,6 +87,10 @@ from danger_search.rgbd_door_detector import (
     DoorPanelObservation,
 )
 from danger_search.landmark_drift_monitor import LandmarkDriftConfig
+from danger_search.entrance_geometry_corrector import (
+    EntranceCorrectionOutcome,
+    EntranceGeometryCorrector,
+)
 from danger_search.mission_reporting import MissionReportingRuntime, StatusReport
 from danger_search.return_home_planner import (
     initial_entry_reverse_path,
@@ -311,6 +315,9 @@ class MissionManager:
         self._frontier_plan_timeout_logged = False
         self._frontier_plan_timed_out_request_id: int | None = None
         self._entry_config = InitialEntryConfig.from_section(self.config.entry)
+        self._entrance_geometry_corrector = EntranceGeometryCorrector(
+            self.config.localization["entrance_geometry_config"]
+        )
         self._door_refresh_config = DoorRefreshConfig(
             timeout=float(self.config.entry["door_refresh_timeout"]),
             maximum_center_shift=float(
@@ -514,6 +521,7 @@ class MissionManager:
             elevator_opening_confirmation_sensor_refresh=float(
                 getattr(self, "elevator_opening_confirmation_sensor_refresh", 0.5)
             ),
+            entrance_geometry_correction_fn=self.correct_entrance_geometry,
         )
 
     def _planning_constraints(self):
@@ -541,6 +549,73 @@ class MissionManager:
             end_xy,
             constraints=self._planning_constraints(),
         )
+
+    def correct_entrance_geometry(
+        self,
+        phase: str,
+        pose: tuple[float, float, float],
+    ) -> EntranceCorrectionOutcome:
+        """在开局或主入口过门前执行一次固定几何 XY 纠偏。"""
+        corrector = getattr(self, "_entrance_geometry_corrector", None)
+        if corrector is None or getattr(self, "pose_provider", None) is None:
+            return EntranceCorrectionOutcome("done", reason="disabled")
+        outcome = corrector.tick(
+            phase,
+            now=get_time(),
+            frames=self._current_landmark_frames(),
+            latest_cloud_stamp=getattr(self._map_runtime, "last_cloud_stamp", None),
+            floor_height=float(self.mapper.floor_height),
+            pose_provider=self.pose_provider,
+            controller=self.controller,
+            map_runtime=self._map_runtime,
+            robot_pose=pose,
+            robot_floor=int(self.current_floor),
+        )
+        evaluation = corrector.last_evaluations.get(str(phase))
+        if evaluation is not None and outcome.status == "done":
+            self._log_structured(
+                {
+                    "event": "entrance_geometry_correction_evaluated",
+                    "phase": str(phase),
+                    "status": evaluation.status,
+                    "correction_xy": evaluation.correction_xy,
+                    "correction_norm": evaluation.correction_norm,
+                    "residual_p70": evaluation.residual_p70,
+                    "uniqueness_margin": evaluation.uniqueness_margin,
+                    "frame_spread": evaluation.frame_spread,
+                    "point_count": evaluation.point_count,
+                    "outcome_reason": outcome.reason,
+                }
+            )
+        if outcome.applied:
+            self._log_structured(
+                {
+                    "event": "entrance_geometry_correction_applied",
+                    "phase": str(phase),
+                    "correction_xy": outcome.correction_xy,
+                    "correction_epoch": int(self.pose_provider.continuity_epoch),
+                }
+            )
+        elif outcome.reason in {
+            "cloud_stale",
+            "correction_ack_timeout",
+            "correction_request_rejected",
+            "stationary_timeout",
+            "insufficient_frames",
+            "match_unavailable",
+            "correction_exceeded",
+            "frame_spread_exceeded",
+            "residual_too_high",
+            "ambiguous",
+        }:
+            self._log_structured(
+                {
+                    "event": "entrance_geometry_correction_degraded",
+                    "phase": str(phase),
+                    "reason": outcome.reason,
+                }
+            )
+        return outcome
 
     def building_services_required(self) -> bool:
         return _building_services_required(
@@ -2862,6 +2937,14 @@ class MissionManager:
         # 公开起点位于主入口外时，先沿当前合法姿态和已确认 FREE 走廊深入，
         # 避免普通 frontier 评分优先选择入口外更近的侧向边界。目标完全由
         # 当前传感器地图推导，不读取门坐标、布局 metadata 或固定世界坐标。
+        if (
+            self.current_floor == 0
+            and self.current_task is None
+            and getattr(self, "runtime_profile", "formal") == "formal"
+        ):
+            correction = self.correct_entrance_geometry("startup", pose)
+            if correction.status == "running" or correction.applied:
+                return
         if self._run_initial_entry(pose, grid):
             return
 

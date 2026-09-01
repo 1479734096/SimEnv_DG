@@ -67,6 +67,12 @@ python3 tools/offline/check_production_boundary.py
 `ENTER_CABIN/EXIT_CABIN` 阶段及有界离门上下文只关闭地面支撑 `UNKNOWN`
 临时停车，显式 `DROP` 始终保持生效。
 
+当前入口定位保护还包括固定外墙几何的有界 XY 纠偏：开局和开门后过门前分别最多尝试一次，
+仅使用当前 `/scan` 注册的多帧 Livox 点云，固定合同不等于读取场景 metadata，也不估计 yaw。
+至少三帧一致、墙体两侧支持和残差通过后才向合法 `PoseProvider` 请求纠偏；任何陈旧、
+质量不足、请求或回执超时都会在 3 秒内回退原流程。成功纠偏会清路径并同步危险源语义轨迹，
+下一轮仍需用 GUI 日志确认真实门前姿态、足端支撑和误障碍是否消失。
+
 ## 当前速度与预算规范
 
 - **巡航限速与防坠硬保护**：巡航与探索线速度统一稳健限速为 `0.65 m/s`。即使关闭未知区域保持（`unknown_support_hold_enabled=false`），四足足端一旦出现真实悬空，地面支撑门立即输出零速并在超时后转入 `SUPPORT_PATH_UNAVAILABLE` 重规划，杜绝坠楼。

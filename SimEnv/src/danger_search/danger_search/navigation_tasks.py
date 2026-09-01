@@ -257,6 +257,19 @@ class OpenDoorAndPass(NavigationTask):
             return RUNNING
 
         if self.phase == "REFRESH_OPENING":
+            correction = context.correct_entrance_geometry("before_pass", pose)
+            if correction is not None:
+                if getattr(correction, "status", None) == RUNNING:
+                    context.controller.stop(reason="entrance_geometry_before_pass")
+                    return RUNNING
+                if bool(getattr(correction, "applied", False)):
+                    self._wait_point = None
+                    self._pass_point = None
+                    self._commit_point = None
+                    # 纠偏后当前位置仍在已停车的门前，立即用新 epoch 的近场
+                    # 点云刷新门几何，避免沿纠偏前的旧等待点再次横向撞门。
+                    self.phase = "REFRESH_OPENING"
+                    return RUNNING
             status = context.refresh_open_door_geometry(self.door_id, pose)
             if status == RUNNING:
                 context.controller.stop(reason="door_opening_refresh")
