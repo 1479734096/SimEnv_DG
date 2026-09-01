@@ -156,14 +156,18 @@ class PoseProvider:
         self,
         correction_xy: tuple[float, float],
         *,
+        correction_yaw: float = 0.0,
         maximum_correction: float,
+        maximum_yaw_correction: float = 0.12,
         maximum_linear_speed: float,
         maximum_angular_speed: float,
     ) -> int | None:
-        """机器人静止时发布一次有序纠正请求；不满足门控则拒绝。"""
+        """机器人静止时发布一次有序平面 SE(2) 纠正请求。"""
         try:
             dx, dy = (float(correction_xy[0]), float(correction_xy[1]))
+            dyaw = float(correction_yaw)
             maximum = float(maximum_correction)
+            maximum_yaw = float(maximum_yaw_correction)
             linear_limit = float(maximum_linear_speed)
             angular_limit = float(maximum_angular_speed)
         except (IndexError, TypeError, ValueError):
@@ -171,13 +175,23 @@ class PoseProvider:
         if (
             not all(
                 np.isfinite(value)
-                for value in (dx, dy, maximum, linear_limit, angular_limit)
+                for value in (
+                    dx,
+                    dy,
+                    dyaw,
+                    maximum,
+                    maximum_yaw,
+                    linear_limit,
+                    angular_limit,
+                )
             )
             or maximum <= 0.0
             or linear_limit <= 0.0
             or angular_limit <= 0.0
-            or float(np.hypot(dx, dy)) <= 0.0
+            or maximum_yaw <= 0.0
+            or (float(np.hypot(dx, dy)) <= 0.0 and abs(dyaw) <= 0.0)
             or float(np.hypot(dx, dy)) > maximum
+            or abs(dyaw) > maximum_yaw
         ):
             return None
         sample = self.latest()
@@ -199,11 +213,11 @@ class PoseProvider:
         message.header.frame_id = "world"
         message.vector.x = dx
         message.vector.y = dy
-        message.vector.z = 0.0
+        message.vector.z = dyaw
         self._correction_publisher.publish(message)
         return sequence
 
-    def correction_ack(self, sequence: int) -> tuple[float, float, float] | None:
+    def correction_ack(self, sequence: int) -> tuple[float, ...] | None:
         with self._lock:
             return self._correction_acks.get(int(sequence))
 
@@ -354,12 +368,20 @@ class PoseProvider:
             float(getattr(message.vector, "x", float("nan"))),
             float(getattr(message.vector, "y", float("nan"))),
         )
+        yaw = float(getattr(message.vector, "z", 0.0))
         if sequence <= 0 or stamp is None or not np.all(np.isfinite(values)):
             return
         with self._lock:
             if sequence in self._correction_acks:
                 return
-            self._correction_acks[sequence] = (values[0], values[1], stamp)
+            if not np.isfinite(yaw):
+                return
+            self._correction_acks[sequence] = (
+                values[0],
+                values[1],
+                yaw,
+                stamp,
+            ) if abs(yaw) > 1e-12 else (values[0], values[1], stamp)
             self._continuity_epoch += 1
             self._samples = deque(
                 (sample for sample in self._samples if sample.stamp > stamp),

@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 import math
 from typing import Iterable
 
+import numpy as np
+
 
 LOW_CANDIDATE = "LOW_CANDIDATE"
 LOW_CONFIRMED = "LOW_CONFIRMED"
@@ -120,6 +122,76 @@ class ObstacleEvidenceLedger:
             cell: set(owners) for cell, owners in self.inflation_owners.items()
         }
         return result
+
+    def transform_planar(self, transform_xy) -> None:
+        """将障碍核心、膨胀所有权和历史世界坐标同步变换。"""
+        rotation, offset, cell_transform = transform_xy
+        transformed_cores: dict[tuple[int, int], ObstacleCoreRecord] = {}
+        transformed_owners: dict[tuple[int, int], set[tuple[int, int]]] = {}
+        for record in self.cores.values():
+            target_cell = cell_transform(*self._cell_world(record.cell))
+            if target_cell is None:
+                continue
+            target_inflated = {
+                target
+                for target in (
+                    cell_transform(*self._cell_world(cell))
+                    for cell in record.inflated_cells
+                )
+                if target is not None
+            }
+            target = ObstacleCoreRecord(
+                cell=target_cell,
+                inflated_cells=target_inflated,
+                kind=record.kind,
+                floor_index=record.floor_index,
+                map_epoch=record.map_epoch,
+                localization_epoch=record.localization_epoch,
+                hit_generations=set(record.hit_generations),
+                hit_world_poses=[
+                    tuple(rotation @ np.asarray(position) + offset)
+                    for position in record.hit_world_poses
+                ],
+                counter_generations=set(record.counter_generations),
+                counter_world_poses=[
+                    tuple(rotation @ np.asarray(position) + offset)
+                    for position in record.counter_world_poses
+                ],
+                first_hit_generation=record.first_hit_generation,
+                last_hit_generation=record.last_hit_generation,
+                hit_generation_count=record.hit_generation_count,
+                last_counter_generation=record.last_counter_generation,
+                counter_generation_count=record.counter_generation_count,
+                protected_hit_generations=set(record.protected_hit_generations),
+                protected_hit_pose_samples=[
+                    (generation, *(rotation @ np.asarray((x, y)) + offset))
+                    for generation, x, y in record.protected_hit_pose_samples
+                ],
+                protected_counter_generations=set(record.protected_counter_generations),
+                protected_counter_world_poses=[
+                    tuple(rotation @ np.asarray(position) + offset)
+                    for position in record.protected_counter_world_poses
+                ],
+                last_protected_hit_generation=record.last_protected_hit_generation,
+                last_protected_counter_generation=record.last_protected_counter_generation,
+                protected_trail_confirmed=record.protected_trail_confirmed,
+            )
+            existing = transformed_cores.get(target_cell)
+            if existing is None or target.kind in BLOCKING_OBSTACLE_KINDS:
+                transformed_cores[target_cell] = target
+            else:
+                existing.inflated_cells.update(target.inflated_cells)
+            for cell in target_inflated:
+                transformed_owners.setdefault(cell, set()).add(target_cell)
+        self.cores = transformed_cores
+        self.inflation_owners = transformed_owners
+
+    def _cell_world(self, cell: tuple[int, int]) -> tuple[float, float]:
+        gx, gy = cell
+        return (
+            self.origin_x + (int(gx) + 0.5) * self.resolution,
+            self.origin_y + (int(gy) + 0.5) * self.resolution,
+        )
 
     def blocking_at(self, cell: tuple[int, int]) -> bool:
         return any(

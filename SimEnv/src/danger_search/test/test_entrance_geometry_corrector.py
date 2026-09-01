@@ -37,6 +37,29 @@ def test_fixed_entrance_geometry_recovers_xy_without_yaw_change():
     assert result.residual_p70 < 0.12
 
 
+def test_fixed_entrance_geometry_recovers_bounded_yaw():
+    reference = np.asarray(_wall_points(), dtype=float)
+    yaw = 0.06
+    cosine = np.cos(yaw)
+    sine = np.sin(yaw)
+    rotation = np.asarray(((cosine, -sine), (sine, cosine)))
+    translation = np.asarray((0.12, -0.08))
+    current = reference.copy()
+    current[:, :2] = (current[:, :2] - translation) @ rotation.T
+    corrector = EntranceGeometryCorrector(
+        EntranceGeometryConfig(minimum_points=40, minimum_uniqueness_margin=0.02)
+    )
+    result = corrector.evaluate(
+        [current.tolist() for _ in range(3)],
+        floor_height=2.6,
+    )
+
+    assert result.status == "accepted"
+    assert result.correction_yaw == pytest.approx(-yaw, abs=0.021)
+    assert result.residual_improvement >= 0.03
+    assert result.residual_p70 < 0.12
+
+
 def test_inconsistent_frames_are_rejected():
     corrector = EntranceGeometryCorrector(
         EntranceGeometryConfig(minimum_points=40, maximum_frame_spread=0.05)
@@ -178,3 +201,48 @@ def test_accepted_correction_waits_for_ack_then_clears_path():
     assert applied.applied
     assert applied.correction_xy == (-0.30, 0.12)
     assert any("applied" in str(reason) for reason in controller.reasons)
+
+
+def test_yaw_ack_is_forwarded_to_map_runtime():
+    corrector = EntranceGeometryCorrector(
+        EntranceGeometryConfig(minimum_points=40, minimum_uniqueness_margin=0.02)
+    )
+    controller = _Controller()
+    pose_provider = _PoseProvider(ack=None)
+    calls = []
+
+    class MapRuntime:
+        def apply_planar_correction(self, *args, **kwargs):
+            calls.append((args, kwargs))
+
+    frames = [_wall_points((0.30, -0.12)) for _ in range(3)]
+    requested = corrector.tick(
+        "startup",
+        now=1.0,
+        frames=frames,
+        latest_cloud_stamp=1.0,
+        floor_height=2.6,
+        pose_provider=pose_provider,
+        controller=controller,
+        map_runtime=MapRuntime(),
+        robot_pose=(0.0, -3.2, 1.57),
+        robot_floor=0,
+    )
+    assert requested.status == "running"
+    pose_provider.ack = (-0.30, 0.12, 0.04, 1.0)
+    applied = corrector.tick(
+        "startup",
+        now=1.1,
+        frames=frames,
+        latest_cloud_stamp=1.0,
+        floor_height=2.6,
+        pose_provider=pose_provider,
+        controller=controller,
+        map_runtime=MapRuntime(),
+        robot_pose=(0.0, -3.2, 1.57),
+        robot_floor=0,
+    )
+
+    assert applied.applied
+    assert applied.correction_yaw == pytest.approx(0.04)
+    assert calls[0][1]["correction_yaw"] == pytest.approx(0.04)

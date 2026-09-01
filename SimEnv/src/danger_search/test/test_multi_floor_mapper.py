@@ -1419,6 +1419,26 @@ class MultiFloorMapperTest(unittest.TestCase):
         far_cell = grid.world_to_grid(10.0, 0.0)
         self.assertEqual(grid.occ_cores[far_cell].kind, "LOW_CANDIDATE")
 
+    def test_planar_transform_moves_observation_and_obstacle_evidence(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+            obstacle_inflation_radius=0.0,
+        )
+        grid = mapper.floor(0)
+        grid.fill_base(FREE)
+        source = grid.world_to_grid(0.5, 0.0)
+        grid.mark_occupied(*source)
+
+        mapper.transform_planar(0.0, 0.0, math.pi / 2.0)
+
+        target = grid.world_to_grid(-0.05, 0.55)
+        self.assertEqual(grid.data[target[1], target[0]], OCC)
+        self.assertIn(target, grid.occ_cores)
+
 
 if __name__ == "__main__":
     unittest.main()

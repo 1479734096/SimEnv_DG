@@ -1,4 +1,4 @@
-"""利用固定主入口几何估计有限的平面平移纠偏候选。
+"""利用固定主入口几何估计有限的平面 SE(2) 纠偏候选。
 
 本模块只消费已经由参赛方定位节点注册到世界坐标的 Livox 点云，不读取真值、
 场景文件或运行时建筑 metadata。入口合同仅描述比赛中不随楼层布局变化的外墙
@@ -32,6 +32,12 @@ class EntranceGeometryConfig:
     coarse_step: float = 0.05
     maximum_residual_p70: float = 0.12
     minimum_uniqueness_margin: float = 0.04
+    maximum_yaw_correction: float = 0.12
+    yaw_coarse_step: float = 0.02
+    maximum_yaw_spread: float = 0.03
+    minimum_yaw_correction: float = 0.01
+    minimum_residual_improvement: float = 0.03
+    minimum_side_points: int = 16
     timeout: float = 3.0
     maximum_frame_age: float = 1.0
     maximum_linear_speed: float = 0.08
@@ -52,6 +58,11 @@ class EntranceGeometryConfig:
             self.maximum_frame_age,
             self.maximum_linear_speed,
             self.maximum_angular_speed,
+            self.maximum_yaw_correction,
+            self.yaw_coarse_step,
+            self.maximum_yaw_spread,
+            self.minimum_yaw_correction,
+            self.minimum_residual_improvement,
         )
         if (
             not all(math.isfinite(float(value)) and float(value) > 0.0 for value in positive)
@@ -62,7 +73,9 @@ class EntranceGeometryConfig:
             or self.required_frames < 2
             or self.minimum_correction >= self.maximum_correction
             or self.coarse_step > self.maximum_correction
+            or self.yaw_coarse_step > self.maximum_yaw_correction
             or not 0.0 <= self.minimum_uniqueness_margin <= 1.0
+            or self.minimum_side_points < 8
         ):
             raise ValueError("主入口几何纠偏参数无效")
 
@@ -74,9 +87,15 @@ class EntranceGeometryEvaluation:
     status: str
     correction_xy: tuple[float, float] | None = None
     correction_norm: float | None = None
+    correction_yaw: float | None = None
     residual_p70: float | None = None
+    translation_only_residual_p70: float | None = None
+    residual_improvement: float | None = None
     uniqueness_margin: float = 0.0
     frame_spread: float | None = None
+    yaw_spread: float | None = None
+    left_support: int = 0
+    right_support: int = 0
     point_count: int = 0
 
 
@@ -88,6 +107,7 @@ class EntranceCorrectionOutcome:
     applied: bool = False
     reason: str | None = None
     correction_xy: tuple[float, float] | None = None
+    correction_yaw: float = 0.0
 
 
 class EntranceGeometryCorrector:
@@ -108,7 +128,7 @@ class EntranceGeometryCorrector:
         floor_height: float,
         floor: int = 0,
     ) -> EntranceGeometryEvaluation:
-        """在当前连续定位段内匹配入口外墙，禁止估计 yaw。"""
+        """在当前连续定位段内匹配入口外墙并估计有限 yaw。"""
         selected = [
             self._filter_frame(frame, floor_height=float(floor_height), floor=int(floor))
             for frame in frames
@@ -123,27 +143,47 @@ class EntranceGeometryCorrector:
             return EntranceGeometryEvaluation("match_unavailable")
         corrections = np.asarray([item[0] for item in usable], dtype=float)
         median_correction = np.median(corrections, axis=0)
-        spread = float(np.max(np.linalg.norm(corrections - median_correction, axis=1)))
+        spread = float(
+            np.max(np.linalg.norm(corrections[:, :2] - median_correction[:2], axis=1))
+        )
+        yaw_spread = float(
+            np.max(np.abs(corrections[:, 2] - median_correction[2]))
+        )
         residual = float(np.median([item[2] for item in usable]))
-        uniqueness = float(min(item[3] for item in usable))
+        translation_only_residual = float(np.median([item[3] for item in usable]))
+        uniqueness = float(min(item[4] for item in usable))
         point_count = int(sum(len(frame) for frame in selected))
-        norm = float(np.linalg.norm(median_correction))
+        norm = float(np.linalg.norm(median_correction[:2]))
+        residual_improvement = translation_only_residual - residual
         common = dict(
             correction_xy=(float(median_correction[0]), float(median_correction[1])),
             correction_norm=norm,
+            correction_yaw=float(median_correction[2]),
             residual_p70=residual,
+            translation_only_residual_p70=translation_only_residual,
+            residual_improvement=residual_improvement,
             uniqueness_margin=uniqueness,
             frame_spread=spread,
+            yaw_spread=yaw_spread,
             point_count=point_count,
+            left_support=int(np.median([item[5] for item in usable])),
+            right_support=int(np.median([item[6] for item in usable])),
         )
         if norm > self.config.maximum_correction:
             return EntranceGeometryEvaluation("correction_exceeded", **common)
         if spread > self.config.maximum_frame_spread:
             return EntranceGeometryEvaluation("frame_spread_exceeded", **common)
+        if yaw_spread > self.config.maximum_yaw_spread:
+            return EntranceGeometryEvaluation("yaw_spread_exceeded", **common)
         if residual > self.config.maximum_residual_p70:
             return EntranceGeometryEvaluation("residual_too_high", **common)
-        if norm < self.config.minimum_correction:
+        if norm < self.config.minimum_correction and abs(float(median_correction[2])) < self.config.minimum_yaw_correction:
             return EntranceGeometryEvaluation("no_correction_needed", **common)
+        if (
+            abs(float(median_correction[2])) >= self.config.minimum_yaw_correction
+            and residual_improvement < self.config.minimum_residual_improvement
+        ):
+            return EntranceGeometryEvaluation("yaw_not_supported", **common)
         if uniqueness < self.config.minimum_uniqueness_margin:
             return EntranceGeometryEvaluation("ambiguous", **common)
         return EntranceGeometryEvaluation("accepted", **common)
@@ -180,15 +220,21 @@ class EntranceGeometryCorrector:
                 return EntranceCorrectionOutcome("done", reason="correction_ack_timeout")
             self._operations.pop(key, None)
             self._phase_done.add(key)
+            if len(ack) >= 4:
+                dx, dy, correction_yaw, _ack_stamp = ack[:4]
+            else:
+                dx, dy, _ack_stamp = ack[:3]
+                correction_yaw = 0.0
             correction_runtime = getattr(map_runtime, "apply_planar_correction", None)
             if callable(correction_runtime):
                 corrected_xy = (
-                    float(robot_pose[0]) + float(ack[0]),
-                    float(robot_pose[1]) + float(ack[1]),
+                    float(robot_pose[0]) + float(dx),
+                    float(robot_pose[1]) + float(dy),
                 )
                 correction_runtime(
-                    float(ack[0]),
-                    float(ack[1]),
+                    float(dx),
+                    float(dy),
+                    correction_yaw=float(correction_yaw),
                     now=float(now),
                     robot_floor=int(robot_floor),
                     robot_xy=corrected_xy,
@@ -197,7 +243,8 @@ class EntranceGeometryCorrector:
             return EntranceCorrectionOutcome(
                 "done",
                 applied=True,
-                correction_xy=(float(ack[0]), float(ack[1])),
+                correction_xy=(float(dx), float(dy)),
+                correction_yaw=float(correction_yaw),
             )
 
         if key in self._phase_attempted:
@@ -234,7 +281,9 @@ class EntranceGeometryCorrector:
         controller.stop(reason=f"entrance_geometry_correction_{key}_request")
         sequence = pose_provider.request_planar_correction(
             evaluation.correction_xy,
+            correction_yaw=float(evaluation.correction_yaw or 0.0),
             maximum_correction=self.config.maximum_correction,
+            maximum_yaw_correction=self.config.maximum_yaw_correction,
             maximum_linear_speed=self.config.maximum_linear_speed,
             maximum_angular_speed=self.config.maximum_angular_speed,
         )
@@ -284,61 +333,107 @@ class EntranceGeometryCorrector:
             return None
         current_xy = np.asarray(current, dtype=float)
         maximum_dy = int(math.floor(self.config.maximum_correction / self.config.coarse_step))
-        candidates: list[tuple[float, float, int, np.ndarray, float, float]] = []
+        maximum_yaw = int(math.floor(self.config.maximum_yaw_correction / self.config.yaw_coarse_step))
+        candidates: list[tuple[float, float, int, np.ndarray, float, float, int, int]] = []
         half_gap = self.config.opening_width / 2.0 + 0.10
-        minimum_side_points = max(8, self.config.minimum_points // 5)
-        for iy in range(-maximum_dy, maximum_dy + 1):
-            dy = iy * self.config.coarse_step
-            shifted_y = current_xy[:, 1] + dy
-            wall_band = np.abs(shifted_y - self.config.wall_y) <= max(
-                0.12, self.config.wall_thickness
-            )
-            shifted_x = current_xy[:, 0]
-            side_limit = self.config.maximum_correction
-            left = shifted_x <= self.config.center_x - half_gap + side_limit
-            right = shifted_x >= self.config.center_x + half_gap - side_limit
-            left_x = shifted_x[wall_band & left]
-            right_x = shifted_x[wall_band & right]
-            if len(left_x) < minimum_side_points or len(right_x) < minimum_side_points:
-                continue
-            # 缺口两侧内缘提供 x 方向基准；取分位数可抑制少量门板或杂点。
-            left_inner = float(np.quantile(left_x, 0.95))
-            right_inner = float(np.quantile(right_x, 0.05))
-            dx = self.config.center_x - 0.5 * (left_inner + right_inner)
-            correction = np.asarray((dx, dy), dtype=float)
-            shifted = current_xy + correction
-            delta = shifted[:, None, :] - reference[None, :, :]
-            distances = np.sqrt(np.min(np.sum(delta * delta, axis=2), axis=1))
-            eligible = distances <= 0.35
-            score = float(np.count_nonzero(distances[eligible] <= 0.14)) / max(1, len(current_xy))
-            center_error = abs(float(np.median(shifted_y[wall_band])) - self.config.wall_y)
-            side_support = float(min(len(left_x), len(right_x))) / max(1, len(current_xy))
-            candidates.append(
-                (
-                    score,
-                    center_error,
-                    iy,
-                    correction,
-                    float(np.quantile(distances[eligible], 0.70)),
-                    side_support,
+        minimum_side_points = max(self.config.minimum_side_points, self.config.minimum_points // 5)
+        for iyaw in range(-maximum_yaw, maximum_yaw + 1):
+            dyaw = iyaw * self.config.yaw_coarse_step
+            cosine = math.cos(dyaw)
+            sine = math.sin(dyaw)
+            rotation = np.asarray(((cosine, -sine), (sine, cosine)), dtype=float)
+            rotated = current_xy @ rotation.T
+            for iy in range(-maximum_dy, maximum_dy + 1):
+                dy = iy * self.config.coarse_step
+                shifted_y = rotated[:, 1] + dy
+                wall_band = np.abs(shifted_y - self.config.wall_y) <= max(
+                    0.12, self.config.wall_thickness
                 )
-            )
+                shifted_x = rotated[:, 0]
+                side_limit = self.config.maximum_correction
+                left = shifted_x <= self.config.center_x - half_gap + side_limit
+                right = shifted_x >= self.config.center_x + half_gap - side_limit
+                left_x = shifted_x[wall_band & left]
+                right_x = shifted_x[wall_band & right]
+                if len(left_x) < minimum_side_points or len(right_x) < minimum_side_points:
+                    continue
+                # 缺口两侧内缘提供 x 方向基准；取分位数可抑制少量门板或杂点。
+                left_inner = float(np.quantile(left_x, 0.95))
+                right_inner = float(np.quantile(right_x, 0.05))
+                dx = self.config.center_x - 0.5 * (left_inner + right_inner)
+                correction = np.asarray((dx, dy, dyaw), dtype=float)
+                shifted = rotated + np.asarray((dx, dy), dtype=float)
+                delta = shifted[:, None, :] - reference[None, :, :]
+                distances = np.sqrt(np.min(np.sum(delta * delta, axis=2), axis=1))
+                eligible = distances <= 0.35
+                if not np.any(eligible):
+                    continue
+                score = float(np.count_nonzero(distances[eligible] <= 0.14)) / max(1, len(current_xy))
+                center_error = abs(float(np.median(shifted_y[wall_band])) - self.config.wall_y)
+                side_support = float(min(len(left_x), len(right_x))) / max(1, len(current_xy))
+                candidates.append(
+                    (
+                        score,
+                        center_error,
+                        iyaw,
+                        correction,
+                        float(np.quantile(distances[eligible], 0.70)),
+                        side_support,
+                        len(left_x),
+                        len(right_x),
+                    )
+                )
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (item[0], -item[1]), reverse=True)
-        best_score, _center_error, _iy, correction, residual_p70, side_support = candidates[0]
+        # 先按几何残差选最优解，命中率只用于同残差候选的次级排序。
+        candidates.sort(key=lambda item: (item[4], -item[0], item[1]))
+        best_score, _center_error, _iyaw, correction, residual_p70, side_support, left_count, right_count = candidates[0]
         second_score = max(
-            (item[0] for item in candidates[1:] if abs(item[2] - _iy) >= 2),
+            (item[0] for item in candidates[1:] if abs(item[2] - _iyaw) >= 2),
             default=0.0,
         )
-        shifted = current_xy + correction
+        dyaw = float(correction[2])
+        cosine = math.cos(dyaw)
+        sine = math.sin(dyaw)
+        rotation = np.asarray(((cosine, -sine), (sine, cosine)), dtype=float)
+        shifted = current_xy @ rotation.T + correction[:2]
         delta = shifted[:, None, :] - reference[None, :, :]
         distances = np.sqrt(np.min(np.sum(delta * delta, axis=2), axis=1))
         valid = distances <= 0.35
         if int(np.count_nonzero(valid)) < self.config.minimum_points:
             return None
         uniqueness = max(float(best_score - second_score), float(side_support))
-        return correction, best_score, max(residual_p70, float(np.quantile(distances[valid], 0.70))), uniqueness
+        se2_residual = max(residual_p70, float(np.quantile(distances[valid], 0.70)))
+        translation_only = self._match_translation_only(current_xy, reference)
+        return correction, best_score, se2_residual, translation_only, uniqueness, left_count, right_count
+
+    def _match_translation_only(self, current: np.ndarray, reference: np.ndarray) -> float:
+        """计算同一候选搜索中的仅平移基线残差。"""
+        maximum_dy = int(math.floor(self.config.maximum_correction / self.config.coarse_step))
+        half_gap = self.config.opening_width / 2.0 + 0.10
+        minimum_side_points = max(self.config.minimum_side_points, self.config.minimum_points // 5)
+        best = math.inf
+        for iy in range(-maximum_dy, maximum_dy + 1):
+            dy = iy * self.config.coarse_step
+            shifted_y = current[:, 1] + dy
+            wall_band = np.abs(shifted_y - self.config.wall_y) <= max(
+                0.12, self.config.wall_thickness
+            )
+            left = current[:, 0] <= self.config.center_x - half_gap + self.config.maximum_correction
+            right = current[:, 0] >= self.config.center_x + half_gap - self.config.maximum_correction
+            left_x = current[wall_band & left, 0]
+            right_x = current[wall_band & right, 0]
+            if len(left_x) < minimum_side_points or len(right_x) < minimum_side_points:
+                continue
+            dx = self.config.center_x - 0.5 * (
+                float(np.quantile(left_x, 0.95)) + float(np.quantile(right_x, 0.05))
+            )
+            shifted = current + np.asarray((dx, dy), dtype=float)
+            distances = np.sqrt(np.min(np.sum((shifted[:, None, :] - reference[None, :, :]) ** 2, axis=2), axis=1))
+            valid = distances <= 0.35
+            if int(np.count_nonzero(valid)) >= self.config.minimum_points:
+                best = min(best, float(np.quantile(distances[valid], 0.70)))
+        return best
 
     def _voxelize(self, points: np.ndarray) -> np.ndarray:
         if len(points) == 0:

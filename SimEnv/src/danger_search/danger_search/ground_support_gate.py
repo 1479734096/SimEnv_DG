@@ -5,8 +5,9 @@
 
 状态分三类：``CLEAR`` 透明放行；``OBSERVATION_HOLD/STALE_DATA_HOLD`` 是可由
 新鲜正支撑自动解除的临时零速；DROP、超包络速度和停车超时进入锁存状态，
-必须由任务层写入局部禁区、重规划或结束任务。墙钟与控制/仿真时间同时保存，
-从而在 ``/clock`` 冻结时仍能检测“已要求停车但无法确认停稳”的异常。
+必须由任务层写入局部禁区、重规划或结束任务。已确认无空洞的电梯 CROSS 阶段
+只跳过支撑边界观察，显式 DROP 和速度包络仍保持硬保护。墙钟与控制/仿真时间
+同时保存，从而在 ``/clock`` 冻结时仍能检测“已要求停车但无法确认停稳”的异常。
 """
 from __future__ import annotations
 
@@ -286,6 +287,7 @@ class GroundSupportSafetyGate:
         self._hold_context_sequence = 0
         self._temporary_hold_context_id: int | None = None
         self._unknown_support_hold_enabled = True
+        self._controlled_elevator_crossing = False
         self._latched_drop_point_world: tuple[float, float] | None = None
         self._latched_drop_clusters: tuple[DropClusterEvidence, ...] = ()
         self._boundary_candidate_centroid: tuple[float, float] | None = None
@@ -365,6 +367,12 @@ class GroundSupportSafetyGate:
         if not self.enabled:
             return
         self._unknown_support_hold_enabled = bool(enabled)
+
+    def set_controlled_elevator_crossing(self, enabled: bool) -> None:
+        """切换已确认无空洞的电梯 CROSS 阶段支撑边界豁免。"""
+        if not self.enabled:
+            return
+        self._controlled_elevator_crossing = bool(enabled)
 
     def support_sweep_context_snapshot(
         self,
@@ -510,14 +518,15 @@ class GroundSupportSafetyGate:
             )
         elif self.state in _TEMPORARY_HOLDS and elapsed >= self.config.observation_hold_timeout:
             assessment = self._assessment
-            has_real_drop = (
+            has_real_drop = bool(
                 assessment is not None
                 and (
                     bool(assessment.drop_confirmed)
                     or bool(assessment.drop_intersects_sweep)
                     or bool(assessment.drop_clusters)
                     or (
-                        assessment.support_boundary_detected
+                        not self._controlled_elevator_crossing
+                        and assessment.support_boundary_detected
                         and not assessment.current_footprint_supported
                     )
                 )
@@ -626,6 +635,23 @@ class GroundSupportSafetyGate:
         stop_distance = requested_stop_distance
         self.last_stop_distance = stop_distance
 
+        # 电梯 CROSS 已由任务层确认无空洞；只保留显式 DROP 和速度包络硬保护，
+        # 不让门槛接缝的支撑边界误判清空跨越路径。阶段结束后由任务层关闭该模式。
+        if self._controlled_elevator_crossing:
+            if self._fresh_drop_blocks(
+                self._assessment,
+                command=requested,
+                pose_yaw=pose_yaw,
+                wall_time=wall_time,
+                control_time=control_now,
+            ):
+                self.true_drop_stop_count += 1
+                self._begin_drop_stop(self._assessment, wall_time, control_now)
+                return (0.0, 0.0, 0.0)
+            if self.state in _TEMPORARY_HOLDS:
+                self._leave_temporary_hold(wall_time, control_now)
+            return requested
+
         if self.state in _TEMPORARY_HOLDS:
             hold_command = self._temporary_hold_command or requested
             hold_pose_yaw = (
@@ -652,7 +678,7 @@ class GroundSupportSafetyGate:
                     and assessment.observation_adequate
                 ):
                     return (0.0, 0.0, 0.0)
-                # 电梯门槛跨越时视角无法补足正支撑；继续等待只会耗尽父任务超时。
+                # 非受控阶段继续等待只会耗尽父任务超时；电梯 CROSS 已在上方单独处理。
                 # 先检查上面的显式 DROP，再解除仅由 UNKNOWN 引起的临时停车。
                 self._leave_temporary_hold(wall_time, control_now)
                 return requested
@@ -700,9 +726,8 @@ class GroundSupportSafetyGate:
             self._begin_drop_stop(assessment, wall_time, control_now)
             return (0.0, 0.0, 0.0)
 
-        # 【核心安全修复】：自身足迹已踩空（踏出支撑边界），属于物理生死线。
-        # 无论 unknown_support_hold_enabled 为何值，一律强制进入临时停车补观测/安全制动，
-        # 绝不短路放行！
+        # 普通导航中自身足迹已踩空（踏出支撑边界）属于物理生死线；电梯 CROSS
+        # 的已知门槛通道已在上方走受控豁免分支。
         near_footprint_unsupported = (
             assessment.support_boundary_detected
             and not assessment.current_footprint_supported
@@ -807,6 +832,7 @@ class GroundSupportSafetyGate:
             "reason_code": self.reason_code,
             "terminal": self.terminal,
             "unknown_support_hold_enabled": self._unknown_support_hold_enabled,
+            "controlled_elevator_crossing": self._controlled_elevator_crossing,
             "validated_max_speed": self.envelope.validated_max_speed,
             "stop_distance_table": [list(item) for item in self.envelope.table],
             "stop_envelope_index_source": "requested_command",

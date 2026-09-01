@@ -276,6 +276,7 @@ class ScanLocalizationNode {
     bool diagnostic_frame_details = false;
     bool landmark_correction_enabled = false;
     double landmark_correction_maximum = 1.20;
+    double landmark_correction_maximum_yaw = 0.12;
     double landmark_correction_command_speed = 0.02;
     double landmark_correction_angular_speed = 0.10;
     double landmark_correction_maximum_age = 1.0;
@@ -387,6 +388,9 @@ class ScanLocalizationNode {
     private_nh_.param("landmark_correction_maximum",
                       landmark_correction_maximum,
                       landmark_correction_maximum);
+    private_nh_.param("landmark_correction_maximum_yaw",
+                      landmark_correction_maximum_yaw,
+                      landmark_correction_maximum_yaw);
     private_nh_.param("landmark_correction_command_speed",
                       landmark_correction_command_speed,
                       landmark_correction_command_speed);
@@ -485,10 +489,12 @@ class ScanLocalizationNode {
     if (!std::isfinite(landmark_correction_maximum) ||
         !std::isfinite(landmark_correction_command_speed) ||
         !std::isfinite(landmark_correction_angular_speed) ||
+        !std::isfinite(landmark_correction_maximum_yaw) ||
         !std::isfinite(landmark_correction_maximum_age) ||
         landmark_correction_maximum <= 0.0 ||
         landmark_correction_command_speed < 0.0 ||
         landmark_correction_angular_speed <= 0.0 ||
+        landmark_correction_maximum_yaw <= 0.0 ||
         landmark_correction_maximum_age <= 0.0) {
       throw std::runtime_error("地标平移纠正参数无效");
     }
@@ -562,6 +568,7 @@ class ScanLocalizationNode {
     diagnostic_frame_details_ = diagnostic_frame_details;
     landmark_correction_enabled_ = landmark_correction_enabled;
     landmark_correction_maximum_ = landmark_correction_maximum;
+    landmark_correction_maximum_yaw_ = landmark_correction_maximum_yaw;
     landmark_correction_command_speed_ = landmark_correction_command_speed;
     landmark_correction_angular_speed_ = landmark_correction_angular_speed;
     landmark_correction_maximum_age_ = landmark_correction_maximum_age;
@@ -678,18 +685,21 @@ class ScanLocalizationNode {
       return;
     }
     const Eigen::Vector2d correction(message->vector.x, message->vector.y);
+    const double yaw_correction = message->vector.z;
     const double correction_norm = correction.norm();
     const ros::Time now = ros::Time::now();
     const double age = now.toSec() - message->header.stamp.toSec();
     if (message->header.seq == 0 || message->header.frame_id != "world" ||
         message->header.stamp.isZero() || !correction.allFinite() ||
-        !std::isfinite(message->vector.z) || std::abs(message->vector.z) > 1e-9 ||
+        !std::isfinite(yaw_correction) ||
+        std::abs(yaw_correction) > landmark_correction_maximum_yaw_ ||
         !std::isfinite(age) || age < 0.0 ||
-        age > landmark_correction_maximum_age_ || correction_norm <= 0.0 ||
+        age > landmark_correction_maximum_age_ ||
+        (correction_norm <= 0.0 && std::abs(yaw_correction) <= 1e-12) ||
         correction_norm > landmark_correction_maximum_) {
       ROS_ERROR(
-          "拒绝非法或过期的地标平移纠正请求：seq=%u norm=%.3f age=%.3f",
-          message->header.seq, correction_norm, age);
+          "拒绝非法或过期的地标 SE(2) 纠正请求：seq=%u norm=%.3f yaw=%.3f age=%.3f",
+          message->header.seq, correction_norm, yaw_correction, age);
       return;
     }
 
@@ -725,13 +735,33 @@ class ScanLocalizationNode {
         return;
       }
     }
-    if (!imu_odometry_->TranslatePlanar(correction)) {
-      ROS_ERROR("地标平移纠正事务失败：seq=%u", message->header.seq);
+    if (!imu_odometry_->ApplyPlanarSe2(correction, yaw_correction)) {
+      ROS_ERROR("地标 SE(2) 纠正事务失败：seq=%u", message->header.seq);
       return;
     }
 
-    adaptive_base_translation_.head<2>() += correction;
-    initial_world_base_translation_.head<2>() += correction;
+    const Eigen::Matrix3d se2_rotation =
+        Eigen::AngleAxisd(yaw_correction, Eigen::Vector3d::UnitZ())
+            .toRotationMatrix();
+    const Eigen::Matrix2d rotation = se2_rotation.topLeftCorner<2, 2>();
+    initial_world_base_rotation_ =
+        se2_rotation * initial_world_base_rotation_;
+    initial_world_base_translation_.head<2>() =
+        rotation * initial_world_base_translation_.head<2>() + correction;
+    adaptive_base_translation_.head<2>() =
+        rotation * adaptive_base_translation_.head<2>() + correction;
+    Eigen::Vector3d corrected_livox0_translation = world_livox0_.translation();
+    corrected_livox0_translation.head<2>() =
+        rotation * corrected_livox0_translation.head<2>() + correction;
+    world_livox0_ = SE3d(
+        SO3d(se2_rotation * world_livox0_.rotationMatrix()),
+        corrected_livox0_translation);
+    {
+      std::lock_guard<std::mutex> fusion_lock(fusion_mutex_);
+      fused_planar_position_ = rotation * fused_planar_position_ + correction;
+      fused_at_last_depth_ = rotation * fused_at_last_depth_ + correction;
+      depth_fusion_offset_ = rotation * depth_fusion_offset_ + correction;
+    }
     adaptive_depth_proposal_ = {};
     adaptive_depth_proposal_stamp_ = ros::Time();
     consecutive_livox_only_veto_count_ = 0;
@@ -748,12 +778,12 @@ class ScanLocalizationNode {
     applied.header.frame_id = "world";
     applied.vector.x = correction.x();
     applied.vector.y = correction.y();
-    applied.vector.z = 0.0;
+    applied.vector.z = yaw_correction;
     correction_state_publisher_.publish(applied);
     ROS_WARN(
-        "已原子应用地标平移纠正：seq=%u correction=(%.3f, %.3f) "
+        "已原子应用地标 SE(2) 纠正：seq=%u correction=(%.3f, %.3f, %.4f) "
         "position=(%.3f, %.3f) generation=%lu",
-        message->header.seq, correction.x(), correction.y(),
+        message->header.seq, correction.x(), correction.y(), yaw_correction,
         adaptive_base_translation_.x(), adaptive_base_translation_.y(),
         static_cast<unsigned long>(imu_odometry_->map_generation()));
   }
@@ -2286,6 +2316,7 @@ class ScanLocalizationNode {
   bool diagnostic_frame_details_ = false;
   bool landmark_correction_enabled_ = false;
   double landmark_correction_maximum_ = 1.20;
+  double landmark_correction_maximum_yaw_ = 0.12;
   double landmark_correction_command_speed_ = 0.02;
   double landmark_correction_angular_speed_ = 0.10;
   double landmark_correction_maximum_age_ = 1.0;

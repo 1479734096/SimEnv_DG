@@ -505,6 +505,31 @@ class ImuConstrainedOdometry {
     return true;
   }
 
+  /// 将当前局部地图和最后提交位姿作为一个事务应用世界系平面 SE(2) 变换。
+  bool ApplyPlanarSe2(const Eigen::Vector2d &correction, double yaw_correction) {
+    if (!initialized_ || !correction.allFinite() ||
+        !std::isfinite(yaw_correction)) {
+      return false;
+    }
+    const Eigen::Matrix2d rotation =
+        Eigen::AngleAxisd(yaw_correction, Eigen::Vector3d::UnitZ())
+            .toRotationMatrix()
+            .topLeftCorner<2, 2>();
+    PointMap transformed;
+    transformed.reserve(map_points_.size());
+    for (const auto &item : map_points_) {
+      Eigen::Vector3d point = item.second;
+      point.head<2>() = rotation * point.head<2>() + correction;
+      transformed.try_emplace(KeyFor(point, config_.map_voxel_size), point);
+    }
+    map_points_ = std::move(transformed);
+    last_translation_.head<2>() =
+        rotation * last_translation_.head<2>() + correction;
+    ++map_generation_;
+    RebuildSearchIndex();
+    return true;
+  }
+
  private:
   struct GridKey {
     int x;

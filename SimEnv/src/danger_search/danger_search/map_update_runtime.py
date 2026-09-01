@@ -319,12 +319,19 @@ class MapUpdateRuntime:
         dx: float,
         dy: float,
         *,
+        correction_yaw: float = 0.0,
         now: float | None = None,
         robot_floor: int | None = None,
         robot_xy: tuple[float, float] | None = None,
     ) -> DangerObstacleSyncResult:
         """在定位节点回执后同步平移轨迹，并重建全部已实例化楼层的语义 OCC。"""
-        translated = self.tracker.translate_planar(dx, dy)
+        map_runtime = getattr(self.mapper, "transform_planar", None)
+        if callable(map_runtime):
+            map_runtime(float(dx), float(dy), float(correction_yaw))
+        if abs(float(correction_yaw)) > 1e-12:
+            translated = self.tracker.transform_planar(dx, dy, correction_yaw)
+        else:
+            translated = self.tracker.translate_planar(dx, dy)
         synchronized = self.synchronize_confirmed_danger_obstacles(
             now=now,
             robot_floor=robot_floor,

@@ -11,7 +11,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Iterable
 
@@ -535,6 +535,110 @@ class FloorGrid:
             self.origin_x + (gx + 0.5) * self.resolution,
             self.origin_y + (gy + 0.5) * self.resolution,
         )
+
+    def transform_planar(self, dx: float, dy: float, yaw: float) -> None:
+        """将楼层栅格及其证据索引整体变换到新的世界系。"""
+        values = (float(dx), float(dy), float(yaw))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("楼层栅格 SE(2) 变换量必须为有限数")
+        cosine = math.cos(values[2])
+        sine = math.sin(values[2])
+        rotation = np.asarray(((cosine, -sine), (sine, cosine)), dtype=float)
+        offset = np.asarray(values[:2], dtype=float)
+
+        def transform_cell(x: float, y: float):
+            transformed = rotation @ np.asarray((float(x), float(y))) + offset
+            return self.world_to_grid(float(transformed[0]), float(transformed[1]))
+
+        def remap(source: np.ndarray) -> np.ndarray:
+            target = np.full_like(source, UNKNOWN)
+            ys, xs = np.nonzero(source != UNKNOWN)
+            for gy, gx in zip(ys.tolist(), xs.tolist()):
+                destination = transform_cell(*self.grid_to_world(gx, gy))
+                if destination is None:
+                    continue
+                tx, ty = destination
+                state = int(source[gy, gx])
+                if state > int(target[ty, tx]):
+                    target[ty, tx] = state
+            return target
+
+        self.base[:] = remap(self.observation_layer)
+        self._derived[:] = remap(self.planning_layer)
+
+        def transform_cells(cells):
+            return {
+                destination
+                for destination in (
+                    transform_cell(*self.grid_to_world(*cell)) for cell in cells
+                )
+                if destination is not None
+            }
+
+        self.black_owners = {
+            cell: set(owners)
+            for cell, owners in self._transform_owner_map(self.black_owners, transform_cells).items()
+        }
+        transformed_semantic = self._transform_owner_map(
+            self.semantic_occupied_owners, transform_cells
+        )
+        self.semantic_occupied_owners = transformed_semantic
+        self.semantic_occupied_owner_cells = self._invert_owner_map(transformed_semantic)
+        self.protected_trail_cells = transform_cells(self.protected_trail_cells)
+        if self.last_protected_trail_xy is not None:
+            self.last_protected_trail_xy = tuple(
+                rotation @ np.asarray(self.last_protected_trail_xy) + offset
+            )
+        self.negative_cells = transform_cells(self.negative_cells)
+        self.negative_cell_owners = self._transform_owner_map(
+            self.negative_cell_owners, transform_cells
+        )
+        self.negative_first_state = {
+            cell: state
+            for cell, state in (
+                (destination, self.negative_first_state[source])
+                for source in self.negative_first_state
+                for destination in (
+                    transform_cell(*self.grid_to_world(*source)),
+                )
+                if destination is not None
+            )
+        }
+        self.negative_cluster_confirmations = {
+            cluster_id: frozenset(transform_cells(cells))
+            for cluster_id, cells in self.negative_cluster_confirmations.items()
+        }
+        self.negative_cluster_records = {
+            cluster_id: replace(
+                record,
+                source_cells=frozenset(transform_cells(record.source_cells)),
+            )
+            for cluster_id, record in self.negative_cluster_records.items()
+        }
+        self.obstacle_evidence.transform_planar((rotation, offset, transform_cell))
+        self._dirty_cells = set()
+        self._refresh_cells(
+            (gx, gy)
+            for gy in range(self.size_y)
+            for gx in range(self.size_x)
+        )
+
+    @staticmethod
+    def _transform_owner_map(source, transform_cells):
+        result = {}
+        for cell, owners in source.items():
+            destination_set = transform_cells((cell,))
+            for destination in destination_set:
+                result.setdefault(destination, set()).update(owners)
+        return result
+
+    @staticmethod
+    def _invert_owner_map(source):
+        result = {}
+        for cell, owners in source.items():
+            for owner in owners:
+                result.setdefault(owner, set()).add(cell)
+        return result
 
     def is_traversable(self, gx: int, gy: int) -> bool:
         if not (0 <= gx < self.size_x and 0 <= gy < self.size_y):
@@ -1080,6 +1184,15 @@ class MultiFloorGridMap:
     def instantiated_floor_indices(self) -> tuple[int, ...]:
         """返回当前已创建的楼层，避免语义层为未知楼层凭空建图。"""
         return tuple(sorted(self._floors))
+
+    def transform_planar(self, dx: float, dy: float, yaw: float) -> tuple[int, ...]:
+        """同步变换全部已实例化楼层及其世界坐标证据。"""
+        values = (float(dx), float(dy), float(yaw))
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("地图 SE(2) 变换量必须为有限数")
+        for grid in self._floors.values():
+            grid.transform_planar(*values)
+        return self.instantiated_floor_indices
 
     def estimate_floor_from_z(self, z: float) -> int:
         """按楼层高度把绝对 Z 量化为非负楼层编号。"""

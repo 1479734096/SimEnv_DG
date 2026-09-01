@@ -107,6 +107,7 @@
     <param name="landmark_correction_enabled"
            value="$(arg landmark_correction_enabled)"/>
     <param name="landmark_correction_maximum" value="1.20"/>
+    <param name="landmark_correction_maximum_yaw" value="0.12"/>
     <param name="landmark_correction_command_speed" value="0.02"/>
     <param name="landmark_correction_angular_speed" value="0.10"/>
     <param name="landmark_correction_maximum_age" value="1.0"/>

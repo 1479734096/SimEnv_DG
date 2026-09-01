@@ -1,80 +1,11 @@
 # 开发与验证手册
 
-## 定位源与量程单次对照矩阵
+## 逻辑优先，停止自动回归测试
 
-定位漂移对照固定使用 `adaptive_shared_map`，只改变 RGB-D 是否生成定位候选和 Livox
-定位点云最大量程。正式默认已采用 G3：`max_range=15m` 且关闭 RGB-D 定位候选；RGB-D
-仍用于危险源、门和电梯感知。四组各运行一次，固定按 G1、G2、G3、G4 顺序执行；算法
-失败不补跑。只有定位 ready、
-MissionManager 已创建并开始任务预算才计为该组一次有效运行；此前的环境启动失败不计入
-参数试验，并停止矩阵先排查环境。
-
-四组公共参数为：`seed=8127`、两层、`floor_timeout=280s`、最短探索 `60s`、总预算
-`620s`、完整往返、Gazebo GUI 开启、逐帧定位诊断关闭。每组使用新的空证据目录，运行前
-确认 ROS 端口 `11311` 空闲且没有残留 Gazebo、定位、任务、控制器或 rosbag 进程。
-
-```bash
-# G1：生产重复基线，RGB-D 参与定位，max_range=15m
-SEED=8127 GUI=true ELEVATOR_TEST_FLOOR_COUNT=2 \
-ELEVATOR_TEST_FLOOR_TIMEOUT=280 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
-ELEVATOR_TEST_MAX_RUNTIME=620 ELEVATOR_TEST_WALL_TIMEOUT=10800 \
-ELEVATOR_TEST_FULL_CYCLE=1 ELEVATOR_TEST_RECORD_DRIFT=1 \
-ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0 \
-ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map \
-ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0 \
-ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=true \
-ELEVATOR_TEST_LOG_DIR=/home/xbh/tzb26/evidence/simenv/seed8127_loc_ab_g1_77e85d5_r15 \
-tools/sim/run_elevator_gui_test.sh
-
-# G2：仅把 max_range 改为 5m
-SEED=8127 GUI=true ELEVATOR_TEST_FLOOR_COUNT=2 \
-ELEVATOR_TEST_FLOOR_TIMEOUT=280 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
-ELEVATOR_TEST_MAX_RUNTIME=620 ELEVATOR_TEST_WALL_TIMEOUT=10800 \
-ELEVATOR_TEST_FULL_CYCLE=1 ELEVATOR_TEST_RECORD_DRIFT=1 \
-ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0 \
-ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map \
-ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=5.0 \
-ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=true \
-ELEVATOR_TEST_LOG_DIR=/home/xbh/tzb26/evidence/simenv/seed8127_loc_ab_g2_77e85d5_r5 \
-tools/sim/run_elevator_gui_test.sh
-
-# G3：仅关闭 RGB-D 定位候选，max_range 保持 15m
-SEED=8127 GUI=true ELEVATOR_TEST_FLOOR_COUNT=2 \
-ELEVATOR_TEST_FLOOR_TIMEOUT=280 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
-ELEVATOR_TEST_MAX_RUNTIME=620 ELEVATOR_TEST_WALL_TIMEOUT=10800 \
-ELEVATOR_TEST_FULL_CYCLE=1 ELEVATOR_TEST_RECORD_DRIFT=1 \
-ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0 \
-ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map \
-ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0 \
-ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false \
-ELEVATOR_TEST_LOG_DIR=/home/xbh/tzb26/evidence/simenv/seed8127_loc_ab_g3_77e85d5_livox_r15 \
-tools/sim/run_elevator_gui_test.sh
-
-# G4：关闭 RGB-D 定位候选，并把 max_range 改为 5m
-SEED=8127 GUI=true ELEVATOR_TEST_FLOOR_COUNT=2 \
-ELEVATOR_TEST_FLOOR_TIMEOUT=280 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
-ELEVATOR_TEST_MAX_RUNTIME=620 ELEVATOR_TEST_WALL_TIMEOUT=10800 \
-ELEVATOR_TEST_FULL_CYCLE=1 ELEVATOR_TEST_RECORD_DRIFT=1 \
-ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0 \
-ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map \
-ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=5.0 \
-ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false \
-ELEVATOR_TEST_LOG_DIR=/home/xbh/tzb26/evidence/simenv/seed8127_loc_ab_g4_77e85d5_livox_r5 \
-tools/sim/run_elevator_gui_test.sh
-```
-
-退出后比较 RMSE、P95、最大/末端误差、真值行程、完整闭环结果，以及历史
-`elapsed=120～163s` 窗口的误差增长。候选最低门槛为 RMSE `<=0.20m`、P95
-`<=0.30m`、最大和末端误差 `<=0.35m`，且不能通过少走路、定位冻结或超过 `3s` 的
-odom 陈旧规避问题路段。G3 单次结果尚未达到定位门槛；用户已明确决定将其设为正式
-默认，后续仍需用独立复测确认泛化效果。
-
-本矩阵暂不测试 `max_range=8m`、`minimum_residual_cutoff=0.06`、
-`maximum_map_distance=8m`、`maximum_iterations=8`、
-`shared_map_max_source_divergence=0.02`、`maximum_correspondence_distance=0.35`、体素大小
-或独立 `livox_imu_local_map` 后端。若 `5m` 胜出，优先补测 `8m`；其他参数继续按单变量
-顺序评估。不得把 `scan_to_map_maximum_correction` 降到 `0.005m`，不得用命令速度尺度
-补偿少走距离，也不得恢复共同模式门、冻结子图或定位 state/epoch。
+本手册不再规定或推荐自动测试、回归测试、固定 seed 矩阵、pytest/gtests、测试 runner 或
+长时 Gazebo 闭环。以后先理清代码逻辑、调用链、输入输出和失败降级，再直接实施最小范围
+修改。测试源码、历史命令和既有运行证据仅供查阅，不作为当前修改门槛；运行时验证如需取得，
+由用户另行安排。
 
 ## 构建
 
@@ -91,23 +22,7 @@ sha256sum -c OFFICIAL_FILES.sha256
 git diff --check
 ```
 
-## 第 1 层 Python 契约测试
-
-```bash
-source devel/setup.bash
-python3 -m pytest -q \
-  src/danger_search/test/test_interface_policy.py \
-  src/danger_search/test/test_result_writer.py \
-  src/danger_search/test/test_time_utils.py
-```
-
-## 第 2 层定位测试
-
-```bash
-source /opt/ros/noetic/setup.bash
-catkin_make run_tests_danger_search run_tests_danger_search_localization -j2
-catkin_test_results build/test_results
-```
+## 定位与接口运行约束
 
 单独启动定位节点时必须显式选择正式后端：
 
@@ -126,8 +41,8 @@ roslaunch danger_search_localization scan_localization.launch \
 ```
 
 该候选只用 `/scan`、`/trunk_imu` 和自身 `/cmd_vel` 做定位；RGB-D 仍由任务节点用于
-危险源、门和电梯感知。Stage15 固定 seed 闭环未通过，禁止在正式运行中选择该候选，
-也禁止根据任务阶段或实时输入在它与正式 `adaptive_shared_map` 之间自动切换。
+危险源、门和电梯感知。历史阶段曾记录该候选的失败，正式运行禁止选择它，也禁止根据任务
+阶段或实时输入在它与正式 `adaptive_shared_map` 之间自动切换。
 
 正式启动默认使用 `adaptive_shared_map`、`max_range=15m`，并关闭 RGB-D 定位候选；也可用
 下面命令独立诊断：
@@ -141,12 +56,8 @@ roslaunch danger_search_localization scan_localization.launch \
 该后端使用 `/trunk_imu` 定姿、Livox 维护唯一局部地图并提供平移候选。定位节点默认不
 订阅 RGB-D 深度点云；任务节点仍使用 RGB-D 完成危险源、门和电梯感知。Livox 候选无效
 时会停止发布新 odom/cloud，调用方必须保留既有陈旧定位和 3 秒不可用门，不能用旧位姿
-伪造新时间戳。需要复现 G1 时可显式传入
-`adaptive_rgbd_localization_enabled:=true`，恢复 RGB-D 与 Livox 针对同一地图逐帧竞争
-平移候选。Stage17 当前 `8/20` 个有效 seed 全部完成
-闭环且没有定位诱发失败，但矩阵尚未完成，seed `1612` 的末端误差也超过冻结硬门。
-正式默认是按用户明确决策直接切换，不代表矩阵已经通过；禁止现场修改
-`shared_map_*` 阈值。Stage17 工程验收状态为通过，剩余矩阵属于后续风险量化。
+伪造新时间戳。历史参数对照和 Stage17 seed 结果仅供追溯，不作为当前修改依据。正式默认按
+当前配置执行，禁止现场修改 `shared_map_*` 阈值。
 
 需要回退旧后端时必须显式指定，避免把诊断行为误当成正式默认：
 
@@ -160,28 +71,10 @@ roslaunch danger_search danger_search.launch \
 
 节点启动后先锁存发布 `ready=false`。机器人站立稳定、连续楼面证据满足门槛后才发布 `ready=true`、里程计和配准点云；调用方不得用固定等待替代该就绪信号。
 
-持续姿态健康的确定性回归不依赖 Gazebo：测试先用合成 `/scan` 楼面和竖直
-`/trunk_imu` 建立 health/ready，再发布倾倒 IMU，要求两者均撤销：
+正式模式强制启用 MissionManager health 门控；诊断模式才允许关闭。定位和接口行为通过逻辑
+审阅、配置核对与已有运行日志分析，不再自动执行回归用例。
 
-```bash
-source /opt/ros/noetic/setup.bash
-source devel/setup.bash
-catkin_make run_tests_danger_search_localization -j2
-```
-
-该用例用于日常确定性回归。第 8.2 层另以 Gazebo 可控侧倾验证了正式定位和 MissionManager
-的失效安全；证据见 `reports/STAGE8_2_REPORT.md`。正式模式强制启用 MissionManager
-health 门控；诊断 smoke 才允许关闭。
-
-## 第 3 层建图与规划测试
-
-```bash
-source devel/setup.bash
-python3 -m pytest -q \
-  src/danger_search/test/test_multi_floor_mapper.py \
-  src/danger_search/test/test_planner.py \
-  src/danger_search/test/test_frontier_explorer.py
-```
+## 建图与规划运行约束
 
 正式配置默认开启分楼层轨迹保护：`trail_protection_radius=0.25`、
 `trail_protection_near_range=2.0`、`trail_protection_confirm_generations=3`、
@@ -191,53 +84,23 @@ python3 -m pytest -q \
 
 阶段性能测量使用默认 `280×480` 栅格。普通 A* 必须保留迭代预算；`BUDGET_EXHAUSTED` 不等于不可达，不得据此写 BLACK 或前沿黑名单。无预算长墙绕行约 170 ms；第 7 层已要求返航穷举只在地图和历史轨迹快照的后台线程运行，主 tick 在结果就绪前持续零速。
 
-## 第 4 层路径执行与安全门测试
+## 路径执行与安全门运行约束
 
-```bash
-source devel/setup.bash
-python3 -m pytest -q \
-  src/danger_search/test/test_local_controller.py \
-  src/danger_search/test/test_ground_support_gate.py
-```
+普通导航先由安全门确认新鲜、充足支撑；支撑边界不足时当前 tick 和后续保活均发布零速。电梯
+`ENTER_CABIN/EXIT_CABIN` 的 `CROSS` 阶段是已确认无空洞的受控门槛通道，允许暂时跳过支撑边界
+判定，但速度包络和显式 DROP 仍必须停车，CROSS 结束后恢复检测。
 
-ROS 发布闭环使用独立 master：先给安全门一帧新鲜、充足支撑，确认 `/cmd_vel` 可出现非零跟踪命令；再给出支撑边界不足评估，确认当前 tick 和后续保活均只发布零速。测试结束必须关闭独立 `roscore`，不得连接正在运行的比赛 master。
+定位默认速度死区是线速度 `0.05 m/s`、角速度 `0.03 rad/s`。`GroundSupportGateConfig` 必须显式保持停稳阈值不小于这两个值；若后续调整定位死区，必须同步审阅动态停车逻辑。
 
-定位默认速度死区是线速度 `0.05 m/s`、角速度 `0.03 rad/s`。`GroundSupportGateConfig` 必须显式保持停稳阈值不小于这两个值；若后续调整定位死区，必须同步修改安全门配置并重跑动态停车验证。
+## RGB-D 感知运行约束
 
-## 第 5 层 RGB-D 感知测试
+感知逻辑必须覆盖合成红球、红色平面干扰、暗色门板、门板消失、双侧滑门开口、稀疏远端深度、同帧多候选和非法刚体变换。`camera_to_world` 必须使用右手刚体变换；正式光学坐标转换是 world `Y=-optical X`，不得使用镜像矩阵。
 
-```bash
-source devel/setup.bash
-python3 -m pytest -q \
-  src/danger_search/test/test_detection_tracker.py \
-  src/danger_search/test/test_red_sphere_detector.py \
-  src/danger_search/test/test_rgbd_door_detector.py
-```
+`floor_local` 模式只允许在上层构造 `camera_to_world` 时增加一次 `floor_index * floor_height`；检测器直接应用传入矩阵，不再自行修正 z。已有两层运行日志用于核对最终结果坐标。
 
-测试覆盖合成红球、红色平面干扰、暗色门板、门板消失、双侧滑门开口、稀疏远端深度、同帧多候选和非法刚体变换。`camera_to_world` 必须使用右手刚体变换；正式光学坐标转换是 world `Y=-optical X`，不得使用镜像矩阵。
+## 建筑交互与导航运行约束
 
-`floor_local` 模式只允许在上层构造 `camera_to_world` 时增加一次 `floor_index * floor_height`；检测器直接应用传入矩阵，不再自行修正 z。第 6/7 层接线后必须以两层场景验证最终结果坐标。
-
-## 第 6 层建筑交互与导航任务测试
-
-```bash
-source devel/setup.bash
-python3 -m pytest -q \
-  src/danger_search/test/test_building_control_client.py \
-  src/danger_search/test/test_local_semantic_detector.py \
-  src/danger_search/test/test_navigation_tasks.py
-```
-
-测试使用 fake manager 和注入式服务函数验证异步协议，不连接真实比赛服务。重点断言：未知 ID/楼层拒绝、授权请求字段保持、门洞/轿厢必须有点云证据、A* 不可达与预算耗尽均不生成直线路径，以及过门/进出厢的对齐和阻塞失败边界。
-
-电梯开门后的局部穿越回归还必须执行：
-
-```bash
-source devel/setup.bash
-python3 -m pytest -q \
-  src/danger_search/test/test_elevator_crossing_runtime.py \
-  src/danger_search/test/test_navigation_tasks.py
-```
+异步协议使用 fake manager 和注入式服务函数建模，不连接真实比赛服务。运行逻辑必须保证：未知 ID/楼层拒绝、授权请求字段保持、门洞/轿厢必须有点云证据、A* 不可达与预算耗尽均不生成直线路径，以及过门/进出厢的对齐和阻塞失败边界。
 
 正式默认要求 3 个不同 Livox 点云代次，最大间隔 `0.5s`；4s 内无法确认时返回
 `elevator_open_crossing_geometry_unavailable`，不得回退旧注册中心。目标层位姿距新轿厢中心
@@ -247,210 +110,21 @@ python3 -m pytest -q \
 若近处稳定结构和远处真实门框同时存在，必须跳过近处结构继续搜索距离窗口内的门框；
 不能把“三帧稳定”单独当作语义正确。
 
-`use_truth_proximity_detector` 只保留历史诊断兼容，正式 profile 必须为 false。真实 `/set_door_state`、`/call_elevator` 与视觉开口闭环留到第 8/10 层正式 runner 验收。
+`use_truth_proximity_detector` 只保留历史诊断兼容，正式 profile 必须为 false。真实 `/set_door_state`、`/call_elevator` 与视觉开口闭环由人工运行时观察。
 
-第 10.1 层主入口 GUI 回归必须确认：机器人原地请求开门，近场连续两帧确认净空后再
+第 10.1 层主入口运行记录应确认：机器人原地请求开门，近场连续两帧确认净空后再
 低速直线通过；首个前沿位于门后侧，离门期间不得出现 `STALE_DATA_HOLD` 或
 `ground_support_path_unavailable`。完整证据见 `reports/STAGE10_1_REPORT.md`。
 
-## 第 7 层任务编排测试
+## 任务编排运行约束
 
-```bash
-source devel/setup.bash
-python3 -m pytest -q \
-  src/danger_search/test/test_time_utils.py \
-  src/danger_search/test/test_coordinate_transform.py \
-  src/danger_search/test/test_progress_monitor.py \
-  src/danger_search/test/test_mission_manager_helpers.py
-```
+返航规划第一次 tick 只创建后台任务并调用 `controller.stop(reason="return_home_plan_pending")`；不能恢复成同步 A*。楼层对齐超时是终止故障，必须进入 `WRITE_RESULT`。电梯摘要保持三态：未完成为 `null`、完成为 `true`、失败为 `false`。
 
-返航规划第一次 tick 只创建后台任务并调用 `controller.stop(reason="return_home_plan_pending")`；测试必须等待该任务完成后再推进下一 tick，不能恢复成同步 A*。楼层对齐超时是终止故障，必须进入 `WRITE_RESULT`。电梯摘要保持三态：未完成为 `null`、完成为 `true`、失败为 `false`。
+## 运行证据与历史记录
 
-## 官方底座冒烟
-
-```bash
-GUI=false SEED=42 FLOOR_COUNT=1 \
-PAUSED=true AUTO_UNPAUSE=1 \
-./auto.sh
-```
-
-键盘 `2` 站立，稳定后使用 `6` 进入 RL `/cmd_vel` 模式。不要使用 `PAUSED=false` 全传感器组合。
-
-第 8.3 层已在获准修改的 `auto.sh` 中关闭启动竞争：等待 `spawn_model` 延迟配置完成，
-最后写入 calf 安全角，再等待 `junior_ctrl` 命令首帧后恢复物理。不要再使用固定延时或从
-参赛节点调用 Gazebo 配置服务。`START_CONTROLLER=0` 会保持物理暂停；无键盘运行应使用
-`CONTROLLER_FOREGROUND=0`。
-
-## Gazebo 证据记录
-
-涉及运行时行为的阶段至少记录：Git 提交、seed、楼层数、关键环境变量、ROS/Gazebo 隔离端口、仿真与墙钟时长、传感器频率、状态转换、结果摘要和退出后的残留进程。一次运行足以证明确定性边界时不扩大矩阵；随机性使结论不清时再做固定 seed 复测。
-
-Gazebo 日志、bag、生成场景和真值不提交到 Git，只把与结论直接相关的短摘要写入对应 `reports/STAGE<N>_REPORT.md`。
-
-本地电梯穿越修复固定跑两轮，代码在两轮之间冻结，只改变定位 `max_range`。公共条件为
-seed=8127、G3 Livox-only、两层、`floor_timeout=280s`、最短探索 `60s`、总预算 `620s`、
-完整往返、GUI=true、逐帧定位诊断关闭、离线真值只在结束后分析。环境变量分别使用
-`ELEVATOR_SIM_STALL_WALL=300` 和 `ELEVATOR_GO_TO_DOOR_STALL_WALL=120`；总墙钟上限为
-`1800s`。每轮使用新空目录，runner 就绪后另开 RViz：
-
-```bash
-source devel/setup.bash
-rviz -d src/danger_search/config/elevator_baseline.rviz
-```
-
-该 RViz 配置的 Fixed Frame 为 `world`。正式运行时，定位 odom、配准点云、
-`/nav/map_debug`、`/danger_search/path_raw`、`/danger_search/path_followed` 和
-`/danger_search/local_target` 的 `header.frame_id` 都应为 `world`。若显示错位，先用
-`rostopic echo -n 1 <topic>/header` 核对标签，不能添加恒等静态 TF；相对原点 smoke
-使用 `danger_search_relative`，不适用正式 RViz 配置。
-
-第一轮 `ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0`，第二轮仅改为 `8.0`；均设置
-`ELEVATOR_TEST_RECORD_DRIFT=1`、`ELEVATOR_TEST_RECORD_RGBD=0`、
-`ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1`、`ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0`、
-`ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS=0`、
-`ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false`。验收必须同时报告完整闭环、两个
-本地几何确认事件、CROSS 结果和离线 RMSE/P95/最大/末端误差；启动成功不等于闭环成功，
-人工中止不记算法失败。
-
-正式 launch 与 `run_elevator_gui_test.sh` 的定位点云量程默认值均为 `15.0m`。
-上述 `8.0m` 只是历史 A/B 对照的显式覆盖；若仍需复现，必须在命令行明确设置
-`ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=8.0`，不得再作为专项 runner 的隐式默认。
-
-### STAGE33 双锚点与电梯重试验收
-
-当前正式配置必须保持以下基线：`max_linear=0.65m/s`、
-`boundary_hold_margin=0.40m`、`async_planning_enabled=false`、
-`opportunistic_replan_period=0.0`、`localization_max_range=15.0m`。电梯开口首次确认、重试
-次数、重试窗口和新帧屏障分别为 `15.0s`、`1`、`10.0s`、`0.5s`。运行前先核对有效参数，
-不能用提高速度、缩小防坠余量或把量程降到历史 `8.0m` 的方式补偿时间。
-
-按用户当前安排，完整仿真由人工执行。两层 0→1→0→主入口返航的推荐命令如下；证据目录
-必须是不存在或为空的新目录：
-
-```bash
-SEED=8127 GUI=true ELEVATOR_TEST_FLOOR_COUNT=2 \
-ELEVATOR_TEST_FLOOR_TIMEOUT=280 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60 \
-ELEVATOR_TEST_MAX_RUNTIME=620 ELEVATOR_TEST_WALL_TIMEOUT=10800 \
-ELEVATOR_TEST_FULL_CYCLE=1 ELEVATOR_TEST_RECORD_DRIFT=1 \
-ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0 \
-ELEVATOR_TEST_LOCALIZATION_BACKEND=adaptive_shared_map \
-ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0 \
-ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false \
-ELEVATOR_TEST_LOG_DIR=/tmp/danger_search_stage33_seed8127 \
-tools/sim/run_elevator_gui_test.sh
-```
-
-`ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1` 只让独立 rosbag 记录离线评估输入，不允许生产节点
-订阅或读取真值。若本轮只验证行为而不需要漂移评分，可设为 `0`。
-
-运行结束后先检查结构化事件：
-
-```bash
-rg 'sparse_landmark_anchor_frozen|sparse_landmark_relocalization_evaluated|sparse_landmark_correction_applied|elevator_door_open_sensor_confirmed|elevator_door_confirmation_retry_started|elevator_door_confirmation_retry_exhausted|elevator_local_crossing_geometry_confirmed' \
-  /tmp/danger_search_stage33_seed8127/mission.log
-```
-
-入口定位专项验收：另外检查 `entrance_geometry_correction_evaluated`、
-`entrance_geometry_correction_applied` 和 `entrance_geometry_correction_degraded`。
-`phase=startup` 与 `phase=before_pass` 都必须在 3 秒内给出 `accepted`、
-`no_correction_needed` 或明确降级原因；若为 `accepted`，必须有纠偏回执、连续性 epoch
-变化和路径清除。任何一轮都不得出现超过 3 秒持续等待、重复请求或无回执继续运动。
-同时记录纠偏前后合法 pose 的 XY、门前最近障碍距离、实际 `/cmd_vel`、足端支撑状态和路径首段，
-用这些证据区分初始定位偏差、门区误障碍与运动接触问题。固定入口合同不随室内 seed 变化，
-不要把 `team_scene_info.json` 或离线真值加入运行链。
-
-验收口径如下：
-
-- 开局必须分别出现 `landmark_id=main_entrance` 与 `landmark_id=elevator` 的锚点冻结事件；
-  缺任一锚点都不能宣称双锚点闭环已验证。
-- 到源层电梯和返航主入口时应出现重定位评估。状态为 `no_correction_needed` 是合法成功；
-  状态为 `accepted` 时还必须出现同序号的 `sparse_landmark_correction_applied` 回执。
-  质量门拒绝不应注入，不能为了制造 applied 事件降低阈值。
-- 源层和目标层都必须先出现开口传感器确认，再出现对应的本地穿越几何确认和 CROSS 成功；
-  服务 accepted、轿厢到层或地图条带清理都不能代替开口证据。
-- 只有首次 `15s` 超时才应出现 `elevator_door_confirmation_retry_started`，同一门最多一次。
-  源层重试后应重新呼梯、重新开门并复核锚点；目标层重试期间机器人必须保持在轿厢内。
-  出现 `elevator_door_confirmation_retry_exhausted` 时本轮应明确记失败，不能继续盲穿。
-- 最终必须完成 0→1→0、穿出主入口、回到出生点并写出结果；仅到达 1 层不算完整闭环。
-
-专项 runner 会在证据目录生成 `TEST_SUMMARY.txt`、`mission.log`、`auto.log`、诊断 bag 和可选
-漂移统计。阶段报告需记录 seed、Git SHA、有效参数、仿真/墙钟时长、状态转换、结果、清理
-情况与未验证风险。
-
-### STAGE35 危险源避障与前沿转弯验收
-
-本阶段不改变正式楼层预算、`max_linear=0.65m/s`、同步规划或 `15.0m` 定位量程。完整闭环
-可按上述 runner 执行；为保留后续定位、感知与规划证据，应设置
-`ELEVATOR_TEST_RECORD_DRIFT=1`、`ELEVATOR_TEST_RECORD_RGBD=1` 与
-`ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=1`，并保持
-`ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=0`。是否打开 GUI/RViz 不影响日志验收。
-
-运行结束后至少检查：
-
-```bash
-rg 'danger_obstacle_sync|danger_obstacle_reprojected|danger_source_overlap|frontier_selection|initial_heading_error|cumulative_turn_angle|path_turn_cost|far_small_pocket_pruned|sparse_landmark_|elevator_door_confirmation_retry' \
-  "$EVIDENCE_DIR/mission.log"
-```
-
-- 换层初段若出现预呼梯，其服务参数必须为 `open_doors=false`；在
-  `elevator_geometry_refresh`（或其有界降级）和候梯点二次对准前，不得出现源层
-  `elevator_door_open_confirmation_started`。源层开门确认事件只能在该近场流程之后出现。
-- 目标层升梯也必须使用 `open_doors=false`；`elevator_door_open_confirmation_started` 必须晚于
-  轿厢内调头完成。出厢后应出现一次 `elevator_target_door_close_requested`，其 `mode` 为
-  `async`，且不得阻塞下一楼层建图。
-- `danger_obstacle_sync` 可引用已确认轨迹，或仅限两个相隔至少 `0.08s` 的高质量预保护轨迹；
-  预保护轨迹必须在 `0.75s` 无新帧后撤销。出现新增语义 OCC 后旧路径应被清除并重规划。
-- 若有 `sparse_landmark_correction_applied`，应有同一序号的
-  `danger_obstacle_reprojected`；确认危险源坐标和 OCC 所在楼层必须同步平移。
-- `danger_source_overlap` 是 fail-closed 安全结果：机器人应停车并写出已有检测结果，不能
-  继续执行旧路径。
-- `frontier_selection` 的最终候选应包含 `initial_heading_error`、
-  `cumulative_turn_angle` 和 `path_turn_cost`；远距收益低于 `4` 格的候选应以
-  `far_small_pocket_pruned` 结束，不能进入 A*。
-
-本轮优先级以地面支撑与运动安全为首要检查项，下一轮重点记录支撑边界、真实悬空、停车输出和
-`SUPPORT_PATH_UNAVAILABLE` 重规划结果。前沿探索与路径转弯、电梯门时序、时间预算与配置暂作
-观察项，不因单次运行波动修改；只有出现明确可复现问题才重新打开对应修复任务。
-
-RGB-D/Livox 危险源链路需区分两个时刻：Livox 深度修正发生在 RGB-D 候选生成阶段，早于 Tracker
-多帧 `CONFIRMED`；`danger_obstacle_sync` 和语义 OCC 写入则发生在候选进入 Tracker 后，不能把
-两者混写成“确认后才使用 Livox”。
-
-### 8m 人工中止轮与后续复现口径
-
-`seed8127_g3_old_crossing_full_max8_20260814_r1` 虽按完整闭环参数启动，但在任务 elapsed
-`153.5s`、真值行程 `38.24m` 时人工结束，尚未达到一层 `280s` 预算，也未进入电梯；只能
-用于分析前半程定位和建图，不能登记为“8m 完整轮”。离线指标为 RMSE `0.1219m`、P95
-`0.1668m`、最大 `0.2013m`、末端 `0.1731m`、最大 yaw `0.00463rad`。
-
-与同机 15m 轮比较时必须按相同真值行程截取，不能拿 8m 的 38m 与 15m 的 62m 或完整长轮
-直接比较。15m 在前 `38.24m` 的 RMSE/P95/最大/末端为
-`0.1271/0.1827/0.1973/0.1499m`；结果混合且路径不同，只能说明 8m 有轻微改善迹象，不能
-证明 8m 最优，也不能证明它没有效果。8m 定位输出为 `9.947Hz`、最大间隔 `0.204s`，本轮
-没有形成硬件负载导致的定位掉帧链。两份旧证据都未保存 Git SHA 和定位可执行文件哈希，且
-15m 轮早于当天最终提交，不能把它们写成严格的代码冻结 A/B。
-
-历史 Stage17 的 seed=8127 指标 `RMSE=0.0869m/P95=0.1379m` 来自
-`floor_timeout=33s、min_floor_explore_time=5s、max_runtime=180s、GUI=false` 的短闭环；
-当前 8m 轮是一层 `153.5s` 长探索。两者运动路段、任务时序和运行条件均不同，Stage17 数字
-不能作为当前 8m 长轮应达到的直接基准，且该 handoff 没有把 `max_range` 写入冻结配置。
-
-当前 runner 的 `elevator_diagnostic.bag` 默认没有录制 `/nav/map_debug` 或
-`/danger_search/localization/cloud_registered`；只有在逐帧定位诊断开启时才额外录 `/scan`。
-因此现有 8m bag 不能逐格重建截图中的假障碍来源。下一次跨电脑比较必须同时冻结并记录：
-Git SHA、定位可执行文件哈希、有效参数、seed、GUI/诊断开关、场景公开文件哈希、仿真时长、
-真值行程、odom 频率和最大间隔。优先在两台电脑重放同一份 `/scan + /trunk_imu + /cmd_vel`
-原始 bag：若输出不同，检查构建和数值环境；若输出一致而在线 Gazebo 不同，差异来自物理轨迹
-或调度，不再归因于 `max_range`。
-
-定位后续严格按单变量执行：先保持 `max_range=8m` 测 `maximum_map_distance=8m`，再分别测试
-`minimum_residual_cutoff=0.06` 和 `maximum_iterations=8`；每个候选先做同 bag 离线重放，
-胜出后才做 GUI 完整闭环。地图假障碍另行处理 HIGH_HARD 严格反证生命周期，不能通过扩大
-历史轨迹永久 FREE 范围、降低障碍高度阈值或降低全局停车距离掩盖。
-
-该问题已于 2026-08-14 暂停。恢复前先阅读
-`docs/team/LOCALIZATION_MAP_HANDOFF_20260814.md`，不要把随后处理的“返航时无法出大门、无法
-回到出生点”与本轮定位/地图结论混为同一根因。
+本手册不再安排自动 runner、固定 seed 矩阵或回归复测。已有 Gazebo 日志、bag、参数对照和
+阶段报告只作为历史证据，用于在用户提供新运行结果后分析因果链；不得据此自动追加运行、扫
+参数或修改前沿、预算、电梯时序等逻辑。
 
 ## 第 8 层正式入口与结果闭包
 
@@ -468,23 +142,11 @@ roslaunch danger_search danger_search.launch controller_ready_ack:=true
 节点会在建立任何任务控制前显式失败。节点还会等待内部定位 ready，等待期间不创建
 `MissionManager`，也不计入任务预算。
 
-不依赖 Gazebo 的短超时闭包检查：
-
-```bash
-source devel/setup.bash
-roslaunch danger_search danger_search_smoke.launch \
-  result_file:=/tmp/danger_search_smoke_detected.json \
-  mission_summary_file:=/tmp/danger_search_smoke_summary.json
-```
-
 禁止在正式任务已经发布非零命令后再按 `6` 切入 RL 模式；标准流程必须先以零命令切入
 RL、等待稳定，再启动任务。标准启动流程中，机器狗由 fixed stand (按 2) 切换至 RL /cmd_vel (按 6)
-之间必须保留至少 2.0s 的物理接触阻尼等待时间（`run_elevator_gui_test.sh` 已内置 `sleep 2.0`），以平息
+之间必须保留至少 2.0s 的物理接触阻尼等待时间，以平息
 四足落地接地冲击。定位节点在姿态门控稳定确认后发布 ready。该流程已在第 8.3 层通过 GUI
-移动闭环。跌倒后的失效安全
-已完成单元测试、ROS 合成和 Gazebo 可控侧倾闭环。证据见 `reports/STAGE8_REPORT.md`、
-`reports/STAGE8_1_REPORT.md`、`reports/STAGE8_2_REPORT.md` 和
-`reports/STAGE8_3_REPORT.md`。
+移动闭环。跌倒后的失效安全证据保留在历史阶段报告中，不构成当前自动回归要求。
 
 ## 第 9 层离线工具
 

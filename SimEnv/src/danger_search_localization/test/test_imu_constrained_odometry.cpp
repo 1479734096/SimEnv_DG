@@ -102,6 +102,32 @@ TEST(ImuConstrainedOdometry, RecoversPlanarTranslationWithKnownOrientation) {
   EXPECT_DOUBLE_EQ(moved.translation.z(), moved_translation.z());
 }
 
+TEST(ImuConstrainedOdometry, AppliesPlanarSe2ToCommittedMapAndPose) {
+  ImuConstrainedOdometryConfig config;
+  config.minimum_correspondences = 80;
+  ImuConstrainedOdometry odometry(config);
+  const auto world_points = MakeAsymmetricStructure();
+  const Eigen::Vector3d initial_translation(0.2, -3.1, 0.35);
+  ASSERT_TRUE(odometry.RegisterFrame(
+      SensorVectors(world_points, initial_translation), initial_translation)
+                  .accepted);
+  const auto generation_before = odometry.map_generation();
+  const Eigen::Vector2d correction(0.12, -0.08);
+  const double yaw_correction = 0.06;
+  const Eigen::Matrix2d rotation =
+      Eigen::AngleAxisd(yaw_correction, Eigen::Vector3d::UnitZ())
+          .toRotationMatrix()
+          .topLeftCorner<2, 2>();
+
+  ASSERT_TRUE(odometry.ApplyPlanarSe2(correction, yaw_correction));
+  const auto translated = odometry.last_committed_translation();
+  EXPECT_NEAR(translated.x(), (rotation * initial_translation.head<2>() + correction).x(), 1e-9);
+  EXPECT_NEAR(translated.y(), (rotation * initial_translation.head<2>() + correction).y(), 1e-9);
+  EXPECT_DOUBLE_EQ(translated.z(), initial_translation.z());
+  EXPECT_EQ(odometry.map_generation(), generation_before + 1);
+  EXPECT_GT(odometry.map_point_count(), 0U);
+}
+
 TEST(ImuConstrainedOdometry, RejectsFrameWithoutEnoughStructure) {
   ImuConstrainedOdometryConfig config;
   config.minimum_correspondences = 80;
