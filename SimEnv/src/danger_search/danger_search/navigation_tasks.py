@@ -891,13 +891,14 @@ class TakeElevator(NavigationTask):
             if not self._early_call_elevator_started:
                 self._early_call_elevator_started = True
                 try:
+                    # 保留远距离预呼梯的并行收益，但门板必须一直保留到近场
+                    # 注册和二次对准完成；深色门面是该阶段唯一可靠的定位特征。
                     self._early_call_elevator_task = client.call_elevator(
-                        self.elevator_id, self.current_floor, True
+                        self.elevator_id, self.current_floor, False
                     )
-                    client.open_door(current_door_id)
                 except Exception as exc:
                     if rospy is not None:
-                        rospy.logwarn("[%s] 远距离呼梯预开门发起异常，回退至常规开门: %s", self.name, exc)
+                        rospy.logwarn("[%s] 远距离预呼梯发起异常，回退至近场呼梯: %s", self.name, exc)
 
             if self._navigate_to(context, pose, refresh_wait):
                 self._exit_alignment_count = 0
@@ -1034,7 +1035,7 @@ class TakeElevator(NavigationTask):
                 lambda: (
                     self._early_call_elevator_task
                     if self._early_call_elevator_task is not None
-                    else client.call_elevator(self.elevator_id, self.current_floor, True)
+                    else client.call_elevator(self.elevator_id, self.current_floor, False)
                 ),
             )
             if status == FAILED:
@@ -1257,7 +1258,9 @@ class TakeElevator(NavigationTask):
                 self._floor_transition_started = True
             status = self._run_service(
                 context,
-                lambda: client.call_elevator(self.elevator_id, self.target_floor, True),
+                # 目标层也必须先保持门关闭；仅在轿厢内调头完成后由
+                # OPEN_TARGET_FLOOR_DOOR 显式开门，便于传感器确认开口。
+                lambda: client.call_elevator(self.elevator_id, self.target_floor, False),
                 hold_position=False,
             )
             if status == FAILED:
@@ -1459,6 +1462,13 @@ class TakeElevator(NavigationTask):
                 if getattr(context, "elevator_async_target_door_close_enabled", True):
                     try:
                         client.close_door(target_door_id)
+                        context.log_structured(
+                            {
+                                "event": "elevator_target_door_close_requested",
+                                "door_id": str(target_door_id),
+                                "mode": "async",
+                            }
+                        )
                     except Exception as exc:
                         if rospy is not None:
                             rospy.logwarn(

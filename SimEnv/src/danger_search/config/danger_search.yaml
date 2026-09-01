@@ -64,13 +64,13 @@ mission:
   # /nav/goal 不属于比赛公开接口，仅诊断工具可显式开启。
   manual_goal_enabled: false
   # 正式总预算按公开 served_floors 数量选择；专项配置可用更短 max_runtime。
-  max_runtime: 900.0
-  runtime_by_floor: [[1, 500.0], [2, 720.0], [3, 900.0]]
-  floor_timeout: 310.0
+  max_runtime: 600.0
+  runtime_by_floor: [[1, 540.0], [2, 840.0], [3, 1280.0]]
+  floor_timeout: 360.0
   # 非最后一层仍以 floor_timeout 保护后续楼层；最后一层由全局返航预算收口。
   # 设为 false 可立即恢复“所有楼层到时即结束”的旧语义。
   last_floor_uses_global_budget: true
-  min_floor_explore_time: 60.0
+  min_floor_explore_time: 150.0
   min_floor_travel_distance: 6.0
   min_known_area: 44.0
   no_reachable_frontier_confirmations: 2
@@ -236,7 +236,10 @@ frontier:
   # 平方根收益保留高价值远目标机会，同时提高路程代价以形成收益兼顾的广度优先。
   information_gain_weight: 0.5
   path_cost_weight: 3.0
-  yaw_cost_weight: 0.2
+  # 完整诊断轮在 omega=1.2rad/s 的路径转向中翻倒；提高首段和累计转角代价，
+  # 让路径多出约半米时仍优先选择更连续的走廊方向。
+  yaw_cost_weight: 0.4
+  path_turn_cost_weight: 0.7
   forward_alignment_weight: 0.8
   revisit_penalty_weight: 2.0
   # frontier 目标优先落在更安全的 free cell，不贴障碍和 unknown 边缘。
@@ -264,26 +267,28 @@ frontier:
   max_planning_candidates: 8
   max_goal_candidates_per_frontier: 2
   max_fallback_planning_candidates: 8
-  # 远距离封闭孤岛前沿剪枝：未知格数<10且距离>3.5m时直接剪枝，防止长途清扫边角碎片
-  min_far_expected_gain: 10.0
+  # 远距离封闭孤岛前沿剪枝：收益低于 4 格才直接剪枝。R=0.15m 红球的
+  # 局部未知投影可接近这一量级，不能再以 8 格阈值漏掉小房间或壁龛。
+  min_far_expected_gain: 4.0
   far_prune_distance: 3.5
 
 controller:
   # PathFollower 的路径跟踪与唯一 /cmd_vel 输出上限；最终仍经过 ground_support 门。
-  max_linear: 0.75
+  max_linear: 0.65
   # 0 保持既有全局上限；正数仅限制首次 EXIT_CABIN 通过尝试。
   exit_first_max_linear: 0.0
   # 当前 RL 的横移与转向耦合会抵消 yaw 响应；首版只用 v+omega 跟踪。
   # 保留参数入口，后续若重训/标定横移控制可直接恢复，不改控制器代码。
   max_lateral: 0.01
-  max_angular: 1.2
+  # 限制最高旋转命令，降低四足步态在路径急转时的侧翻风险。
+  max_angular: 0.90
   min_linear_fraction: 0.35
   # 中等偏角弧线跟踪的航向速度下限；曲率、障碍和地面支撑仍可继续压低。
   arc_turn_min_linear_fraction: 0.15
   goal_tolerance: 0.25
   waypoint_tolerance: 0.25
   corner_tolerance: 0.15
-  pure_pursuit_lookahead: 1.0
+  pure_pursuit_lookahead: 0.85
   # A1 强化学习步态在小速度下存在死区，-0.35 可确保激发稳定的后退踏步。
   reverse_speed: -0.35
   recover_duration: 0.5
@@ -314,6 +319,7 @@ ground_support:
   # 覆盖至 1.00 m/s 高速直道奔跑的制动安全包络表。
   stop_distance_table:
     - [0.60, 0.09337727739487302]
+    - [0.651, 0.10195826367975175]
     - [0.80, 0.15200000000000000]
     - [1.00, 0.23000000000000000]
   # 定位差分只承担停稳确认与有界异常观察，不作为物理速度上界或停车表索引。
@@ -328,9 +334,9 @@ ground_support:
   maximum_longitudinal_unknown_gap: 0.10
   minimum_longitudinal_support_ratio: 0.75
   sweep_half_width: 0.435393
-  minimum_lookahead: 0.60
+  minimum_lookahead: 0.50
   # 该前视上限只对当前已验证速度负责；扩速前必须重新验证完整安全包络。
-  maximum_lookahead: 1.00
+  maximum_lookahead: 0.80
   footprint_front_reach: 0.30
   support_band: 0.08
   minimum_drop: 0.30
@@ -482,6 +488,13 @@ tracker:
   max_average_rmse: 0.04
   nms_radius: 0.9
   stale_after: 30.0
+  # 正式结果仍保持四帧确认；以下仅保护运动路径。两个独立高质量帧先写入
+  # 临时语义 OCC，0.75s 内没有新帧就撤销，避免单帧误检和红色干扰项永久堵图。
+  obstacle_min_hits: 2
+  obstacle_min_confidence: 0.90
+  obstacle_max_average_rmse: 0.025
+  obstacle_max_age: 0.75
+  obstacle_min_observation_span: 0.08
 
 floor:
   # 正式电梯 ID 来自公开 team_scene_info.json；空间几何只能由传感器注册。

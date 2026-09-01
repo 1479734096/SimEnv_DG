@@ -117,11 +117,44 @@ class Track:
         self.last_seen = now
         self.mean_position = self._calculate_weighted_position()
 
+    def translate_planar(self, dx: float, dy: float) -> None:
+        """将同一定位连续段的轨迹观测整体平移到新坐标系。"""
+        offset = np.array((float(dx), float(dy)), dtype=float)
+        self.mean_position = np.array(self.mean_position, dtype=float, copy=True)
+        self.mean_position[:2] += offset
+        translated_positions: list[np.ndarray] = []
+        for position in self.positions:
+            translated = np.array(position, dtype=float, copy=True)
+            translated[:2] += offset
+            translated_positions.append(translated)
+        self.positions = translated_positions
+
+    def _effective_indices(self) -> list[int]:
+        """获取用于质心和方差计算的最优近场子集索引。
+
+        当存在近距离高质量观测（<= 1.8m）时，彻底剔除较远的历史粗检点（> min_dist + 0.6m），
+        并仅采信最新的若干近场帧，避免远距离历史误差拉偏近场收敛位置。
+        """
+        if not self.positions:
+            return []
+        min_dist = min(self.distances) if self.distances else 1.0
+        if min_dist <= 1.8:
+            cutoff = min_dist + 0.6
+            indices = [i for i, d in enumerate(self.distances) if d <= cutoff]
+            if len(indices) > 6:
+                indices = indices[-6:]
+            return indices
+        return list(range(len(self.positions)))
+
     def _calculate_weighted_position(self) -> np.ndarray:
         if not self.positions:
             return self.mean_position
+        indices = self._effective_indices()
         weights = []
-        for conf, rmse, dist in zip(self.confidences, self.rmses, self.distances):
+        for idx in indices:
+            conf = self.confidences[idx]
+            rmse = self.rmses[idx]
+            dist = self.distances[idx]
             safe_dist = max(dist, 0.4)
             safe_rmse = max(rmse, 0.005)
             safe_conf = max(conf, 0.01)
@@ -129,19 +162,21 @@ class Track:
             weights.append(w)
         weights_arr = np.array(weights, dtype=float)
         total_w = float(np.sum(weights_arr))
+        selected_positions = [self.positions[i] for i in indices]
         if total_w > 0.0 and np.isfinite(total_w):
-            pts = np.vstack(self.positions)
+            pts = np.vstack(selected_positions)
             return np.sum(pts * weights_arr[:, np.newaxis], axis=0) / total_w
-        return np.mean(np.vstack(self.positions), axis=0)
+        return np.mean(np.vstack(selected_positions), axis=0)
 
     def recent_hit_count(self, now: float, window: float) -> int:
         cutoff = now - window
         return sum(1 for hit_time in self.hit_times if hit_time >= cutoff)
 
     def position_std(self) -> float:
-        if len(self.positions) <= 1:
+        indices = self._effective_indices()
+        if len(indices) <= 1:
             return 0.0
-        values = np.vstack(self.positions)
+        values = np.vstack([self.positions[i] for i in indices])
         return float(np.max(np.std(values, axis=0)))
 
     def average_confidence(self) -> float:
@@ -169,6 +204,11 @@ class DetectionTracker:
         max_average_rmse: float = 0.04,
         nms_radius: float = 0.9,
         stale_after: float = 30.0,
+        obstacle_min_hits: int = 2,
+        obstacle_min_confidence: float = 0.90,
+        obstacle_max_average_rmse: float = 0.025,
+        obstacle_max_age: float = 0.75,
+        obstacle_min_observation_span: float = 0.08,
     ):
         self.association_radius = float(association_radius)
         self.confirmation_window = float(confirmation_window)
@@ -178,10 +218,19 @@ class DetectionTracker:
         self.max_average_rmse = float(max_average_rmse)
         self.nms_radius = float(nms_radius)
         self.stale_after = float(stale_after)
+        self.obstacle_min_hits = int(obstacle_min_hits)
+        self.obstacle_min_confidence = float(obstacle_min_confidence)
+        self.obstacle_max_average_rmse = float(obstacle_max_average_rmse)
+        self.obstacle_max_age = float(obstacle_max_age)
+        self.obstacle_min_observation_span = float(
+            obstacle_min_observation_span
+        )
         finite_nonnegative = (
             self.max_position_std,
             self.max_average_rmse,
             self.nms_radius,
+            self.obstacle_max_average_rmse,
+            self.obstacle_min_observation_span,
         )
         if (
             not math.isfinite(self.association_radius)
@@ -189,14 +238,19 @@ class DetectionTracker:
             or not math.isfinite(self.confirmation_window)
             or self.confirmation_window <= 0.0
             or self.min_hits <= 0
+            or self.obstacle_min_hits <= 0
             or not all(
                 math.isfinite(value) and value >= 0.0
                 for value in finite_nonnegative
             )
             or not math.isfinite(self.min_confidence)
             or not 0.0 <= self.min_confidence <= 1.0
+            or not math.isfinite(self.obstacle_min_confidence)
+            or not 0.0 <= self.obstacle_min_confidence <= 1.0
             or not math.isfinite(self.stale_after)
             or self.stale_after <= 0.0
+            or not math.isfinite(self.obstacle_max_age)
+            or self.obstacle_max_age <= 0.0
         ):
             raise ValueError("检测跟踪关联、确认、质量或过期参数无效")
         self._tracks: list[Track] = []
@@ -224,8 +278,8 @@ class DetectionTracker:
             )
         self._refresh_status(timestamp)
 
-    def confirmed_positions(self, now: float | None = None) -> list[list[float]]:
-        """返回质量优先、经 NMS 去重的确认目标坐标。
+    def confirmed_tracks(self, now: float | None = None) -> list[Track]:
+        """返回质量优先、经 NMS 去重后的确认轨迹。
 
         NMS 不删除内部轨迹，只决定本次输出集合，因此诊断仍能看到被近邻高质量
         轨迹抑制的观测历史。
@@ -246,7 +300,87 @@ class DetectionTracker:
         for track in confirmed:
             if all(_distance(track.mean_position, other.mean_position) > self.nms_radius for other in selected):
                 selected.append(track)
-        return [track.mean_position.astype(float).tolist() for track in selected]
+        return selected
+
+    def obstacle_tracks(self, now: float | None = None) -> list[Track]:
+        """返回可写入语义 OCC 的确认轨迹与高质量双帧预保护轨迹。
+
+        未确认轨迹只有在两帧独立观测、拟合残差和置信度都明显强于最终输出
+        门槛时才临时阻挡路径；停止刷新后会在短年龄上限内自动撤销，不能把
+        单帧误检或旧候选永久写入地图。
+        """
+        timestamp = float(now if now is not None else get_time())
+        if not math.isfinite(timestamp):
+            raise ValueError("危险源障碍查询时间必须是有限数")
+        if self._last_update_time is not None and timestamp < self._last_update_time:
+            raise ValueError("危险源障碍查询时间不能早于最后观测")
+        self._refresh_status(timestamp)
+
+        eligible: list[Track] = []
+        for track in self._tracks:
+            if track.status == CONFIRMED:
+                eligible.append(track)
+            elif (
+                track.status == TENTATIVE
+                and self._is_protective_tentative(track, timestamp)
+            ):
+                eligible.append(track)
+        # 确认轨迹优先于临时预保护轨迹，避免高置信度的短期候选抑制最终结果。
+        eligible.sort(
+            key=lambda item: (
+                item.status == CONFIRMED,
+                item.average_confidence(),
+                len(item.hit_times),
+            ),
+            reverse=True,
+        )
+
+        selected: list[Track] = []
+        for track in eligible:
+            if all(
+                _distance(track.mean_position, other.mean_position) > self.nms_radius
+                for other in selected
+            ):
+                selected.append(track)
+        return selected
+
+    def _is_protective_tentative(self, track: Track, now: float) -> bool:
+        """判定未确认轨迹是否足以在短时间内保护机器人不压过目标。"""
+        if now - track.last_seen > self.obstacle_max_age:
+            return False
+        recent_hits = [
+            stamp for stamp in track.hit_times
+            if stamp >= now - self.confirmation_window
+        ]
+        if len(recent_hits) < self.obstacle_min_hits:
+            return False
+        if (
+            recent_hits[-1] - recent_hits[0]
+            < self.obstacle_min_observation_span
+        ):
+            return False
+        return (
+            track.average_confidence() >= self.obstacle_min_confidence
+            and track.average_rmse() <= self.obstacle_max_average_rmse
+            and track.position_std() <= self.max_position_std
+        )
+
+    def confirmed_positions(self, now: float | None = None) -> list[list[float]]:
+        """返回质量优先、经 NMS 去重的确认目标坐标。"""
+        return [
+            track.mean_position.astype(float).tolist()
+            for track in self.confirmed_tracks(now=now)
+        ]
+
+    def translate_planar(self, dx: float, dy: float) -> int:
+        """原子平移全部历史轨迹，保持纠偏后的输出与后续观测同坐标。"""
+        offset_x = float(dx)
+        offset_y = float(dy)
+        if not math.isfinite(offset_x) or not math.isfinite(offset_y):
+            raise ValueError("检测轨迹平移量必须为有限数")
+        for track in self._tracks:
+            track.translate_planar(offset_x, offset_y)
+        return len(self._tracks)
 
     def get_pending_inspection_target(
         self,

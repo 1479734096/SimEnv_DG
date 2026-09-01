@@ -60,6 +60,43 @@ class MultiFloorMapperTest(unittest.TestCase):
         self.assertFalse(grid.is_traversable(*center))
         self.assertFalse(grid.is_traversable(*neighbor))
 
+    def test_semantic_occupied_owner_survives_free_ray_door_clear_and_epoch(self):
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+            obstacle_inflation_radius=0.25,
+        )
+        grid = mapper.floor(0)
+        grid.fill_base(FREE)
+        owner = "danger:7"
+        grid.replace_semantic_occupied_radius(
+            0.0,
+            0.0,
+            0.40,
+            owner=owner,
+        )
+        center = grid.world_to_grid(0.0, 0.0)
+        self.assertIsNotNone(center)
+        self.assertEqual(int(grid.data[center[1], center[0]]), OCC)
+
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(-1.0, 0.0, 0.3),
+            points=[(1.0, 0.0, 0.0)],
+            cloud_generation=2,
+            map_epoch=1,
+            localization_epoch=1,
+        )
+        mapper.clear_dynamic_door_strip(0, 0.0, 0.0, 0.0, 1.2, 0.5)
+        grid.activate_evidence_scope(map_epoch=2, localization_epoch=1)
+
+        self.assertEqual(int(grid.data[center[1], center[0]]), OCC)
+        self.assertIn(owner, grid.semantic_occupied_owners[center])
+        self.assertEqual(grid.get_constraint_kind(*center), "danger_obstacle")
+
     @staticmethod
     def _trail_protection_mapper(**overrides):
         params = {
@@ -1385,4 +1422,3 @@ class MultiFloorMapperTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

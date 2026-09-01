@@ -10,12 +10,19 @@ from danger_search.floor_transition_runtime import (
 from danger_search.elevator_observation_runtime import ElevatorObservationRuntime
 from danger_search.elevator_registration_runtime import ElevatorRegistrationRuntime
 from danger_search.exploration_runtime import ExplorationRuntime
-from danger_search.map_update_runtime import MapUpdateRuntime
-from danger_search.mapper import MultiFloorGridMap
+from danger_search.map_update_runtime import ImageDetectionResult, MapUpdateRuntime
+from danger_search.detection_tracker import (
+    REJECTED,
+    DetectionCandidate,
+    DetectionTracker,
+)
+from danger_search.mapper import MultiFloorGridMap, OCC
 from danger_search.navigation_context import NavigationTaskContext
 from danger_search.perception_runtime import (
     CloudInput,
     CloudPreparation,
+    ImageInput,
+    ImagePreparation,
     INPUT_INVALID,
     INPUT_MATCHED,
     INPUT_POSE_PENDING,
@@ -341,6 +348,147 @@ class MapUpdateRuntimeTest(unittest.TestCase):
         self.assertAlmostEqual(result.forward_obstacle.distance, 0.4)
         self.assertAlmostEqual(result.radial_obstacle_distance, 0.4)
 
+    def test_confirmed_nms_tracks_create_and_reproject_semantic_occupancy(self):
+        runtime = MapUpdateRuntime.__new__(MapUpdateRuntime)
+        runtime.mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+            obstacle_inflation_radius=0.25,
+        )
+        runtime.detector = SimpleNamespace(target_radius=0.15)
+        runtime.tracker = DetectionTracker(
+            association_radius=0.2,
+            min_hits=2,
+            nms_radius=0.9,
+        )
+        runtime.mapper.floor(0)
+        runtime.mapper.floor(1)
+
+        runtime.tracker.update(
+            [
+                DetectionCandidate.from_sequence(
+                    [0.0, 0.0, 0.15], confidence=0.9, distance=2.0
+                ),
+                DetectionCandidate.from_sequence(
+                    [0.5, 0.0, 0.15], confidence=0.8, distance=2.0
+                ),
+                DetectionCandidate.from_sequence(
+                    [0.0, 0.0, 2.75], confidence=0.95, distance=2.0
+                ),
+                DetectionCandidate.from_sequence(
+                    [2.0, 0.0, 0.15], confidence=0.9, distance=2.0
+                ),
+            ],
+            now=1.0,
+        )
+        tentative = runtime.synchronize_confirmed_danger_obstacles(now=1.0)
+        self.assertEqual(tentative.selected_track_ids, ())
+        self.assertEqual(runtime.mapper.floor(0).semantic_occupied_owner_cells, {})
+
+        runtime.tracker.update(
+            [
+                DetectionCandidate.from_sequence(
+                    [0.0, 0.0, 0.15], confidence=0.9, distance=2.0
+                ),
+                DetectionCandidate.from_sequence(
+                    [0.5, 0.0, 0.15], confidence=0.8, distance=2.0
+                ),
+                DetectionCandidate.from_sequence(
+                    [0.0, 0.0, 2.75], confidence=0.95, distance=2.0
+                ),
+            ],
+            now=2.0,
+        )
+
+        first = runtime.synchronize_confirmed_danger_obstacles(now=2.0)
+        floor_zero = runtime.mapper.floor(0)
+        floor_one = runtime.mapper.floor(1)
+        zero_cell = floor_zero.world_to_grid(0.0, 0.0)
+        one_cell = floor_one.world_to_grid(0.0, 0.0)
+        self.assertIsNotNone(zero_cell)
+        self.assertIsNotNone(one_cell)
+        self.assertEqual(first.selected_track_ids, (3, 1))
+        self.assertEqual(first.instantiated_floor_indices, (0, 1))
+        self.assertIn("danger:1", floor_zero.semantic_occupied_owners[zero_cell])
+        self.assertNotIn("danger:2", floor_zero.semantic_occupied_owner_cells)
+        self.assertIn("danger:3", floor_one.semantic_occupied_owners[one_cell])
+
+        unchanged_overlap = runtime.synchronize_confirmed_danger_obstacles(
+            now=2.0,
+            robot_floor=0,
+            robot_xy=(0.0, 0.0),
+        )
+        self.assertEqual(unchanged_overlap.changed_owner_ids, ())
+        self.assertEqual(unchanged_overlap.overlap_owner_ids, ("danger:1",))
+
+        corrected = runtime.apply_planar_correction(
+            0.6,
+            -0.6,
+            now=2.0,
+            robot_floor=0,
+            robot_xy=(2.0, 2.0),
+        )
+        moved_zero = floor_zero.world_to_grid(0.6, -0.6)
+        moved_one = floor_one.world_to_grid(0.6, -0.6)
+        self.assertIsNotNone(moved_zero)
+        self.assertIsNotNone(moved_one)
+        self.assertEqual(corrected.translated_track_count, 4)
+        self.assertEqual(int(floor_zero.data[moved_zero[1], moved_zero[0]]), OCC)
+        self.assertEqual(int(floor_one.data[moved_one[1], moved_one[0]]), OCC)
+        self.assertNotIn("danger:1", floor_zero.semantic_occupied_owners.get(zero_cell, set()))
+        self.assertAlmostEqual(runtime.tracker.tracks[0].positions[0][0], 0.6)
+        self.assertAlmostEqual(runtime.tracker.tracks[0].positions[0][1], -0.6)
+
+        runtime.tracker.update([], now=40.0)
+        rejected = runtime.synchronize_confirmed_danger_obstacles(now=40.0)
+        self.assertEqual(runtime.tracker.tracks[3].status, REJECTED)
+        self.assertNotIn("danger:4", rejected.changed_owner_ids)
+        self.assertNotIn("danger:4", floor_zero.semantic_occupied_owner_cells)
+
+    def test_high_quality_tentative_track_creates_then_expires_semantic_obstacle(self):
+        """近场双帧红球先保护路径；失去新帧后必须自行撤销。"""
+        runtime = MapUpdateRuntime.__new__(MapUpdateRuntime)
+        runtime.mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+            obstacle_inflation_radius=0.25,
+        )
+        runtime.detector = SimpleNamespace(target_radius=0.15)
+        runtime.tracker = DetectionTracker(
+            association_radius=0.2,
+            min_hits=4,
+            obstacle_min_hits=2,
+            obstacle_min_confidence=0.90,
+            obstacle_max_average_rmse=0.025,
+            obstacle_max_age=0.75,
+            obstacle_min_observation_span=0.08,
+        )
+        floor = runtime.mapper.floor(0)
+        candidate = DetectionCandidate.from_sequence(
+            [0.0, 0.0, 0.15], confidence=0.95, rmse=0.01, distance=1.0
+        )
+        runtime.tracker.update([candidate], now=1.0)
+        runtime.tracker.update([candidate], now=1.1)
+
+        protected = runtime.synchronize_confirmed_danger_obstacles(now=1.1)
+        cell = floor.world_to_grid(0.0, 0.0)
+        self.assertIsNotNone(cell)
+        self.assertEqual(protected.selected_track_ids, (1,))
+        self.assertEqual(protected.protective_track_ids, (1,))
+        self.assertIn("danger:1", floor.semantic_occupied_owners[cell])
+
+        expired = runtime.synchronize_confirmed_danger_obstacles(now=1.86)
+        self.assertEqual(expired.selected_track_ids, ())
+        self.assertEqual(expired.protective_track_ids, ())
+        self.assertIn("danger:1", expired.changed_owner_ids)
+        self.assertNotIn("danger:1", floor.semantic_occupied_owner_cells)
+
 
 class PerceptionMappingRuntimeTest(unittest.TestCase):
     def test_cloud_cache_updates_existing_points_without_mapping(self):
@@ -428,6 +576,58 @@ class PerceptionMappingRuntimeTest(unittest.TestCase):
         self.assertEqual(map_runtime.last_cloud_stamp, 1.0)
         self.assertEqual(map_runtime.latest_cloud_points, [(0.4, 0.0, 0.4)])
         self.assertAlmostEqual(committed.map_result.forward_obstacle.distance, 0.4)
+
+    def test_image_commit_propagates_floor_and_time_matched_robot_xy(self):
+        consumed = []
+        received = []
+        perception = SimpleNamespace(consume_image=consumed.append)
+        map_runtime = SimpleNamespace(
+            last_image_stamp=None,
+            update_images=lambda bundle, camera_to_world, **kwargs: (
+                received.append((bundle, camera_to_world, kwargs))
+                or ImageDetectionResult(())
+            ),
+        )
+        pose_provider = SimpleNamespace(
+            sensor_to_world_matrix=lambda *_args, **_kwargs: (
+                (1.0, 0.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0, 0.0),
+                (0.0, 0.0, 1.0, 0.0),
+                (0.0, 0.0, 0.0, 1.0),
+            )
+        )
+        runtime = PerceptionMappingRuntime(
+            perception=perception,
+            map_runtime=map_runtime,
+            floor_coordinates=FloorCoordinateModel("absolute", 2.6),
+            pose_provider=pose_provider,
+        )
+        sample = SimpleNamespace(
+            xyz=(1.0, 2.0, 0.3),
+            xy_yaw=(1.0, 2.0, 0.1),
+        )
+        bundle = SimpleNamespace()
+        preparation = ImagePreparation(
+            INPUT_MATCHED,
+            ImageInput(bundle, 9, (3.0, 3.0, 3.0)),
+            SimpleNamespace(sample=sample),
+        )
+
+        runtime.commit_image(
+            preparation,
+            floor_index=1,
+            camera_mount_xyz=(0.0, 0.0, 0.0),
+            camera_mount_rpy=(0.0, 0.0, 0.0),
+            depth_frame_is_optical=False,
+            now=3.0,
+        )
+
+        self.assertEqual(consumed, [9])
+        self.assertEqual(map_runtime.last_image_stamp, 3.0)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0][2]["floor_index"], 1)
+        self.assertEqual(received[0][2]["robot_xy"], (1.0, 2.0))
+        self.assertEqual(received[0][2]["now"], 3.0)
 
     def test_unmatched_cloud_cannot_commit(self):
         runtime = PerceptionMappingRuntime(

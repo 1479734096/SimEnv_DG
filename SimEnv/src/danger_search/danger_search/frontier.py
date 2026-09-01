@@ -131,6 +131,29 @@ class FrontierCandidateDebug:
     expected_unknown_gain: float = 0.0
     optimistic_score: float | None = None
     elimination_stage: str = ""
+    information_gain_reward: float | None = None
+    path_cost: float | None = None
+    initial_heading_error: float | None = None
+    initial_heading_cost: float | None = None
+    cumulative_turn_angle: float | None = None
+    path_turn_cost: float | None = None
+    revisit_penalty: float | None = None
+    forward_bonus: float | None = None
+
+
+@dataclass(frozen=True)
+class FrontierScoreTerms:
+    """最终前沿评分的可审计分项。"""
+
+    information_gain_reward: float
+    path_cost: float
+    initial_heading_error: float | None
+    initial_heading_cost: float
+    cumulative_turn_angle: float
+    path_turn_cost: float
+    revisit_penalty: float
+    forward_bonus: float
+    score: float
 
 
 @dataclass(frozen=True)
@@ -158,6 +181,7 @@ class FrontierExplorer:
         information_gain_weight: float = 2.0,
         path_cost_weight: float = 1.0,
         yaw_cost_weight: float = 0.3,
+        path_turn_cost_weight: float = 0.35,
         forward_alignment_weight: float = 0.0,
         revisit_penalty_weight: float = 2.0,
         frontier_obstacle_clearance: float = 0.25,
@@ -181,6 +205,7 @@ class FrontierExplorer:
         self.information_gain_weight = float(information_gain_weight)
         self.path_cost_weight = float(path_cost_weight)
         self.yaw_cost_weight = float(yaw_cost_weight)
+        self.path_turn_cost_weight = float(path_turn_cost_weight)
         self.forward_alignment_weight = float(forward_alignment_weight)
         self.revisit_penalty_weight = float(revisit_penalty_weight)
         self.frontier_obstacle_clearance = float(frontier_obstacle_clearance)
@@ -201,6 +226,7 @@ class FrontierExplorer:
             self.information_gain_weight,
             self.path_cost_weight,
             self.yaw_cost_weight,
+            self.path_turn_cost_weight,
             self.forward_alignment_weight,
             self.revisit_penalty_weight,
             self.frontier_obstacle_clearance,
@@ -259,6 +285,7 @@ class FrontierExplorer:
             information_gain_weight=self.information_gain_weight,
             path_cost_weight=self.path_cost_weight,
             yaw_cost_weight=self.yaw_cost_weight,
+            path_turn_cost_weight=self.path_turn_cost_weight,
             forward_alignment_weight=self.forward_alignment_weight,
             revisit_penalty_weight=self.revisit_penalty_weight,
             frontier_obstacle_clearance=self.frontier_obstacle_clearance,
@@ -520,13 +547,13 @@ class FrontierExplorer:
                     self.record_failure(grid, frontier.centroid)
                 continue
             reachable_count += 1
-            score = self._score_frontier(
+            score_terms = self._frontier_score_terms(
                 frontier,
                 path,
                 robot_pose,
-                target_xy=target_xy,
                 expected_unknown_gain=candidate_debug.expected_unknown_gain,
-            ) + context_adjustment
+            )
+            score = score_terms.score + context_adjustment
             candidate_debug_records.append(
                 replace(
                     candidate_debug,
@@ -535,6 +562,7 @@ class FrontierExplorer:
                     rejection_reason="",
                     reachability_result="reached",
                     elimination_stage="final_scoring",
+                    **self._score_terms_debug_fields(score_terms),
                 )
             )
             if score > best_score:
@@ -995,12 +1023,7 @@ class FrontierExplorer:
             ):
                 continue
             gain = self._expected_unknown_gain(grid, frontier, target)
-            if (
-                self.far_prune_distance > 0.0
-                and self.min_far_expected_gain > 0.0
-                and target_dist > self.far_prune_distance
-                and gain < self.min_far_expected_gain
-            ):
+            if self._is_far_small_pocket(target, robot_xy, gain):
                 continue
             expected_gains[target] = gain
             optimistic_scores[target] = self._optimistic_score(
@@ -1030,6 +1053,20 @@ class FrontierExplorer:
             optimistic_scores,
             best_target,
             best_score,
+        )
+
+    def _is_far_small_pocket(
+        self,
+        target_xy: tuple[float, float],
+        robot_xy: tuple[float, float],
+        expected_gain: float,
+    ) -> bool:
+        """统一远距离小前沿剪枝，A* 前后必须使用同一判据。"""
+        return bool(
+            self.far_prune_distance > 0.0
+            and self.min_far_expected_gain > 0.0
+            and _world_distance(target_xy, robot_xy) > self.far_prune_distance
+            and expected_gain < self.min_far_expected_gain
         )
 
     def _expected_unknown_gain(
@@ -1091,25 +1128,84 @@ class FrontierExplorer:
         target_xy: tuple[float, float] | None = None,
         expected_unknown_gain: float | None = None,
     ) -> float:
+        """按实际 A* 路径评分；保留 target_xy 仅兼容既有调用方。"""
+        return self._frontier_score_terms(
+            frontier,
+            path,
+            robot_pose,
+            expected_unknown_gain=expected_unknown_gain,
+        ).score
+
+    def _frontier_score_terms(
+        self,
+        frontier: Frontier,
+        path: list[tuple[float, float]],
+        robot_pose: tuple[float, float, float],
+        *,
+        expected_unknown_gain: float | None = None,
+    ) -> FrontierScoreTerms:
+        """计算最终评分及路径首段、内点转弯等可审计分项。"""
         cost = path_length(path)
-        goal_xy = target_xy if target_xy is not None else frontier.centroid
-        target_yaw = math.atan2(goal_xy[1] - robot_pose[1], goal_xy[0] - robot_pose[0])
-        yaw_cost = abs(_angle_wrap(target_yaw - robot_pose[2]))
+        initial_heading_error, cumulative_turn_angle = _path_turn_metrics(
+            path,
+            robot_pose[2],
+        )
         revisit_penalty = 1.0 if cost < 0.8 else 0.0
         gain = (
             frontier.expected_unknown_gain
             if expected_unknown_gain is None
             else float(expected_unknown_gain)
         )
-        forward_alignment = math.cos(target_yaw - robot_pose[2])
-        forward_bonus = self.forward_alignment_weight * max(0.0, forward_alignment)
-        return (
-            self.information_gain_weight * math.sqrt(max(0.0, gain))
-            - self.path_cost_weight * cost
-            - self.yaw_cost_weight * yaw_cost
-            - self.revisit_penalty_weight * revisit_penalty
+        information_gain_reward = self.information_gain_weight * math.sqrt(
+            max(0.0, gain)
+        )
+        path_cost = self.path_cost_weight * cost
+        initial_heading_cost = self.yaw_cost_weight * (
+            initial_heading_error if initial_heading_error is not None else 0.0
+        )
+        path_turn_cost = self.path_turn_cost_weight * cumulative_turn_angle
+        weighted_revisit_penalty = self.revisit_penalty_weight * revisit_penalty
+        forward_bonus = 0.0
+        if initial_heading_error is not None:
+            forward_bonus = self.forward_alignment_weight * max(
+                0.0,
+                math.cos(initial_heading_error),
+            )
+        score = (
+            information_gain_reward
+            - path_cost
+            - initial_heading_cost
+            - path_turn_cost
+            - weighted_revisit_penalty
             + forward_bonus
         )
+        return FrontierScoreTerms(
+            information_gain_reward=information_gain_reward,
+            path_cost=path_cost,
+            initial_heading_error=initial_heading_error,
+            initial_heading_cost=initial_heading_cost,
+            cumulative_turn_angle=cumulative_turn_angle,
+            path_turn_cost=path_turn_cost,
+            revisit_penalty=weighted_revisit_penalty,
+            forward_bonus=forward_bonus,
+            score=score,
+        )
+
+    @staticmethod
+    def _score_terms_debug_fields(
+        score_terms: FrontierScoreTerms,
+    ) -> dict[str, float | None]:
+        """将最终评分分项投影到候选诊断记录。"""
+        return {
+            "information_gain_reward": score_terms.information_gain_reward,
+            "path_cost": score_terms.path_cost,
+            "initial_heading_error": score_terms.initial_heading_error,
+            "initial_heading_cost": score_terms.initial_heading_cost,
+            "cumulative_turn_angle": score_terms.cumulative_turn_angle,
+            "path_turn_cost": score_terms.path_turn_cost,
+            "revisit_penalty": score_terms.revisit_penalty,
+            "forward_bonus": score_terms.forward_bonus,
+        }
 
     def _optimistic_score(
         self,
@@ -1120,7 +1216,11 @@ class FrontierExplorer:
         expected_unknown_gain: float | None = None,
         context_adjustment: float = 0.0,
     ) -> float:
-        """不运行规划的候选预排序，下界用欧氏距离，最终选择仍使用路径长度。"""
+        """不运行规划的候选预排序。
+
+        预排序没有 A* 路径，只能以目标直线方位估计首段朝向；最终选择始终改用
+        ``_frontier_score_terms`` 的真实路径评分，不能把该启发式当作最终分数。
+        """
         goal_xy = target_xy if target_xy is not None else frontier.centroid
         distance = _world_distance(goal_xy, (robot_pose[0], robot_pose[1]))
         target_yaw = math.atan2(
@@ -1505,6 +1605,7 @@ class FrontierExplorer:
             float | None,
             float,
             float | None,
+            FrontierScoreTerms,
         ] | None = None
         for target_xy in candidates:
             if self._is_blacklisted(grid, target_xy):
@@ -1529,12 +1630,7 @@ class FrontierExplorer:
                 if target_xy in expected_gain_cache
                 else self._expected_unknown_gain(grid, frontier, target_xy)
             )
-            if (
-                self.far_prune_distance > 0.0
-                and self.min_far_expected_gain > 0.0
-                and _world_distance(target_xy, robot_xy) > self.far_prune_distance
-                and gain < self.min_far_expected_gain
-            ):
+            if self._is_far_small_pocket(target_xy, robot_xy, gain):
                 saw_far_pruned = True
                 continue
             if (
@@ -1563,13 +1659,13 @@ class FrontierExplorer:
                     debug_path_length = path_length(result.path)
                     continue
                 expected_gain = expected_gain_cache.get(target_xy, 0.0)
-                candidate_score = self._score_frontier(
+                score_terms = self._frontier_score_terms(
                     frontier,
                     result.path,
                     robot_pose,
-                    target_xy=target_xy,
                     expected_unknown_gain=expected_gain,
-                ) + context_adjustment
+                )
+                candidate_score = score_terms.score + context_adjustment
                 if best_choice is None or candidate_score > best_choice[3]:
                     best_choice = (
                         target_xy,
@@ -1579,6 +1675,7 @@ class FrontierExplorer:
                         context_penalty,
                         expected_gain,
                         optimistic_score_cache.get(target_xy),
+                        score_terms,
                     )
             elif result.budget_exhausted:
                 # 预算耗尽：可能可达，不能黑名单，标记后跳过本轮。
@@ -1609,6 +1706,7 @@ class FrontierExplorer:
                     expected_unknown_gain=best_choice[5],
                     optimistic_score=best_choice[6],
                     elimination_stage="final_scoring",
+                    **self._score_terms_debug_fields(best_choice[7]),
                 ),
             )
         # 没有可达候选：若全是预算耗尽，则不视为不可达，避免误黑名单。
@@ -2080,6 +2178,14 @@ class FrontierExplorer:
             "euclidean_distance": candidate.euclidean_distance,
             "path_length": candidate.path_length,
             "final_score": candidate.final_score,
+            "information_gain_reward": candidate.information_gain_reward,
+            "path_cost": candidate.path_cost,
+            "initial_heading_error": candidate.initial_heading_error,
+            "initial_heading_cost": candidate.initial_heading_cost,
+            "cumulative_turn_angle": candidate.cumulative_turn_angle,
+            "path_turn_cost": candidate.path_turn_cost,
+            "revisit_penalty": candidate.revisit_penalty,
+            "forward_bonus": candidate.forward_bonus,
             "rejection_reason": candidate.rejection_reason,
             "door_context_adjustment": candidate.door_context_adjustment,
             "door_context_penalty": candidate.door_context_penalty,
@@ -2181,6 +2287,28 @@ def _world_distance_sq(grid: FloorGrid, cell: tuple[int, int], robot_xy: tuple[f
 
 def _world_distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _path_turn_metrics(
+    path: list[tuple[float, float]],
+    robot_yaw: float,
+) -> tuple[float | None, float]:
+    """提取真实路径首段航向误差及有效内点累计绝对转角。"""
+    headings: list[float] = []
+    for start, end in zip(path, path[1:]):
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        if math.hypot(dx, dy) <= 1e-6:
+            continue
+        headings.append(math.atan2(dy, dx))
+    if not headings:
+        return None, 0.0
+    initial_heading_error = abs(_angle_wrap(headings[0] - robot_yaw))
+    cumulative_turn_angle = sum(
+        abs(_angle_wrap(next_heading - heading))
+        for heading, next_heading in zip(headings, headings[1:])
+    )
+    return initial_heading_error, cumulative_turn_angle
 
 
 def _flood_fill(mask: np.ndarray, visited: np.ndarray, start_x: int, start_y: int) -> list[tuple[int, int]]:

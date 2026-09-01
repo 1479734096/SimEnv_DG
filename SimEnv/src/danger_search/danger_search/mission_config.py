@@ -487,10 +487,10 @@ class _MissionConfigBuilder:
         ), purpose="局部目标调试")
 
         self.startup_delay = float(_param("mission/startup_delay", 2.0))
-        configured_max_runtime = float(_param("mission/max_runtime", 840.0))
+        configured_max_runtime = float(_param("mission/max_runtime", 600.0))
         runtime_by_floor = _param(
             "mission/runtime_by_floor",
-            [[1, 300.0], [2, 620.0], [3, 840.0]],
+            [[1, 540.0], [2, 840.0], [3, 1280.0]],
         )
         self.max_floor = int(_param("mission/max_floor", 1))
         if self.runtime_profile == "formal" and self.building_features is not None:
@@ -517,11 +517,11 @@ class _MissionConfigBuilder:
             max_floor=self.max_floor,
             runtime_by_floor=runtime_by_floor,
         )
-        self.floor_timeout = float(_param("mission/floor_timeout", 180.0))
+        self.floor_timeout = float(_param("mission/floor_timeout", 360.0))
         self.last_floor_uses_global_budget = bool(
             _param("mission/last_floor_uses_global_budget", True)
         )
-        self.min_floor_explore_time = float(_param("mission/min_floor_explore_time", 20.0))
+        self.min_floor_explore_time = float(_param("mission/min_floor_explore_time", 150.0))
 
         # 方案 C：全局时间预算参数
         self.return_safety_buffer = float(_param("mission/return_safety_buffer", 30.0))
@@ -789,6 +789,7 @@ class _MissionConfigBuilder:
                 "ground_support/stop_distance_table",
                 [
                     [0.60, 0.09337727739487302],
+                    [0.651, 0.10195826367975175],
                     [0.80, 0.15200000000000000],
                     [1.00, 0.23000000000000000],
                 ],
@@ -952,7 +953,10 @@ class _MissionConfigBuilder:
             "stuck_blacklist_radius": float(_param("frontier/stuck_blacklist_radius", 1.20)),
             "information_gain_weight": float(_param("frontier/information_gain_weight", 2.0)),
             "path_cost_weight": float(_param("frontier/path_cost_weight", 1.0)),
-            "yaw_cost_weight": float(_param("frontier/yaw_cost_weight", 0.3)),
+            "yaw_cost_weight": float(_param("frontier/yaw_cost_weight", 0.4)),
+            "path_turn_cost_weight": float(
+                _param("frontier/path_turn_cost_weight", 0.7)
+            ),
             "forward_alignment_weight": float(
                 _param("frontier/forward_alignment_weight", 0.8)
             ),
@@ -975,7 +979,7 @@ class _MissionConfigBuilder:
             ),
             "goal_tolerance": float(_param("controller/goal_tolerance", 0.35)),
             "min_far_expected_gain": float(
-                _param("frontier/min_far_expected_gain", 10.0)
+                _param("frontier/min_far_expected_gain", 4.0)
             ),
             "far_prune_distance": float(
                 _param("frontier/far_prune_distance", 3.5)
@@ -1019,7 +1023,7 @@ class _MissionConfigBuilder:
         self.controller_params = {
             "max_linear": float(_param("controller/max_linear", 0.80)),
             "max_lateral": float(_param("controller/max_lateral", 0.25)),
-            "max_angular": float(_param("controller/max_angular", 1.2)),
+            "max_angular": float(_param("controller/max_angular", 0.90)),
             "min_linear_fraction": float(_param("controller/min_linear_fraction", 0.35)),
             "arc_turn_min_linear_fraction": float(
                 _param("controller/arc_turn_min_linear_fraction", 0.0)
@@ -1378,6 +1382,21 @@ class _MissionConfigBuilder:
             "max_average_rmse": float(_param("tracker/max_average_rmse", 0.04)),
             "nms_radius": float(_param("tracker/nms_radius", 0.9)),
             "stale_after": float(_param("tracker/stale_after", 30.0)),
+            "obstacle_min_hits": int(
+                _param("tracker/obstacle_min_hits", 2)
+            ),
+            "obstacle_min_confidence": float(
+                _param("tracker/obstacle_min_confidence", 0.90)
+            ),
+            "obstacle_max_average_rmse": float(
+                _param("tracker/obstacle_max_average_rmse", 0.025)
+            ),
+            "obstacle_max_age": float(
+                _param("tracker/obstacle_max_age", 0.75)
+            ),
+            "obstacle_min_observation_span": float(
+                _param("tracker/obstacle_min_observation_span", 0.08)
+            ),
         }
         if self.runtime_profile == "formal":
             elevator_id = next(iter(self.building_features.elevator_features))

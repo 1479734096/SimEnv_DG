@@ -277,6 +277,10 @@ class FloorGrid:
         )
         self.evidence_scope = (self.floor_index, 1, 1)
         self.black_owners: dict[tuple[int, int], set[str]] = {}
+        # 已确认危险源由检测链独立登记为语义 OCC。它不属于点云证据账本，
+        # 因而不会被自由射线、动态门清理或 evidence epoch 切换误删。
+        self.semantic_occupied_owners: dict[tuple[int, int], set[str]] = {}
+        self.semantic_occupied_owner_cells: dict[str, set[tuple[int, int]]] = {}
         self.protected_trail_cells: set[tuple[int, int]] = set()
         self.last_protected_trail_xy: tuple[float, float] | None = None
 
@@ -327,7 +331,9 @@ class FloorGrid:
         cell = (int(gx), int(gy))
         if not self._in_bounds(*cell):
             return
-        if cell in self.protected_trail_cells:
+        if self.semantic_occupied_owners.get(cell):
+            state = OCC
+        elif cell in self.protected_trail_cells:
             if self.black_owners.get(cell):
                 state = BLACK
             elif self.negative_cell_owners.get(cell):
@@ -380,6 +386,8 @@ class FloorGrid:
             origin_y=self.origin_y,
         )
         self.black_owners.clear()
+        self.semantic_occupied_owners.clear()
+        self.semantic_occupied_owner_cells.clear()
         self.protected_trail_cells.clear()
         self.last_protected_trail_xy = None
         self.negative_cells.clear()
@@ -436,6 +444,14 @@ class FloorGrid:
         result.black_owners = {
             cell: set(owners) for cell, owners in self.black_owners.items()
         }
+        result.semantic_occupied_owners = {
+            cell: set(owners)
+            for cell, owners in self.semantic_occupied_owners.items()
+        }
+        result.semantic_occupied_owner_cells = {
+            owner: set(cells)
+            for owner, cells in self.semantic_occupied_owner_cells.items()
+        }
         result.protected_trail_cells = set(self.protected_trail_cells)
         result.last_protected_trail_xy = self.last_protected_trail_xy
         result.negative_cells = set(self.negative_cells)
@@ -484,7 +500,11 @@ class FloorGrid:
         )
         if requested == self.evidence_scope:
             return
-        affected = set(self.inflation_owners) | set(self.negative_cell_owners)
+        affected = (
+            set(self.inflation_owners)
+            | set(self.negative_cell_owners)
+            | set(self.semantic_occupied_owners)
+        )
         self.obstacle_evidence = ObstacleEvidenceLedger(
             floor_index=self.floor_index,
             size_x=self.size_x,
@@ -554,6 +574,8 @@ class FloorGrid:
         if not self._in_bounds(*cell):
             return None
 
+        if self.semantic_occupied_owners.get(cell):
+            return "danger_obstacle"
         if self.obstacle_evidence.blocking_at(cell):
             return "obstacle"
         if self.black_owners.get(cell):
@@ -600,6 +622,100 @@ class FloorGrid:
             low_confirm_window_generations=1,
             pose_separation=0.0,
         )
+
+    def replace_semantic_occupied_radius(
+        self,
+        x: float,
+        y: float,
+        radius: float,
+        *,
+        owner: str,
+    ) -> frozenset[tuple[int, int]]:
+        """以所有者为单位原子替换一块语义 OCC 圆形覆盖。"""
+        center_x = float(x)
+        center_y = float(y)
+        safe_radius = float(radius)
+        owner_id = str(owner).strip()
+        if (
+            not owner_id
+            or not all(
+                math.isfinite(value)
+                for value in (center_x, center_y, safe_radius)
+            )
+            or safe_radius < 0.0
+        ):
+            raise ValueError("语义 OCC 的位置、半径或所有者无效")
+        previous = set(self.semantic_occupied_owner_cells.get(owner_id, ()))
+        replacement = self._semantic_occupied_cells(
+            center_x,
+            center_y,
+            safe_radius,
+        )
+        if previous == replacement:
+            return frozenset()
+
+        for cell in previous:
+            owners = self.semantic_occupied_owners.get(cell)
+            if owners is None:
+                continue
+            owners.discard(owner_id)
+            if not owners:
+                self.semantic_occupied_owners.pop(cell, None)
+        if replacement:
+            self.semantic_occupied_owner_cells[owner_id] = set(replacement)
+            for cell in replacement:
+                self.semantic_occupied_owners.setdefault(cell, set()).add(owner_id)
+        else:
+            self.semantic_occupied_owner_cells.pop(owner_id, None)
+        affected = previous | replacement
+        self._refresh_cells(affected)
+        return frozenset(affected)
+
+    def clear_semantic_occupied_owner(
+        self,
+        owner: str,
+    ) -> frozenset[tuple[int, int]]:
+        """仅撤销指定所有者的语义 OCC，不影响重叠的其他危险源。"""
+        owner_id = str(owner).strip()
+        if not owner_id:
+            return frozenset()
+        cells = set(self.semantic_occupied_owner_cells.pop(owner_id, ()))
+        for cell in cells:
+            owners = self.semantic_occupied_owners.get(cell)
+            if owners is None:
+                continue
+            owners.discard(owner_id)
+            if not owners:
+                self.semantic_occupied_owners.pop(cell, None)
+        self._refresh_cells(cells)
+        return frozenset(cells)
+
+    def semantic_occupied_owner_ids(self, *, prefix: str | None = None) -> set[str]:
+        """返回语义 OCC 所有者，供运行时精确撤销被 NMS 抑制的危险源。"""
+        owners = set(self.semantic_occupied_owner_cells)
+        if prefix is None:
+            return owners
+        return {owner for owner in owners if owner.startswith(str(prefix))}
+
+    def _semantic_occupied_cells(
+        self,
+        x: float,
+        y: float,
+        radius: float,
+    ) -> set[tuple[int, int]]:
+        center = self.world_to_grid(x, y)
+        if center is None:
+            return set()
+        cells = int(math.ceil(float(radius) / self.resolution))
+        result: set[tuple[int, int]] = set()
+        for gy in range(center[1] - cells, center[1] + cells + 1):
+            for gx in range(center[0] - cells, center[0] + cells + 1):
+                if not self._in_bounds(gx, gy):
+                    continue
+                wx, wy = self.grid_to_world(gx, gy)
+                if math.hypot(wx - x, wy - y) <= radius + 1e-9:
+                    result.add((gx, gy))
+        return result
 
     def clear_region(self, cells: Iterable[tuple[int, int]]) -> int:
         """清除指定格子中的正障碍，恢复为观测层状态或负障碍。
@@ -959,6 +1075,11 @@ class MultiFloorGridMap:
                 origin_y=self.origin_y,
             )
         return self._floors[floor_index]
+
+    @property
+    def instantiated_floor_indices(self) -> tuple[int, ...]:
+        """返回当前已创建的楼层，避免语义层为未知楼层凭空建图。"""
+        return tuple(sorted(self._floors))
 
     def estimate_floor_from_z(self, z: float) -> int:
         """按楼层高度把绝对 Z 量化为非负楼层编号。"""

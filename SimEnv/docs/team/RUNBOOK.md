@@ -318,7 +318,7 @@ rviz -d src/danger_search/config/elevator_baseline.rviz
 
 ### STAGE33 双锚点与电梯重试验收
 
-当前正式配置必须保持以下基线：`max_linear=0.75m/s`、
+当前正式配置必须保持以下基线：`max_linear=0.65m/s`、
 `boundary_hold_margin=0.40m`、`async_planning_enabled=false`、
 `opportunistic_replan_period=0.0`、`localization_max_range=15.0m`。电梯开口首次确认、重试
 次数、重试窗口和新帧屏障分别为 `15.0s`、`1`、`10.0s`、`0.5s`。运行前先核对有效参数，
@@ -367,6 +367,45 @@ rg 'sparse_landmark_anchor_frozen|sparse_landmark_relocalization_evaluated|spars
 专项 runner 会在证据目录生成 `TEST_SUMMARY.txt`、`mission.log`、`auto.log`、诊断 bag 和可选
 漂移统计。阶段报告需记录 seed、Git SHA、有效参数、仿真/墙钟时长、状态转换、结果、清理
 情况与未验证风险。
+
+### STAGE35 危险源避障与前沿转弯验收
+
+本阶段不改变正式楼层预算、`max_linear=0.65m/s`、同步规划或 `15.0m` 定位量程。完整闭环
+可按上述 runner 执行；为保留后续定位、感知与规划证据，应设置
+`ELEVATOR_TEST_RECORD_DRIFT=1`、`ELEVATOR_TEST_RECORD_RGBD=1` 与
+`ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=1`，并保持
+`ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=0`。是否打开 GUI/RViz 不影响日志验收。
+
+运行结束后至少检查：
+
+```bash
+rg 'danger_obstacle_sync|danger_obstacle_reprojected|danger_source_overlap|frontier_selection|initial_heading_error|cumulative_turn_angle|path_turn_cost|far_small_pocket_pruned|sparse_landmark_|elevator_door_confirmation_retry' \
+  "$EVIDENCE_DIR/mission.log"
+```
+
+- 换层初段若出现预呼梯，其服务参数必须为 `open_doors=false`；在
+  `elevator_geometry_refresh`（或其有界降级）和候梯点二次对准前，不得出现源层
+  `elevator_door_open_confirmation_started`。源层开门确认事件只能在该近场流程之后出现。
+- 目标层升梯也必须使用 `open_doors=false`；`elevator_door_open_confirmation_started` 必须晚于
+  轿厢内调头完成。出厢后应出现一次 `elevator_target_door_close_requested`，其 `mode` 为
+  `async`，且不得阻塞下一楼层建图。
+- `danger_obstacle_sync` 可引用已确认轨迹，或仅限两个相隔至少 `0.08s` 的高质量预保护轨迹；
+  预保护轨迹必须在 `0.75s` 无新帧后撤销。出现新增语义 OCC 后旧路径应被清除并重规划。
+- 若有 `sparse_landmark_correction_applied`，应有同一序号的
+  `danger_obstacle_reprojected`；确认危险源坐标和 OCC 所在楼层必须同步平移。
+- `danger_source_overlap` 是 fail-closed 安全结果：机器人应停车并写出已有检测结果，不能
+  继续执行旧路径。
+- `frontier_selection` 的最终候选应包含 `initial_heading_error`、
+  `cumulative_turn_angle` 和 `path_turn_cost`；远距收益低于 `4` 格的候选应以
+  `far_small_pocket_pruned` 结束，不能进入 A*。
+
+本轮优先级以地面支撑与运动安全为首要检查项，下一轮重点记录支撑边界、真实悬空、停车输出和
+`SUPPORT_PATH_UNAVAILABLE` 重规划结果。前沿探索与路径转弯、电梯门时序、时间预算与配置暂作
+观察项，不因单次运行波动修改；只有出现明确可复现问题才重新打开对应修复任务。
+
+RGB-D/Livox 危险源链路需区分两个时刻：Livox 深度修正发生在 RGB-D 候选生成阶段，早于 Tracker
+多帧 `CONFIRMED`；`danger_obstacle_sync` 和语义 OCC 写入则发生在候选进入 Tracker 后，不能把
+两者混写成“确认后才使用 Livox”。
 
 ### 8m 人工中止轮与后续复现口径
 
@@ -430,7 +469,10 @@ roslaunch danger_search danger_search_smoke.launch \
 ```
 
 禁止在正式任务已经发布非零命令后再按 `6` 切入 RL 模式；标准流程必须先以零命令切入
-RL、等待稳定，再启动任务。该流程已在第 8.3 层通过 GUI 移动闭环。跌倒后的失效安全
+RL、等待稳定，再启动任务。标准启动流程中，机器狗由 fixed stand (按 2) 切换至 RL /cmd_vel (按 6)
+之间必须保留至少 2.0s 的物理接触阻尼等待时间（`run_elevator_gui_test.sh` 已内置 `sleep 2.0`），以平息
+四足落地接地冲击。定位节点在姿态门控稳定确认后发布 ready。该流程已在第 8.3 层通过 GUI
+移动闭环。跌倒后的失效安全
 已完成单元测试、ROS 合成和 Gazebo 可控侧倾闭环。证据见 `reports/STAGE8_REPORT.md`、
 `reports/STAGE8_1_REPORT.md`、`reports/STAGE8_2_REPORT.md` 和
 `reports/STAGE8_3_REPORT.md`。

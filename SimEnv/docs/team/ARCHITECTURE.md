@@ -33,7 +33,7 @@
 - `danger_search.mission_node_runtime`：ROS 节点初始化、订阅、定时器、墙钟 watchdog 和 shutdown 生命周期；不决定任务状态。
 - `danger_search.mission_reporting`：结果文件、运行摘要、状态/地图诊断话题和结构化日志的唯一输出边界。
 - `danger_search.progress_monitor`：前沿选择与位姿进度的诊断状态机；只产生诊断/cooldown，不修改地图或任务状态。
-- `danger_search.red_sphere_detector`：同步 RGB-D 的红色分割、深度反投影、已知半径模型提议和高斯-牛顿几何精炼；只有上层提供同时间匹配的刚体 `camera_to_world` 才输出逻辑 world 候选。
+- `danger_search.red_sphere_detector`：同步 RGB-D 的红色分割、深度反投影、已知半径模型提议和高斯-牛顿几何精炼；若上层提供同时间匹配的 Livox 点云，则在候选进入 Tracker 前进行视锥深度修正；只有提供合法刚体 `camera_to_world` 才输出逻辑 world 候选。
 - `danger_search.detection_tracker`：危险源候选的多帧关联、按置信度/距离平方/拟合 RMSE 加权融合、质量确认和空间 NMS；同一输入帧对每条轨迹最多贡献一次命中。
 - `danger_search.rgbd_door_detector`：深色门板的平面/尺寸验证和开门视觉变化；只输出匿名几何观测，不解释门 ID、不调用服务。
 - `danger_search.building_control_client`：公开 door/elevator ID、服务权限和运行时传感器几何的唯一结合点；异步服务响应不直接改地图。
@@ -77,6 +77,7 @@
 - Python `PoseProvider` 只接受有限、四元数有效且时间严格递增的内部里程计样本；任务层必须通过 `LocalizationRuntime` 判断陈旧、待匹配和过期状态。
 - MissionManager 在 health=false 时优先于里程计陈旧判定立即停车、取消成功资格并进入失败写出；定位可用但 health 持续缺失时也必须超时失败。
 - 定位线/角速度死区分别为 `0.05 m/s`、`0.03 rad/s`；地面支撑门的停稳阈值不得小于对应死区，否则构造时失败。
+- 地面支撑与防坠硬保护：巡航限速 $0.65\text{ m/s}$；即使 `unknown_support_hold_enabled=false`，一旦四足足端检测到下方无支撑（悬崖/空洞），强制输出零速并在超时后触发 `SUPPORT_PATH_UNAVAILABLE` 重规划，绝不坠楼。
 
 ## 定位后端与传感器职责
 
@@ -141,7 +142,7 @@
 - 单点路径在目标容差外仍是有效活动路径，必须朝该点跟踪，不能访问不存在的下一段。
 - 地面支撑门开启且尚无有效评估时，非零命令进入 `STALE_DATA_HOLD`，不得以“尚未发现缺口”为由放行。
 - 支撑不足后的定时保活只能重发已经过门控的零速；恢复放行必须等待新的控制 tick，不能重放停车前旧命令。
-- 正式控制与防坠基线固定为 `max_linear: 0.75m/s`、
+- 正式控制与防坠基线固定为 `max_linear: 0.65m/s`、
   `boundary_hold_margin: 0.40m`、`observation_hold_timeout: 3.0s`；不能通过提速、缩小
   边界余量或缩短观察停车来换取探索时间。
 

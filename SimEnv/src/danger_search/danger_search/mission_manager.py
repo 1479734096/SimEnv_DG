@@ -671,7 +671,6 @@ class MissionManager:
         operation_key: str,
     ) -> LandmarkRelocalizationOutcome:
         """在已停车的任务阶段评估锚点，并等待定位节点原子回执。"""
-        del pose  # 匹配输入是与里程计同坐标的已配准点云。
         key = str(operation_key)
         landmark = str(landmark_id)
         if landmark == "main_entrance" and self.state != RETURN_HOME:
@@ -693,6 +692,42 @@ class MissionManager:
             ack = self.pose_provider.correction_ack(sequence)
             if ack is not None:
                 self._landmark_relocalization_operations.pop(key, None)
+                correction_runtime = getattr(
+                    self._map_runtime,
+                    "apply_planar_correction",
+                    None,
+                )
+                if not callable(correction_runtime):
+                    self._handle_danger_obstacle_reprojection_unavailable(sequence)
+                    return LandmarkRelocalizationOutcome(
+                        RUNNING,
+                        reason="danger_obstacle_reprojection_unavailable",
+                    )
+                corrected_robot_xy = self._corrected_robot_xy(pose, ack)
+                danger_sync = correction_runtime(
+                    float(ack[0]),
+                    float(ack[1]),
+                    now=now,
+                    robot_floor=int(self.current_floor),
+                    robot_xy=corrected_robot_xy,
+                )
+                self._log_danger_obstacle_sync(
+                    danger_sync,
+                    event="danger_obstacle_reprojected",
+                    floor=int(self.current_floor),
+                    correction_xy=(float(ack[0]), float(ack[1])),
+                    sequence=sequence,
+                )
+                if getattr(danger_sync, "overlap_owner_ids", ()):
+                    self._handle_danger_source_overlap(
+                        owner_ids=tuple(danger_sync.overlap_owner_ids),
+                        floor=int(self.current_floor),
+                        source="landmark_correction",
+                    )
+                    return LandmarkRelocalizationOutcome(
+                        RUNNING,
+                        reason="danger_source_overlap",
+                    )
                 self.controller.clear_path(reason="landmark_relocalization_applied")
                 self._log_structured(
                     {
@@ -745,6 +780,129 @@ class MissionManager:
             "started_at": now,
         }
         return LandmarkRelocalizationOutcome(RUNNING)
+
+    def _corrected_robot_xy(
+        self,
+        fallback_pose: tuple[float, float, float],
+        correction_ack,
+    ) -> tuple[float, float]:
+        """优先使用已切换 epoch 的定位样本，避免用纠偏前姿态判断 OCC 重叠。"""
+        latest = getattr(self.pose_provider, "latest", None)
+        sample = latest() if callable(latest) else None
+        xy_yaw = getattr(sample, "xy_yaw", None)
+        if xy_yaw is not None and len(xy_yaw) >= 2:
+            x = float(xy_yaw[0])
+            y = float(xy_yaw[1])
+            if math.isfinite(x) and math.isfinite(y):
+                return (x, y)
+        return (
+            float(fallback_pose[0]) + float(correction_ack[0]),
+            float(fallback_pose[1]) + float(correction_ack[1]),
+        )
+
+    def _log_danger_obstacle_sync(
+        self,
+        result,
+        *,
+        event: str,
+        floor: int,
+        correction_xy: tuple[float, float] | None = None,
+        sequence: int | None = None,
+    ) -> None:
+        """仅在语义 OCC 实际变更时输出可关联的结构化诊断。"""
+        if result is None:
+            return
+        changed_owner_ids = tuple(getattr(result, "changed_owner_ids", ()))
+        overlap_owner_ids = tuple(getattr(result, "overlap_owner_ids", ()))
+        translated_track_count = int(
+            getattr(result, "translated_track_count", 0)
+        )
+        if not changed_owner_ids and not overlap_owner_ids and not translated_track_count:
+            return
+        payload = {
+            "event": str(event),
+            "floor": int(floor),
+            "selected_track_ids": list(
+                getattr(result, "selected_track_ids", ())
+            ),
+            "protective_track_ids": list(
+                getattr(result, "protective_track_ids", ())
+            ),
+            "changed_owner_ids": list(changed_owner_ids),
+            "changed_cell_count": int(getattr(result, "changed_cell_count", 0)),
+            "overlap_owner_ids": list(overlap_owner_ids),
+            "translated_track_count": translated_track_count,
+            "instantiated_floor_indices": list(
+                getattr(result, "instantiated_floor_indices", ())
+            ),
+        }
+        if correction_xy is not None:
+            payload["correction_xy"] = [
+                float(correction_xy[0]),
+                float(correction_xy[1]),
+            ]
+        if sequence is not None:
+            payload["sequence"] = int(sequence)
+        self._log_structured(payload)
+
+    def _handle_danger_obstacle_reprojection_unavailable(self, sequence: int) -> None:
+        """定位坐标已切换但语义 OCC 未能重投影时，禁止继续运动。"""
+        reason = "danger_obstacle_reprojection_unavailable"
+        controller = getattr(self, "controller", None)
+        stop = getattr(controller, "stop", None)
+        if callable(stop):
+            stop(reason=reason)
+        clear_path = getattr(controller, "clear_path", None)
+        if callable(clear_path):
+            clear_path(reason=reason)
+        self._record_failure(reason)
+        self._mission_success_eligible = False
+        self._log_structured(
+            {
+                "event": reason,
+                "sequence": int(sequence),
+                "floor": int(self.current_floor),
+            }
+        )
+        if self.state not in (WRITE_RESULT, FINISH, MISSION_FAILED):
+            self._transition_state(
+                WRITE_RESULT,
+                reason_code=reason,
+                call_site="MissionManager.relocalize_landmark",
+            )
+
+    def _handle_danger_source_overlap(
+        self,
+        *,
+        owner_ids: tuple[str, ...],
+        floor: int,
+        source: str,
+    ) -> None:
+        """确认危险源安全圆覆盖当前站位时，停车并走既有失败写结果流程。"""
+        reason = "danger_source_overlap"
+        controller = getattr(self, "controller", None)
+        stop = getattr(controller, "stop", None)
+        if callable(stop):
+            stop(reason=reason)
+        clear_path = getattr(controller, "clear_path", None)
+        if callable(clear_path):
+            clear_path(reason=reason)
+        self._record_failure(reason)
+        self._mission_success_eligible = False
+        self._log_structured(
+            {
+                "event": reason,
+                "floor": int(floor),
+                "owner_ids": list(owner_ids),
+                "source": str(source),
+            }
+        )
+        if self.state not in (WRITE_RESULT, FINISH, MISSION_FAILED):
+            self._transition_state(
+                WRITE_RESULT,
+                reason_code=reason,
+                call_site="MissionManager._handle_danger_source_overlap",
+            )
 
     def _apply_elevator_refresh_result(
         self,
@@ -1109,6 +1267,10 @@ class MissionManager:
         self._sync_ground_support_task_context(pose)
         self._ground_support.observe_odometry(self.controller, pose_sample)
         self._update_mapping_and_detection(snapshot, pose, xyz, pose_sample)
+        # 感知链可能刚确认危险源覆盖当前站位并进入 WRITE_RESULT。该 tick
+        # 不能再推进旧任务或下发旧路径，下一轮只负责写出已有结果并停机。
+        if self.state in (WRITE_RESULT, FINISH, MISSION_FAILED):
+            return
         self._freeze_available_landmark_anchors()
         constraint_update = self._ground_support.apply_confirmed_support(self.mapper)
         if constraint_update.revoked_region_ids:
@@ -1786,6 +1948,30 @@ class MissionManager:
         )
         camera_to_world = image_commit.camera_to_world
         detection_result = image_commit.detection_result
+        danger_sync = getattr(detection_result, "danger_obstacle_sync", None)
+        self._log_danger_obstacle_sync(
+            danger_sync,
+            event="danger_obstacle_sync",
+            floor=int(self.current_floor),
+        )
+        if danger_sync is not None and getattr(
+            danger_sync,
+            "overlap_owner_ids",
+            (),
+        ):
+            self._handle_danger_source_overlap(
+                owner_ids=tuple(danger_sync.overlap_owner_ids),
+                floor=int(self.current_floor),
+                source="rgbd_confirmation",
+            )
+            return
+        if danger_sync is not None and getattr(
+            danger_sync,
+            "changed_owner_ids",
+            (),
+        ):
+            # 旧路径可能在确认前穿过危险源；必须强制下一轮基于新 OCC 重新规划。
+            self.controller.clear_path(reason="danger_obstacle_sync")
         if self.rgbd_door_detector is not None:
             door_observations = list(detection_result.door_observations)
             registration = self._elevator_observation.registration

@@ -314,7 +314,15 @@ class _TestMapRuntime:
             ),
         )
 
-    def update_images(self, bundle, camera_to_world, *, now):
+    def update_images(
+        self,
+        bundle,
+        camera_to_world,
+        *,
+        now,
+        floor_index=None,
+        robot_xy=None,
+    ):
         candidates = self.detector.detect_messages(
             bundle.rgb_msg,
             bundle.depth_msg,
@@ -494,6 +502,183 @@ class MissionManagerHelperTest(unittest.TestCase):
 
         self.assertFalse(timed_out)
         self.assertEqual(reason, "mission_tick_wall_stall_disabled")
+
+    def test_danger_source_overlap_stops_and_enters_existing_result_failure_flow(self):
+        manager = _make_test_manager()
+        manager.state = EXPLORE_FLOOR
+        manager._mission_success_eligible = True
+        stopped = []
+        cleared = []
+        failures = []
+        transitions = []
+        events = []
+        manager.controller = SimpleNamespace(
+            stop=lambda **kwargs: stopped.append(kwargs),
+            clear_path=lambda **kwargs: cleared.append(kwargs),
+        )
+        manager._record_failure = failures.append
+        manager._transition_state = lambda state, **kwargs: transitions.append(
+            (state, kwargs)
+        )
+        manager._log_structured = events.append
+
+        manager._handle_danger_source_overlap(
+            owner_ids=("danger:7",),
+            floor=0,
+            source="rgbd_confirmation",
+        )
+
+        self.assertEqual(stopped, [{"reason": "danger_source_overlap"}])
+        self.assertEqual(cleared, [{"reason": "danger_source_overlap"}])
+        self.assertEqual(failures, ["danger_source_overlap"])
+        self.assertFalse(manager._mission_success_eligible)
+        self.assertEqual(transitions[0][0], WRITE_RESULT)
+        self.assertEqual(transitions[0][1]["reason_code"], "danger_source_overlap")
+        self.assertEqual(events[0]["event"], "danger_source_overlap")
+
+    def test_tick_stops_before_current_task_when_mapping_enters_write_result(self):
+        manager = _make_test_manager()
+        manager.state = EXPLORE_FLOOR
+        manager.max_runtime = 100.0
+        manager._elapsed = lambda: 1.0
+        manager._publish_status = lambda: None
+        manager._perception_runtime = SimpleNamespace(snapshot=lambda: object())
+        manager.pose_provider = SimpleNamespace(
+            latest=lambda: mission_manager_module.PoseSample(
+                stamp=1.0,
+                xyz=(0.0, 0.0, 0.3),
+                quaternion_xyzw=(0.0, 0.0, 0.0, 1.0),
+                linear_xyz=(0.0, 0.0, 0.0),
+                angular_xyz=(0.0, 0.0, 0.0),
+            )
+        )
+        manager._apply_localization_progress_decision = lambda _sample: True
+        manager._update_pose_progress = lambda _pose: None
+        manager._record_initial_entry_trace_pose = lambda _pose: None
+        manager._record_floor_navigation_trace_pose = lambda _pose: None
+        manager._sync_ground_support_task_context = lambda _pose: None
+        manager._ground_support.observe_odometry = lambda *_args: None
+        manager._update_mapping_and_detection = lambda *_args: setattr(
+            manager,
+            "state",
+            WRITE_RESULT,
+        )
+        task_ticks = []
+        manager.current_task = SimpleNamespace(
+            tick=lambda *_args: task_ticks.append(True) or RUNNING
+        )
+
+        manager.tick()
+
+        self.assertEqual(manager.state, WRITE_RESULT)
+        self.assertEqual(task_ticks, [])
+
+    def test_landmark_ack_reprojects_danger_tracks_before_resuming_navigation(self):
+        manager = _make_test_manager()
+        manager.current_floor = 0
+        manager._landmark_relocalizer = SimpleNamespace(
+            anchors={"elevator": SimpleNamespace(floor=0)},
+            config=SimpleNamespace(correction_timeout=2.0),
+        )
+        manager._landmark_relocalization_operations = {
+            "test": {"sequence": 11, "started_at": 0.0}
+        }
+        manager.pose_provider = SimpleNamespace(
+            correction_ack=lambda sequence: (0.3, -0.2, 1.0)
+            if sequence == 11
+            else None,
+            latest=lambda: SimpleNamespace(xy_yaw=(1.3, 1.8, 0.0)),
+        )
+        applied = []
+        manager._map_runtime = SimpleNamespace(
+            apply_planar_correction=lambda dx, dy, **kwargs: (
+                applied.append((dx, dy, kwargs))
+                or SimpleNamespace(
+                    translated_track_count=1,
+                    selected_track_ids=(7,),
+                    changed_owner_ids=("danger:7",),
+                    changed_cell_count=49,
+                    overlap_owner_ids=(),
+                )
+            )
+        )
+        manager.controller = SimpleNamespace(
+            stop=lambda **_kwargs: None,
+            clear_path=lambda **_kwargs: None,
+        )
+        events = []
+        manager._log_structured = events.append
+
+        result = manager.relocalize_landmark(
+            "elevator",
+            "lift_door_0",
+            (1.0, 2.0, 0.0),
+            "test",
+        )
+
+        self.assertEqual(result.status, DONE)
+        self.assertTrue(result.applied)
+        self.assertEqual(len(applied), 1)
+        self.assertEqual(applied[0][0:2], (0.3, -0.2))
+        self.assertEqual(applied[0][2]["robot_floor"], 0)
+        self.assertEqual(applied[0][2]["robot_xy"], (1.3, 1.8))
+        self.assertTrue(math.isfinite(applied[0][2]["now"]))
+        self.assertEqual(events[0]["event"], "danger_obstacle_reprojected")
+        self.assertEqual(events[1]["event"], "sparse_landmark_correction_applied")
+
+    def test_landmark_ack_overlap_keeps_navigation_task_from_advancing(self):
+        manager = _make_test_manager()
+        manager.current_floor = 0
+        manager._landmark_relocalizer = SimpleNamespace(
+            anchors={"elevator": SimpleNamespace(floor=0)},
+            config=SimpleNamespace(correction_timeout=2.0),
+        )
+        manager._landmark_relocalization_operations = {
+            "test": {"sequence": 12, "started_at": 0.0}
+        }
+        manager.pose_provider = SimpleNamespace(
+            correction_ack=lambda sequence: (0.1, 0.0, 1.0)
+            if sequence == 12
+            else None,
+            latest=lambda: SimpleNamespace(xy_yaw=(1.1, 2.0, 0.0)),
+        )
+        manager._map_runtime = SimpleNamespace(
+            apply_planar_correction=lambda *_args, **_kwargs: SimpleNamespace(
+                translated_track_count=1,
+                selected_track_ids=(7,),
+                changed_owner_ids=("danger:7",),
+                changed_cell_count=49,
+                overlap_owner_ids=("danger:7",),
+            )
+        )
+        calls = []
+        manager.controller = SimpleNamespace(
+            stop=lambda **kwargs: calls.append(("stop", kwargs)),
+            clear_path=lambda **kwargs: calls.append(("clear", kwargs)),
+        )
+        manager._handle_danger_source_overlap = lambda **kwargs: calls.append(
+            ("overlap", kwargs)
+        )
+        manager._log_structured = lambda _event: None
+
+        result = manager.relocalize_landmark(
+            "elevator",
+            "lift_door_0",
+            (1.0, 2.0, 0.0),
+            "test",
+        )
+
+        self.assertEqual(result.status, RUNNING)
+        self.assertEqual(result.reason, "danger_source_overlap")
+        self.assertIn(("overlap", {
+            "owner_ids": ("danger:7",),
+            "floor": 0,
+            "source": "landmark_correction",
+        }), calls)
+        self.assertNotIn(
+            ("clear", {"reason": "landmark_relocalization_applied"}),
+            calls,
+        )
 
     def test_ground_support_scope_transition_invalidates_all_old_evidence_atomically(self):
         manager = _make_test_manager()

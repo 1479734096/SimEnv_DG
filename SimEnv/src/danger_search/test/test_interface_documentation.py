@@ -281,7 +281,9 @@ class InterfaceDocumentationTest(unittest.TestCase):
         self.assertEqual(float(frontier["expected_gain_radius"]), 3.0)
         self.assertEqual(float(frontier["information_gain_weight"]), 0.5)
         self.assertEqual(float(frontier["path_cost_weight"]), 3.0)
-        self.assertEqual(float(frontier["yaw_cost_weight"]), 0.2)
+        self.assertEqual(float(frontier["yaw_cost_weight"]), 0.4)
+        self.assertEqual(float(frontier["path_turn_cost_weight"]), 0.7)
+        self.assertEqual(float(frontier["min_far_expected_gain"]), 4.0)
         self.assertEqual(int(frontier["max_planning_candidates"]), 8)
         self.assertEqual(int(frontier["max_goal_candidates_per_frontier"]), 2)
 

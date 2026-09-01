@@ -1,7 +1,12 @@
 import math
 import unittest
 
-from danger_search.detection_tracker import CONFIRMED, DetectionCandidate, DetectionTracker
+from danger_search.detection_tracker import (
+    CONFIRMED,
+    TENTATIVE,
+    DetectionCandidate,
+    DetectionTracker,
+)
 
 
 class DetectionTrackerTest(unittest.TestCase):
@@ -71,6 +76,35 @@ class DetectionTrackerTest(unittest.TestCase):
         self.assertAlmostEqual(positions[0][0], 1.015, places=3)
         self.assertEqual(tracker.tracks[0].status, CONFIRMED)
 
+    def test_high_quality_two_frame_tentative_track_can_shortly_protect_path(self):
+        """预保护必须早于四帧确认，但不能让同一时间戳重复伪造双帧。"""
+        tracker = DetectionTracker(
+            min_hits=4,
+            obstacle_min_hits=2,
+            obstacle_min_confidence=0.90,
+            obstacle_max_average_rmse=0.025,
+            obstacle_max_age=0.75,
+            obstacle_min_observation_span=0.08,
+        )
+        candidate = DetectionCandidate.from_sequence(
+            [1.0, 2.0, 0.15], confidence=0.95, rmse=0.01, distance=1.0
+        )
+
+        tracker.update([candidate], now=1.0)
+        self.assertEqual(tracker.obstacle_tracks(now=1.0), [])
+        tracker.update([candidate], now=1.1)
+
+        protected = tracker.obstacle_tracks(now=1.1)
+        self.assertEqual([track.track_id for track in protected], [1])
+        self.assertEqual(protected[0].status, TENTATIVE)
+        # 未收到新帧时临时保护必须有界撤销，不能永久占住地图。
+        self.assertEqual(tracker.obstacle_tracks(now=1.86), [])
+
+        repeated_stamp = DetectionTracker(min_hits=4)
+        repeated_stamp.update([candidate], now=2.0)
+        repeated_stamp.update([candidate], now=2.0)
+        self.assertEqual(repeated_stamp.obstacle_tracks(now=2.0), [])
+
     def test_nms_removes_duplicate_confirmed_tracks(self):
         tracker = DetectionTracker(min_hits=1, nms_radius=0.9)
         tracker.update([DetectionCandidate.from_sequence([1.0, 1.0, 0.15], confidence=1.0)], now=0.0)
@@ -122,6 +156,42 @@ class DetectionTrackerTest(unittest.TestCase):
     def test_invalid_candidate_distance_is_rejected(self):
         with self.assertRaises(ValueError):
             DetectionCandidate.from_sequence([1.0, 2.0, 0.15], distance=-0.5)
+
+    def test_planar_correction_moves_track_mean_and_observation_history(self):
+        tracker = DetectionTracker(min_hits=1)
+        tracker.update(
+            [
+                DetectionCandidate.from_sequence(
+                    [1.0, 2.0, 0.15], confidence=0.9, distance=2.0
+                )
+            ],
+            now=1.0,
+        )
+        tracker.update(
+            [
+                DetectionCandidate.from_sequence(
+                    [1.1, 2.1, 0.15], confidence=0.9, distance=2.0
+                )
+            ],
+            now=2.0,
+        )
+
+        translated = tracker.translate_planar(0.3, -0.2)
+
+        self.assertEqual(translated, 1)
+        track = tracker.tracks[0]
+        self.assertAlmostEqual(track.mean_position[0], 1.35)
+        self.assertAlmostEqual(track.mean_position[1], 1.85)
+        self.assertAlmostEqual(track.positions[0][0], 1.3)
+        self.assertAlmostEqual(track.positions[0][1], 1.8)
+        self.assertAlmostEqual(track.positions[1][0], 1.4)
+        self.assertAlmostEqual(track.positions[1][1], 1.9)
+        confirmed = tracker.confirmed_positions(now=2.0)
+        self.assertEqual(len(confirmed), 1)
+        self.assertAlmostEqual(confirmed[0][0], 1.35)
+        self.assertAlmostEqual(confirmed[0][1], 1.85)
+        self.assertAlmostEqual(confirmed[0][2], 0.15)
+
     def test_pending_inspection_target_and_mark_inspected(self):
         tracker = DetectionTracker(min_hits=1)
         # 添加一个距离 3.0m 的候选目标 (0.0, 3.0)

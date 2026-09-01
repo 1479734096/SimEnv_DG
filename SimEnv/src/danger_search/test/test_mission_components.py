@@ -113,6 +113,15 @@ def test_config_fields_are_partitioned_once_into_read_only_sections():
         raise AssertionError("配置分组必须只读")
 
 
+def test_frontier_scoring_defaults_include_real_path_turn_penalty():
+    config = _diagnostic_config()
+    params = config.values["frontier_params"]
+
+    assert params["yaw_cost_weight"] == 0.4
+    assert params["path_turn_cost_weight"] == 0.7
+    assert params["min_far_expected_gain"] == 4.0
+
+
 def test_global_frame_is_wired_to_map_and_path_diagnostics():
     config = load_mission_config(
         lambda name, default=None: (

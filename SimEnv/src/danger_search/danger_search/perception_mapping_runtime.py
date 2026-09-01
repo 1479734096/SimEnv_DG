@@ -189,6 +189,8 @@ class PerceptionMappingRuntime:
             image_input.bundle,
             camera_to_world,
             now=float(now),
+            floor_index=int(floor_index),
+            robot_xy=(float(sample.xy_yaw[0]), float(sample.xy_yaw[1])),
         )
         return ImageCommitResult(
             stamp=image_stamp,

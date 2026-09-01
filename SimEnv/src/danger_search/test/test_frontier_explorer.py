@@ -260,6 +260,14 @@ class FrontierExplorerTest(unittest.TestCase):
             "euclidean_distance",
             "path_length",
             "final_score",
+            "information_gain_reward",
+            "path_cost",
+            "initial_heading_error",
+            "initial_heading_cost",
+            "cumulative_turn_angle",
+            "path_turn_cost",
+            "revisit_penalty",
+            "forward_bonus",
             "rejection_reason",
             "door_context_adjustment",
             "door_context_penalty",
@@ -269,6 +277,8 @@ class FrontierExplorerTest(unittest.TestCase):
         }
         self.assertTrue(required_fields.issubset(payload["candidates"][0]))
         self.assertTrue(payload["candidates"][0]["selected"])
+        self.assertIsNotNone(payload["candidates"][0]["initial_heading_error"])
+        self.assertIsNotNone(payload["candidates"][0]["cumulative_turn_angle"])
 
     def test_selection_debug_records_small_cluster_rejection(self):
         grid = FloorGrid(
@@ -356,7 +366,8 @@ class FrontierExplorerTest(unittest.TestCase):
         self.assertTrue(explorer._has_blocked_clearance(grid, (5, 5), 3))
         self.assertEqual(explorer._distance_to_blocked(grid, (5, 5), max_search_steps=3), 3.0)
 
-    def test_score_frontier_uses_actual_target_for_yaw_cost(self):
+    def test_score_frontier_uses_actual_path_first_segment_not_target_centroid(self):
+        """最终评分的朝向项只能由真实路径首段决定。"""
         explorer = FrontierExplorer(min_cluster_size=1)
         frontier = Frontier(cells=((0, 0),), centroid=(-1.0, 0.0), information_gain=5.0)
         path = [(0.0, 0.0), (1.0, 0.0)]
@@ -373,7 +384,47 @@ class FrontierExplorerTest(unittest.TestCase):
             (0.0, 0.0, 0.0),
         )
 
-        self.assertGreater(score_with_safe_target, score_with_old_centroid)
+        self.assertAlmostEqual(score_with_safe_target, score_with_old_centroid)
+
+    def test_score_frontier_penalizes_actual_path_turns_not_goal_bearing(self):
+        """同一目标的绕行路径必须因首段和中途转弯而降分。"""
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            information_gain_weight=0.0,
+            path_cost_weight=0.0,
+            yaw_cost_weight=1.0,
+            forward_alignment_weight=1.0,
+            revisit_penalty_weight=0.0,
+            path_turn_cost_weight=0.5,
+        )
+        frontier = Frontier(
+            cells=((0, 0),),
+            centroid=(2.0, 0.0),
+            information_gain=1.0,
+        )
+        robot_pose = (0.0, 0.0, 0.0)
+
+        straight_score = explorer._score_frontier(
+            frontier,
+            [(0.0, 0.0), (2.0, 0.0)],
+            robot_pose,
+        )
+        turning_score = explorer._score_frontier(
+            frontier,
+            [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (2.0, 0.0)],
+            robot_pose,
+        )
+
+        self.assertGreater(straight_score, turning_score)
+        terms = explorer._frontier_score_terms(
+            frontier,
+            [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (2.0, 0.0)],
+            robot_pose,
+        )
+        self.assertAlmostEqual(terms.initial_heading_error, math.pi / 2.0)
+        self.assertAlmostEqual(terms.cumulative_turn_angle, 3.0 * math.pi / 4.0)
+        self.assertGreater(terms.initial_heading_cost, 0.0)
+        self.assertGreater(terms.path_turn_cost, 0.0)
 
     def test_expected_unknown_gain_counts_four_connected_unknown_inside_three_meter_circle(self):
         grid = FloorGrid(
@@ -658,6 +709,7 @@ class FrontierExplorerTest(unittest.TestCase):
             information_gain_weight=1.0,
             path_cost_weight=1.0,
             yaw_cost_weight=0.0,
+            path_turn_cost_weight=0.0,
             revisit_penalty_weight=0.0,
         )
 
@@ -1743,22 +1795,22 @@ class FrontierExplorerTest(unittest.TestCase):
         self.assertAlmostEqual(score_straight - score_perp, 1.0)
 
     def test_far_small_enclosed_pocket_is_pruned(self):
-        """验证距离超过 3.5m 且期望收益小于 30 的封闭孤岛前沿被直接剪枝。"""
+        """验证距离超过 3.5m 且期望收益小于 4 的封闭孤岛前沿被直接剪枝。"""
         grid = FloorGrid(
             floor_index=0, resolution=0.1, width=10.0, length=10.0,
             origin_x=0.0, origin_y=0.0,
         )
         robot_pose = (0.0, 0.0, 0.0)
-        # 远距离小前沿 (距离 5.0m, gain=10 < 30)
+        # 远距离小前沿 (距离 5.0m, gain=3 < 4)
         far_target = (5.0, 0.0)
-        far_frontier = Frontier(cells=((50, 0),), centroid=far_target, information_gain=10.0)
+        far_frontier = Frontier(cells=((50, 0),), centroid=far_target, information_gain=3.0)
         explorer = FrontierExplorer(
             min_cluster_size=1,
-            min_far_expected_gain=30.0,
+            min_far_expected_gain=4.0,
             far_prune_distance=3.5,
         )
         explorer._candidate_targets_for_frontier = lambda *_args: [far_target]
-        explorer._expected_unknown_gain = lambda *_args: 10.0
+        explorer._expected_unknown_gain = lambda *_args: 3.0
 
         targets, planning, gains, scores, best_target, best_score = explorer._prepare_frontier_targets(
             grid, far_frontier, robot_pose, None
@@ -1767,6 +1819,35 @@ class FrontierExplorerTest(unittest.TestCase):
         self.assertEqual(best_score, -math.inf)
         self.assertEqual(scores, {})
 
+    def test_far_small_pocket_cannot_reenter_astar_after_preplanning(self):
+        """同一剪枝判据在 A* 阶段也必须阻止远距小前沿复活。"""
+        grid = FloorGrid(
+            floor_index=0, resolution=0.1, width=10.0, length=10.0,
+            origin_x=0.0, origin_y=0.0,
+        )
+        robot_pose = (0.0, 0.0, 0.0)
+        far_target = (5.0, 0.0)
+        frontier = Frontier(cells=((50, 0),), centroid=far_target, information_gain=3.0)
+        explorer = FrontierExplorer(
+            min_cluster_size=1,
+            min_far_expected_gain=4.0,
+            far_prune_distance=3.5,
+        )
+
+        with patch("danger_search.frontier.astar_plan") as astar:
+            target, path, *_unused, debug = explorer._resolve_frontier_target(
+                grid,
+                frontier,
+                robot_pose,
+                candidate_targets=[far_target],
+                expected_gain_cache={far_target: 3.0},
+            )
+
+        self.assertIsNone(target)
+        self.assertEqual(path, [])
+        self.assertEqual(debug.rejection_reason, "far_small_pocket_pruned")
+        astar.assert_not_called()
+
     def test_near_small_enclosed_pocket_is_retained(self):
         """验证距离在 3.5m 以内的小前沿正常保留（近场顺路扫除）。"""
         grid = FloorGrid(
@@ -1774,16 +1855,16 @@ class FrontierExplorerTest(unittest.TestCase):
             origin_x=0.0, origin_y=0.0,
         )
         robot_pose = (0.0, 0.0, 0.0)
-        # 近距离小前沿 (距离 2.0m, gain=10 < 30)
+        # 近距离小前沿 (距离 2.0m, gain=3 < 4)
         near_target = (2.0, 0.0)
-        near_frontier = Frontier(cells=((20, 0),), centroid=near_target, information_gain=10.0)
+        near_frontier = Frontier(cells=((20, 0),), centroid=near_target, information_gain=3.0)
         explorer = FrontierExplorer(
             min_cluster_size=1,
-            min_far_expected_gain=30.0,
+            min_far_expected_gain=4.0,
             far_prune_distance=3.5,
         )
         explorer._candidate_targets_for_frontier = lambda *_args: [near_target]
-        explorer._expected_unknown_gain = lambda *_args: 10.0
+        explorer._expected_unknown_gain = lambda *_args: 3.0
 
         targets, planning, gains, scores, best_target, best_score = explorer._prepare_frontier_targets(
             grid, near_frontier, robot_pose, None
@@ -1792,23 +1873,23 @@ class FrontierExplorerTest(unittest.TestCase):
         self.assertGreater(best_score, -math.inf)
         self.assertIn(near_target, scores)
 
-    def test_far_large_open_frontier_is_retained(self):
-        """验证距离超过 3.5m 但期望收益大于等于 30 的开放大前沿正常保留。"""
+    def test_far_threshold_frontier_is_retained(self):
+        """验证距离超过 3.5m 且期望收益等于 4 的前沿仍可进入规划。"""
         grid = FloorGrid(
             floor_index=0, resolution=0.1, width=10.0, length=10.0,
             origin_x=0.0, origin_y=0.0,
         )
         robot_pose = (0.0, 0.0, 0.0)
-        # 远距离大前沿 (距离 5.0m, gain=100 >= 30)
+        # 临界收益前沿 (距离 5.0m, gain=4 == 4)
         far_target = (5.0, 0.0)
-        far_frontier = Frontier(cells=((50, 0),), centroid=far_target, information_gain=100.0)
+        far_frontier = Frontier(cells=((50, 0),), centroid=far_target, information_gain=4.0)
         explorer = FrontierExplorer(
             min_cluster_size=1,
-            min_far_expected_gain=30.0,
+            min_far_expected_gain=4.0,
             far_prune_distance=3.5,
         )
         explorer._candidate_targets_for_frontier = lambda *_args: [far_target]
-        explorer._expected_unknown_gain = lambda *_args: 100.0
+        explorer._expected_unknown_gain = lambda *_args: 4.0
 
         targets, planning, gains, scores, best_target, best_score = explorer._prepare_frontier_targets(
             grid, far_frontier, robot_pose, None
@@ -1827,16 +1908,16 @@ class FrontierExplorerTest(unittest.TestCase):
             for gx in range(1, 90):
                 grid.mark_free(gx, gy)
         robot_pose = (0.5, 0.5, 0.0)
-        # 远距离小前沿 (距离 5.0m, 期望收益 10 < 30)
+        # 远距离小前沿 (距离 5.0m, 期望收益 3 < 4)
         far_target = (5.5, 0.5)
-        far_frontier = Frontier(cells=((55, 5),), centroid=far_target, information_gain=10.0)
+        far_frontier = Frontier(cells=((55, 5),), centroid=far_target, information_gain=3.0)
         explorer = FrontierExplorer(
             min_cluster_size=1,
-            min_far_expected_gain=30.0,
+            min_far_expected_gain=4.0,
             far_prune_distance=3.5,
         )
         explorer._candidate_targets_for_frontier = lambda *_args: [far_target]
-        explorer._expected_unknown_gain = lambda *_args: 10.0
+        explorer._expected_unknown_gain = lambda *_args: 3.0
 
         selected, _path = explorer.select_frontier(
             grid, robot_pose, None, frontiers=[far_frontier]

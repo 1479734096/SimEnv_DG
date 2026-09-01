@@ -1192,6 +1192,61 @@ class TakeElevatorTest(unittest.TestCase):
         self.assertEqual(task.tick(_task_context(manager), (0.85, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
 
+    def test_source_door_stays_closed_until_near_geometry_refresh_and_alignment(self):
+        """远距离预呼梯不得抹掉用于电梯定位的深色门板。"""
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        elevator_calls = []
+        open_calls = []
+        manager.building_client.call_elevator = (
+            lambda elevator_id, floor, open_doors: elevator_calls.append(
+                (elevator_id, floor, open_doors)
+            )
+            or _DoneService()
+        )
+        manager.building_client.open_door = (
+            lambda door_id: open_calls.append(door_id) or _DoneService()
+        )
+        manager.refresh_elevator_geometry = lambda *_args: DONE
+        task = TakeElevator(0, 1)
+        context = _task_context(manager)
+
+        # 远距离阶段只能预呼梯，厅门必须保持关闭供近场几何注册使用。
+        with patch.object(task, "_navigate_to", return_value=True):
+            self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "ALIGN_TO_CURRENT_DOOR")
+        self.assertEqual(elevator_calls, [("elevator_main", 0, False)])
+        self.assertEqual(open_calls, [])
+
+        # 完成近场几何刷新、重新到候梯点并对准后，才允许进入显式开门阶段。
+        with patch.object(task, "_tick_target_door_alignment", return_value=True):
+            self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "REFRESH_CURRENT_ELEVATOR_GEOMETRY")
+        self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "GO_TO_REFRESHED_ELEVATOR_DOOR")
+        with patch.object(task, "_navigate_to", return_value=True):
+            self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "ALIGN_TO_REFRESHED_ELEVATOR_DOOR")
+        with patch.object(task, "_tick_target_door_alignment", return_value=True):
+            self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
+        self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
+        self.assertEqual(open_calls, [])
+        self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task.phase, "OPEN_CURRENT_FLOOR_DOOR")
+        self.assertEqual(open_calls, [])
+
+        self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
+        self.assertEqual(open_calls, ["lift_door_ground"])
+
     def test_confirmed_current_door_refreshes_live_crossing_before_enter(self):
         grid = MultiFloorGridMap(
             resolution=0.1,
@@ -2123,6 +2178,37 @@ class TakeElevatorTest(unittest.TestCase):
         self.assertEqual(task.phase, "DONE")
         self.assertEqual(manager.building_client.closed_doors, ["lift_door_upper"])
 
+    def test_async_target_door_close_emits_structured_request_event(self):
+        """离厢完成后必须留下非阻塞关门请求的可审计证据。"""
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(1)
+        manager = self._exit_manager(grid)
+        events = []
+        manager._log_structured = events.append
+        task = TakeElevator(0, 1)
+        task.phase = "EXIT_CABIN"
+
+        with patch.object(task, "_tick_cabin_transit", return_value=DONE):
+            status = task.tick(_task_context(manager), (0.85, 2.60, math.pi))
+
+        self.assertEqual(status, DONE)
+        self.assertEqual(manager.building_client.closed_doors, ["lift_door_upper"])
+        self.assertEqual(
+            events,
+            [
+                {
+                    "event": "elevator_target_door_close_requested",
+                    "door_id": "lift_door_upper",
+                    "mode": "async",
+                }
+            ],
+        )
+
     def test_exit_cabin_with_sync_door_close_falls_back_to_close_target_floor_door(self):
         grid = MultiFloorGridMap(
             resolution=0.1,
@@ -2867,7 +2953,7 @@ class TakeElevatorTest(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(service_calls, [("elevator_main", 1, True)])
+        self.assertEqual(service_calls, [("elevator_main", 1, False)])
 
     def test_wait_target_door_requires_unblocked_straight_cabin_segment(self):
         grid = MultiFloorGridMap(

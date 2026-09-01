@@ -92,6 +92,7 @@ class GroundSupportGateConfig:
     validated_max_speed: float | None = None
     stop_distance_table: tuple[tuple[float, float], ...] = (
         (0.60, 0.09337727739487302),
+        (0.651, 0.10195826367975175),
         (0.80, 0.15200000000000000),
         (1.00, 0.23000000000000000),
     )
@@ -515,6 +516,10 @@ class GroundSupportSafetyGate:
                     bool(assessment.drop_confirmed)
                     or bool(assessment.drop_intersects_sweep)
                     or bool(assessment.drop_clusters)
+                    or (
+                        assessment.support_boundary_detected
+                        and not assessment.current_footprint_supported
+                    )
                 )
             )
             if not has_real_drop:
@@ -640,6 +645,13 @@ class GroundSupportSafetyGate:
                 self._begin_drop_stop(assessment, wall_time, control_now)
                 return (0.0, 0.0, 0.0)
             if not self._unknown_support_hold_enabled:
+                if (
+                    assessment is not None
+                    and assessment.support_boundary_detected
+                    and not assessment.current_footprint_supported
+                    and assessment.observation_adequate
+                ):
+                    return (0.0, 0.0, 0.0)
                 # 电梯门槛跨越时视角无法补足正支撑；继续等待只会耗尽父任务超时。
                 # 先检查上面的显式 DROP，再解除仅由 UNKNOWN 引起的临时停车。
                 self._leave_temporary_hold(wall_time, control_now)
@@ -686,6 +698,26 @@ class GroundSupportSafetyGate:
         ):
             self.true_drop_stop_count += 1
             self._begin_drop_stop(assessment, wall_time, control_now)
+            return (0.0, 0.0, 0.0)
+
+        # 【核心安全修复】：自身足迹已踩空（踏出支撑边界），属于物理生死线。
+        # 无论 unknown_support_hold_enabled 为何值，一律强制进入临时停车补观测/安全制动，
+        # 绝不短路放行！
+        near_footprint_unsupported = (
+            assessment.support_boundary_detected
+            and not assessment.current_footprint_supported
+            and assessment.observation_adequate
+        )
+        if near_footprint_unsupported:
+            self._begin_temporary_hold_context(requested, pose_yaw)
+            self._capture_failure_witness(assessment)
+            self.observation_hold_count += 1
+            self._enter_state(
+                OBSERVATION_HOLD,
+                "ground_support_observation_hold",
+                wall_time,
+                control_time=control_now,
+            )
             return (0.0, 0.0, 0.0)
 
         if not self._unknown_support_hold_enabled:
