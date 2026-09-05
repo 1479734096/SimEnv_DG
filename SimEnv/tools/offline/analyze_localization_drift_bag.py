@@ -30,6 +30,10 @@ class DriftSample:
     error_y: float
     yaw_error: float
     truth_distance: float
+    absolute_position_error: float = 0.0
+    absolute_error_x: float = 0.0
+    absolute_error_y: float = 0.0
+    absolute_yaw_error: float = 0.0
 
 
 def _angle_wrap(value: float) -> float:
@@ -143,6 +147,10 @@ def _compute_drift(
                 error_y=error_y,
                 yaw_error=yaw_error,
                 truth_distance=truth_distance,
+                absolute_position_error=math.hypot(estimate.x - truth.x, estimate.y - truth.y),
+                absolute_error_x=estimate.x - truth.x,
+                absolute_error_y=estimate.y - truth.y,
+                absolute_yaw_error=_angle_wrap(estimate.yaw - truth.yaw),
             )
         )
     return samples
@@ -189,6 +197,24 @@ def _summary(samples: list[DriftSample]) -> dict[str, float | int]:
     }
 
 
+def _absolute_summary(samples: list[DriftSample]) -> dict:
+    """不拟合坐标变换，保留会影响危险源 world 坐标的初始化误差。"""
+    if not samples:
+        return {"sample_count": 0}
+    errors = [sample.absolute_position_error for sample in samples]
+    return {
+        "sample_count": len(samples), "alignment": "none",
+        "initial_position_error": samples[0].absolute_position_error,
+        "initial_yaw_error": samples[0].absolute_yaw_error,
+        "final_position_error": samples[-1].absolute_position_error,
+        "final_yaw_error": samples[-1].absolute_yaw_error,
+        "maximum_position_error": max(errors),
+        "rms_position_error": math.sqrt(sum(value * value for value in errors) / len(errors)),
+        "p95_position_error": _percentile(errors, 0.95),
+        "maximum_absolute_yaw_error": max(abs(sample.absolute_yaw_error) for sample in samples),
+    }
+
+
 def _write_csv(path: Path, samples: Iterable[DriftSample]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as stream:
@@ -200,7 +226,7 @@ def _write_csv(path: Path, samples: Iterable[DriftSample]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="离线计算生产定位相对 Gazebo 真值的首帧对齐漂移",
+        description="离线计算首帧对齐漂移及未对齐 world 绝对 XY/yaw 误差（弧度）",
     )
     parser.add_argument("bag", type=Path)
     parser.add_argument(
@@ -242,6 +268,10 @@ def main() -> int:
         "first_truth_stamp": first_truth_stamp,
         "first_aligned_estimate_stamp": first_aligned_estimate_stamp,
         "elapsed_time_origin": "first_aligned_estimate_header_stamp",
+        "relative_alignment": "first_pose_se2",
+        "absolute_world": _absolute_summary(samples),
+        "first_matched_estimate": asdict(pairs[0][0]),
+        "first_matched_truth": asdict(pairs[0][1]),
         **_summary(samples),
     }
 

@@ -191,6 +191,8 @@ class PerceptionMappingRuntime:
             now=float(now),
             floor_index=int(floor_index),
             robot_xy=(float(sample.xy_yaw[0]), float(sample.xy_yaw[1])),
+            image_stamp=image_stamp,
+            localization_epoch=getattr(preparation.pose_lookup, "localization_epoch", None),
         )
         return ImageCommitResult(
             stamp=image_stamp,

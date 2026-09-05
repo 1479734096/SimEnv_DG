@@ -91,6 +91,7 @@ class PoseLookup:
     status: str
     sample: PoseSample | None
     delta: float | None
+    localization_epoch: int | None = None
 
 
 class PoseProvider:
@@ -269,15 +270,16 @@ class PoseProvider:
             raise ValueError("max_delta 必须为非负有限数")
         with self._lock:
             if not self._samples:
-                return PoseLookup(POSE_PENDING, None, None)
+                return PoseLookup(POSE_PENDING, None, None, self._continuity_epoch)
             nearest = min(self._samples, key=lambda sample: abs(sample.stamp - target))
             latest_stamp = self._samples[-1].stamp
+            epoch = self._continuity_epoch
         delta = abs(nearest.stamp - target)
         if delta <= tolerance:
-            return PoseLookup(POSE_MATCHED, nearest, delta)
+            return PoseLookup(POSE_MATCHED, nearest, delta, epoch)
         if latest_stamp < target + tolerance:
-            return PoseLookup(POSE_PENDING, None, delta)
-        return PoseLookup(POSE_EXPIRED, None, delta)
+            return PoseLookup(POSE_PENDING, None, delta, epoch)
+        return PoseLookup(POSE_EXPIRED, None, delta, epoch)
 
     def sensor_to_world_matrix(
         self,

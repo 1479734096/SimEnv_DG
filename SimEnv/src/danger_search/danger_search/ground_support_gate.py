@@ -5,8 +5,8 @@
 
 状态分三类：``CLEAR`` 透明放行；``OBSERVATION_HOLD/STALE_DATA_HOLD`` 是可由
 新鲜正支撑自动解除的临时零速；DROP、超包络速度和停车超时进入锁存状态，
-必须由任务层写入局部禁区、重规划或结束任务。已确认无空洞的电梯 CROSS 阶段
-只跳过支撑边界观察，显式 DROP 和速度包络仍保持硬保护。墙钟与控制/仿真时间
+必须由任务层写入局部禁区、重规划或结束任务。已确认无空洞的 0 层和电梯 CROSS
+跳过包括显式 DROP 在内的防坠检测，但保留速度包络。墙钟与控制/仿真时间
 同时保存，从而在 ``/clock`` 冻结时仍能检测“已要求停车但无法确认停稳”的异常。
 """
 from __future__ import annotations
@@ -288,6 +288,9 @@ class GroundSupportSafetyGate:
         self._temporary_hold_context_id: int | None = None
         self._unknown_support_hold_enabled = True
         self._controlled_elevator_crossing = False
+        self._hole_exemption_provider = None
+        self._hole_exemption_reason = None
+        self.hole_scope_revision = 0
         self._latched_drop_point_world: tuple[float, float] | None = None
         self._latched_drop_clusters: tuple[DropClusterEvidence, ...] = ()
         self._boundary_candidate_centroid: tuple[float, float] | None = None
@@ -323,7 +326,7 @@ class GroundSupportSafetyGate:
 
     def update_assessment(self, assessment: GroundSupportAssessment) -> None:
         """接收时间单调的新评估并累计连续正支撑帧，用于滞回释放。"""
-        if not self.enabled:
+        if not self.enabled or self.hole_detection_exempt:
             return
         if not self._assessment_has_valid_numbers(assessment):
             # 畸形证据不能继续保留上一帧“安全”结论；清空后由唯一出口进入
@@ -373,6 +376,42 @@ class GroundSupportSafetyGate:
         if not self.enabled:
             return
         self._controlled_elevator_crossing = bool(enabled)
+
+    def set_hole_exemption_provider(self, provider) -> None:
+        """由唯一速度出口读取当前阶段，避免主循环缓存落后于子任务转换。"""
+        self._hole_exemption_provider = provider
+
+    @property
+    def hole_detection_exempt(self) -> bool:
+        reason = (
+            self._hole_exemption_provider()
+            if self._hole_exemption_provider is not None
+            else ("elevator_cross" if self._controlled_elevator_crossing else None)
+        )
+        if reason != self._hole_exemption_reason:
+            self._hole_exemption_reason = reason
+            self.hole_scope_revision += 1
+            self.invalidate_assessment()
+            self._pending_failure_witness = None
+            # 豁免只撤销防坠证据，不能解除速度异常或时钟超时锁存。
+            if self.state in _TEMPORARY_HOLDS or (
+                reason is not None and (
+                    self.state in {DROP_STOPPING, SUPPORT_PATH_UNAVAILABLE}
+                    or (self.state == SAFETY_BLOCKED and self.reason_code in {
+                        "negative_obstacle", "drop_source_cluster_missing",
+                    })
+                )
+            ):
+                self.state = CLEAR
+                self.reason_code = None
+                self._state_enter_wall_time = None
+                self._state_enter_control_time = None
+                self._temporary_hold_command = None
+                self._temporary_hold_pose_yaw = None
+                self._temporary_hold_context_id = None
+                self._latched_drop_clusters = ()
+                self._latched_drop_point_world = None
+        return reason is not None
 
     def support_sweep_context_snapshot(
         self,
@@ -505,6 +544,7 @@ class GroundSupportSafetyGate:
         """按仿真时间推进正常观察和停车上限。"""
         if not self.enabled:
             return
+        self.hole_detection_exempt
         self._note_control_progress(control_time, wall_time)
         if self._state_enter_control_time is None:
             return
@@ -635,21 +675,8 @@ class GroundSupportSafetyGate:
         stop_distance = requested_stop_distance
         self.last_stop_distance = stop_distance
 
-        # 电梯 CROSS 已由任务层确认无空洞；只保留显式 DROP 和速度包络硬保护，
-        # 不让门槛接缝的支撑边界误判清空跨越路径。阶段结束后由任务层关闭该模式。
-        if self._controlled_elevator_crossing:
-            if self._fresh_drop_blocks(
-                self._assessment,
-                command=requested,
-                pose_yaw=pose_yaw,
-                wall_time=wall_time,
-                control_time=control_now,
-            ):
-                self.true_drop_stop_count += 1
-                self._begin_drop_stop(self._assessment, wall_time, control_now)
-                return (0.0, 0.0, 0.0)
-            if self.state in _TEMPORARY_HOLDS:
-                self._leave_temporary_hold(wall_time, control_now)
+        # 无空洞保证仅豁免防坠，上方速度与定位差分异常检查仍然生效。
+        if self.hole_detection_exempt:
             return requested
 
         if self.state in _TEMPORARY_HOLDS:
@@ -797,7 +824,7 @@ class GroundSupportSafetyGate:
         control_time: float | None = None,
     ) -> bool:
         """新 cloud 到达后立即锁存 DROP，实际零速仍由统一命令出口发布。"""
-        if not self.enabled or self.state in _LATCHED_STATES:
+        if not self.enabled or self.hole_detection_exempt or self.state in _LATCHED_STATES:
             return False
         control_now = float(wall_time if control_time is None else control_time)
         self._note_control_progress(control_now, wall_time)
@@ -833,6 +860,8 @@ class GroundSupportSafetyGate:
             "terminal": self.terminal,
             "unknown_support_hold_enabled": self._unknown_support_hold_enabled,
             "controlled_elevator_crossing": self._controlled_elevator_crossing,
+            "hole_exemption_reason": self._hole_exemption_reason,
+            "hole_scope_revision": self.hole_scope_revision,
             "validated_max_speed": self.envelope.validated_max_speed,
             "stop_distance_table": [list(item) for item in self.envelope.table],
             "stop_envelope_index_source": "requested_command",
@@ -990,7 +1019,7 @@ class GroundSupportSafetyGate:
         self._temporary_hold_pose_yaw = None
         self._temporary_hold_context_id = None
         self._stopped_sample_count = 0
-        if self.state != SAFETY_BLOCKED or self.reason_code != "negative_obstacle":
+        if self.state in {CLEAR, OBSERVATION_HOLD, STALE_DATA_HOLD, SUPPORT_PATH_UNAVAILABLE}:
             # scope 变化后没有可复用的 HOLD 命令，也没有合法的进入时间。
             # 回到 CLEAR，让下一条非零命令经缺评估分支重新建立完整的
             # fail-closed HOLD 上下文；直接伪造 STALE_DATA_HOLD 会永久无法释放。

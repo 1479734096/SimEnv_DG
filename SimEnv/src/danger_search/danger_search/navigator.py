@@ -121,7 +121,7 @@ class PathFollower:
     _path_reason: str | None = field(default=None, init=False)
     _debug_turn_in_place: bool = field(default=False, init=False)
     _pose_provider: object | None = field(default=None, init=False)
-    _tracking_status: str = field(default="IDLE", init=False)
+    _tracking_status: str = field(default=IDLE, init=False)
     _terminal_pending: bool = field(default=False, init=False)
     _terminal_reason: str | None = field(default=None, init=False)
     _status_sequence: int = field(default=0, init=False)
@@ -361,7 +361,7 @@ class PathFollower:
         self._debug_stuck_elapsed = 0.0
         self._turn_in_place_active = False
         self._turn_release_count = 0
-        self._tracking_status = "RUNNING"
+        self._tracking_status = RUNNING
         self._terminal_pending = False
         self._terminal_reason = None
         self._status_sequence += 1
@@ -472,7 +472,7 @@ class PathFollower:
         self._align_settle_samples = 0
         self._turn_in_place_active = False
         self._turn_release_count = 0
-        self._tracking_status = "IDLE"
+        self._tracking_status = IDLE
         self._path_generation += 1
         self._route_remaining = None
         self._path_reason = None
@@ -529,7 +529,7 @@ class PathFollower:
                 reason = self._terminal_reason
                 sequence = self._status_sequence
                 self._terminal_pending = False
-                self._tracking_status = "IDLE"
+                self._tracking_status = IDLE
                 self._terminal_reason = None
                 self._status_sequence += 1
                 self._clear_path_locked(reason=reason or "terminal_consumed")
@@ -700,7 +700,7 @@ class PathFollower:
             return self._recover_step_locked(now)
         if not self._path:
             self._publish_locked(0.0, 0.0, zero_reason="no_path")
-            self._tracking_status = "IDLE"
+            self._tracking_status = IDLE
             return IDLE
 
         try:

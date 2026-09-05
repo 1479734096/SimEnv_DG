@@ -32,6 +32,9 @@ class CloudMapResult:
 class ImageDetectionResult:
     door_observations: tuple[DoorPanelObservation, ...]
     danger_obstacle_sync: "DangerObstacleSyncResult" | None = None
+    matched_cloud_stamp: float | None = None
+    candidate_diagnostics: tuple[dict, ...] = ()
+    candidate_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -49,7 +52,7 @@ class DangerObstacleSyncResult:
 
 @dataclass(frozen=True)
 class RegisteredCloudFrame:
-    """供地标重定位使用的有限历史，不参与地图或任务决策缓存。"""
+    """供地标匹配和 RGB-D 候选距离修正使用的同坐标系有限历史。"""
 
     stamp: float
     floor: int
@@ -81,6 +84,7 @@ class MapUpdateRuntime:
         self.nearest_radial_obstacle_distance: float | None = None
         self.last_floor_alignment_mismatch_key = None
         self.last_rgbd_pose_lookup_log_time = 0.0
+        self._last_candidate_diagnostic_time = -math.inf
         self.recent_cloud_frames: deque[RegisteredCloudFrame] = deque(maxlen=6)
         mapper_params = dict(map_params)
         mapper_params["negative_minimum_drop"] = minimum_drop
@@ -171,14 +175,24 @@ class MapUpdateRuntime:
         now: float,
         floor_index: int | None = None,
         robot_xy: tuple[float, float] | None = None,
+        image_stamp: float | None = None,
+        localization_epoch: int | None = None,
     ) -> ImageDetectionResult:
         recent_cloud = None
-        recent_frames = getattr(self, "recent_cloud_frames", None)
-        if recent_frames:
-            recent_cloud = recent_frames[-1].points
-        elif getattr(self, "latest_cloud_points", None):
-            recent_cloud = self.latest_cloud_points
+        matched_frame = None
+        if image_stamp is not None and math.isfinite(image_stamp) and localization_epoch is not None:
+            eligible = [
+                frame for frame in self.recent_cloud_frames
+                if frame.floor == floor_index
+                and frame.localization_epoch == localization_epoch
+                and math.isfinite(frame.stamp)
+                and abs(frame.stamp - image_stamp) <= self.detector.lidar_max_time_delta
+            ]
+            if eligible:
+                matched_frame = min(eligible, key=lambda frame: abs(frame.stamp - image_stamp))
+                recent_cloud = matched_frame.points
 
+        diagnostics = [] if now - self._last_candidate_diagnostic_time >= 2.0 else None
         candidates = self.detector.detect_messages(
             bundle.rgb_msg,
             bundle.depth_msg,
@@ -186,7 +200,10 @@ class MapUpdateRuntime:
             camera_to_world,
             require_world_transform=True,
             cloud_points=recent_cloud,
+            diagnostics=diagnostics,
         )
+        if diagnostics:
+            self._last_candidate_diagnostic_time = now
         if candidates:
             self.tracker.update(candidates, now=now)
         danger_obstacle_sync = None
@@ -209,7 +226,12 @@ class MapUpdateRuntime:
                     camera_to_world,
                 )
             )
-        return ImageDetectionResult(observations, danger_obstacle_sync)
+        return ImageDetectionResult(
+            observations, danger_obstacle_sync,
+            matched_cloud_stamp=matched_frame.stamp if matched_frame is not None else None,
+            candidate_diagnostics=tuple(diagnostics or ()),
+            candidate_count=len(candidates),
+        )
 
     def synchronize_confirmed_danger_obstacles(
         self,

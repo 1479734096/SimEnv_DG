@@ -1,21 +1,42 @@
 Panels:
   - Class: rviz/Displays
+    Help Height: 70
     Name: 显示
+    Property Tree Widget:
+      Expanded: ~
+      Splitter Ratio: 0.5
+    Tree Height: 320
   - Class: rviz/Views
+    Expanded:
+      - /Current View1
     Name: 视图
+    Splitter Ratio: 0.5
+Preferences:
+  PromptSaveOnExit: true
+Toolbars:
+  toolButtonStyle: 2
 Visualization Manager:
   Class: ""
   Displays:
-    - Alpha: 0.35
+    - Alpha: 0.3499999940395355
       Cell Size: 1
       Class: rviz/Grid
       Color: 120; 120; 120
       Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
       Name: 参考网格
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
       Plane: XY
       Plane Cell Count: 40
       Reference Frame: world
-    - Alpha: 0.82
+      Value: true
+    - Alpha: 0.8199999928474426
       Class: rviz/Map
       Color Scheme: map
       Draw Behind: true
@@ -23,83 +44,135 @@ Visualization Manager:
       Name: DOG 栅格地图
       Topic: /nav/map_debug
       Unreliable: false
+      Use Timestamp: false
+      Value: true
     - Alpha: 1
-      Buffer Length: 1
+      Autocompute Intensity Bounds: true
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
       Class: rviz/PointCloud2
       Color: 120; 210; 255
       Color Transformer: FlatColor
-      Decay Time: 0.35
-      Enabled: true
+      Decay Time: 0.3499999940395355
+      Enabled: false
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
       Name: 定位注册点云
       Position Transformer: XYZ
       Queue Size: 10
       Selectable: false
       Size (Pixels): 2
+      Size (m): 0.009999999776482582
       Style: Points
       Topic: /danger_search/localization/cloud_registered
       Unreliable: false
-    - Angle Tolerance: 0.05
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Angle Tolerance: 0.05000000074505806
       Class: rviz/Odometry
+      Covariance:
+        Orientation:
+          Alpha: 0.5
+          Color: 255; 255; 127
+          Color Style: Unique
+          Frame: Local
+          Offset: 1
+          Scale: 1
+          Value: true
+        Position:
+          Alpha: 0.30000001192092896
+          Color: 204; 51; 204
+          Scale: 1
+          Value: true
+        Value: true
       Enabled: true
       Keep: 500
       Name: DOG 定位轨迹
-      Position Tolerance: 0.05
+      Position Tolerance: 0.05000000074505806
+      Queue Size: 10
       Shape:
         Alpha: 1
-        Axes Length: 0.35
-        Axes Radius: 0.03
+        Axes Length: 0.3499999940395355
+        Axes Radius: 0.029999999329447746
         Color: 255; 230; 0
-        Head Length: 0.18
-        Head Radius: 0.07
+        Head Length: 0.18000000715255737
+        Head Radius: 0.07000000029802322
         Shaft Length: 0.25
-        Shaft Radius: 0.03
+        Shaft Radius: 0.029999999329447746
         Value: Arrow
       Topic: /danger_search/localization/odom
       Unreliable: false
+      Value: true
     - Alpha: 1
       Buffer Length: 1
       Class: rviz/Path
       Color: 230; 50; 50
       Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
       Line Style: Lines
-      Line Width: 0.04
+      Line Width: 0.03999999910593033
       Name: A星原始路径
       Offset:
         X: 0
         Y: 0
-        Z: 0.04
+        Z: 0.03999999910593033
+      Pose Color: 255; 85; 255
       Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
       Topic: /danger_search/path_raw
       Unreliable: false
+      Value: true
     - Alpha: 1
       Buffer Length: 1
       Class: rviz/Path
       Color: 40; 220; 90
       Enabled: true
+      Head Diameter: 0.30000001192092896
+      Head Length: 0.20000000298023224
+      Length: 0.30000001192092896
       Line Style: Lines
-      Line Width: 0.07
+      Line Width: 0.07000000029802322
       Name: 实际跟随路径
       Offset:
         X: 0
         Y: 0
-        Z: 0.08
+        Z: 0.07999999821186066
+      Pose Color: 255; 85; 255
       Pose Style: None
+      Queue Size: 10
+      Radius: 0.029999999329447746
+      Shaft Diameter: 0.10000000149011612
+      Shaft Length: 0.10000000149011612
       Topic: /danger_search/path_followed
       Unreliable: false
+      Value: true
     - Alpha: 1
       Axes Length: 0.5
-      Axes Radius: 0.05
+      Axes Radius: 0.05000000074505806
       Class: rviz/Pose
       Color: 255; 170; 0
       Enabled: true
       Head Length: 0.25
-      Head Radius: 0.09
+      Head Radius: 0.09000000357627869
       Name: 局部跟踪目标
-      Shaft Length: 0.35
-      Shaft Radius: 0.05
+      Queue Size: 10
+      Shaft Length: 0.3499999940395355
+      Shaft Radius: 0.05000000074505806
       Shape: Arrow
       Topic: /danger_search/local_target
       Unreliable: false
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 28; 31; 35
@@ -109,24 +182,44 @@ Visualization Manager:
   Name: DOG 二层基线观察
   Tools:
     - Class: rviz/Interact
+      Hide Inactive Objects: true
     - Class: rviz/MoveCamera
     - Class: rviz/Select
     - Class: rviz/FocusCamera
     - Class: rviz/Measure
   Value: true
-Views:
-  Current:
-    Angle: 0
-    Class: rviz/TopDownOrtho
-    Name: 二维俯视
-    Near Clip Distance: 0.01
-    Scale: 35
-    Target Frame: world
-    X: 0
-    Y: 5
-  Saved: ~
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 10.50288200378418
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Field of View: 0.7853981852531433
+      Focal Point:
+        X: 1.1544642448425293
+        Y: 2.780621290206909
+        Z: 0.002819064538925886
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Pitch: 1.5697963237762451
+      Target Frame: <Fixed Frame>
+      Yaw: 4.683563709259033
+    Saved: ~
 Window Geometry:
   Height: 850
+  Hide Left Dock: false
+  Hide Right Dock: false
+  QMainWindow State: 000000ff00000000fd000000010000000000000158000002f8fc0200000002fb00000004663e793a010000003d000001c8000000ce00fffffffb0000000489c656fe010000020b0000012a000000a900ffffff00000352000002f800000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Width: 1200
-  X: 40
-  Y: 60
+  X: 84
+  Y: 27
+  显示:
+    collapsed: false
+  视图:
+    collapsed: false

@@ -1265,10 +1265,16 @@ class ScanLocalizationNode {
               angular_speed, stance_initialization_gate_.consecutive_frames());
           return;
         }
-        const Eigen::Isometry3d world_base_matrix =
+        Eigen::Isometry3d world_base_matrix =
             danger_search_localization::BuildWorldBaseFromGroundPlane(
                 ground->normal_base, ground->distance_from_base,
                 start_pose_.x, start_pose_.y, start_pose_.yaw);
+        if (current_imu_sample.has_value()) {
+          // 赛方 /trunk_imu 以 world 为姿态参考，imu_link 与 base 同向。
+          // 站稳时重置为出生姿态会丢掉站立期间的旋转，形成永久坐标偏差。
+          // 楼面仍负责高度和站立门控，后续地标纠偏沿用统一锚定事务。
+          world_base_matrix.linear() = current_imu_sample->rotation;
+        }
         const SE3d world_base0(
             SO3d(world_base_matrix.linear()), world_base_matrix.translation());
         world_livox0_ = world_base0 * base_to_livox_;
@@ -1306,6 +1312,16 @@ class ScanLocalizationNode {
             ground->distance_from_base, ground->normal_base.x(), ground->normal_base.y(),
             ground->normal_base.z(), ground->inlier_count, ground->candidate_count,
             start_pose_.z);
+        ROS_INFO(
+            "localization_world_initialized scan_stamp=%.6f imu_stamp=%.6f "
+            "orientation_source=%s x=%.6f y=%.6f z=%.6f yaw=%.6f public_start_yaw=%.6f",
+            message->header.stamp.toSec(),
+            current_imu_sample.has_value() ? current_imu_sample->stamp.toSec() : 0.0,
+            current_imu_sample.has_value() ? "trunk_imu_world" : "public_start_ground",
+            world_base_matrix.translation().x(), world_base_matrix.translation().y(),
+            world_base_matrix.translation().z(),
+            std::atan2(world_base_matrix.linear()(1, 0), world_base_matrix.linear()(0, 0)),
+            start_pose_.yaw);
       }
     }
 

@@ -18,6 +18,7 @@ class EntranceGeometryConfig:
     """固定入口合同及有界质量门槛。"""
 
     enabled: bool = True
+    apply_correction: bool = False
     center_x: float = 0.0
     wall_y: float = 0.09
     opening_width: float = 2.0
@@ -108,6 +109,7 @@ class EntranceCorrectionOutcome:
     reason: str | None = None
     correction_xy: tuple[float, float] | None = None
     correction_yaw: float = 0.0
+    overlap_owner_ids: tuple[str, ...] = ()
 
 
 class EntranceGeometryCorrector:
@@ -208,6 +210,12 @@ class EntranceGeometryCorrector:
             return EntranceCorrectionOutcome("done")
         if key not in self._phase_started:
             self._phase_started[key] = float(now)
+        if not self.config.apply_correction:
+            # 观察模式一次取样，不停车、不请求定位写入，也不等待收集更多帧。
+            self._phase_done.add(key)
+            evaluation = self.evaluate(frames, floor_height=floor_height, floor=robot_floor)
+            self.last_evaluations[key] = evaluation
+            return EntranceCorrectionOutcome("done", reason="observation_only")
         if key in self._operations:
             sequence, started = self._operations[key]
             ack = pose_provider.correction_ack(sequence)
@@ -218,33 +226,42 @@ class EntranceGeometryCorrector:
                 self._operations.pop(key, None)
                 self._phase_done.add(key)
                 return EntranceCorrectionOutcome("done", reason="correction_ack_timeout")
-            self._operations.pop(key, None)
-            self._phase_done.add(key)
             if len(ack) >= 4:
                 dx, dy, correction_yaw, _ack_stamp = ack[:4]
             else:
                 dx, dy, _ack_stamp = ack[:3]
                 correction_yaw = 0.0
+            sample = pose_provider.latest()
+            if sample is None or sample.stamp <= float(_ack_stamp):
+                if float(now) - started < self.config.timeout:
+                    controller.stop(reason=f"entrance_geometry_waiting_for_pose_{key}")
+                    return EntranceCorrectionOutcome("running")
+                self._operations.pop(key, None)
+                self._phase_done.add(key)
+                return EntranceCorrectionOutcome("done", reason="corrected_pose_timeout")
+            self._operations.pop(key, None)
+            self._phase_done.add(key)
             correction_runtime = getattr(map_runtime, "apply_planar_correction", None)
+            overlap_owner_ids = ()
             if callable(correction_runtime):
-                corrected_xy = (
-                    float(robot_pose[0]) + float(dx),
-                    float(robot_pose[1]) + float(dy),
-                )
-                correction_runtime(
+                # 回执之后的 PoseProvider 样本已在新 SE(2) 坐标系，不能再平移
+                # 一次；使用实样本也避免漏掉 yaw 对机器人 XY 的旋转分量。
+                synchronized = correction_runtime(
                     float(dx),
                     float(dy),
                     correction_yaw=float(correction_yaw),
                     now=float(now),
                     robot_floor=int(robot_floor),
-                    robot_xy=corrected_xy,
+                    robot_xy=tuple(sample.xy_yaw[:2]),
                 )
+                overlap_owner_ids = tuple(synchronized.overlap_owner_ids)
             controller.clear_path(reason=f"entrance_geometry_correction_{key}_applied")
             return EntranceCorrectionOutcome(
                 "done",
                 applied=True,
                 correction_xy=(float(dx), float(dy)),
                 correction_yaw=float(correction_yaw),
+                overlap_owner_ids=overlap_owner_ids,
             )
 
         if key in self._phase_attempted:

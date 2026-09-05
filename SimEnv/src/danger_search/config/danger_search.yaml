@@ -59,6 +59,8 @@ localization:
   sparse_correction_timeout: 2.0
   # 固定主入口合同：只用于入口外墙点云的有界 XY 纠偏，不读取生成场景文件。
   entrance_geometry_enabled: true
+  # 缺少实测闭环证据，默认只观察候选，不停车、不注入绝对位姿。
+  entrance_geometry_apply_correction: false
   entrance_geometry_center_x: 0.0
   entrance_geometry_wall_y: 0.09
   entrance_geometry_opening_width: 2.0
@@ -178,6 +180,9 @@ mission:
   # 方案 C：全局时间预算参数
   # 返航安全缓冲（秒）：在 estimated_return_time 之外再预留的时间
   return_safety_buffer: 30.0
+  # 总期限包含返航；超时记失败，但允许有独立上限的安全收尾，不再发起新核验。
+  return_cleanup_timeout: 180.0
+  return_cleanup_wall_timeout: 600.0
   # 返航保守速度估计（m/s），用于估算返航时间
   return_speed_estimate: 0.4
   # 换层基础时间估计（秒）；seed=8127 正式返程实测 1→0 为 69.5 秒。
@@ -421,6 +426,8 @@ detection:
   min_radius: 0.10
   max_radius: 0.22
   max_rmse: 0.035
+  # 候选级修正只使用同楼层、同定位 epoch 且最接近 RGB 时间的 Livox 帧。
+  lidar_max_time_delta: 0.10
   ransac_iterations: 80
   ransac_sample_size: 4
   max_depth: 8.0

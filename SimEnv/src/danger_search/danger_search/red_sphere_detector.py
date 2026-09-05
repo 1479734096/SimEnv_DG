@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import random
 from typing import Sequence
@@ -54,6 +54,7 @@ class RedSphereDetector:
         min_radius: float = 0.10,
         max_radius: float = 0.22,
         max_rmse: float = 0.035,
+        lidar_max_time_delta: float = 0.10,
         min_depth: float = 0.35,
         max_depth: float = 8.0,
         ransac_iterations: int = 80,
@@ -68,6 +69,7 @@ class RedSphereDetector:
         self.min_radius = float(min_radius)
         self.max_radius = float(max_radius)
         self.max_rmse = float(max_rmse)
+        self.lidar_max_time_delta = float(lidar_max_time_delta)
         self.min_depth = float(min_depth)
         self.max_depth = float(max_depth)
         self.ransac_iterations = int(ransac_iterations)
@@ -85,6 +87,7 @@ class RedSphereDetector:
                     self.min_radius,
                     self.max_radius,
                     self.max_rmse,
+                    self.lidar_max_time_delta,
                     self.min_depth,
                     self.max_depth,
                 )
@@ -108,6 +111,7 @@ class RedSphereDetector:
         *,
         require_world_transform: bool = False,
         cloud_points: Sequence[Sequence[float]] | np.ndarray | None = None,
+        diagnostics: list[dict] | None = None,
     ) -> list[DetectionCandidate]:
         """将 ROS 图像转换为数组后进入无 ROS 依赖的检测核心。"""
         if self._bridge is None:
@@ -130,6 +134,7 @@ class RedSphereDetector:
             stamp=stamp,
             require_world_transform=require_world_transform,
             cloud_points=cloud_points,
+            diagnostics=diagnostics,
         )
 
     def detect_arrays(
@@ -142,6 +147,7 @@ class RedSphereDetector:
         stamp: float | None = None,
         require_world_transform: bool = False,
         cloud_points: Sequence[Sequence[float]] | np.ndarray | None = None,
+        diagnostics: list[dict] | None = None,
     ) -> list[DetectionCandidate]:
         """执行一帧完整检测并返回所有通过几何校验的候选。
 
@@ -225,28 +231,69 @@ class RedSphereDetector:
 
             center = sphere.center
             obs_dist = float(np.linalg.norm(sphere.center))
+            candidate_rmse = sphere.rmse
+            original_distance = obs_dist
+            refined_center = None
+            refined_dist = None
+            refined_rmse = None
+            refinement_accepted = False
+            original_center = center
             if matrix is not None:
                 center = _transform_point(matrix, center)
+                original_center = center
                 if cloud_points is not None:
-                    center, obs_dist = self._refine_center_with_lidar(
+                    refined_center, refined_dist = self._refine_center_with_lidar(
                         center=center,
                         camera_to_world=matrix,
                         cloud_points=cloud_points,
                         obs_dist=obs_dist,
+                        target_radius=self.target_radius,
                     )
+                    # 用同一批 RGB-D 内点复核新球心；邻近墙面不能借用原球体
+                    # 拟合的低 RMSE 获得正式确认资格。不一致时保留纯 RGB-D 候选。
+                    residuals = np.abs(np.linalg.norm(points - sphere.center, axis=1) - sphere.radius)
+                    inliers = points[residuals <= max(self.max_rmse * 2.0, 0.04)]
+                    if len(inliers) >= 12 and np.all(np.isfinite(refined_center)):
+                        optical_center = matrix[:3, :3].T @ (refined_center - matrix[:3, 3])
+                        refined_residuals = np.linalg.norm(inliers - optical_center, axis=1) - sphere.radius
+                        refined_rmse = float(np.sqrt(np.mean(refined_residuals ** 2)))
+                        if refined_rmse <= self.max_rmse:
+                            center, obs_dist = refined_center, refined_dist
+                            candidate_rmse = max(sphere.rmse, refined_rmse)
+                            refinement_accepted = True
             if not np.all(np.isfinite(center)):
                 continue
-            confidence = self._score_detection(contour, sphere)
+            confidence = self._score_detection(contour, replace(sphere, rmse=candidate_rmse))
             candidates.append(
                 DetectionCandidate.from_sequence(
                     center.tolist(),
                     confidence=confidence,
-                    rmse=sphere.rmse,
+                    rmse=candidate_rmse,
                     radius=sphere.radius,
                     stamp=resolved_stamp,
                     distance=obs_dist,
                 )
             )
+            if diagnostics is not None and len(diagnostics) < 8:
+                diagnostics.append({
+                    "stamp": resolved_stamp,
+                    "coordinate_frame": "world" if matrix is not None else "camera_optical",
+                    "rgbd_center": original_center.tolist(),
+                    "rgbd_distance": original_distance, "rgbd_rmse": float(sphere.rmse),
+                    "lidar_proposed_center": (
+                        refined_center.tolist()
+                        if refined_center is not None and np.all(np.isfinite(refined_center))
+                        else None
+                    ),
+                    "lidar_proposed_distance": refined_dist,
+                    "lidar_proposed_rgbd_rmse": (
+                        refined_rmse if refined_rmse is not None and math.isfinite(refined_rmse)
+                        else None
+                    ),
+                    "refinement_accepted": refinement_accepted,
+                    "final_center": center.tolist(), "final_distance": obs_dist,
+                    "final_rmse": float(candidate_rmse), "confidence": float(confidence),
+                })
         return candidates
 
     def _refine_center_with_lidar(

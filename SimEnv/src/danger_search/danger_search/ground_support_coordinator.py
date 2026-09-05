@@ -74,6 +74,7 @@ class GroundSupportCoordinator:
         self.localization_epoch = 1
         self.last_cloud_generation = 0
         self.last_cloud_stamp: float | None = None
+        self._last_hole_scope_revision = -1
         self._negative_obstacle_commit_count = 0
         if not params["production_gate_enabled"]:
             self.components = GroundSupportComponents(None, None)
@@ -424,9 +425,17 @@ class GroundSupportCoordinator:
             return
         if pose_provider is None:
             return
+        with _controller_command_transaction(controller):
+            if gate.hole_detection_exempt:
+                return
+            hole_scope_revision = gate.hole_scope_revision
         with self._scope_lock:
             if int(floor_index) != self._active_floor:
                 return
+            if self._last_hole_scope_revision != hole_scope_revision:
+                grid.invalidate_evidence()
+                self.feedback.discard_pending_batches()
+                self._last_hole_scope_revision = hole_scope_revision
             frame_scope = (
                 int(floor_index),
                 int(self._map_epochs.get(int(floor_index), 1)),
@@ -609,6 +618,8 @@ class GroundSupportCoordinator:
             ),
         )
         with _controller_command_transaction(controller), self._scope_lock:
+            if gate.hole_detection_exempt or gate.hole_scope_revision != hole_scope_revision:
+                return
             current_scope = (
                 self._active_floor,
                 self._map_epochs.get(self._active_floor, 1),

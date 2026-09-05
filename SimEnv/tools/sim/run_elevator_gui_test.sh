@@ -26,6 +26,8 @@ ELEVATOR_TEST_KEEP_RUNNING="${ELEVATOR_TEST_KEEP_RUNNING:-0}"
 ELEVATOR_TEST_FULL_CYCLE="${ELEVATOR_TEST_FULL_CYCLE:-1}"
 ELEVATOR_TEST_RECORD_DRIFT="${ELEVATOR_TEST_RECORD_DRIFT:-0}"
 ELEVATOR_TEST_RECORD_RGBD="${ELEVATOR_TEST_RECORD_RGBD:-0}"
+ELEVATOR_TEST_RGBD_MAX_SIZE_MB="${ELEVATOR_TEST_RGBD_MAX_SIZE_MB:-16384}"
+ELEVATOR_TEST_RGBD_MAX_WALL_SECONDS="${ELEVATOR_TEST_RGBD_MAX_WALL_SECONDS:-7200}"
 ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH="${ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH:-0}"
 ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS="${ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS:-0}"
 ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS="${ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS:-0}"
@@ -47,6 +49,9 @@ MASTER_PID=""
 GAZEBO_PID=""
 BAG_PID=""
 RGBD_BAG_PID=""
+RGBD_RECORDING_STATE="disabled"
+DRIFT_RECORDING_STATE="disabled"
+RGBD_RECORDING_STARTED_WALL=0
 RUNTIME_DIR=""
 RESULT="未完成"
 DETAIL="脚本提前退出"
@@ -72,7 +77,9 @@ usage() {
   ELEVATOR_GO_TO_DOOR_STALL_WALL=120   厅外导航无路径墙钟超时（秒）
   ELEVATOR_TEST_FULL_CYCLE=1            继续验证返程电梯与主入口退出
   ELEVATOR_TEST_RECORD_DRIFT=1          录制自身定位、控制和姿态诊断 bag
-  ELEVATOR_TEST_RECORD_RGBD=1           额外录制 RGB-D 供失败后离线重放
+  ELEVATOR_TEST_RECORD_RGBD=1           从任务启动持续录制隔离 RGB-D 诊断数据
+  ELEVATOR_TEST_RGBD_MAX_SIZE_MB=16384   单包容量上限（MB），达到后只停止录包
+  ELEVATOR_TEST_RGBD_MAX_WALL_SECONDS=7200  录包墙钟上限，达到后只停止录包
   ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1  同时录制真值供运行结束后离线漂移评估
   ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=1  启用逐帧定位日志并在诊断 bag 录制 /scan
   ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS=1  启用只读电梯地标漂移诊断
@@ -157,6 +164,10 @@ write_summary() {
     printf 'full_cycle=%s\n' "$ELEVATOR_TEST_FULL_CYCLE"
     printf 'record_drift=%s\n' "$ELEVATOR_TEST_RECORD_DRIFT"
     printf 'record_rgbd=%s\n' "$ELEVATOR_TEST_RECORD_RGBD"
+    printf 'rgbd_recording_state=%s\n' "$RGBD_RECORDING_STATE"
+    printf 'drift_recording_state=%s\n' "$DRIFT_RECORDING_STATE"
+    printf 'rgbd_max_size_mb=%s\n' "$ELEVATOR_TEST_RGBD_MAX_SIZE_MB"
+    printf 'rgbd_max_wall_seconds=%s\n' "$ELEVATOR_TEST_RGBD_MAX_WALL_SECONDS"
     printf 'offline_truth=%s\n' "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH"
     printf 'localization_diagnostics=%s\n' "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS"
     printf 'landmark_drift_diagnostics=%s\n' "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS"
@@ -178,21 +189,49 @@ write_summary() {
   } > "$LOG_DIR/TEST_SUMMARY.txt"
 }
 
+stop_recording() {
+  local pid_variable="$1" state_variable="$2" reason="$3" stop_started=$SECONDS
+  local recorder_pid="${!pid_variable}"
+  if [[ ! "$recorder_pid" =~ ^[0-9]+$ ]]; then
+    return
+  fi
+  terminate_group "$recorder_pid" INT
+  while kill -0 "$recorder_pid" 2>/dev/null && (( SECONDS - stop_started < 10 )); do
+    sleep 1
+  done
+  if kill -0 "$recorder_pid" 2>/dev/null; then
+    terminate_group "$recorder_pid" TERM
+    reason="${reason}_forced_stop"
+    sleep 1
+  fi
+  if kill -0 "$recorder_pid" 2>/dev/null; then
+    terminate_group "$recorder_pid" KILL
+    sleep 1
+  fi
+  if kill -0 "$recorder_pid" 2>/dev/null; then
+    # 不可中断的磁盘 I/O 可能使 KILL 也不能立即退出，不再无界 wait。
+    reason="${reason}_exit_unconfirmed"
+  else
+    wait "$recorder_pid" 2>/dev/null || true
+    printf -v "$pid_variable" '%s' ""
+  fi
+  printf -v "$state_variable" '%s' "$reason"
+  log "录包停止处理：$pid_variable=$recorder_pid $reason；保留 bag/active 原件"
+}
+
+stop_rgbd_recording() {
+  stop_recording RGBD_BAG_PID RGBD_RECORDING_STATE "$1"
+}
+
 cleanup() {
   local exit_code=$?
   trap - EXIT
   terminate_node_list "$MISSION_NODE_PIDS" INT
   terminate_group "$MISSION_PID" INT
-  terminate_group "$RGBD_BAG_PID" INT
   terminate_group "$BAG_PID" INT
-  sleep 1
-  if [[ "$RGBD_BAG_PID" =~ ^[0-9]+$ ]]; then
-    wait "$RGBD_BAG_PID" 2>/dev/null || true
-  fi
-  if [[ "$BAG_PID" =~ ^[0-9]+$ ]]; then
-    wait "$BAG_PID" 2>/dev/null || true
-  fi
-  if [[ "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" == "1" && \
+  stop_rgbd_recording "task_ended"
+  stop_recording BAG_PID DRIFT_RECORDING_STATE "task_ended"
+  if [[ -z "$BAG_PID" && "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" == "1" && \
         -f "$LOG_DIR/elevator_diagnostic.bag" ]]; then
     python3 "$WORKSPACE_ROOT/tools/offline/analyze_localization_drift_bag.py" \
       "$LOG_DIR/elevator_diagnostic.bag" \
@@ -200,7 +239,7 @@ cleanup() {
       --json "$LOG_DIR/localization_drift.json" \
       > "$LOG_DIR/localization_drift.log" 2>&1 || true
   fi
-  if [[ "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" == "1" && \
+  if [[ -z "$BAG_PID" && "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" == "1" && \
         "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" == "1" && \
         -f "$LOG_DIR/elevator_diagnostic.bag" ]]; then
     python3 "$WORKSPACE_ROOT/tools/offline/analyze_localization_quality_bag.py" \
@@ -211,7 +250,7 @@ cleanup() {
       --json "$LOG_DIR/localization_quality.json" \
       > "$LOG_DIR/localization_quality.log" 2>&1 || true
   fi
-  if [[ "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS" == "1" && \
+  if [[ -z "$BAG_PID" && "$ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS" == "1" && \
         -f "$LOG_DIR/mission.log" && \
         -f "$LOG_DIR/localization_drift.csv" && \
         -f "$LOG_DIR/localization_drift.json" ]]; then
@@ -352,6 +391,12 @@ for flag in "$ELEVATOR_TEST_RECORD_DRIFT" "$ELEVATOR_TEST_RECORD_RGBD" "$ELEVATO
     exit 2
   fi
 done
+for limit in "$ELEVATOR_TEST_RGBD_MAX_SIZE_MB" "$ELEVATOR_TEST_RGBD_MAX_WALL_SECONDS"; do
+  if [[ ! "$limit" =~ ^[1-9][0-9]{0,5}$ ]]; then
+    printf 'RGB-D 容量和墙钟上限必须是 1 至 999999 的整数：%s\n' "$limit" >&2
+    exit 2
+  fi
+done
 if [[ "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" == "1" && "$ELEVATOR_TEST_RECORD_DRIFT" != "1" ]]; then
   printf '启用离线真值时必须同时设置 ELEVATOR_TEST_RECORD_DRIFT=1\n' >&2
   exit 2
@@ -386,7 +431,7 @@ if [[ "$ELEVATOR_TEST_RECORD_DRIFT" == "1" ]]; then
   done
 fi
 if [[ "$ELEVATOR_TEST_RECORD_RGBD" == "1" ]]; then
-  for command_name in rosbag rosnode; do
+  for command_name in rosbag rosnode stat; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
       printf '缺少 RGB-D 诊断命令：%s\n' "$command_name" >&2
       exit 2
@@ -500,6 +545,22 @@ setsid roslaunch danger_search danger_search.launch \
   > "$MISSION_LOG" 2>&1 &
 MISSION_PID=$!
 
+if [[ "$ELEVATOR_TEST_RECORD_RGBD" == "1" ]]; then
+  # 单包到容量上限自然退出，不循环分片、不覆盖旧证据，也不再以注册电梯为终点。
+  setsid rosbag record --buffsize=256 --size="$ELEVATOR_TEST_RGBD_MAX_SIZE_MB" \
+    -O "$LOG_DIR/elevator_rgbd.bag" \
+    /real_sense/rgb/image_raw/compressed \
+    /real_sense/depth/image_raw \
+    /real_sense/rgb/camera_info \
+    /real_sense/depth/camera_info \
+    /danger_search/localization/odom \
+    > "$LOG_DIR/rgbd_rosbag.log" 2>&1 &
+  RGBD_BAG_PID=$!
+  RGBD_RECORDING_STARTED_WALL=$SECONDS
+  RGBD_RECORDING_STATE="recording"
+  log "已启动有界全任务 RGB-D 录包：${ELEVATOR_TEST_RGBD_MAX_SIZE_MB} MB / ${ELEVATOR_TEST_RGBD_MAX_WALL_SECONDS} 墙钟秒"
+fi
+
 if [[ "$ELEVATOR_TEST_RECORD_DRIFT" == "1" ]]; then
   bag_topics=(
     /danger_search/localization/odom
@@ -523,6 +584,7 @@ if [[ "$ELEVATOR_TEST_RECORD_DRIFT" == "1" ]]; then
     "${bag_topics[@]}" \
     > "$LOG_DIR/rosbag.log" 2>&1 &
   BAG_PID=$!
+  DRIFT_RECORDING_STATE="recording"
   log "已启动隔离诊断录包；真值仅供运行结束后离线评估"
 fi
 
@@ -558,27 +620,30 @@ registration_reported=0
 change_floor_reported=0
 go_to_door_stall_started=0
 upward_complete=0
-rgbd_recording_started=0
 last_elapsed=""
 sim_stall_started=0
 mission_wrapper_exit_reported=0
 
 while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
-  if [[ "$ELEVATOR_TEST_RECORD_RGBD" == "1" ]] && \
-     (( rgbd_recording_started == 0 )) && \
-     grep -Fq "开始一次全向 RGB-D 电梯门地标扫描" "$MISSION_LOG"; then
-    # 只录扫描窗口，避免把全程原始深度写入磁盘；独立 rosbag 不进入生产输入链。
-    setsid rosbag record --buffsize=256 \
-      -O "$LOG_DIR/elevator_rgbd.bag" \
-      /real_sense/rgb/image_raw/compressed \
-      /real_sense/depth/image_raw \
-      /real_sense/rgb/camera_info \
-      /real_sense/depth/camera_info \
-      /danger_search/localization/odom \
-      > "$LOG_DIR/rgbd_rosbag.log" 2>&1 &
-    RGBD_BAG_PID=$!
-    rgbd_recording_started=1
-    log "电梯扫描已开始，启动隔离 RGB-D 诊断录包"
+  if [[ "$RGBD_BAG_PID" =~ ^[0-9]+$ ]]; then
+    if ! kill -0 "$RGBD_BAG_PID" 2>/dev/null; then
+      rgbd_exit=0
+      wait "$RGBD_BAG_PID" 2>/dev/null || rgbd_exit=$?
+      rgbd_bytes="$(stat -c %s "$LOG_DIR/elevator_rgbd.bag" 2>/dev/null || printf 0)"
+      if [[ "$RGBD_RECORDING_STATE" == "recording" ]]; then
+        RGBD_RECORDING_STATE="recorder_exited_${rgbd_exit}"
+        if (( rgbd_exit == 0 && rgbd_bytes >= ELEVATOR_TEST_RGBD_MAX_SIZE_MB * 1024 * 1024 )); then
+          RGBD_RECORDING_STATE="size_limit"
+        fi
+      else
+        RGBD_RECORDING_STATE="${RGBD_RECORDING_STATE}_exit_${rgbd_exit}"
+      fi
+      RGBD_BAG_PID=""
+      log "RGB-D 录包已停止：$RGBD_RECORDING_STATE；任务继续，详见 rgbd_rosbag.log"
+    elif [[ "$RGBD_RECORDING_STATE" == "recording" ]] && \
+         (( SECONDS - RGBD_RECORDING_STARTED_WALL >= ELEVATOR_TEST_RGBD_MAX_WALL_SECONDS )); then
+      stop_rgbd_recording "wall_limit"
+    fi
   fi
   if [[ "$ELEVATOR_TEST_FULL_CYCLE" == "1" ]] && \
      grep -F '"event": "mission_result_write"' "$MISSION_LOG" 2>/dev/null | \
@@ -608,12 +673,6 @@ while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
   if (( registration_reported == 0 )) && \
      grep -Fq "局部传感器连续确认电梯候选并注册运行期竖井几何" "$MISSION_LOG"; then
     registration_reported=1
-    if [[ "$RGBD_BAG_PID" =~ ^[0-9]+$ ]]; then
-      terminate_group "$RGBD_BAG_PID" INT
-      wait "$RGBD_BAG_PID" 2>/dev/null || true
-      RGBD_BAG_PID=""
-      log "电梯注册完成，停止 RGB-D 扫描窗口录包"
-    fi
     log "电梯视觉注册成功"
   fi
 

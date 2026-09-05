@@ -331,6 +331,8 @@ _CONFIG_GROUP_FIELDS = {
             "return_home_max_stuck_retries",
             "return_home_veto_lookahead",
             "return_safety_buffer",
+            "return_cleanup_timeout",
+            "return_cleanup_wall_timeout",
             "return_speed_estimate",
         }
     ),
@@ -533,6 +535,12 @@ class _MissionConfigBuilder:
 
         # 方案 C：全局时间预算参数
         self.return_safety_buffer = float(_param("mission/return_safety_buffer", 30.0))
+        self.return_cleanup_timeout = float(_param("mission/return_cleanup_timeout", 180.0))
+        self.return_cleanup_wall_timeout = float(_param("mission/return_cleanup_wall_timeout", 600.0))
+        if any(not math.isfinite(value) or value <= 0.0 for value in (
+            self.return_cleanup_timeout, self.return_cleanup_wall_timeout,
+        )):
+            raise ValueError("超时返航收尾的任务时钟和墙钟上限必须为有限正数")
         self.return_speed_estimate = float(_param("mission/return_speed_estimate", 0.35))
         self.floor_change_time_estimate = float(_param("mission/floor_change_time_estimate", 70.0))
         self.floor_finish_time_ratio = float(_param("mission/floor_finish_time_ratio", 0.75))
@@ -1131,6 +1139,7 @@ class _MissionConfigBuilder:
             "min_radius": float(_param("detection/min_radius", 0.10)),
             "max_radius": float(_param("detection/max_radius", 0.22)),
             "max_rmse": float(_param("detection/max_rmse", 0.035)),
+            "lidar_max_time_delta": float(_param("detection/lidar_max_time_delta", 0.10)),
             "ransac_iterations": int(_param("detection/ransac_iterations", 80)),
             "ransac_sample_size": int(_param("detection/ransac_sample_size", 4)),
             "min_depth": float(_param("detection/min_depth", 0.35)),
@@ -1366,6 +1375,7 @@ class _MissionConfigBuilder:
         )
         self.entrance_geometry_config = EntranceGeometryConfig(
             enabled=bool(_param("localization/entrance_geometry_enabled", True)),
+            apply_correction=bool(_param("localization/entrance_geometry_apply_correction", False)),
             center_x=float(_param("localization/entrance_geometry_center_x", 0.0)),
             wall_y=float(_param("localization/entrance_geometry_wall_y", 0.09)),
             opening_width=float(_param("localization/entrance_geometry_opening_width", 2.0)),

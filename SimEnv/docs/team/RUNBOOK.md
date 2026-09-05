@@ -86,9 +86,9 @@ roslaunch danger_search danger_search.launch \
 
 ## 路径执行与安全门运行约束
 
-普通导航先由安全门确认新鲜、充足支撑；支撑边界不足时当前 tick 和后续保活均发布零速。电梯
-`ENTER_CABIN/EXIT_CABIN` 的 `CROSS` 阶段是已确认无空洞的受控门槛通道，允许暂时跳过支撑边界
-判定，但速度包络和显式 DROP 仍必须停车，CROSS 结束后恢复检测。
+高层普通导航保留地面支撑门。按用户保证，0 层及 `ENTER_CABIN/EXIT_CABIN` 的 `CROSS`
+不检测空洞，也不依据显式 DROP 停车；高层 CROSS 结束后必须用新证据恢复检测。
+实体障碍、速度包络、定位与站立健康不豁免；换层歧义不能仅凭旧 current_floor=0 放行。
 
 定位默认速度死区是线速度 `0.05 m/s`、角速度 `0.03 rad/s`。`GroundSupportGateConfig` 必须显式保持停稳阈值不小于这两个值；若后续调整定位死区，必须同步审阅动态停车逻辑。
 
@@ -171,14 +171,15 @@ SETUPTOOLS_USE_DISTUTILS=stdlib catkin_make install
 ## 2026-09-05 接手后的运行前提
 
 本次没有启动仿真或回归，结论见[静态审查报告](../../reports/DANGER_PRIORITY_STATIC_REVIEW_20260905.md)。
-风险1/2已做代码修复，但完整预算、CROSS阶段切换/支撑新鲜度及入口纠偏回执边界尚未闭合；
+风险1/2和后续确定性缺陷已做代码修复；预算仍依赖返航估计，门区定位和实际出梯未验证，
 不能据此宣称全链可运行或直接安排下一轮自动runner。
 
 核验参数：`mission/danger_inspection_timeout=30.0`（单次总计）、
 `mission/danger_verification_timeout=5.0`、`mission/danger_verification_min_hits=2`、
 `mission/danger_verification_min_observation_span=0.08`、
 `mission/danger_inspection_retry_cooldown=5.0`、`tracker/inspection_max_attempts=3`。
-尝试上限包括规划失败，耗尽后保留正式确认结果，继续普通任务；该上限不构成返航时间预留。
+尝试上限包括规划失败，耗尽后保留正式确认结果，继续普通任务。探索核验准入另预留单次
+总上限、接近路线折返时间、返航估计和缓冲；返航途中核验不预扣，仍有单次上限和尝试上限。
 定位ready在120秒墙钟未到达时启动失败，释放订阅、不创建任务，不要将此出口记为探索失败闭环。
 
 若用户后续安排人工运行，按同轮证据核对：
@@ -194,3 +195,60 @@ SETUPTOOLS_USE_DISTUTILS=stdlib catkin_make install
    话题清单。轮4没有独立RGB-D bag，旧diagnostic bag也没有注册点云/地图，不能据此证明时空融合。
 6. 结果必须同时检查Confirmed+NMS、failure reason、outcome、return_home与楼层退出证书；
    门口/轿厢内失败保存JSON是部分结果，不是完成搜索返航。
+
+新增配置与观察合同：
+
+- `localization/entrance_geometry_apply_correction=false`：默认只观察候选，不等待、不注入。
+  `entrance_geometry_correction_evaluated` 的 accepted 不等于 applied；缺少帧会记录 insufficient_frames。
+- `detection/lidar_max_time_delta=0.10`：同楼层和查询 epoch 选最近云；查看限频事件
+  `rgbd_livox_time_match` 的 RGB/深度/pose/cloud stamp、time_delta、epoch。cloud_stamp=null
+  表示没有时间匹配云，仍可使用合法 RGB-D 候选。
+- `mission/return_cleanup_timeout=180.0`、`return_cleanup_wall_timeout=600.0`：名义总期限到达
+  后停止新核验，完成当前流程再返航；独立上限耗尽则停车写失败部分结果。到家但已超时仍失败，
+  不允许通过放宽结果判定掩盖 `mission_timeout`。
+- GroundSupport 日志增加 `hole_exemption_reason` 和 `hole_scope_revision`；高层 POSITION、ALIGN、
+  EXIT_BACKOFF、普通导航不得因之前的 CROSS 沿用豁免，速度异常锁存不随阶段改变消失。
+
+## 9.5.20.25 后的人工取证约定
+
+本轮结论见[证据报告](../../reports/RUN_20260905_2025_REVIEW.md)。本次未执行仿真或验证脚本。
+用户另行安排运行时：
+
+1. 保存 `localization_world_initialized`，核对 scan/IMU stamp、orientation_source、初始 XY/yaw。
+   正式路径应为 `trunk_imu_world`；入口默认观察，不能期待 applied 或 epoch 跳变。
+2. 观察 `elevator_service_started/finished/timeout`、`elevator_cabin_turn_completed/failed`、
+   `elevator_door_open_confirmed`。目标开门请求必须在换层服务成功后发起，不再等调头完成；
+   出梯仍要开口和对准均通过。异步不等于同时发起互相冲突的门/换层请求。
+3. `danger_inspection_phase` 应呈现 IDLE→APPROACHING→ALIGNING→VERIFYING→IDLE，
+   失败进入 IDLE 时保留原因。结合 `danger_perception_summary` 的修正前后坐标、质量及时间戳
+   分析跳变；摘要限频且截断，不代表全部候选或完整图像证据。
+4. `ELEVATOR_TEST_RECORD_RGBD=1` 现在从任务启动持续录包，默认
+   `ELEVATOR_TEST_RGBD_MAX_SIZE_MB=16384`、`ELEVATOR_TEST_RGBD_MAX_WALL_SECONDS=7200`。
+   达到任一上限只停 RGB-D 录包，不循环分片或删除旧包；容量可能超出最后一条消息大小，
+   墙钟检查有 runner 轮询延迟。`TEST_SUMMARY.txt` 记录 `rgbd_recording_state`；强制停止可能
+   留下 `.active`，保留原件。录包启用不代表已经覆盖全程，仍须检查起止时间和退出原因。
+5. 漂移 JSON 原有顶层字段继续表示首帧 SE(2) 对齐后的相对漂移；新增 `absolute_world`
+   表示原始 world XY/yaw 误差，角度单位弧度。CSV 新增 `absolute_*` 列；不要混用两种指标。
+   这些真值比较只能在任务结束后离线进行，结果不得用于当次定位或重写危险源坐标。
+
+### 续审修复与构建记录
+
+已构建 `scan_localization_node`（未执行任何测试目标）：
+
+```bash
+source /opt/ros/noetic/setup.bash
+cmake --build build --target scan_localization_node -- -j2
+```
+
+以上命令复用本工作区既有 CMake 配置，产物为
+`devel/lib/danger_search_localization/scan_localization_node`。本次编译和链接成功，未启动节点。
+
+- 主门请求查看 `door_service_started/finished/timeout`；超时30秒任务时间或180秒墙钟，
+  `request_cancelled=false` 表示不能据客户端超时推定门动画已取消。返航不能重新打开失败门。
+- 门前对准看 `elevator_door_alignment_timeout` 或 `elevator_door_alignment_retry_exhausted`；
+  单阶段12秒任务时间/180秒墙钟，漂移重启最多3次，不因重启而刷新计时。
+- 关闭局部穿越几何时，出梯直线预检仅忽略负障碍；应仍能被实际 OCC/BLACK 挡住。
+- `TEST_SUMMARY.txt` 同时保存 `rgbd_recording_state` 和 `drift_recording_state`。
+  `_forced_stop` 表示使用过 TERM/KILL，`_exit_unconfirmed` 表示仍无法确认退出；不要把这类
+  包当作完整证据，也不要删除 `.active`。每个停止过程约12秒内结束轮询，不保证操作系统能
+  立即终止不可中断 I/O。旧离线分析工具本身的耗时不包含在这12秒内。

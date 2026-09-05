@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import math
+import time
 from typing import TYPE_CHECKING
 
 try:
@@ -99,6 +100,8 @@ class OpenDoorAndPass(NavigationTask):
     _PASS_ALIGN_TIMEOUT = 12.0
     # 细对准期间允许的位置漂移半径：原地转向不应移动，超出即认为锚点失效。
     _PASS_ALIGN_ANCHOR_RADIUS = 0.30
+    _SERVICE_TIMEOUT = 30.0
+    _SERVICE_WALL_TIMEOUT = 180.0
 
     def __init__(self, door_id: str, *, pass_offset: float = 0.8, commit_distance: float = 1.8):
         door_id = str(door_id).strip()
@@ -118,6 +121,9 @@ class OpenDoorAndPass(NavigationTask):
         self._pass_point: tuple[float, float] | None = None
         self._commit_point: tuple[float, float] | None = None
         self._service_task: AsyncServiceCall | None = None
+        self._service_started_at = 0.0
+        self._service_started_wall = 0.0
+        self.failure_reason: str | None = None
         self._retry_count = 0
         self._last_navigation_blocked = False
         self._last_navigation_stuck = False
@@ -259,6 +265,10 @@ class OpenDoorAndPass(NavigationTask):
         if self.phase == "REFRESH_OPENING":
             correction = context.correct_entrance_geometry("before_pass", pose)
             if correction is not None:
+                if getattr(correction, "reason", None) in {
+                    "correction_ack_timeout", "corrected_pose_timeout",
+                } or getattr(correction, "overlap_owner_ids", ()):
+                    return FAILED
                 if getattr(correction, "status", None) == RUNNING:
                     context.controller.stop(reason="entrance_geometry_before_pass")
                     return RUNNING
@@ -711,16 +721,42 @@ class OpenDoorAndPass(NavigationTask):
         return RUNNING
 
     def _run_service(self, context: NavigationTaskContext, task_factory) -> str:
+        if self.failure_reason == "door_service_timeout":
+            return FAILED
         if self._service_task is None:
+            context.controller.clear_path(reason="door_service_wait")
             self._service_task = task_factory()
+            self._service_started_at = get_time()
+            self._service_started_wall = time.monotonic()
+            context.log_structured({
+                "event": "door_service_started", "door_id": self.door_id,
+                "phase": self.phase, "attempt": self._retry_count + 1,
+            })
             return RUNNING
 
         if not self._service_task.done():
+            if (
+                get_time() - self._service_started_at > self._SERVICE_TIMEOUT
+                or time.monotonic() - self._service_started_wall > self._SERVICE_WALL_TIMEOUT
+            ):
+                # 未收到响应不能推定环境动作已取消，不清空任务并重发请求。
+                self.failure_reason = "door_service_timeout"
+                context.log_structured({
+                    "event": "door_service_timeout", "door_id": self.door_id,
+                    "elapsed": get_time() - self._service_started_at,
+                    "wall_elapsed": time.monotonic() - self._service_started_wall,
+                    "request_cancelled": False,
+                })
+                return self._fail_crossing(context, self.failure_reason)
             context.controller.stop()
             return RUNNING
 
         ok = self._service_task.ok()
         message = self._service_task.message()
+        context.log_structured({
+            "event": "door_service_finished", "door_id": self.door_id,
+            "ok": bool(ok), "elapsed": get_time() - self._service_started_at,
+        })
         if not ok:
             if rospy is not None:
                 rospy.logwarn(f"[{self.name}] 服务失败：{message}")
@@ -730,8 +766,8 @@ class OpenDoorAndPass(NavigationTask):
                     rospy.loginfo(f"[{self.name}] 正在重试 ({self._retry_count}/1)...")
                 self._service_task = None
                 return RUNNING
-            context.record_failure(f"开门服务失败: {message}")
-            return FAILED
+            self.failure_reason = "door_service_failed"
+            return self._fail_crossing(context, f"开门服务失败: {message}")
 
         self._service_task = None
         self._retry_count = 0
@@ -803,6 +839,8 @@ class TakeElevator(NavigationTask):
     _DEFAULT_WAIT_STANDOFF = 0.8
     _DEFAULT_REFRESH_STANDOFF = 1.2
     _CABIN_TURN_TIMEOUT = 12.0
+    _SERVICE_TIMEOUT = 30.0
+    _SERVICE_WALL_TIMEOUT = 180.0
 
     def __init__(self, current_floor: int, target_floor: int, elevator_id: str = "elevator_main"):
         current_floor = int(current_floor)
@@ -829,6 +867,12 @@ class TakeElevator(NavigationTask):
         self._cabin_transit_goal_grace = 0
         self._cabin_turn_completed = False
         self._cabin_turn_wait_start: float | None = None
+        self._door_alignment_phase: str | None = None
+        self._door_alignment_started_at = 0.0
+        self._door_alignment_started_wall = 0.0
+        self._door_alignment_drift_retries = 0
+        self._service_started_at = 0.0
+        self._service_started_wall = 0.0
         self._exit_backoff_target_xy: tuple[float, float] | None = None
         self._exit_backoff_start_xy: tuple[float, float] | None = None
         self._exit_backoff_direction: tuple[float, float] | None = None
@@ -1217,6 +1261,14 @@ class TakeElevator(NavigationTask):
                 return FAILED
             return RUNNING
 
+        if self.phase in {
+            "CLOSE_CURRENT_FLOOR_DOOR", "CALL_ELEVATOR_TO_TARGET_FLOOR",
+            "OPEN_TARGET_FLOOR_DOOR", "WAIT_TARGET_DOOR_OPEN",
+            "RETRY_TARGET_DOOR_SENSOR_REFRESH",
+        }:
+            if self._tick_parallel_cabin_turn(context, pose, target_wait) == FAILED:
+                return FAILED
+
         if self.phase == "CLOSE_CURRENT_FLOOR_DOOR":
             status = self._run_service(
                 context,
@@ -1225,13 +1277,6 @@ class TakeElevator(NavigationTask):
             )
             if status == FAILED:
                 return FAILED
-            # 关门期间并行推进轿厢内对准
-            if not self._cabin_turn_completed:
-                aligned = self._tick_target_door_alignment(context, pose, target_wait)
-                if aligned:
-                    if self.failure_reason is not None:
-                        return FAILED
-                    self._cabin_turn_completed = True
             if status == DONE:
                 # 关门完成立即发起升梯，调头在升梯过程中继续并行完成，消除 0 层静止空等
                 self.phase = "CALL_ELEVATOR_TO_TARGET_FLOOR"
@@ -1250,13 +1295,6 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         if self.phase == "CALL_ELEVATOR_TO_TARGET_FLOOR":
-            # 升梯期间在后台继续推进对准目标门
-            if not self._cabin_turn_completed:
-                aligned = self._tick_target_door_alignment(context, pose, target_wait)
-                if aligned:
-                    if self.failure_reason is not None:
-                        return FAILED
-                    self._cabin_turn_completed = True
             if not self._floor_transition_started:
                 try:
                     context.begin_floor_transition(
@@ -1271,38 +1309,14 @@ class TakeElevator(NavigationTask):
                 self._floor_transition_started = True
             status = self._run_service(
                 context,
-                # 目标层也必须先保持门关闭；仅在轿厢内调头完成后由
-                # OPEN_TARGET_FLOOR_DOOR 显式开门，便于传感器确认开口。
+                # 服务完成后立即显式开目标门；开门与调头并行，出梯再汇合。
                 lambda: client.call_elevator(self.elevator_id, self.target_floor, False),
                 hold_position=False,
             )
             if status == FAILED:
                 return FAILED
             if status == DONE:
-                if not self._cabin_turn_completed:
-                    self.phase = "WAIT_CABIN_TURN_COMPLETE"
-                    self._cabin_turn_wait_start = get_time()
-                else:
-                    self.phase = "OPEN_TARGET_FLOOR_DOOR"
-            return RUNNING
-
-        if self.phase == "WAIT_CABIN_TURN_COMPLETE":
-            if not self._cabin_turn_completed:
-                aligned = self._tick_target_door_alignment(context, pose, target_wait)
-                if aligned:
-                    if self.failure_reason is not None:
-                        return FAILED
-                    self._cabin_turn_completed = True
-                elif (
-                    self._cabin_turn_wait_start is not None
-                    and get_time() - self._cabin_turn_wait_start > self._CABIN_TURN_TIMEOUT
-                ):
-                    self.failure_reason = "elevator_cabin_turn_timeout"
-                    context.record_failure(self.failure_reason)
-                    if rospy is not None:
-                        rospy.logerr("[%s] 轿厢内调头超时（>%.1fs）", self.name, self._CABIN_TURN_TIMEOUT)
-                    return FAILED
-            if self._cabin_turn_completed:
+                self._cabin_turn_wait_start = get_time()
                 self.phase = "OPEN_TARGET_FLOOR_DOOR"
             return RUNNING
 
@@ -1317,7 +1331,9 @@ class TakeElevator(NavigationTask):
 
         if self.phase == "OPEN_TARGET_FLOOR_DOOR":
             self._begin_door_open_confirmation(context, target_door_id)
-            status = self._run_service(context, lambda: client.open_door(target_door_id))
+            status = self._run_service(
+                context, lambda: client.open_door(target_door_id), hold_position=False
+            )
             if status == FAILED:
                 self._finish_door_open_confirmation(context, target_door_id)
                 return FAILED
@@ -1328,7 +1344,6 @@ class TakeElevator(NavigationTask):
 
         if self.phase == "RETRY_TARGET_DOOR_SENSOR_REFRESH":
             # 目标层时机器人必须留在轿厢内；只等待新鲜局部观测后重新开门。
-            context.controller.stop(reason="elevator_target_door_retry_refresh")
             if not self._retry_sensor_is_fresh(context):
                 if self._retry_refresh_expired(context):
                     return self._fail_door_confirmation_exhausted(
@@ -1340,7 +1355,6 @@ class TakeElevator(NavigationTask):
             return RUNNING
 
         if self.phase == "WAIT_TARGET_DOOR_OPEN":
-            context.controller.stop(reason="elevator_wait_target_door_open")
             if not self._door_opening_is_confirmed(
                 context,
                 target_door_id,
@@ -1357,6 +1371,8 @@ class TakeElevator(NavigationTask):
                         context, target_door_id, target=True
                     )
                 return RUNNING
+            if not self._cabin_turn_completed:
+                return RUNNING
             if not self._floor_transition_confirmed:
                 try:
                     context.confirm_floor_transition(self.target_floor)
@@ -1370,10 +1386,11 @@ class TakeElevator(NavigationTask):
                 return RUNNING
             grid = context.mapper.floor(self.target_floor)
             straight_segment_blocked = _segment_crosses_blocked_cell(
-                grid,
+                # 这里只预检即将 CROSS 的直线段，不豁免当前对准或普通导航。
+                grid.without_negative_obstacles(),
                 cabin_center,
                 target_wait,
-                constraints=context.planning_constraints,
+                constraints=None,
             )
             if not straight_segment_blocked:
                 self._reset_cabin_transit()
@@ -1403,10 +1420,11 @@ class TakeElevator(NavigationTask):
                         goal_cell,
                         goal_value,
                     )
-            if self.phase == "WAIT_TARGET_DOOR_OPEN" and get_time() - self._wait_start_time > 10.0:
-                if rospy is not None:
-                    rospy.logwarn("[%s] 等待目标楼层电梯门可通行超时，继续等待地图连通", self.name)
-                self._wait_start_time = get_time()
+            if self.phase == "WAIT_TARGET_DOOR_OPEN" and get_time() - self._wait_start_time > self._SERVICE_TIMEOUT:
+                return self._fail_navigation(
+                    context, "elevator_target_exit_blocked_timeout",
+                    "目标门已开放，但出梯正障碍检查持续不通过",
+                )
             return RUNNING
 
         if self.phase == "REFRESH_TARGET_OPEN_CROSSING":
@@ -1699,6 +1717,10 @@ class TakeElevator(NavigationTask):
         if not context.confirm_elevator_door_open(door_id, pose):
             return False
         self._door_open_confirmed.add(door_id)
+        context.log_structured({
+            "event": "elevator_door_open_confirmed", "door_id": str(door_id),
+            "phase": self.phase, "cabin_turn_completed": self._cabin_turn_completed,
+        })
         _clear_opened_door_area(context, door_id)
         self._finish_door_open_confirmation(context, door_id)
         return True
@@ -1706,6 +1728,39 @@ class TakeElevator(NavigationTask):
     def _finish_door_open_confirmation(self, context: NavigationTaskContext, door_id: str) -> None:
         context.finish_elevator_door_open_confirmation(door_id)
         self._door_confirmation_started.discard(door_id)
+
+    def _tick_parallel_cabin_turn(
+        self,
+        context: NavigationTaskContext,
+        pose: tuple[float, float, float],
+        target_wait: tuple[float, float],
+    ) -> str:
+        if self._cabin_turn_completed:
+            context.controller.stop(reason="elevator_cabin_turn_completed")
+            return DONE
+        aligned = self._tick_target_door_alignment(context, pose, target_wait)
+        if aligned and self.failure_reason is None:
+            self._cabin_turn_completed = True
+            context.log_structured({
+                "event": "elevator_cabin_turn_completed", "phase": self.phase,
+                "target_floor": self.target_floor, "pose": list(pose),
+            })
+            return DONE
+        if (
+            self._cabin_turn_wait_start is not None
+            and get_time() - self._cabin_turn_wait_start > self._CABIN_TURN_TIMEOUT
+        ):
+            self.failure_reason = "elevator_cabin_turn_timeout"
+        if self.failure_reason is not None:
+            context.controller.clear_path(reason=self.failure_reason)
+            context.record_failure(self.failure_reason)
+            context.log_structured({
+                "event": "elevator_cabin_turn_failed", "phase": self.phase,
+                "reason": self.failure_reason, "pose": list(pose),
+                "service_pending": self._service_task is not None,
+            })
+            return FAILED
+        return RUNNING
 
     def _tick_target_door_alignment(
         self,
@@ -1723,11 +1778,43 @@ class TakeElevator(NavigationTask):
           调用方必须检查 failure_reason 走失败路径。
         """
         controller = context.controller
+        bounded_door_alignment = self.phase in {
+            "ALIGN_TO_CURRENT_DOOR", "ALIGN_TO_REFRESHED_ELEVATOR_DOOR",
+            "RETRY_ALIGN_CURRENT_DOOR", "ALIGN_TO_TARGET_DOOR",
+        }
+        if bounded_door_alignment:
+            if self._door_alignment_phase != self.phase:
+                self._door_alignment_phase = self.phase
+                self._door_alignment_started_at = get_time()
+                self._door_alignment_started_wall = time.monotonic()
+                self._door_alignment_drift_retries = 0
+            if (
+                get_time() - self._door_alignment_started_at > self._CABIN_TURN_TIMEOUT
+                or time.monotonic() - self._door_alignment_started_wall > self._SERVICE_WALL_TIMEOUT
+            ):
+                self.failure_reason = "elevator_door_alignment_timeout"
+                controller.clear_path(reason=self.failure_reason)
+                context.record_failure(self.failure_reason)
+                context.log_structured({
+                    "event": "elevator_door_alignment_failed", "phase": self.phase,
+                    "reason": self.failure_reason,
+                    "elapsed": get_time() - self._door_alignment_started_at,
+                    "wall_elapsed": time.monotonic() - self._door_alignment_started_wall,
+                })
+                return True
         result = controller.poll_result()
         if result.status == DONE and result.reason == "alignment_done":
+            self._door_alignment_phase = None
             return True
         if result.status == STUCK:
             if result.reason == "alignment_drift":
+                if bounded_door_alignment:
+                    self._door_alignment_drift_retries += 1
+                    if self._door_alignment_drift_retries > 3:
+                        self.failure_reason = "elevator_door_alignment_retry_exhausted"
+                        controller.clear_path(reason=self.failure_reason)
+                        context.record_failure(self.failure_reason)
+                        return True
                 # 位置漂移：锚点已失效，重新进入对准（重新 SETTLE）。
                 self._exit_alignment_count = 0
                 controller.begin_heading_alignment(target_wait, max_angular=0.65)
@@ -1767,10 +1854,10 @@ class TakeElevator(NavigationTask):
             else self._target_crossing_geometry
         )
         if crossing_geometry is None and _segment_crosses_blocked_cell(
-            grid,
+            grid.without_negative_obstacles(),
             commit_start,
             target_xy,
-            constraints=context.planning_constraints,
+            constraints=None,
         ):
             self._cabin_transit_alignment_count = 0
             if rospy is not None:
@@ -1801,6 +1888,8 @@ class TakeElevator(NavigationTask):
         self._crossing_blocked_since = None
         self._cabin_transit_start_xy = commit_start
         self._cabin_transit_target_xy = target_xy
+        # 先发布阶段，再装载路径，统一速度出口才能在首条命令就采用 CROSS 策略。
+        self.cabin_transit_stage = "CROSS"
         context.controller.set_path(
             [commit_start, target_xy],
             max_linear=max_linear,
@@ -1809,7 +1898,6 @@ class TakeElevator(NavigationTask):
             obstacle_slow_distance=0.30,
             reason="elevator_cabin_cross_path",
         )
-        self.cabin_transit_stage = "CROSS"
         self._cabin_transit_position_align_flips = 0
         self._log_cabin_transit_stage(
             "CROSS",
@@ -2792,15 +2880,41 @@ class TakeElevator(NavigationTask):
     ) -> str:
         if self._service_task is None:
             self._service_task = task_factory()
+            self._service_started_at = get_time()
+            self._service_started_wall = time.monotonic()
+            context.log_structured({
+                "event": "elevator_service_started", "phase": self.phase,
+                "attempt": self._retry_count + 1, "hold_position": hold_position,
+            })
             return RUNNING
 
         if not self._service_task.done():
+            if (
+                get_time() - self._service_started_at > self._SERVICE_TIMEOUT
+                or time.monotonic() - self._service_started_wall > self._SERVICE_WALL_TIMEOUT
+            ):
+                # 超时不等于服务端取消，不能重发可能仍在移动轿厢的请求。
+                self.failure_reason = "elevator_service_timeout"
+                context.controller.clear_path(reason=self.failure_reason)
+                context.record_failure(self.failure_reason)
+                context.log_structured({
+                    "event": "elevator_service_timeout", "phase": self.phase,
+                    "elapsed": get_time() - self._service_started_at,
+                    "wall_elapsed": time.monotonic() - self._service_started_wall,
+                    "request_cancelled": False,
+                })
+                return FAILED
             if hold_position:
                 context.controller.stop()
             return RUNNING
 
         ok = self._service_task.ok()
         message = self._service_task.message()
+        context.log_structured({
+            "event": "elevator_service_finished", "phase": self.phase,
+            "ok": bool(ok), "elapsed": get_time() - self._service_started_at,
+            "wall_elapsed": time.monotonic() - self._service_started_wall,
+        })
         if not ok:
             if rospy is not None:
                 rospy.logwarn(f"[{self.name}] 服务失败：{message}")
@@ -2811,6 +2925,8 @@ class TakeElevator(NavigationTask):
                 self._service_task = None
                 return RUNNING
             # 重试失败
+            self.failure_reason = "elevator_service_failed"
+            context.controller.clear_path(reason=self.failure_reason)
             context.record_failure(f"电梯服务失败: {message}")
             return FAILED
 

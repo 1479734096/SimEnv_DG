@@ -645,6 +645,15 @@ class FloorGrid:
             return False
         return int(self.data[gy, gx]) in (FREE, VISITED)
 
+    def without_negative_obstacles(self) -> "FloorGrid":
+        """为已保证无空洞的跨越生成规划副本，不撤销实体障碍或任务禁区。"""
+        result = self.copy()
+        cells = set(result.negative_cell_owners) | set(result.negative_cells)
+        result.negative_cell_owners.clear()
+        result.negative_cells.clear()
+        result._refresh_cells(cells)
+        return result
+
     def is_planning_traversable(self, gx: int, gy: int) -> bool:
         """规划层可通行性（考虑所有约束：障碍、黑区、负障碍）。
 

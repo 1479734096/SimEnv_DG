@@ -320,6 +320,7 @@ class MissionManager:
         self._forced_task_failure_reason: str | None = None
         self._elevator_success: bool | None = None
         self._timeout_triggered = False
+        self._return_cleanup_started_wall = None
         self._failure_reasons: list[str] = []
         self._last_pose: tuple[float, float, float] | None = None
         self._last_xyz: tuple[float, float, float] | None = None
@@ -435,6 +436,8 @@ class MissionManager:
         self.explorer = components.explorer
         self.controller = components.controller
         self._ground_support = components.ground_support
+        if self._ground_support.gate is not None:
+            self._ground_support.gate.set_hole_exemption_provider(self._hole_detection_exemption)
         self.building_client = components.building_client
         self._progress_monitor = components.progress_monitor
         self._floor_coordinates = components.floor_coordinates
@@ -573,7 +576,22 @@ class MissionManager:
         )
 
     def _planning_constraints(self):
+        if self._hole_detection_exemption() is not None:
+            return None
         return self._ground_support.planning_constraints(self.current_floor)
+
+    def _hole_detection_exemption(self) -> str | None:
+        """只依据已确认楼层和当前任务阶段使用用户声明的无空洞保证。"""
+        task = self.current_task
+        if (
+            isinstance(task, TakeElevator)
+            and task.phase in {"ENTER_CABIN", "EXIT_CABIN"}
+            and task.cabin_transit_stage == "CROSS"
+        ):
+            return "elevator_cross"
+        if self.current_floor == 0 and not self._floor_transition_runtime.active:
+            return "floor_zero"
+        return None
 
     def _plan_path(
         self,
@@ -610,7 +628,13 @@ class MissionManager:
         outcome = corrector.tick(
             phase,
             now=get_time(),
-            frames=self._current_landmark_frames(),
+            frames=[
+                frame.points for frame in self._map_runtime.recent_cloud_frames
+                if frame.floor == self.current_floor
+                and frame.localization_epoch == self.pose_provider.continuity_epoch
+                and math.isfinite(frame.stamp)
+                and 0.0 <= get_time() - frame.stamp <= corrector.config.maximum_frame_age
+            ],
             latest_cloud_stamp=getattr(self._map_runtime, "last_cloud_stamp", None),
             floor_height=float(self.mapper.floor_height),
             pose_provider=self.pose_provider,
@@ -644,6 +668,7 @@ class MissionManager:
                     "right_support": evaluation.right_support,
                     "point_count": evaluation.point_count,
                     "outcome_reason": outcome.reason,
+                    "apply_correction": corrector.config.apply_correction,
                 }
             )
         if outcome.applied:
@@ -676,6 +701,21 @@ class MissionManager:
                     "phase": str(phase),
                     "reason": outcome.reason,
                 }
+            )
+        if outcome.overlap_owner_ids:
+            self._handle_danger_source_overlap(
+                owner_ids=outcome.overlap_owner_ids, floor=self.current_floor,
+                source="entrance_geometry_correction",
+            )
+        if outcome.reason in {"correction_ack_timeout", "corrected_pose_timeout"}:
+            # 请求可能已被定位节点应用；回执/新位姿不完整时不能继续使用旧地图。
+            self._record_failure(outcome.reason)
+            self._mission_success_eligible = False
+            self.controller.clear_path(reason=outcome.reason)
+            self.controller.stop(reason=outcome.reason)
+            self._transition_state(
+                WRITE_RESULT, reason_code=outcome.reason,
+                call_site="MissionManager.correct_entrance_geometry",
             )
         return outcome
 
@@ -1130,6 +1170,13 @@ class MissionManager:
         停止与地面不安全混为一谈。首次 tick 前不武装，配置非正值显式关闭。
         """
         timeout = float(getattr(self, "tick_wall_stall_timeout", 0.0))
+        cleanup_started = self._return_cleanup_started_wall
+        if (
+            cleanup_started is not None
+            and self.state not in {WRITE_RESULT, FINISH, MISSION_FAILED}
+            and monotonic_now - cleanup_started >= self.return_cleanup_wall_timeout
+        ):
+            return True, "return_cleanup_wall_timeout"
         if timeout <= 0.0:
             return False, "mission_tick_wall_stall_disabled"
         last_tick = getattr(self, "_last_tick_wall_time", None)
@@ -1350,22 +1397,44 @@ class MissionManager:
             outcome = "finished" if self.state == FINISH else "failed"
             self._request_shutdown(f"danger_search mission {outcome}")
             return
-        # max_runtime 是探索预算。预算耗尽后仍必须让已经启动的返航闭环完成，
-        # 否则会在电梯、主门或写结果的最后一步把安全收尾误判成任务失败。
-        return_closure_active = bool(
-            self._return_home_started
-            and self.state in {RETURN_HOME, CHANGE_FLOOR, WRITE_RESULT}
-        )
-        if self._elapsed() >= self.max_runtime and not return_closure_active:
-            MissionReportingRuntime.logwarn("接近时间预算，写出当前检测结果")
+        # 总期限包含返航。超时不伪造成功，也不在门槛或轿厢中直接终止流程。
+        if (
+            self._elapsed() >= self.max_runtime
+            and not self._timeout_triggered
+            and not self._return_home_completed
+        ):
+            MissionReportingRuntime.logwarn("任务总期限已到，记录超时失败并进入有限返航收尾")
             self._timeout_triggered = True
-            self._record_failure("探索超时")
+            self._return_cleanup_started_wall = time.monotonic()
+            self._record_failure("mission_timeout")
             self._mission_success_eligible = False
-            self._transition_state(
-                WRITE_RESULT,
-                reason_code="mission_timeout",
-                call_site="MissionManager.tick:max_runtime",
+        if self._timeout_triggered and self.state != WRITE_RESULT:
+            cleanup_expired = (
+                self._elapsed() >= self.max_runtime + self.return_cleanup_timeout
+                or time.monotonic() - self._return_cleanup_started_wall
+                >= self.return_cleanup_wall_timeout
             )
+            if cleanup_expired:
+                self._record_failure("return_cleanup_timeout")
+                self.controller.clear_path(reason="return_cleanup_timeout")
+                self.controller.stop(reason="return_cleanup_timeout")
+                self._transition_state(
+                    WRITE_RESULT,
+                    reason_code="return_cleanup_timeout",
+                    call_site="MissionManager.tick:cleanup_timeout",
+                )
+            elif self.state == CHANGE_FLOOR:
+                self.return_after_floor_change = True
+            elif (
+                self.state != RETURN_HOME
+                and self.current_task is None
+                and self._danger_inspection.phase == DANGER_INSPECTION_IDLE
+            ):
+                self._transition_state(
+                    RETURN_HOME,
+                    reason_code="mission_timeout_return_home",
+                    call_site="MissionManager.tick:max_runtime",
+                )
         if self.state == WRITE_RESULT:
             self._write_result(
                 reason_code=getattr(self, "_pending_result_write_reason", None),
@@ -1423,6 +1492,8 @@ class MissionManager:
 
         if self.current_task is not None:
             status = self._tick_current_task_status(pose)
+            if self.state in {WRITE_RESULT, FINISH, MISSION_FAILED}:
+                return
             if status in (DONE, FAILED):
                 completed_task_name = getattr(self.current_task, "name", type(self.current_task).__name__)
                 completed_task_phase = getattr(self.current_task, "phase", None)
@@ -2075,6 +2146,10 @@ class MissionManager:
         if image_pose is None:
             self._perception_mapping.discard_image(image_preparation)
             return
+        if image_lookup.localization_epoch != self.pose_provider.continuity_epoch:
+            self._perception_mapping.discard_image(image_preparation)
+            self._log_structured({"event": "rgbd_rejected", "reason": "localization_epoch_changed"})
+            return
         image_commit = self._perception_mapping.commit_image(
             image_preparation,
             floor_index=self.current_floor,
@@ -2085,7 +2160,39 @@ class MissionManager:
         )
         camera_to_world = image_commit.camera_to_world
         detection_result = image_commit.detection_result
+        if get_time() - getattr(self, "_last_fusion_log_time", -math.inf) >= 2.0:
+            self._last_fusion_log_time = get_time()
+            cloud_stamp = detection_result.matched_cloud_stamp
+            self._log_structured({
+                "event": "rgbd_livox_time_match",
+                "rgb_stamp": image_stamp,
+                "depth_stamp": image_stamps[1],
+                "pose_stamp": image_pose.stamp,
+                "cloud_stamp": cloud_stamp,
+                "time_delta": abs(cloud_stamp - image_stamp) if cloud_stamp is not None else None,
+                "floor": self.current_floor,
+                "localization_epoch": image_lookup.localization_epoch,
+            })
         danger_sync = getattr(detection_result, "danger_obstacle_sync", None)
+        if detection_result.candidate_diagnostics:
+            self._log_structured({
+                "event": "danger_perception_summary", "rgb_stamp": image_stamp,
+                "depth_stamp": image_stamps[1], "pose_stamp": image_pose.stamp,
+                "cloud_stamp": detection_result.matched_cloud_stamp,
+                "floor": self.current_floor,
+                "localization_epoch": image_lookup.localization_epoch,
+                "candidate_count": detection_result.candidate_count,
+                "candidates": list(detection_result.candidate_diagnostics),
+                "tracks": [{
+                    "track_id": track.track_id, "status": track.status,
+                    "position": track.mean_position.tolist(),
+                    "hits": len(track.hit_times), "first_seen": track.first_seen,
+                    "last_seen": track.last_seen, "position_std": track.position_std(),
+                    "confidence": track.average_confidence(), "rmse": track.average_rmse(),
+                    "inspected": track.inspected,
+                } for track in self.tracker.tracks[-16:]],
+                "nms_confirmed_ids": list(danger_sync.selected_track_ids) if danger_sync else [],
+            })
         self._log_danger_obstacle_sync(
             danger_sync,
             event="danger_obstacle_sync",
@@ -2241,6 +2348,9 @@ class MissionManager:
             return
         # 支撑层有独立消费游标。即使本帧因换层歧义或 TF 缺失跳过，也不得重放旧帧。
         self._ground_support.last_cloud_stamp = cloud_stamp
+        with _controller_command_transaction(self.controller):
+            if gate.hole_detection_exempt:
+                return
         pose_provider = getattr(self, "pose_provider", None)
         pose_sample = pose_provider.at(cloud_stamp) if pose_provider is not None else None
         if pose_sample is None:
@@ -2477,6 +2587,8 @@ class MissionManager:
                     crossing_setter(controlled_crossing)
                 if callable(setter):
                     setter(enabled)
+                if gate is not None:
+                    gate.hole_detection_exempt
 
     def _return_entry_trace_is_trusted(
         self,
@@ -3013,7 +3125,7 @@ class MissionManager:
         self._exploration.probe_attempt = 0
 
     def _danger_path_can_be_preempted(self) -> bool:
-        """只允许抢占普通探索路径，不打断恢复、对准或终态锁存。"""
+        """只抢占普通巡航，不打断子任务、恢复、对准或终态锁存。"""
         planning = self.controller.planning_progress_snapshot()
         if planning.terminal_pending:
             return False
@@ -3026,7 +3138,10 @@ class MissionManager:
         if controller_mode in {"RECOVER", "ALIGN"}:
             return False
         if planning.active:
-            return planning.path_reason in DANGER_PREEMPTIBLE_PATH_REASONS
+            allowed = DANGER_PREEMPTIBLE_PATH_REASONS
+            if self.state == RETURN_HOME:
+                allowed = {"return_home_planned_path", "return_home_entry_trace_path"}
+            return planning.path_reason in allowed
         return not self.controller.has_path()
 
     def _clear_frontier_intent_for_danger(self) -> None:
@@ -3087,8 +3202,12 @@ class MissionManager:
             return False
         if not marker(int(track_id)):
             return False
+        previous_progress = self.controller.planning_progress_snapshot()
         try:
             self._clear_frontier_intent_for_danger()
+            if self.state == RETURN_HOME:
+                self._return_home.planner = None
+                self._return_home.entry_trace_scope = None
             self.controller.set_path(
                 list(plan.path),
                 reason=DANGER_INSPECTION_PATH_REASON,
@@ -3119,8 +3238,13 @@ class MissionManager:
         )
         self._danger_inspection.started_at = float(now)
         self._danger_inspection.path_generation = int(progress.path_generation)
+        self._log_danger_inspection_phase(DANGER_INSPECTION_IDLE, "target_selected", {
+            "previous_path_reason": previous_progress.path_reason,
+            "previous_terminal_pending": previous_progress.terminal_pending,
+            "previous_path_generation": previous_progress.path_generation,
+        })
         MissionReportingRuntime.loginfo(
-            "发现当前楼层确认危险源，抢占普通探索路径执行近场核验："
+            "发现当前楼层确认危险源，抢占普通巡航路径执行近场核验："
             "track_id=%d target=(%.2f, %.2f) approach=(%.2f, %.2f)",
             int(track_id),
             target_position[0],
@@ -3161,7 +3285,23 @@ class MissionManager:
         )
         if context.track_id is not None:
             self._log_danger_inspection_failure(context.track_id, reason)
+        previous_phase = context.phase
+        context.phase = DANGER_INSPECTION_IDLE
+        self._log_danger_inspection_phase(previous_phase, reason)
         context.reset()
+
+    def _log_danger_inspection_phase(
+        self, previous_phase: str, reason: str, extra: dict | None = None,
+    ) -> None:
+        context = self._danger_inspection
+        self._log_structured({
+            "event": "danger_inspection_phase", "elapsed": float(self._elapsed()),
+            "mission_state": self.state, "floor": self.current_floor,
+            "track_id": context.track_id, "from": previous_phase, "to": context.phase,
+            "reason": reason, "path_generation": context.path_generation,
+            "target_xy": context.target_xy, "approach_xy": context.approach_xy,
+            **(extra or {}),
+        })
 
     def _log_danger_inspection_failure(self, track_id: int, reason: str) -> None:
         attempts = self.tracker.inspection_attempt_count(track_id)
@@ -3219,6 +3359,7 @@ class MissionManager:
                     ),
                 )
                 context.phase = DANGER_INSPECTION_ALIGNING
+                self._log_danger_inspection_phase(DANGER_INSPECTION_APPROACHING, "approach_done")
                 return True
             self._fail_danger_inspection(
                 result.reason or "approach_%s" % result.status.lower(),
@@ -3233,6 +3374,7 @@ class MissionManager:
             if result.status == DONE:
                 context.phase = DANGER_INSPECTION_VERIFYING
                 context.verification_started_at = float(now)
+                self._log_danger_inspection_phase(DANGER_INSPECTION_ALIGNING, "alignment_done")
                 self.controller.stop(reason="danger_verification_hold")
                 return True
             self._fail_danger_inspection(
@@ -3284,6 +3426,8 @@ class MissionManager:
                     "危险源近场核验完成：track_id=%d",
                     int(context.track_id),
                 )
+                context.phase = DANGER_INSPECTION_IDLE
+                self._log_danger_inspection_phase(DANGER_INSPECTION_VERIFYING, "verified")
                 context.reset()
                 return True
             if (
@@ -3312,11 +3456,12 @@ class MissionManager:
             )
         if (
             not getattr(self, "danger_approach_verification_enabled", True)
-            or self.state != EXPLORE_FLOOR
+            or self.state not in {EXPLORE_FLOOR, RETURN_HOME}
             or self.current_task is not None
-            or getattr(self, "_return_home_started", False)
             or self.home_pose is None
-            or mission_elapsed + float(self.return_safety_buffer) >= self.max_runtime
+            or self._timeout_triggered
+            or mission_elapsed >= self.max_runtime
+            or (self.state == RETURN_HOME and not self._mission_success_eligible)
         ):
             return DangerInspectionArbitration()
 
@@ -3324,9 +3469,9 @@ class MissionManager:
         if target is None:
             return DangerInspectionArbitration()
         effective_return_time = return_time
-        if effective_return_time is None:
+        if effective_return_time is None and self.state == EXPLORE_FLOOR:
             effective_return_time = self._estimate_return_time(pose)
-        if (
+        if self.state == EXPLORE_FLOOR and (
             not math.isfinite(float(effective_return_time))
             or mission_elapsed
             + float(effective_return_time)
@@ -3368,8 +3513,21 @@ class MissionManager:
                 target.track_id, "approach_plan_%s" % getattr(plan, "status", "unavailable")
             )
             return DangerInspectionArbitration()
+        if self.state == EXPLORE_FLOOR:
+            # 单次总上限覆盖接近、对齐、取证及失败耗时；再预留沿接近路径
+            # 回到原位的绕行时间。每次冷却重试都重新准入，不提前扣除返航取证。
+            reserve = (
+                self.danger_inspection_timeout
+                + path_length(plan.path) / max(0.1, self.return_speed_estimate)
+                + float(effective_return_time)
+                + self.return_safety_buffer
+            )
+            if self._elapsed() + reserve >= self.max_runtime:
+                return DangerInspectionArbitration()
         # 规划期间控制定时器可能刚锁存终态；复核与装载共享命令事务。
         with _controller_command_transaction(self.controller):
+            if self._elapsed() >= self.max_runtime:
+                return DangerInspectionArbitration()
             if not self._danger_path_can_be_preempted():
                 return DangerInspectionArbitration(pending=True)
             started = self._start_danger_inspection(target, approach_pose, plan, now)
@@ -3387,6 +3545,22 @@ class MissionManager:
                 self.controller.stop()
             return
 
+        if self._danger_inspection.phase != DANGER_INSPECTION_IDLE:
+            self._tick_active_danger_inspection(pose, now)
+            return
+        return_time = self._estimate_return_time(pose) if self.home_pose is not None else None
+        if return_time is not None and (
+            self._elapsed() + return_time
+            + self.return_safety_buffer >= self.max_runtime
+        ):
+            self._record_floor_exit_certificate("mission_insufficient_time_for_return")
+            self._transition_state(
+                RETURN_HOME,
+                reason_code="mission_insufficient_time_for_return",
+                call_site="MissionManager._tick_explore:return_reserve",
+            )
+            return
+
         # 公开起点位于主入口外时，先沿当前合法姿态和已确认 FREE 走廊深入，
         # 避免普通 frontier 评分优先选择入口外更近的侧向边界。目标完全由
         # 当前传感器地图推导，不读取门坐标、布局 metadata 或固定世界坐标。
@@ -3398,6 +3572,8 @@ class MissionManager:
             and getattr(self._entry, "origin_pose", None) is None
         ):
             correction = self.correct_entrance_geometry("startup", pose)
+            if self.state in {WRITE_RESULT, FINISH, MISSION_FAILED}:
+                return
             if correction.status == "running" or correction.applied:
                 return
         if self._run_initial_entry(pose, grid):
@@ -3452,11 +3628,6 @@ class MissionManager:
         floor_elapsed = now - self.floor_start_time
         mission_elapsed = self._elapsed()
         path_active = self.controller.has_path()
-        return_time = (
-            self._estimate_return_time(pose)
-            if floor_elapsed >= self.min_floor_explore_time
-            else None
-        )
         danger_arbitration = self._arbitrate_danger_inspection(
             pose=pose,
             grid=grid,
@@ -4949,7 +5120,10 @@ class MissionManager:
         """消费一次强制任务失败，否则正常 tick 当前任务。"""
         forced_failure = self._forced_task_failure_reason
         if forced_failure is None:
-            return self.current_task.tick(self.navigation_task_context(), pose)
+            try:
+                return self.current_task.tick(self.navigation_task_context(), pose)
+            finally:
+                self._sync_ground_support_task_context(pose)
         self._forced_task_failure_reason = None
         try:
             self.current_task.failure_reason = forced_failure
@@ -5009,6 +5183,20 @@ class MissionManager:
                     math.hypot(self.home_pose[0] - pose[0], self.home_pose[1] - pose[1])
                 )
             self._return_home_started_logged = True
+        if self._danger_inspection.phase != DANGER_INSPECTION_IDLE:
+            self._tick_active_danger_inspection(pose, get_time())
+            return
+        if (
+            self._return_home.retreat_target is None
+            and math.hypot(self.home_pose[0] - pose[0], self.home_pose[1] - pose[1])
+            > self.home_tolerance
+        ):
+            arbitration = self._arbitrate_danger_inspection(
+                pose=pose, grid=self.mapper.floor(self.current_floor), now=get_time(),
+                mission_elapsed=self._elapsed(), return_time=None,
+            )
+            if arbitration.handled:
+                return
         if self.current_floor != 0 and self.max_floor > 1:
             self._begin_floor_change(
                 0,
@@ -5736,6 +5924,11 @@ class MissionManager:
             clear_path = getattr(getattr(self, "controller", None), "clear_path", None)
             if callable(clear_path):
                 clear_path(reason="danger_inspection_state_exit")
+            previous_phase = danger_context.phase
+            danger_context.phase = DANGER_INSPECTION_IDLE
+            self._log_danger_inspection_phase(previous_phase, "mission_state_exit", {
+                "next_mission_state": new_state, "state_exit_reason": reason_code,
+            })
             danger_context.reset()
         entering_return_home = new_state == RETURN_HOME and old_state != RETURN_HOME
         if entering_return_home:
@@ -5960,6 +6153,8 @@ class MissionManager:
             ),
             "elevator_success": self._elevator_success,
             "timeout_triggered": self._timeout_triggered,
+            "return_cleanup_timeout": self.return_cleanup_timeout,
+            "return_cleanup_wall_timeout": self.return_cleanup_wall_timeout,
             "failure_reason": list(self._failure_reasons),
             "detected_count": int(detected_count),
             "track_count": len(self.tracker.tracks),
