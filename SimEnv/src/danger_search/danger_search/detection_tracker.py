@@ -98,6 +98,7 @@ class Track:
     first_seen: float
     last_seen: float
     hit_times: list[float] = field(default_factory=list)
+    observation_stamps: list[float] = field(default_factory=list)
     positions: list[np.ndarray] = field(default_factory=list)
     confidences: list[float] = field(default_factory=list)
     rmses: list[float] = field(default_factory=list)
@@ -114,6 +115,9 @@ class Track:
         obs_dist = float(candidate.distance) if candidate.distance is not None else 1.0
         self.distances.append(obs_dist)
         self.hit_times.append(now)
+        self.observation_stamps.append(
+            float(candidate.stamp) if candidate.stamp is not None else float(now)
+        )
         self.last_seen = now
         self.mean_position = self._calculate_weighted_position()
 
@@ -236,6 +240,7 @@ class DetectionTracker:
         obstacle_max_average_rmse: float = 0.025,
         obstacle_max_age: float = 0.75,
         obstacle_min_observation_span: float = 0.08,
+        inspection_max_attempts: int = 3,
     ):
         self.association_radius = float(association_radius)
         self.confirmation_window = float(confirmation_window)
@@ -252,6 +257,13 @@ class DetectionTracker:
         self.obstacle_min_observation_span = float(
             obstacle_min_observation_span
         )
+        if (
+            isinstance(inspection_max_attempts, bool)
+            or not isinstance(inspection_max_attempts, int)
+            or inspection_max_attempts <= 0
+        ):
+            raise ValueError("危险源核验尝试上限必须为正整数")
+        self.inspection_max_attempts = inspection_max_attempts
         finite_nonnegative = (
             self.max_position_std,
             self.max_average_rmse,
@@ -285,6 +297,7 @@ class DetectionTracker:
         self._last_update_time: float | None = None
         self._inspection_in_progress: set[int] = set()
         self._inspection_retry_after: dict[int, float] = {}
+        self._inspection_attempts: dict[int, int] = {}
 
     @property
     def tracks(self) -> list[Track]:
@@ -473,6 +486,8 @@ class DetectionTracker:
                 or track.track_id in self._inspection_in_progress
                 or timestamp < self._inspection_retry_after.get(track.track_id, -math.inf)
                 or timestamp - track.last_seen > self.stale_after
+                or self._inspection_attempts.get(track.track_id, 0)
+                >= self.inspection_max_attempts
             ):
                 continue
             if floor_filter is not None and not floor_filter(track):
@@ -497,12 +512,21 @@ class DetectionTracker:
             last_seen=float(track.last_seen),
         )
 
+    def inspection_attempt_count(self, track_id: int) -> int:
+        """返回目标已消耗的核验尝试数，供任务日志说明失败降级。"""
+        return self._inspection_attempts.get(int(track_id), 0)
+
     def mark_inspection_started(self, track_id: int) -> bool:
         """记录已成功装载接近路径，但不把目标标记为已核验。"""
         parsed_id = int(track_id)
         track = next((item for item in self._tracks if item.track_id == parsed_id), None)
-        if track is None or track.inspected:
+        if (
+            track is None or track.inspected
+            or parsed_id in self._inspection_in_progress
+            or self._inspection_attempts.get(parsed_id, 0) >= self.inspection_max_attempts
+        ):
             return False
+        self._inspection_attempts[parsed_id] = self._inspection_attempts.get(parsed_id, 0) + 1
         self._inspection_in_progress.add(parsed_id)
         return True
 
@@ -545,11 +569,13 @@ class DetectionTracker:
         cooldown: float = 5.0,
         now: float | None = None,
     ) -> None:
-        """释放进行中标记并短暂冷却失败目标，允许地图更新后重试。"""
+        """记录规划或执行失败；冷却后可有限重试，不撤销正式确认资格。"""
         parsed_id = int(track_id)
         timestamp = float(now if now is not None else get_time())
         if not math.isfinite(timestamp) or not math.isfinite(float(cooldown)):
             raise ValueError("危险源核验失败冷却参数必须为有限数")
+        if parsed_id not in self._inspection_in_progress:
+            self._inspection_attempts[parsed_id] = self._inspection_attempts.get(parsed_id, 0) + 1
         self._inspection_in_progress.discard(parsed_id)
         self._inspection_retry_after[parsed_id] = timestamp + max(0.0, float(cooldown))
 
@@ -560,16 +586,32 @@ class DetectionTracker:
         since: float,
         now: float | None = None,
         min_hits: int = 2,
+        min_observation_span: float = 0.08,
     ) -> bool:
         """确认目标在核验阶段仍有足够的新鲜多帧观测。"""
         timestamp = float(now if now is not None else get_time())
+        if (
+            not math.isfinite(timestamp) or not math.isfinite(float(since))
+            or not math.isfinite(float(min_observation_span))
+            or float(min_observation_span) <= 0.0
+            or timestamp < float(since)
+        ):
+            return False
         track = next((item for item in self._tracks if item.track_id == int(track_id)), None)
         if track is None or track.status != CONFIRMED or track.inspected:
             return False
         if timestamp - track.last_seen > self.stale_after:
             return False
-        fresh_hits = sum(1 for hit_time in track.hit_times if float(hit_time) >= float(since))
-        return fresh_hits >= max(1, int(min_hits))
+        # 处理时刻与采集时刻都必须属于核验窗口，重复图像时间戳只计一次。
+        fresh_stamps = sorted({
+            stamp for hit_time, stamp in zip(track.hit_times, track.observation_stamps)
+            if float(since) < hit_time <= timestamp
+            and float(since) < stamp <= timestamp
+        })
+        return (
+            len(fresh_stamps) >= max(2, int(min_hits))
+            and fresh_stamps[-1] - fresh_stamps[0] >= float(min_observation_span)
+        )
 
     def mark_inspected(
         self,

@@ -204,6 +204,9 @@ mission:
   danger_verification_timeout: 5.0
   danger_verification_min_hits: 2
   danger_inspection_retry_cooldown: 5.0
+  # 单次接近、对准和核验的总上限；不代表已预留返航时间。
+  danger_inspection_timeout: 30.0
+  danger_verification_min_observation_span: 0.08
 
 map:
   # 每层独立 2.5D 栅格；NEGATIVE 只表达传感器确认的动态负障，不编码房间语义。
@@ -525,6 +528,8 @@ tracker:
   obstacle_max_average_rmse: 0.025
   obstacle_max_age: 0.75
   obstacle_min_observation_span: 0.08
+  # 规划失败也消耗尝试；耗尽后保留 Confirmed 输出资格并继续普通任务。
+  inspection_max_attempts: 3
 
 floor:
   # 正式电梯 ID 来自公开 team_scene_info.json；空间几何只能由传感器注册。

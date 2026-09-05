@@ -170,6 +170,8 @@ _CONFIG_GROUP_FIELDS = {
             "danger_verification_timeout",
             "danger_verification_min_hits",
             "danger_inspection_retry_cooldown",
+            "danger_inspection_timeout",
+            "danger_verification_min_observation_span",
         }
     ),
     "topics": frozenset(
@@ -567,6 +569,12 @@ class _MissionConfigBuilder:
         self.danger_inspection_retry_cooldown = float(
             _param("mission/danger_inspection_retry_cooldown", 5.0)
         )
+        self.danger_inspection_timeout = float(
+            _param("mission/danger_inspection_timeout", 30.0)
+        )
+        self.danger_verification_min_observation_span = float(
+            _param("mission/danger_verification_min_observation_span", 0.08)
+        )
         if (
             not math.isfinite(self.danger_approach_trigger_distance)
             or not math.isfinite(self.danger_approach_standoff_distance)
@@ -580,9 +588,14 @@ class _MissionConfigBuilder:
             or self.danger_verification_timeout <= 0.0
             or isinstance(raw_danger_verification_min_hits, bool)
             or not isinstance(raw_danger_verification_min_hits, int)
-            or raw_danger_verification_min_hits <= 0
+            or raw_danger_verification_min_hits < 2
             or not math.isfinite(self.danger_inspection_retry_cooldown)
             or self.danger_inspection_retry_cooldown < 0.0
+            or not math.isfinite(self.danger_inspection_timeout)
+            or self.danger_inspection_timeout <= self.danger_verification_timeout
+            or not math.isfinite(self.danger_verification_min_observation_span)
+            or not 0.0 < self.danger_verification_min_observation_span
+            < self.danger_verification_timeout
         ):
             raise ValueError("危险源接近与近场核验参数必须为有限有效值")
         self.danger_verification_min_hits = raw_danger_verification_min_hits
@@ -1438,6 +1451,7 @@ class _MissionConfigBuilder:
         ]:
             raise ValueError("正式运行禁止启用 truth_proximity_debug 门检测回退")
         self.tracker_params = {
+            "inspection_max_attempts": _param("tracker/inspection_max_attempts", 3),
             "association_radius": float(_param("tracker/association_radius", 0.45)),
             "confirmation_window": float(_param("tracker/confirmation_window", 10.0)),
             "min_hits": int(_param("tracker/min_hits", 4)),

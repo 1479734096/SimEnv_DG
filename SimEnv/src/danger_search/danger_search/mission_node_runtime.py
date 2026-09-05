@@ -33,8 +33,9 @@ def wait_for_localization_ready(
     subscriber_factory=None,
     shutdown_check=None,
     poll_interval: float = 0.1,
+    wall_timeout: float = 120.0,
 ) -> bool:
-    """等待定位锁存就绪；等待期间不创建任务控制 publisher。"""
+    """有界等待定位锁存就绪；等待期间不创建任务控制 publisher。"""
     if subscriber_factory is None and (rospy is None or Bool is None):
         raise RuntimeError("当前环境没有 ROS Bool 消息，无法等待定位就绪")
     topic = require_internal_input_topic(
@@ -44,6 +45,10 @@ def wait_for_localization_ready(
     interval = float(poll_interval)
     if not math.isfinite(interval) or interval <= 0.0:
         raise ValueError("定位就绪轮询周期必须为正有限数")
+    timeout = float(wall_timeout)
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise ValueError("定位就绪墙钟超时必须为正有限数")
+    deadline = time.monotonic() + timeout
     ready = Event()
 
     def on_ready(message) -> None:
@@ -57,7 +62,10 @@ def wait_for_localization_ready(
         while not ready.is_set():
             if is_shutdown():
                 return False
-            ready.wait(interval)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise TimeoutError("等待合法定位就绪超过 %.1f 秒墙钟时间" % timeout)
+            ready.wait(min(interval, remaining))
         return True
     finally:
         unregister = getattr(subscriber, "unregister", None)
@@ -201,7 +209,11 @@ def main() -> int:
         return 2
     if bool(ros_parameter("wait_for_localization_ready", True)):
         rospy.loginfo("等待定位站立证据与世界系初始化完成")
-        if not wait_for_localization_ready():
+        try:
+            if not wait_for_localization_ready():
+                return 1
+        except TimeoutError as exc:
+            rospy.logfatal("正式任务未创建：%s", exc)
             return 1
         rospy.loginfo("定位已就绪，开始创建任务编排器并计入任务预算")
 

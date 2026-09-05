@@ -167,3 +167,30 @@ SETUPTOOLS_USE_DISTUTILS=stdlib catkin_make install
 ```
 
 该变量只修正 Python 安装后端选择，不改变生产运行依赖。
+
+## 2026-09-05 接手后的运行前提
+
+本次没有启动仿真或回归，结论见[静态审查报告](../../reports/DANGER_PRIORITY_STATIC_REVIEW_20260905.md)。
+风险1/2已做代码修复，但完整预算、CROSS阶段切换/支撑新鲜度及入口纠偏回执边界尚未闭合；
+不能据此宣称全链可运行或直接安排下一轮自动runner。
+
+核验参数：`mission/danger_inspection_timeout=30.0`（单次总计）、
+`mission/danger_verification_timeout=5.0`、`mission/danger_verification_min_hits=2`、
+`mission/danger_verification_min_observation_span=0.08`、
+`mission/danger_inspection_retry_cooldown=5.0`、`tracker/inspection_max_attempts=3`。
+尝试上限包括规划失败，耗尽后保留正式确认结果，继续普通任务；该上限不构成返航时间预留。
+定位ready在120秒墙钟未到达时启动失败，释放订阅、不创建任务，不要将此出口记为探索失败闭环。
+
+若用户后续安排人工运行，按同轮证据核对：
+
+1. OCC变格时，核验安全路径的generation/reason保持；真冲突记录
+   `danger_obstacle_path_blocked`。也查`approach_idle`，不能只查`approach_path_replaced`。
+2. 暂缓预算时DONE/STUCK是否消费、到达记账/恢复是否发生；不能长时间保持terminal_pending。
+3. APPROACHING→ALIGNING→VERIFYING及新鲜RGB stamp跨度；失败日志中的attempts和
+   retry_exhausted应与最多3次一致，单次超过30秒退出，核验不取消外部恢复。
+4. 比较入口绝对odom与离线真值时，不使用已首帧对齐的drift CSV替代绝对误差；同时保留
+   初始化前数据、位姿epoch、控制模式时间和stand→RL真实间隔。
+5. 同时归档RGB/深度/Livox、配准点云和地图；`record_rgbd=1`只表示意图，须核对文件存在与
+   话题清单。轮4没有独立RGB-D bag，旧diagnostic bag也没有注册点云/地图，不能据此证明时空融合。
+6. 结果必须同时检查Confirmed+NMS、failure reason、outcome、return_home与楼层退出证书；
+   门口/轿厢内失败保存JSON是部分结果，不是完成搜索返航。

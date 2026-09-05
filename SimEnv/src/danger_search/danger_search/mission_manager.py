@@ -2107,8 +2107,25 @@ class MissionManager:
             "changed_owner_ids",
             (),
         ):
-            # 旧路径可能在确认前穿过危险源；必须强制下一轮基于新 OCC 重新规划。
-            self.controller.clear_path(reason="danger_obstacle_sync")
+            with _controller_command_transaction(self.controller):
+                inspection = self._danger_inspection
+                progress = self.controller.planning_progress_snapshot()
+                if inspection.phase == DANGER_INSPECTION_IDLE:
+                    self.controller.clear_path(reason="danger_obstacle_sync")
+                elif (
+                    inspection.phase == DANGER_INSPECTION_APPROACHING
+                    and progress.path_reason == DANGER_INSPECTION_PATH_REASON
+                    and progress.path_generation == inspection.path_generation
+                    and not progress.terminal_pending
+                ):
+                    # 核验路径本就绕开目标；仅在更新后的地图实际阻挡剩余路段时退出。
+                    remaining = self.controller.remaining_path_snapshot(pose[:2])
+                    grid = self.mapper.floor(self.current_floor)
+                    if not remaining or not all(
+                        self._segment_is_traversable(grid, start, end)
+                        for start, end in zip(remaining, remaining[1:])
+                    ):
+                        self._fail_danger_inspection("danger_obstacle_path_blocked", get_time())
         if self.rgbd_door_detector is not None:
             door_observations = list(detection_result.door_observations)
             registration = self._elevator_observation.registration
@@ -3125,18 +3142,38 @@ class MissionManager:
                 ),
                 now=now,
             )
-        if context.phase == DANGER_INSPECTION_ALIGNING:
-            end_alignment = getattr(self.controller, "end_heading_alignment", None)
-            if callable(end_alignment):
-                end_alignment()
-        elif self.controller.has_path():
-            self.controller.clear_path(reason="danger_inspection_failed")
+        with _controller_command_transaction(self.controller):
+            progress = self.controller.planning_progress_snapshot()
+            mode = self.controller.tracking_debug_snapshot().get("controller_mode")
+            if context.phase == DANGER_INSPECTION_ALIGNING and mode == "ALIGN":
+                self.controller.end_heading_alignment()
+            elif (
+                mode not in {"RECOVER", "ALIGN"}
+                and progress.path_reason == DANGER_INSPECTION_PATH_REASON
+                and progress.path_generation == context.path_generation
+            ):
+                # 核验失败只能撤销自己拥有的路径，不能清掉刚接管的恢复或其他任务。
+                self.controller.clear_path(reason="danger_inspection_failed")
         MissionReportingRuntime.logwarn(
-            "危险源近场核验失败，目标进入重试冷却：track_id=%s reason=%s",
+            "危险源近场核验失败：track_id=%s reason=%s（按目标尝试上限降级）",
             context.track_id,
             reason,
         )
+        if context.track_id is not None:
+            self._log_danger_inspection_failure(context.track_id, reason)
         context.reset()
+
+    def _log_danger_inspection_failure(self, track_id: int, reason: str) -> None:
+        attempts = self.tracker.inspection_attempt_count(track_id)
+        self._log_structured({
+            "event": "danger_inspection_failed",
+            "elapsed": round(float(self._elapsed()), 3),
+            "track_id": int(track_id),
+            "reason": reason,
+            "attempts": attempts,
+            "max_attempts": self.tracker.inspection_max_attempts,
+            "retry_exhausted": attempts >= self.tracker.inspection_max_attempts,
+        })
 
     def _tick_active_danger_inspection(
         self,
@@ -3145,6 +3182,9 @@ class MissionManager:
     ) -> bool:
         context = self._danger_inspection
         tracker = getattr(self, "tracker", None)
+        if now - context.started_at >= self.danger_inspection_timeout:
+            self._fail_danger_inspection("inspection_timeout", now)
+            return True
         if context.phase == DANGER_INSPECTION_APPROACHING:
             result = self.controller.poll_result()
             if result.status == RUNNING:
@@ -3223,6 +3263,7 @@ class MissionManager:
                     min_hits=int(
                         getattr(self, "danger_verification_min_hits", 2)
                     ),
+                    min_observation_span=self.danger_verification_min_observation_span,
                 )
             ):
                 verified = getattr(tracker, "mark_inspection_verified", None)
@@ -3293,6 +3334,8 @@ class MissionManager:
             >= self.max_runtime
         ):
             return DangerInspectionArbitration()
+        if not self._danger_path_can_be_preempted():
+            return DangerInspectionArbitration(pending=True)
         target_xy = (float(target.position[0]), float(target.position[1]))
         approach_pose = compute_danger_approach_pose(
             grid,
@@ -3303,6 +3346,10 @@ class MissionManager:
             ),
         )
         if approach_pose is None:
+            self.tracker.mark_inspection_failed(
+                target.track_id, cooldown=self.danger_inspection_retry_cooldown, now=now
+            )
+            self._log_danger_inspection_failure(target.track_id, "approach_pose_unavailable")
             return DangerInspectionArbitration()
         plan = self._plan_path(
             grid,
@@ -3314,10 +3361,18 @@ class MissionManager:
             or not bool(getattr(plan, "reached", False))
             or not getattr(plan, "path", None)
         ):
+            self.tracker.mark_inspection_failed(
+                target.track_id, cooldown=self.danger_inspection_retry_cooldown, now=now
+            )
+            self._log_danger_inspection_failure(
+                target.track_id, "approach_plan_%s" % getattr(plan, "status", "unavailable")
+            )
             return DangerInspectionArbitration()
-        if not self._danger_path_can_be_preempted():
-            return DangerInspectionArbitration(pending=True)
-        started = self._start_danger_inspection(target, approach_pose, plan, now)
+        # 规划期间控制定时器可能刚锁存终态；复核与装载共享命令事务。
+        with _controller_command_transaction(self.controller):
+            if not self._danger_path_can_be_preempted():
+                return DangerInspectionArbitration(pending=True)
+            started = self._start_danger_inspection(target, approach_pose, plan, now)
         return DangerInspectionArbitration(handled=started)
 
     def _tick_explore(self, pose: tuple[float, float, float]) -> None:
@@ -3473,6 +3528,8 @@ class MissionManager:
                             reason_code,
                         )
                         self._danger_defer_last_log_time = now
+                    # 暂缓的是预算动作，DONE/STUCK 仍须消费并完成到达或恢复处理。
+                    self._poll_exploration_controller(grid, pose)
                     return
                 # 避免相邻 tick 反复切换导致状态循环
                 last_decision = self._exploration.last_budget_decision
@@ -3932,6 +3989,10 @@ class MissionManager:
             # 否则 clear_path 会改变路径代次，使合法预规划结果无法归属旧路径。
             return
 
+        self._poll_exploration_controller(grid, pose)
+
+    def _poll_exploration_controller(self, grid, pose) -> None:
+        """统一消费探索终态，预算暂缓时也保留到达记账与失败恢复。"""
         status = self.controller.poll_status()
         if status == STUCK:
             self._frontier_arrival_gain.cancel()

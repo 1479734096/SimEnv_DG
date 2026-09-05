@@ -1419,6 +1419,28 @@ class PathFollower:
     def followed_path_snapshot(self) -> list[tuple[float, float]]:
         return list(self._path)
 
+    def remaining_path_snapshot(
+        self, robot_xy: tuple[float, float]
+    ) -> list[tuple[float, float]]:
+        """按当前跟踪段截取待执行折线，避免把已走过的障碍当作前方冲突。"""
+        with self._command_transaction_lock:
+            if not self._path:
+                return []
+            current = (float(robot_xy[0]), float(robot_xy[1]))
+            if len(self._path) == 1:
+                return [current, self._path[0]]
+            index = min(self._waypoint_index, len(self._path) - 2)
+            start, end = self._path[index:index + 2]
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length_squared = dx * dx + dy * dy
+            ratio = (
+                _clamp(((current[0] - start[0]) * dx
+                        + (current[1] - start[1]) * dy) / length_squared, 0.0, 1.0)
+                if length_squared > 1e-12 else 0.0
+            )
+            projection = (start[0] + ratio * dx, start[1] + ratio * dy)
+            return [current, projection, *self._path[index + 1:]]
+
     def requested_command_snapshot(self) -> tuple[float, float, float]:
         with self._command_transaction_lock:
             return tuple(self._last_requested_command)
