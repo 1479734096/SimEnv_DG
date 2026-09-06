@@ -521,6 +521,35 @@ fi
 GAZEBO_PID="$(rosnode info /gazebo 2>/dev/null | \
   awk '$1 == "Pid:" && $2 ~ /^[0-9]+$/ { print $2; exit }' || true)"
 
+# 在站立和 RL 切换之前录包，保留初始化前的姿态与点云证据。
+if [[ "$ELEVATOR_TEST_RECORD_DRIFT" == "1" ]]; then
+  bag_topics=(
+    /danger_search/localization/odom
+    /danger_search/localization/health
+    /cmd_vel
+    /trunk_imu
+    /a1_gazebo/joint_states
+    /danger_search/path_raw
+    /danger_search/path_followed
+    /danger_search/local_target
+    /rosout
+  )
+  if [[ "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" == "1" ]]; then
+    bag_topics+=(/ground_truth/base_w)
+  fi
+  if [[ "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" == "1" ]]; then
+    bag_topics+=(/scan /danger_search/localization/cloud_registered /nav/map_debug)
+    bag_topics+=(/danger_search/localization/ready /danger_search/localization/correction_state)
+  fi
+  setsid rosbag record --buffsize=64 \
+    -O "$LOG_DIR/elevator_diagnostic.bag" \
+    "${bag_topics[@]}" \
+    > "$LOG_DIR/rosbag.log" 2>&1 &
+  BAG_PID=$!
+  DRIFT_RECORDING_STATE="recording"
+  log "已启动隔离诊断录包；真值仅供运行结束后离线评估"
+fi
+
 printf '2' > "$FIFO"
 if ! wait_for_log "$AUTO_LOG" "Switched from passive to fixed stand" 90 "$AUTO_PID"; then
   fail "机器人未进入 fixed stand" 2
@@ -559,33 +588,6 @@ if [[ "$ELEVATOR_TEST_RECORD_RGBD" == "1" ]]; then
   RGBD_RECORDING_STARTED_WALL=$SECONDS
   RGBD_RECORDING_STATE="recording"
   log "已启动有界全任务 RGB-D 录包：${ELEVATOR_TEST_RGBD_MAX_SIZE_MB} MB / ${ELEVATOR_TEST_RGBD_MAX_WALL_SECONDS} 墙钟秒"
-fi
-
-if [[ "$ELEVATOR_TEST_RECORD_DRIFT" == "1" ]]; then
-  bag_topics=(
-    /danger_search/localization/odom
-    /danger_search/localization/health
-    /cmd_vel
-    /trunk_imu
-    /a1_gazebo/joint_states
-    /danger_search/path_raw
-    /danger_search/path_followed
-    /danger_search/local_target
-    /rosout
-  )
-  if [[ "$ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH" == "1" ]]; then
-    bag_topics+=(/ground_truth/base_w)
-  fi
-  if [[ "$ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS" == "1" ]]; then
-    bag_topics+=(/scan)
-  fi
-  setsid rosbag record --buffsize=64 \
-    -O "$LOG_DIR/elevator_diagnostic.bag" \
-    "${bag_topics[@]}" \
-    > "$LOG_DIR/rosbag.log" 2>&1 &
-  BAG_PID=$!
-  DRIFT_RECORDING_STATE="recording"
-  log "已启动隔离诊断录包；真值仅供运行结束后离线评估"
 fi
 
 sleep 2

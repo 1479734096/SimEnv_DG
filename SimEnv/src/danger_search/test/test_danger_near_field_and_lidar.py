@@ -1,9 +1,7 @@
-import math
 import unittest
 import numpy as np
 
 from danger_search.detection_tracker import DetectionCandidate, Track
-from danger_search.red_sphere_detector import RedSphereDetector
 
 
 class TestDangerNearFieldAndLidar(unittest.TestCase):
@@ -57,74 +55,6 @@ class TestDangerNearFieldAndLidar(unittest.TestCase):
         self.assertAlmostEqual(track.mean_position[1], 0.8, delta=0.02)
         # 验证 position_std 没有被 3.5m 与 0.8m 的跨度撑大
         self.assertLess(track.position_std(), 0.05)
-
-    def test_lidar_frustum_refinement_accuracy(self):
-        """验证利用 Livox 视锥点云能精确校准红球真实几何深度。"""
-        detector = RedSphereDetector()
-
-        # 假设相机位于世界原点 (0, 0, 0.28)，平视前向 (+Y)
-        cam_to_world = np.eye(4, dtype=float)
-        cam_to_world[2, 3] = 0.28  # 相机高度 0.28m
-
-        # RGB 初始给出的视觉球心：在 (0.0, 2.2, 0.15)，视觉深度估算偏大了 0.4m
-        visual_center = np.array([0.0, 2.2, 0.15], dtype=float)
-        obs_dist = float(np.linalg.norm(visual_center - cam_to_world[:3, 3]))
-
-        # 构造真实的激光雷达点云：真球心位于 (0.0, 1.80, 0.15)，真实球体前沿表面距离在 1.80 - 0.15 = 1.65m
-        # 在球壳前表面生成 15 个模拟 Livox 激光反射点
-        theta = np.linspace(-0.04, 0.04, 15)
-        lidar_points = []
-        for th in theta:
-            px = 1.65 * math.sin(th)
-            py = 1.65 * math.cos(th)
-            pz = 0.15 + 0.05 * math.sin(th * 10)  # 高度在球面上
-            lidar_points.append([px, py, pz])
-
-        # 加上一些地面杂波点 (z = 0.0) 和远端无关墙面点 (y = 5.0)
-        lidar_points.append([0.0, 1.65, 0.0])   # 地面点
-        lidar_points.append([0.1, 1.70, -0.05])  # 地面点
-        lidar_points.append([0.0, 5.0, 1.0])    # 远墙
-
-        refined_center, refined_dist = detector._refine_center_with_lidar(
-            center=visual_center,
-            camera_to_world=cam_to_world,
-            cloud_points=lidar_points,
-            obs_dist=obs_dist,
-            target_radius=0.15,
-            cone_angle_deg=4.5,
-        )
-
-        # 验证：球心 Y 坐标被激光成功校准至真实球心 1.80m 附近（误差 < 0.03m）
-        self.assertAlmostEqual(refined_center[1], 1.80, delta=0.03)
-        self.assertAlmostEqual(refined_center[0], 0.0, delta=0.02)
-
-    def test_lidar_sparse_fallback_safety(self):
-        """验证激光点稀疏或缺失时平滑回退到原始 RGB-D 坐标，绝不崩溃。"""
-        detector = RedSphereDetector()
-        cam_to_world = np.eye(4, dtype=float)
-        visual_center = np.array([1.0, 2.0, 0.15], dtype=float)
-
-        # 仅 2 个离散稀疏点（不足 5 个门限）
-        sparse_points = [[1.0, 2.0, 0.15], [1.02, 2.01, 0.14]]
-        refined_center, refined_dist = detector._refine_center_with_lidar(
-            center=visual_center,
-            camera_to_world=cam_to_world,
-            cloud_points=sparse_points,
-            obs_dist=2.0,
-        )
-
-        # 验证完全保留原坐标
-        np.testing.assert_array_almost_equal(refined_center, visual_center)
-        self.assertEqual(refined_dist, 2.0)
-
-        # 空点云同样安全回退
-        refined_center_empty, _ = detector._refine_center_with_lidar(
-            center=visual_center,
-            camera_to_world=cam_to_world,
-            cloud_points=[],
-            obs_dist=2.0,
-        )
-        np.testing.assert_array_almost_equal(refined_center_empty, visual_center)
 
     def test_footprint_unsupported_blocks_even_when_unknown_hold_disabled(self):
         """验证机身足端踩空悬空时，即便 unknown_support_hold_enabled 为 False，也绝对强制刹停且超时不误放行。"""

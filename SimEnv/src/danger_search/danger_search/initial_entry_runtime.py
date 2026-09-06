@@ -3,14 +3,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
+import time
 
 from danger_search.building_control_client import DoorInfo
 from danger_search.mission_reporting import MissionReportingRuntime
 from danger_search.navigation_tasks import OpenDoorAndPass
 from danger_search.navigator import DONE, IDLE, STUCK
+from danger_search.time_utils import get_time
 
 
 PROBE_LATERAL_OFFSETS = (0.0, -1.0, 1.0, -2.0, 2.0)
+# 依据 SimEnv初始.zip 内 building_generator_core/README.md 的生成语义；
+# 只用于观察站位和候选身份筛选，不写入定位或替代实测穿门几何。
+MAIN_ENTRANCE_CENTER = (0.0, 0.0)
 
 
 @dataclass(frozen=True)
@@ -23,6 +28,10 @@ class InitialEntryConfig:
     geometry_tolerance: float
     door_pass_offset: float
     door_commit_distance: float
+    door_wait_offset: float = 1.6
+    wait_timeout: float = 5.0
+    center_tolerance: float = 0.60
+    approach_max_linear: float = 0.44
 
     @classmethod
     def from_section(cls, section) -> "InitialEntryConfig":
@@ -39,11 +48,17 @@ class InitialEntryConfig:
             opening_max_distance=float(
                 section["initial_entry_opening_max_distance"]
             ),
+            wait_timeout=float(section["initial_entry_wait_timeout"]),
             geometry_tolerance=float(
                 section["initial_entry_geometry_tolerance"]
             ),
             door_pass_offset=float(section["door_pass_offset"]),
+            door_wait_offset=float(section.get("door_wait_offset", 1.6)),
             door_commit_distance=float(section["door_commit_distance"]),
+            center_tolerance=float(
+                section.get("initial_entry_center_tolerance", 0.60)
+            ),
+            approach_max_linear=float(section["door_pass_max_linear"]),
         )
 
 
@@ -80,6 +95,20 @@ class InitialEntryRuntime:
     clearance_target: tuple[float, float] | None = None
     clearance_door_id: str | None = None
     clearance_path_started: bool = False
+    free_corridor_wait_started_at: float | None = None
+    free_corridor_wait_started_wall: float | None = None
+    observation_retry_count: int = 0
+    service_started_at: float | None = None
+    service_started_wall: float | None = None
+    alignment_started_at: float | None = None
+    alignment_started_wall: float | None = None
+    approach_started_at: float | None = None
+    approach_started_wall: float | None = None
+    observation_reached_at: float | None = None
+    observation_not_before: float | None = None
+    observation_wait_started_at: float | None = None
+    observation_wait_started_wall: float | None = None
+    opening_seen: bool = False
 
     def schedule_clearance(
         self,
@@ -195,47 +224,144 @@ class InitialEntryRuntime:
             return InitialEntryTickResult(False)
         if self.origin_pose is None:
             self.origin_pose = tuple(float(value) for value in pose)
-            self.heading = float(pose[2])
+            self.heading = math.pi / 2.0
             self.trace = [(float(pose[0]), float(pose[1]))]
-
-        heading = float(self.heading)
-        origin = self.origin_pose
-        forward = (math.cos(heading), math.sin(heading))
-        forward_progress = max(
-            0.0,
-            (pose[0] - origin[0]) * forward[0]
-            + (pose[1] - origin[1]) * forward[1],
-        )
-        remaining_distance = max(0.0, config.max_distance - forward_progress)
-        if remaining_distance <= controller.goal_tolerance:
-            controller.clear_path(reason="initial_entry_completed")
-            self.completed = True
-            MissionReportingRuntime.loginfo(
-                "已沿传感器确认走廊深入主入口 %.2f m，开始常规 frontier 探索",
-                forward_progress,
-            )
-            return InitialEntryTickResult(True)
+            self.target = (MAIN_ENTRANCE_CENTER[0], -config.door_wait_offset)
+            if math.hypot(self.target[0] - pose[0], self.target[1] - pose[1]) > config.max_distance:
+                return self._fail(controller, "主入口固定观察点超出首次接近距离上限")
 
         if self.service_task is None:
+            self.service_started_at = get_time()
+            self.service_started_wall = time.monotonic()
+            controller.poll_status()
+            controller.clear_path(reason="initial_entry_opening")
             self.service_task = building_client.open_door("main_entrance")
             controller.stop(reason="initial_entry_opening")
             return InitialEntryTickResult(True)
         if not self.service_task.done():
+            if (
+                get_time() - self.service_started_at >= 30.0
+                or time.monotonic() - self.service_started_wall >= 180.0
+            ):
+                return self._fail(controller, "主入口开门服务超时（未取消请求，不重发）")
             controller.stop(reason="initial_entry_opening")
             return InitialEntryTickResult(True)
         if not self.service_task.ok():
-            self.failed = True
-            return InitialEntryTickResult(
-                False,
-                failure="主入口服务失败: " + self.service_task.message(),
+            return self._fail(controller, "主入口服务失败: " + self.service_task.message())
+
+        target = self.target
+        tolerance = min(0.12, float(controller.goal_tolerance))
+        distance = math.hypot(target[0] - pose[0], target[1] - pose[1])
+        if self.observation_reached_at is None:
+            if self.approach_started_at is None:
+                self.approach_started_at = get_time()
+                self.approach_started_wall = time.monotonic()
+            if (
+                get_time() - self.approach_started_at >= 30.0
+                or time.monotonic() - self.approach_started_wall >= 180.0
+            ):
+                return self._fail(controller, "主入口固定观察点接近超时")
+            if distance <= tolerance:
+                controller.poll_status()
+                controller.clear_path(reason="initial_entry_observation_reached")
+                self.observation_reached_at = get_time()
+                self.observation_not_before = self.observation_reached_at + 0.5
+                self.free_corridor_wait_started_at = None
+                self.free_corridor_wait_started_wall = None
+                self.observation_retry_count = 0
+                door_tracker.confirmations = 0
+                door_tracker.observation = None
+                MissionReportingRuntime.loginfo(
+                    "主入口固定观察点已停车：target=(%.2f, %.2f) pose=(%.2f, %.2f, %.2f)，重新累计停车后点云",
+                    target[0], target[1], pose[0], pose[1], pose[2],
+                )
+                return InitialEntryTickResult(True)
+        elif distance > 0.30:
+            return self._fail(controller, "主入口停车观察期间位置漂移超限")
+        if pose[1] > target[1] + 0.30:
+            return self._fail(controller, "未确认门洞已越过主入口观察边界")
+
+        if (
+            self.observation_reached_at is None
+            and self.free_corridor_wait_started_at is not None
+            and (
+                get_time() - self.free_corridor_wait_started_at >= config.wait_timeout
+                or time.monotonic() - self.free_corridor_wait_started_wall >= 60.0
+            )
+        ):
+            if self.observation_retry_count >= 1:
+                return self._fail(controller, "主入口门洞/观察点路线确认重试耗尽")
+            self.observation_retry_count += 1
+            self.free_corridor_wait_started_at = get_time()
+            self.free_corridor_wait_started_wall = time.monotonic()
+            door_tracker.confirmations = 0
+            door_tracker.observation = None
+            # 保留 last_stamp，重试必须等待新帧，不能重复使用旧候选。
+            MissionReportingRuntime.logwarn(
+                "主入口观察点路线确认超时，重试1/1，不重发开门服务"
             )
 
-        if self.target is None and self.align_heading(
+        # 必须先检查已启动的观察预算，再处理转向，避免姿态扰动跳过截止时间。
+        if self.observation_wait_started_at is not None and (
+            get_time() - self.observation_wait_started_at >= config.wait_timeout
+            or time.monotonic() - self.observation_wait_started_wall >= 60.0
+        ):
+            if self.observation_retry_count >= 1:
+                return self._fail(controller, "主入口门洞确认重试耗尽")
+            self.observation_retry_count += 1
+            self.observation_wait_started_at = get_time()
+            self.observation_wait_started_wall = time.monotonic()
+            self.observation_not_before = get_time() + 0.5
+            door_tracker.confirmations = 0
+            door_tracker.observation = None
+            MissionReportingRuntime.logwarn(
+                "主入口门洞观察超时，重新累计新帧证据（重试1/1），不重发开门服务"
+            )
+
+        status = controller.poll_status()
+        if status in (STUCK, DONE):
+            controller.clear_path(reason="initial_entry_approach_interrupted")
+        heading = (
+            math.atan2(-pose[1], -pose[0])
+            if self.observation_reached_at is not None
+            else math.atan2(target[1] - pose[1], target[0] - pose[0])
+        )
+        was_aligning = self.alignment_started_at is not None
+        if not controller.has_path() and self.align_heading(
             controller,
             pose,
             heading,
         ):
+            if self.alignment_started_at is None:
+                self.alignment_started_at = get_time()
+                self.alignment_started_wall = time.monotonic()
+            elif (
+                get_time() - self.alignment_started_at >= 12.0
+                or time.monotonic() - self.alignment_started_wall >= 180.0
+            ):
+                return self._fail(controller, "主入口接近朝向对准超时")
             return InitialEntryTickResult(True)
+        if was_aligning and self.observation_reached_at is not None:
+            controller.stop(reason="initial_entry_alignment_completed")
+            # 姿态扰动只重置证据起点，不续期观察预算或增加重试机会。
+            self.observation_not_before = get_time() + 0.5
+            if self.observation_wait_started_at is None:
+                self.observation_wait_started_at = get_time()
+                self.observation_wait_started_wall = time.monotonic()
+            door_tracker.confirmations = 0
+            door_tracker.observation = None
+            self.alignment_started_at = None
+            self.alignment_started_wall = None
+            MissionReportingRuntime.loginfo(
+                "主入口观察朝向已稳定，重新等待0.5秒后累计点云"
+            )
+            return InitialEntryTickResult(True)
+        self.alignment_started_at = None
+        self.alignment_started_wall = None
+
+        if self.observation_reached_at is not None and self.observation_wait_started_at is None:
+            self.observation_wait_started_at = get_time()
+            self.observation_wait_started_wall = time.monotonic()
 
         door_result = self.try_start_door_task(
             pose=pose,
@@ -253,63 +379,55 @@ class InitialEntryRuntime:
         if door_result.handled:
             return door_result
 
-        if self.target is None:
-            target = initial_forward_free_target(
-                grid,
-                (pose[0], pose[1], heading),
-                max_distance=remaining_distance,
-                corridor_half_width=config.corridor_half_width,
-                minimum_distance=max(
-                    2.0 * float(controller.goal_tolerance),
-                    config.probe_distance,
-                ),
-            )
-            if target is None:
-                controller.stop(reason="initial_entry_waiting_for_free_corridor")
-                return InitialEntryTickResult(True)
-            if callable(segment_is_traversable) and not segment_is_traversable(
-                grid, (pose[0], pose[1]), target
-            ):
-                controller.stop(reason="initial_entry_planning_constraint")
-                return InitialEntryTickResult(True)
-            self.target = target
-            controller.set_path([(pose[0], pose[1]), target], reason="initial_entry_corridor_path")
-            MissionReportingRuntime.loginfo(
-                "按传感器确认的自由走廊进入主入口："
-                "target=(%.2f, %.2f) distance=%.2f",
-                target[0],
-                target[1],
-                math.hypot(target[0] - pose[0], target[1] - pose[1]),
+        if self.observation_reached_at is not None:
+            return self._wait_for_observation(
+                controller, "initial_entry_waiting_for_opening",
             )
 
-        target = self.target
-        distance = math.hypot(target[0] - pose[0], target[1] - pose[1])
-        if distance <= controller.goal_tolerance:
-            controller.clear_path(reason="initial_entry_completed")
-            self.target = None
-            self.retry_count = 0
-            return InitialEntryTickResult(True)
         if not controller.has_path():
-            if self.retry_count >= 1:
-                self.failed = True
-                return InitialEntryTickResult(
-                    False,
-                    failure="主入口前向进入失败",
+            if self.retry_count >= 2:
+                return self._fail(controller, "主入口固定观察点接近重试耗尽")
+            if not callable(segment_is_traversable):
+                return self._fail(controller, "主入口观察点缺少路径安全检查")
+            lateral = (-math.sin(heading), math.cos(heading))
+            # 继续检查左右足迹带；固定坐标不代表路线已知安全，不绕行未知门区。
+            if not all(
+                segment_is_traversable(
+                    grid,
+                    (pose[0] + offset * lateral[0], pose[1] + offset * lateral[1]),
+                    (target[0] + offset * lateral[0], target[1] + offset * lateral[1]),
                 )
-            self.retry_count += 1
-            if callable(segment_is_traversable) and not segment_is_traversable(
-                grid, (pose[0], pose[1]), target
+                for offset in (-config.corridor_half_width, 0.0, config.corridor_half_width)
             ):
-                controller.stop(reason="initial_entry_planning_constraint")
-                return InitialEntryTickResult(True)
-            controller.set_path([(pose[0], pose[1]), target], reason="initial_entry_reentry_path")
-        status = controller.poll_status()
-        if status == STUCK:
-            controller.clear_path(reason="initial_entry_stuck")
-        elif status == DONE:
-            self.target = None
-            self.retry_count = 0
+                return self._wait_for_observation(controller, "initial_entry_planning_constraint")
+            self.free_corridor_wait_started_at = None
+            self.free_corridor_wait_started_wall = None
+            self.retry_count += 1
+            controller.set_path(
+                [(pose[0], pose[1]), target],
+                max_linear=config.approach_max_linear,
+                goal_tolerance=tolerance,
+                reason="initial_entry_observation_path",
+            )
+            MissionReportingRuntime.loginfo(
+                "接近主入口固定观察点：target=(%.2f, %.2f) distance=%.2f max_linear=%.2f attempt=%d/2",
+                target[0], target[1], distance, config.approach_max_linear, self.retry_count,
+            )
         return InitialEntryTickResult(True)
+
+    def _wait_for_observation(self, controller, reason: str) -> InitialEntryTickResult:
+        if self.observation_reached_at is None and self.free_corridor_wait_started_at is None:
+            self.free_corridor_wait_started_at = get_time()
+            self.free_corridor_wait_started_wall = time.monotonic()
+        controller.poll_status()
+        controller.stop(reason=reason)
+        return InitialEntryTickResult(True)
+
+    def _fail(self, controller, reason: str) -> InitialEntryTickResult:
+        self.failed = True
+        controller.poll_status()
+        controller.clear_path(reason="initial_entry_failed")
+        return InitialEntryTickResult(True, failure=reason)
 
     @staticmethod
     def align_heading(
@@ -350,13 +468,24 @@ class InitialEntryRuntime:
         config: InitialEntryConfig,
     ) -> InitialEntryTickResult:
         """连续点云确认入口门洞后返回待安装的门任务。"""
-        if cloud_stamp is None or cloud_stamp == door_tracker.last_stamp:
+        if (
+            cloud_stamp is None
+            or not math.isfinite(cloud_stamp)
+            or (door_tracker.last_stamp is not None and cloud_stamp <= door_tracker.last_stamp)
+            or (
+                self.observation_not_before is not None
+                and cloud_stamp <= self.observation_not_before
+            )
+        ):
             return InitialEntryTickResult(False)
         observation = local_detector.detect_opening_ahead(
             robot_pose=pose,
             floor_index=int(current_floor),
             cloud_points=cloud_points,
             floor_height=float(floor_height),
+            maximum_distance=config.opening_max_distance,
+            expected_center_xy=MAIN_ENTRANCE_CENTER,
+            maximum_center_error=config.center_tolerance,
         )
         if not door_tracker.observe(
             stamp=cloud_stamp,
@@ -369,19 +498,18 @@ class InitialEntryRuntime:
         observation = door_tracker.observation
         if observation is None:  # pragma: no cover - tracker 合同保证
             raise RuntimeError("入口门洞确认成功但缺少观测")
+        if self.observation_reached_at is None:
+            if not self.opening_seen:
+                self.opening_seen = True
+                MissionReportingRuntime.loginfo(
+                    "主入口远处候选已确认：center=(%.2f, %.2f) distance=%.2f，仍须先到固定观察点停车",
+                    observation.world_xy[0], observation.world_xy[1], observation.distance,
+                )
+            return InitialEntryTickResult(False)
 
         door_id = str(entrance.door_id)
         registered_x = float(observation.world_xy[0])
         registered_y = float(observation.world_xy[1])
-        if self.origin_pose is not None and self.heading is not None:
-            forward_x = math.cos(float(self.heading))
-            forward_y = math.sin(float(self.heading))
-            progress = (
-                (registered_x - float(self.origin_pose[0])) * forward_x
-                + (registered_y - float(self.origin_pose[1])) * forward_y
-            )
-            registered_x = float(self.origin_pose[0]) + progress * forward_x
-            registered_y = float(self.origin_pose[1]) + progress * forward_y
         building_client.doors[door_id] = DoorInfo(
             door_id=door_id,
             kind=str(entrance.kind),
@@ -391,11 +519,13 @@ class InitialEntryRuntime:
             yaw=float(observation.yaw),
             width=float(observation.width),
         )
+        controller.poll_status()
         controller.clear_path(reason="initial_entry_opening_confirmed")
         task = OpenDoorAndPass(
             door_id,
             pass_offset=config.door_pass_offset,
             commit_distance=config.door_commit_distance,
+            wait_offset=config.door_wait_offset,
         )
         task.phase = "CALL_OPEN"
         MissionReportingRuntime.loginfo(

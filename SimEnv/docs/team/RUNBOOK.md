@@ -1,5 +1,10 @@
 # 开发与验证手册
 
+2026-09-05用户单独授权最多三次计次二层闭环，验收与每轮记录见
+`reports/AUTONOMOUS_TWO_FLOOR_20260905.md`，不构成长期自动回归许可。
+启用定位诊断录包时，从stand/RL切换前开始，包含配准点云、地图、ready和纠偏回执。
+源层开门后若地图持续阻塞，应以`elevator_current_entry_blocked_timeout`有界退出。
+
 ## 逻辑优先，停止自动回归测试
 
 本手册不再规定或推荐自动测试、回归测试、固定 seed 矩阵、pytest/gtests、测试 runner 或
@@ -200,9 +205,9 @@ SETUPTOOLS_USE_DISTUTILS=stdlib catkin_make install
 
 - `localization/entrance_geometry_apply_correction=false`：默认只观察候选，不等待、不注入。
   `entrance_geometry_correction_evaluated` 的 accepted 不等于 applied；缺少帧会记录 insufficient_frames。
-- `detection/lidar_max_time_delta=0.10`：同楼层和查询 epoch 选最近云；查看限频事件
-  `rgbd_livox_time_match` 的 RGB/深度/pose/cloud stamp、time_delta、epoch。cloud_stamp=null
-  表示没有时间匹配云，仍可使用合法 RGB-D 候选。
+- 危险源候选不再使用 Livox 球心修正。查看限频事件 `danger_perception_summary` 的
+  RGB/深度/pose stamp、RGB-D 球心、RMSE、置信度和 Tracker 状态；不要期待
+  `rgbd_livox_time_match` 或候选修正前后字段。Livox 仍须按定位、地图和门/电梯用途取证。
 - `mission/return_cleanup_timeout=180.0`、`return_cleanup_wall_timeout=600.0`：名义总期限到达
   后停止新核验，完成当前流程再返航；独立上限耗尽则停车写失败部分结果。到家但已超时仍失败，
   不允许通过放宽结果判定掩盖 `mission_timeout`。
@@ -233,6 +238,10 @@ SETUPTOOLS_USE_DISTUTILS=stdlib catkin_make install
 
 ### 续审修复与构建记录
 
+主入口诊断时不要把 `entrance_geometry_center_x=0` 理解为机器人定位目标；该参数仅是
+初始 yaw 观察合同。确认门洞时检查左右门框、内部中高位占用和扫掠净宽；开门后的地图
+清理不应导致新鲜正障碍距离变为 `null`。若净空证据不足，停车并在有限时限内失败降级。
+
 已构建 `scan_localization_node`（未执行任何测试目标）：
 
 ```bash
@@ -252,3 +261,36 @@ cmake --build build --target scan_localization_node -- -j2
   `_forced_stop` 表示使用过 TERM/KILL，`_exit_unconfirmed` 表示仍无法确认退出；不要把这类
   包当作完整证据，也不要删除 `.active`。每个停止过程约12秒内结束轮询，不保证操作系统能
   立即终止不可中断 I/O。旧离线分析工具本身的耗时不包含在这12秒内。
+
+## 主入口等待点
+
+主入口首段目标固定为world坐标`(0,-1.6)`，接近上限`0.44m/s`；这是基于初始生成器
+公开的入口原点合同设置的导航目标，不是定位纠偏。远场门洞候选上限为3.0m，中心还须
+位于原点0.6m内。提前发现不放行：到点必须停车，只用停车0.5秒后的新点云重新完成两帧
+确认，随后才按实时观测中心执行门外1.6m等待、门内0.8m通过和深入。
+
+检查日志应依次出现`initial_entry_observation_path`、`主入口固定观察点已停车`和
+`点云连续确认主入口门洞`。固定点接近最多30秒任务时间/180秒墙钟；停车观察每轮最多
+5秒，只重试一次且每轮另限60秒墙钟，耗尽后记录失败并返航。电梯厅外等待点0.8m、
+轿厢内目标0.95m保持独立，不跟随主入口参数改变。
+
+控制到点容差最多0.12m，停车漂移超0.30m显式失败；这些是合法定位下的判据，不保证
+真实机身或足端净距。首次对准结束后开始每轮5秒观察；后续重对准和稳定等待计入该预算，
+不会续期或重置次数。路线不可用等待独立计时，首次对准仍有12秒任务时间/180秒墙钟上限。
+开放门洞刷新后，检查`main_entrance`的实时等待点、通过点和机器人位姿：横向中心线误差应
+不大于0.25m；超限必须先出现重新站位日志，不能直接出现`door_pass_point_path`。刷新时距离
+不超过0.30m且横向合格可直接ALIGN；需要重新站位时进入等待点0.25m站位窗后再ALIGN。
+整个站位与对准阶段最多30秒任务时间/180秒墙钟。普通门仍保留
+原流程，不使用本入口专用中心线门控。
+
+电梯进出厢日志必须依次出现`POSITION`、`ALIGN`、`CROSS`。进梯POSITION目标是门外等待点，
+ALIGN目标是轿厢中心；出梯POSITION目标是轿厢中心，ALIGN目标是厅外等待点。不得把电梯门
+中心误当朝向目标。POSITION目标距离和横向误差均允许0.25m；之后必须经过ALIGN，不得从
+POSITION直接跳到CROSS。对准漂移应退回POSITION，站位与对准总计最多30秒。
+首次ALIGN开始后的12秒截止时间不会因重新站位续期，漂移回退最多四次；准备过程另有180秒
+墙钟上限。ALIGN仍用原控制器0.10rad进入确认、0.15rad释放；CROSS完成点仍用原0.15m容差。
+两类站位路径的控制器到点容差会扣除规划终点偏差；这不是缩小任务站位窗。若A*替代终点
+已在窗外，应明确报不可达或`elevator_position_goal_outside_acceptance`，不能反复消耗DONE。
+这些是合法定位下的任务容差，不等于机身真实净空保证；门洞误识别和定位漂移仍需分别检查。
+主入口门识别现行单侧高度跨度阈值为0.30m（适配Livox 45°俯仰下倾雷达视场），已彻底移除blocked_interior内部占用一票否决；主入口过门阶段已废除1.8m避障排除盒，正障碍检测全量生效，若机身偏航擦碰门板将触发急停保护。
+本次只做调用链静态审查、Python语法编译和`git diff --check`，未运行测试、节点或仿真。

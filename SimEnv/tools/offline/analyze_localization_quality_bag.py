@@ -1264,7 +1264,9 @@ def build_quality_samples(
         aligned_truth = _aligned_truth_xy(truth, alignment)
         error_post, error_pre, benefit, benefit_x, benefit_y = correction_benefit(
             (estimate.x, estimate.y), aligned_truth,
-            (frame.applied_x, frame.applied_y),
+            # raw 是相对命令预测的配准修正；applied 是完整帧位移，不能用于
+            # 反事实移除配准，否则会把命令运动一并删除。
+            (frame.raw_x, frame.raw_y),
         )
         depth_velocity = _velocity(
             _nearest(depth_frames, frame.stamp, 0.25, depth_stamps)
@@ -1987,7 +1989,7 @@ def analyze_map_alias(
         aligned_truth = _aligned_truth_xy(truth, alignment)
         original_error, _without, benefit, _bx, _by = correction_benefit(
             (estimate.x, estimate.y), aligned_truth,
-            (frame.applied_x, frame.applied_y),
+            (frame.raw_x, frame.raw_y),
         )
         label = "necessary" if benefit > 0.005 else (
             "harmful" if benefit < -0.005 else "neutral"

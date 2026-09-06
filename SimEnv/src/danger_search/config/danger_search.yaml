@@ -142,15 +142,22 @@ mission:
   no_frontier_retreat_clearance_margin: 0.10
   probe_distance: 1.0
   probe_yaw: 1.5708
-  # 起点存在公开主入口时，先沿当前朝向上由传感器确认的 FREE 走廊深入。
-  # 仅限制局部探测上限，不包含门坐标或场景特例。
+  # 主入口按初始公开合同在 world 原点；首段只到 (0, -door_wait_offset)。
+  # 此值仅限制首次接近距离，不能以走满距离替代门洞确认或放行穿越。
   initial_entry_max_distance: 5.0
   initial_entry_corridor_half_width: 0.25
   initial_entry_opening_confirmations: 2
-  initial_entry_opening_max_distance: 1.50
+  # 远处提前累计候选；到固定观察点停车后仍须重新取得新帧确认。
+  initial_entry_opening_max_distance: 3.00
+  # 仅筛选公开入口中心附近的候选，不把观测或定位吸附到原点。
+  initial_entry_center_tolerance: 0.60
+  # 每轮观察5秒，最多重试一次；耗尽后记录失败并返航。
+  initial_entry_wait_timeout: 5.0
   initial_entry_geometry_tolerance: 0.3
   # 过门后先深入到门后，避免刚过门就把 frontier 选择权交回门口。
   door_pass_offset: 0.8
+  # 主入口等待点单独后撤；门内通过点仍由 door_pass_offset 控制。
+  door_wait_offset: 1.6
   # 服务开门后用近场点云重新对准门洞；跨门段限速，减少横向定位误差积累。
   door_pass_max_linear: 0.44
   # 越过门面后的轴向离门段需要克服门槛接触，但仍低于普通探索速度。
@@ -426,8 +433,6 @@ detection:
   min_radius: 0.10
   max_radius: 0.22
   max_rmse: 0.035
-  # 候选级修正只使用同楼层、同定位 epoch 且最接近 RGB 时间的 Livox 帧。
-  lidar_max_time_delta: 0.10
   ransac_iterations: 80
   ransac_sample_size: 4
   max_depth: 8.0
@@ -448,7 +453,7 @@ local_semantic:
   opening_min_width: 0.65
   opening_max_width: 2.50
   opening_plane_depth: 0.30
-  opening_min_side_height_span: 0.50
+  opening_min_side_height_span: 0.30
   # 多楼层时用合法 RealSense RGB-D 补充发现动态门：深色只负责提出候选，
   # 必须同时通过竖直深度平面、物理尺寸和连续帧约束。
   rgbd_door_detection_enabled: true

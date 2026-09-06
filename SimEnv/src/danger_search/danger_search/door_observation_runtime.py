@@ -336,6 +336,9 @@ class DoorObservationRuntime:
             floor_index=int(current_floor),
             cloud_points=cloud_points,
             floor_height=float(floor_height),
+            maximum_distance=config.opening_max_distance,
+            expected_center_xy=(float(existing.x), float(existing.y)),
+            maximum_center_error=config.maximum_center_shift,
         )
         minimum_width = minimum_refresh_width(
             sweep_half_width=config.sweep_half_width,

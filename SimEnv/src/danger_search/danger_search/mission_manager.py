@@ -283,8 +283,8 @@ class MissionManager:
         # rospy.Timer 使用仿真时间；墙钟线程用该值判断 timer 是否长期未进入。
         self._last_tick_wall_time: float | None = None
         self._tick_wall_forced_shutdown_reason: str | None = None
-        # 主入口探测是一段独立的小状态机：先由合法传感器寻找安全直行目标，
-        # 必要时注册入口门并异步开门，轨迹同时留给最终返航反向复用。
+        # 主入口先沿安全路线到固定观察点，停车后确认实测门洞再交接门任务；
+        # 观察目标不参与定位纠偏，实际轨迹同时留给最终返航反向复用。
         self._entry = InitialEntryRuntime()
         self._door_observation_runtime = DoorObservationRuntime()
         # 主入口任务只负责确认越过门面；机身完全离开门框前禁止把控制权
@@ -2160,25 +2160,11 @@ class MissionManager:
         )
         camera_to_world = image_commit.camera_to_world
         detection_result = image_commit.detection_result
-        if get_time() - getattr(self, "_last_fusion_log_time", -math.inf) >= 2.0:
-            self._last_fusion_log_time = get_time()
-            cloud_stamp = detection_result.matched_cloud_stamp
-            self._log_structured({
-                "event": "rgbd_livox_time_match",
-                "rgb_stamp": image_stamp,
-                "depth_stamp": image_stamps[1],
-                "pose_stamp": image_pose.stamp,
-                "cloud_stamp": cloud_stamp,
-                "time_delta": abs(cloud_stamp - image_stamp) if cloud_stamp is not None else None,
-                "floor": self.current_floor,
-                "localization_epoch": image_lookup.localization_epoch,
-            })
         danger_sync = getattr(detection_result, "danger_obstacle_sync", None)
         if detection_result.candidate_diagnostics:
             self._log_structured({
                 "event": "danger_perception_summary", "rgb_stamp": image_stamp,
                 "depth_stamp": image_stamps[1], "pose_stamp": image_pose.stamp,
-                "cloud_stamp": detection_result.matched_cloud_stamp,
                 "floor": self.current_floor,
                 "localization_epoch": image_lookup.localization_epoch,
                 "candidate_count": detection_result.candidate_count,
@@ -3783,6 +3769,11 @@ class MissionManager:
                 candidate.door_id,
                 pass_offset=self.door_pass_offset,
                 commit_distance=self.door_commit_distance,
+                wait_offset=(
+                    self.door_wait_offset
+                    if candidate.door_id == "main_entrance"
+                    else None
+                ),
             )
             MissionReportingRuntime.loginfo(
                 "局部检测到可控动态门：door_id=%s distance=%.2f source=%s evidence=%d",
@@ -4003,6 +3994,7 @@ class MissionManager:
                     building_client=self.building_client,
                     pass_offset=self.door_pass_offset,
                     now=get_time(),
+                    main_entrance_wait_offset=self.door_wait_offset,
                     planning_constraints=self._planning_constraints(),
                 )
                 if door_id is not None:
@@ -4017,6 +4009,11 @@ class MissionManager:
                         door_id,
                         pass_offset=self.door_pass_offset,
                         commit_distance=self.door_commit_distance,
+                        wait_offset=(
+                            self.door_wait_offset
+                            if door_id == "main_entrance"
+                            else None
+                        ),
                     )
                     MissionReportingRuntime.loginfo(
                         "选择主动靠近并开启未探索门：door_id=%s", door_id
@@ -4463,10 +4460,8 @@ class MissionManager:
         door = self.building_client.doors.get(door_id)
         if door is None:
             return
-        # clear_dynamic_door_strip 的 depth 是完整长度。清理范围至少覆盖门两侧
-        # 等待点及占据膨胀，否则机器人从门内返航时会站在膨胀 OCC 中，A* 和
-        # 直连检查都无法离开。门宽和法向均来自传感器注册结果，不扩展到门外
-        # commit 区域，也不使用场景固定坐标。
+        # depth 是完整长度；等待点后撤不扩大旧门板清理范围，避免删掉门前
+        # 真实障碍。新等待点及通往它的路径仍须通过正常可达性检查。
         half_depth = max(
             self.door_clear_radius,
             self.door_pass_offset
@@ -4519,14 +4514,8 @@ class MissionManager:
         """返回当前主动过门阶段可忽略的已开门洞棱柱。"""
         task = getattr(self, "current_task", None)
         if isinstance(task, OpenDoorAndPass):
-            if getattr(task, "phase", None) not in {"GO_PASS_POINT", "GO_COMMIT_POINT"}:
-                return None
-            # 服务成功、完成门洞对准并提交直线路径后才允许过滤。这样等待点导航
-            # 和普通探索仍保留完整正障碍制动，门服务失败也不会被掩盖。
-            if not bool(getattr(task, "_pass_path_started", False)):
-                return None
-            door_id = task.door_id
-            elevator_crossing = False
+            # 废除门区前向避障盲区盒：开门由地图层擦除OCC放行，实时激光雷达全量保留对真实门板制动
+            return None
         elif isinstance(task, TakeElevator):
             active_door_id = getattr(task, "active_opened_door_id", None)
             if not callable(active_door_id):
@@ -4629,7 +4618,8 @@ class MissionManager:
             side = self._door_navigation.side_label(frontier.centroid)
             if isinstance(wait_point, tuple) and isinstance(pass_point, tuple):
                 side = self._door_navigation.classify_goal_side(
-                    wait_point, pass_point, frontier.centroid
+                    wait_point, pass_point, frontier.centroid,
+                    door_center=debug.get("door_center"),
                 )
         MissionReportingRuntime.loginfo(
             "过门后首次前沿选择：door_id=%s frontier_target=%s score=%.2f path_length=%.2f relative_side=%s commit_point=(%.2f, %.2f) current_pose=(%.2f, %.2f, %.2f) completion_pose=(%.2f, %.2f, %.2f)",
@@ -4705,6 +4695,13 @@ class MissionManager:
         )
         if result.failure is not None:
             self._record_failure(result.failure)
+            self._mission_success_eligible = False
+            self._transition_state(
+                RETURN_HOME,
+                reason_code="initial_entry_failed",
+                call_site="MissionManager._run_initial_entry",
+            )
+            return True
         if result.clear_exploration_target:
             self._frontier_arrival_gain.cancel()
             self.current_frontier = None
@@ -5254,12 +5251,14 @@ class MissionManager:
                         (pose[0], pose[1]),
                         pass_offset=self.door_pass_offset,
                         commit_distance=self.door_commit_distance,
+                        wait_offset=self.door_wait_offset,
                     )
                 )
             except (KeyError, ValueError):
                 pass
             activation_distance = max(
                 1.0,
+                self.door_wait_offset + self.controller.goal_tolerance,
                 float(getattr(self, "door_transition_hold_distance", 2.5)),
             )
             wait_distance = (
@@ -5291,6 +5290,7 @@ class MissionManager:
                     "main_entrance",
                     pass_offset=self.door_pass_offset,
                     commit_distance=self.door_commit_distance,
+                    wait_offset=self.door_wait_offset,
                 )
                 MissionReportingRuntime.loginfo("返航先经已注册主入口离开建筑，再继续回到起点")
                 return

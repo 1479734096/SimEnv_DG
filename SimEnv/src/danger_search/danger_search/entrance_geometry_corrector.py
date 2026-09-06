@@ -296,8 +296,10 @@ class EntranceGeometryCorrector:
         if evaluation.status != "accepted" or evaluation.correction_xy is None:
             return EntranceCorrectionOutcome("done", reason=evaluation.status)
         controller.stop(reason=f"entrance_geometry_correction_{key}_request")
+        # 外墙合同只提供初始航向参考；墙体缺少可靠的绝对平移基准，禁止把
+        # 匹配得到的 XY 偏移注入全局定位。保留 yaw 纠偏仍通过同一有界 PoseProvider。
         sequence = pose_provider.request_planar_correction(
-            evaluation.correction_xy,
+            (0.0, 0.0),
             correction_yaw=float(evaluation.correction_yaw or 0.0),
             maximum_correction=self.config.maximum_correction,
             maximum_yaw_correction=self.config.maximum_yaw_correction,

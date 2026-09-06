@@ -107,6 +107,8 @@ class LocalSemanticDetector:
         maximum_distance: float | None = None,
         min_side_height_span: float | None = None,
         min_evidence_points: int | None = None,
+        expected_center_xy: tuple[float, float] | None = None,
+        maximum_center_error: float | None = None,
     ) -> OpeningObservation | None:
         """从前方两侧竖直结构之间确认门洞，不依赖门坐标真值。"""
         minimum_distance = float(minimum_distance)
@@ -122,6 +124,13 @@ class LocalSemanticDetector:
             or maximum_distance <= minimum_distance
         ):
             raise ValueError("门洞检测距离窗口必须为有限递增范围")
+        if expected_center_xy is not None and (
+            not all(math.isfinite(value) for value in expected_center_xy)
+            or maximum_center_error is None
+            or not math.isfinite(maximum_center_error)
+            or maximum_center_error <= 0.0
+        ):
+            raise ValueError("门洞预期中心必须有限且位置容差必须为正有限数")
         heading = (math.cos(robot_pose[2]), math.sin(robot_pose[2]))
         lateral_axis = (-heading[1], heading[0])
         floor_z = floor_index * floor_height
@@ -203,6 +212,12 @@ class LocalSemanticDetector:
                 + plane_distance * heading[1]
                 + lateral_center * lateral_axis[1],
             )
+            # 先筛身份再选最近候选，否则近处无关开口会遮住真正入口。
+            if expected_center_xy is not None and math.hypot(
+                world_xy[0] - expected_center_xy[0],
+                world_xy[1] - expected_center_xy[1],
+            ) > maximum_center_error:
+                continue
             left_forward = sum(sample[0] for sample in left_evidence) / len(left_evidence)
             right_forward = sum(sample[0] for sample in right_evidence) / len(right_evidence)
             d_forward = left_forward - right_forward

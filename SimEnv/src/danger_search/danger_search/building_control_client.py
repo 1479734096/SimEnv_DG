@@ -260,10 +260,12 @@ class BuildingControlClient:
         robot_pose: tuple[float, float],
         pass_offset: float = 0.8,
         commit_distance: float = 1.8,
+        wait_offset: float | None = None,
     ) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
         """由传感器注册门法向计算等待点、通过点和门后深入点。
 
         法向有两个方向，离机器人更近的一侧作为等待侧，另一侧作为通过侧；
+        wait_offset 单独控制等待侧距离，省略时保留旧的两侧对称合同。
         commit 点继续沿相同方向深入，供探索器建立“已经完整过门”的空间上下文。
         """
         if door_id not in self.doors:
@@ -272,17 +274,19 @@ class BuildingControlClient:
         try:
             robot_x, robot_y = float(robot_pose[0]), float(robot_pose[1])
             offset = float(pass_offset)
+            wait = offset if wait_offset is None else float(wait_offset)
             commit = float(commit_distance)
         except (IndexError, TypeError, ValueError):
             raise ValueError("机器人位置和过门距离必须是二维有限数") from None
         if not all(
-            math.isfinite(value) for value in (robot_x, robot_y, offset, commit)
+            math.isfinite(value) for value in (robot_x, robot_y, offset, wait, commit)
         ):
             raise ValueError("机器人位置和过门距离必须是二维有限数")
         offset = max(offset, 0.05)
+        wait = max(wait, 0.05)
         commit = max(commit, offset)
-        dx = math.cos(door.yaw) * offset
-        dy = math.sin(door.yaw) * offset
+        dx = math.cos(door.yaw) * wait
+        dy = math.sin(door.yaw) * wait
 
         p1 = (door.x + dx, door.y + dy)
         p2 = (door.x - dx, door.y - dy)
@@ -291,9 +295,15 @@ class BuildingControlClient:
         d2 = math.hypot(robot_x - p2[0], robot_y - p2[1])
 
         if d1 < d2:
-            wait_point, pass_point = p1, p2
+            wait_point = p1
+            pass_sign = -1.0
         else:
-            wait_point, pass_point = p2, p1
+            wait_point = p2
+            pass_sign = 1.0
+        pass_point = (
+            door.x + pass_sign * math.cos(door.yaw) * offset,
+            door.y + pass_sign * math.sin(door.yaw) * offset,
+        )
         pass_dir_x = pass_point[0] - door.x
         pass_dir_y = pass_point[1] - door.y
         norm = math.hypot(pass_dir_x, pass_dir_y)

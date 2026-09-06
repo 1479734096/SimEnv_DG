@@ -227,6 +227,7 @@ _CONFIG_GROUP_FIELDS = {
             "door_commit_distance",
             "door_pass_max_linear",
             "door_pass_offset",
+            "door_wait_offset",
             "door_refresh_max_center_shift",
             "door_refresh_timeout",
             "door_transition_duration",
@@ -236,6 +237,8 @@ _CONFIG_GROUP_FIELDS = {
             "initial_entry_max_distance",
             "initial_entry_opening_confirmations",
             "initial_entry_opening_max_distance",
+            "initial_entry_center_tolerance",
+            "initial_entry_wait_timeout",
             "main_entrance_clearance_max_linear",
             "post_door_context_max_duration",
             "post_door_min_distance",
@@ -687,10 +690,16 @@ class _MissionConfigBuilder:
             1, int(_param("mission/initial_entry_opening_confirmations", 2))
         )
         self.initial_entry_opening_max_distance = float(
-            _param("mission/initial_entry_opening_max_distance", 1.2)
+            _param("mission/initial_entry_opening_max_distance", 3.0)
+        )
+        self.initial_entry_center_tolerance = float(
+            _param("mission/initial_entry_center_tolerance", 0.60)
         )
         self.initial_entry_geometry_tolerance = float(
             _param("mission/initial_entry_geometry_tolerance", 0.25)
+        )
+        self.initial_entry_wait_timeout = float(
+            _param("mission/initial_entry_wait_timeout", 5.0)
         )
         if (
             not math.isfinite(self.initial_entry_max_distance)
@@ -699,11 +708,16 @@ class _MissionConfigBuilder:
             or self.initial_entry_corridor_half_width < 0.0
             or not math.isfinite(self.initial_entry_opening_max_distance)
             or self.initial_entry_opening_max_distance <= 0.0
+            or not math.isfinite(self.initial_entry_center_tolerance)
+            or self.initial_entry_center_tolerance <= 0.0
             or not math.isfinite(self.initial_entry_geometry_tolerance)
             or self.initial_entry_geometry_tolerance <= 0.0
+            or not math.isfinite(self.initial_entry_wait_timeout)
+            or self.initial_entry_wait_timeout <= 0.0
         ):
             raise ValueError("初始入口探测参数必须为有限正值")
         self.door_pass_offset = float(_param("mission/door_pass_offset", 0.8))
+        self.door_wait_offset = float(_param("mission/door_wait_offset", 1.6))
         self.door_commit_distance = float(_param("mission/door_commit_distance", 1.8))
         self.door_pass_max_linear = float(
             _param("mission/door_pass_max_linear", 0.25)
@@ -721,7 +735,15 @@ class _MissionConfigBuilder:
             _param("mission/door_clearance_margin", 0.10)
         )
         if (
-            not math.isfinite(self.door_pass_max_linear)
+            not math.isfinite(self.door_pass_offset)
+            or self.door_pass_offset <= 0.0
+            or not math.isfinite(self.door_wait_offset)
+            or self.door_wait_offset <= 0.0
+            or not math.isfinite(self.door_commit_distance)
+            or self.door_commit_distance <= 0.0
+            or self.door_commit_distance < self.door_pass_offset
+            or self.initial_entry_opening_max_distance < self.door_wait_offset + 0.30
+            or not math.isfinite(self.door_pass_max_linear)
             or self.door_pass_max_linear <= 0.0
             or not math.isfinite(self.main_entrance_clearance_max_linear)
             or self.main_entrance_clearance_max_linear <= 0.0
@@ -733,7 +755,7 @@ class _MissionConfigBuilder:
             or self.door_clearance_margin < 0.0
         ):
             raise ValueError(
-                "过门/离门限速、近场重观测超时、中心关联距离和净空余量必须为有限有效值"
+                "过门参数必须有限有效：深入距离不小于通过距离，观测上限至少比等待距离多0.30m"
             )
         self.door_clear_radius = float(_param("mission/door_clear_radius", 0.9))
         self.door_transition_duration = float(_param("mission/door_transition_duration", 3.0))
@@ -1139,7 +1161,6 @@ class _MissionConfigBuilder:
             "min_radius": float(_param("detection/min_radius", 0.10)),
             "max_radius": float(_param("detection/max_radius", 0.22)),
             "max_rmse": float(_param("detection/max_rmse", 0.035)),
-            "lidar_max_time_delta": float(_param("detection/lidar_max_time_delta", 0.10)),
             "ransac_iterations": int(_param("detection/ransac_iterations", 80)),
             "ransac_sample_size": int(_param("detection/ransac_sample_size", 4)),
             "min_depth": float(_param("detection/min_depth", 0.35)),
@@ -1157,10 +1178,12 @@ class _MissionConfigBuilder:
             "opening_max_width": float(_param("local_semantic/opening_max_width", 2.50)),
             "opening_plane_depth": float(_param("local_semantic/opening_plane_depth", 0.30)),
             "opening_min_side_height_span": float(
-                _param("local_semantic/opening_min_side_height_span", 0.50)
+                _param("local_semantic/opening_min_side_height_span", 0.30)
             ),
             "use_truth_proximity_detector": bool(_param("local_semantic/use_truth_proximity_detector", False)),
         }
+        if self.local_detection_params["max_distance"] < self.initial_entry_opening_max_distance:
+            raise ValueError("门洞检测搜索范围不能小于主入口确认距离上限")
         self.rgbd_door_detection_enabled = bool(
             _param("local_semantic/rgbd_door_detection_enabled", True)
         )

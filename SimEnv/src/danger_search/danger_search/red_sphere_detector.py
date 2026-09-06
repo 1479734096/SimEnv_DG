@@ -7,7 +7,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import math
 import random
 from typing import Sequence
@@ -54,7 +54,6 @@ class RedSphereDetector:
         min_radius: float = 0.10,
         max_radius: float = 0.22,
         max_rmse: float = 0.035,
-        lidar_max_time_delta: float = 0.10,
         min_depth: float = 0.35,
         max_depth: float = 8.0,
         ransac_iterations: int = 80,
@@ -69,7 +68,6 @@ class RedSphereDetector:
         self.min_radius = float(min_radius)
         self.max_radius = float(max_radius)
         self.max_rmse = float(max_rmse)
-        self.lidar_max_time_delta = float(lidar_max_time_delta)
         self.min_depth = float(min_depth)
         self.max_depth = float(max_depth)
         self.ransac_iterations = int(ransac_iterations)
@@ -87,7 +85,6 @@ class RedSphereDetector:
                     self.min_radius,
                     self.max_radius,
                     self.max_rmse,
-                    self.lidar_max_time_delta,
                     self.min_depth,
                     self.max_depth,
                 )
@@ -110,7 +107,6 @@ class RedSphereDetector:
         camera_to_world: np.ndarray | None,
         *,
         require_world_transform: bool = False,
-        cloud_points: Sequence[Sequence[float]] | np.ndarray | None = None,
         diagnostics: list[dict] | None = None,
     ) -> list[DetectionCandidate]:
         """将 ROS 图像转换为数组后进入无 ROS 依赖的检测核心。"""
@@ -133,7 +129,6 @@ class RedSphereDetector:
             camera_to_world,
             stamp=stamp,
             require_world_transform=require_world_transform,
-            cloud_points=cloud_points,
             diagnostics=diagnostics,
         )
 
@@ -146,7 +141,6 @@ class RedSphereDetector:
         *,
         stamp: float | None = None,
         require_world_transform: bool = False,
-        cloud_points: Sequence[Sequence[float]] | np.ndarray | None = None,
         diagnostics: list[dict] | None = None,
     ) -> list[DetectionCandidate]:
         """执行一帧完整检测并返回所有通过几何校验的候选。
@@ -231,44 +225,16 @@ class RedSphereDetector:
 
             center = sphere.center
             obs_dist = float(np.linalg.norm(sphere.center))
-            candidate_rmse = sphere.rmse
-            original_distance = obs_dist
-            refined_center = None
-            refined_dist = None
-            refined_rmse = None
-            refinement_accepted = False
-            original_center = center
             if matrix is not None:
                 center = _transform_point(matrix, center)
-                original_center = center
-                if cloud_points is not None:
-                    refined_center, refined_dist = self._refine_center_with_lidar(
-                        center=center,
-                        camera_to_world=matrix,
-                        cloud_points=cloud_points,
-                        obs_dist=obs_dist,
-                        target_radius=self.target_radius,
-                    )
-                    # 用同一批 RGB-D 内点复核新球心；邻近墙面不能借用原球体
-                    # 拟合的低 RMSE 获得正式确认资格。不一致时保留纯 RGB-D 候选。
-                    residuals = np.abs(np.linalg.norm(points - sphere.center, axis=1) - sphere.radius)
-                    inliers = points[residuals <= max(self.max_rmse * 2.0, 0.04)]
-                    if len(inliers) >= 12 and np.all(np.isfinite(refined_center)):
-                        optical_center = matrix[:3, :3].T @ (refined_center - matrix[:3, 3])
-                        refined_residuals = np.linalg.norm(inliers - optical_center, axis=1) - sphere.radius
-                        refined_rmse = float(np.sqrt(np.mean(refined_residuals ** 2)))
-                        if refined_rmse <= self.max_rmse:
-                            center, obs_dist = refined_center, refined_dist
-                            candidate_rmse = max(sphere.rmse, refined_rmse)
-                            refinement_accepted = True
             if not np.all(np.isfinite(center)):
                 continue
-            confidence = self._score_detection(contour, replace(sphere, rmse=candidate_rmse))
+            confidence = self._score_detection(contour, sphere)
             candidates.append(
                 DetectionCandidate.from_sequence(
                     center.tolist(),
                     confidence=confidence,
-                    rmse=candidate_rmse,
+                    rmse=sphere.rmse,
                     radius=sphere.radius,
                     stamp=resolved_stamp,
                     distance=obs_dist,
@@ -278,89 +244,12 @@ class RedSphereDetector:
                 diagnostics.append({
                     "stamp": resolved_stamp,
                     "coordinate_frame": "world" if matrix is not None else "camera_optical",
-                    "rgbd_center": original_center.tolist(),
-                    "rgbd_distance": original_distance, "rgbd_rmse": float(sphere.rmse),
-                    "lidar_proposed_center": (
-                        refined_center.tolist()
-                        if refined_center is not None and np.all(np.isfinite(refined_center))
-                        else None
-                    ),
-                    "lidar_proposed_distance": refined_dist,
-                    "lidar_proposed_rgbd_rmse": (
-                        refined_rmse if refined_rmse is not None and math.isfinite(refined_rmse)
-                        else None
-                    ),
-                    "refinement_accepted": refinement_accepted,
-                    "final_center": center.tolist(), "final_distance": obs_dist,
-                    "final_rmse": float(candidate_rmse), "confidence": float(confidence),
+                    "rgbd_center": center.tolist(),
+                    "rgbd_distance": obs_dist,
+                    "rgbd_rmse": float(sphere.rmse),
+                    "confidence": float(confidence),
                 })
         return candidates
-
-    def _refine_center_with_lidar(
-        self,
-        center: np.ndarray,
-        camera_to_world: np.ndarray,
-        cloud_points: Sequence[Sequence[float]] | np.ndarray | None,
-        obs_dist: float,
-        target_radius: float = 0.15,
-        cone_angle_deg: float = 4.5,
-    ) -> tuple[np.ndarray, float]:
-        """利用视线射线方向上的 Livox 配准点云精炼危险源球心深度与空间位置。"""
-        if cloud_points is None or len(cloud_points) == 0:
-            return center, obs_dist
-        if not np.all(np.isfinite(camera_to_world)) or camera_to_world.shape != (4, 4):
-            return center, obs_dist
-
-        cam_pos = camera_to_world[:3, 3]
-        ray = center - cam_pos
-        initial_dist = float(np.linalg.norm(ray))
-        if initial_dist < 0.3 or not math.isfinite(initial_dist):
-            return center, obs_dist
-        ray_unit = ray / initial_dist
-
-        if isinstance(cloud_points, np.ndarray):
-            pts = cloud_points
-        else:
-            pts = np.asarray(cloud_points, dtype=float)
-
-        if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) == 0:
-            return center, obs_dist
-
-        # 1. 距离窗口初筛: 在视觉预估深度周围 +/- 0.75m 区间内
-        vecs = pts[:, :3] - cam_pos
-        dists = np.linalg.norm(vecs, axis=1)
-        dist_mask = (dists >= max(0.2, initial_dist - 0.75)) & (dists <= initial_dist + 0.75)
-        if not np.any(dist_mask):
-            return center, obs_dist
-
-        candidate_pts = pts[dist_mask]
-        candidate_vecs = vecs[dist_mask]
-        candidate_dists = dists[dist_mask]
-
-        # 2. 地面高度杂波滤除: 红球位于地面上方，排除贴地地板噪点
-        ground_cutoff = center[2] - (target_radius * 0.7)
-        above_ground_mask = candidate_pts[:, 2] >= ground_cutoff
-        if not np.any(above_ground_mask):
-            return center, obs_dist
-
-        candidate_vecs = candidate_vecs[above_ground_mask]
-        candidate_dists = candidate_dists[above_ground_mask]
-
-        # 3. 视锥角约束: 点与视线向量夹角必须在极窄锥体内
-        cos_thresh = math.cos(math.radians(cone_angle_deg))
-        cos_angles = np.dot(candidate_vecs, ray_unit) / np.maximum(candidate_dists, 1e-6)
-        cone_mask = cos_angles >= cos_thresh
-        if np.sum(cone_mask) < 5:  # 点数稀疏时平滑回退，防止漏检
-            return center, obs_dist
-
-        in_cone_dists = candidate_dists[cone_mask]
-        # 4. 取前沿表面分位数加上已知球体物理半径得出精准球心距离
-        surface_dist = float(np.percentile(in_cone_dists, 10))
-        refined_center_dist = surface_dist + target_radius
-
-        # 5. 沿视线方向重构高精球心
-        refined_center = cam_pos + ray_unit * refined_center_dist
-        return refined_center, refined_center_dist
 
     def _red_mask(self, rgb_bgr: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(rgb_bgr, cv2.COLOR_BGR2HSV)

@@ -88,6 +88,7 @@ class DoorNavigationRuntime:
         pass_offset: float,
         now: float,
         planning_constraints=None,
+        main_entrance_wait_offset: float | None = None,
     ) -> str | None:
         doors = self.unopened_doors(
             floor_index=floor_index,
@@ -104,7 +105,12 @@ class DoorNavigationRuntime:
                 wait_point, _ = building_client.get_door_points(
                     door.door_id,
                     robot_xy,
-                    offset=float(pass_offset),
+                    offset=float(
+                        main_entrance_wait_offset
+                        if door.door_id == "main_entrance"
+                        and main_entrance_wait_offset is not None
+                        else pass_offset
+                    ),
                 )
             except ValueError:
                 continue
@@ -133,10 +139,10 @@ class DoorNavigationRuntime:
         if task.wait_point is None or task.pass_point is None:
             self.frontier_debug = None
             return False
-        center = (
-            0.5 * (task.wait_point[0] + task.pass_point[0]),
-            0.5 * (task.wait_point[1] + task.pass_point[1]),
-        )
+        center = task.door_center
+        if center is None:
+            self.frontier_debug = None
+            return False
         pass_x = task.pass_point[0] - center[0]
         pass_y = task.pass_point[1] - center[1]
         if not self.record_passage(
@@ -155,6 +161,7 @@ class DoorNavigationRuntime:
             return False
         self.frontier_debug = {
             "door_id": task.door_id,
+            "door_center": center,
             "wait_point": task.wait_point,
             "pass_point": task.pass_point,
             "commit_point": task.commit_point,
@@ -292,9 +299,13 @@ class DoorNavigationRuntime:
         wait_point: tuple[float, float],
         pass_point: tuple[float, float],
         target_xy: tuple[float, float],
+        *,
+        door_center: tuple[float, float] | None = None,
     ) -> str:
-        center_x = 0.5 * (wait_point[0] + pass_point[0])
-        center_y = 0.5 * (wait_point[1] + pass_point[1])
+        center_x, center_y = door_center if door_center is not None else (
+            0.5 * (wait_point[0] + pass_point[0]),
+            0.5 * (wait_point[1] + pass_point[1]),
+        )
         direction_x = pass_point[0] - wait_point[0]
         direction_y = pass_point[1] - wait_point[1]
         norm = math.hypot(direction_x, direction_y)
@@ -316,9 +327,11 @@ class DoorNavigationRuntime:
         *,
         pass_offset: float,
         commit_distance: float,
+        wait_offset: float | None = None,
     ) -> OpenDoorAndPass:
         return OpenDoorAndPass(
             str(door_id),
             pass_offset=float(pass_offset),
             commit_distance=float(commit_distance),
+            wait_offset=wait_offset,
         )

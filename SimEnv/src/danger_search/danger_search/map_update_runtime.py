@@ -32,7 +32,6 @@ class CloudMapResult:
 class ImageDetectionResult:
     door_observations: tuple[DoorPanelObservation, ...]
     danger_obstacle_sync: "DangerObstacleSyncResult" | None = None
-    matched_cloud_stamp: float | None = None
     candidate_diagnostics: tuple[dict, ...] = ()
     candidate_count: int = 0
 
@@ -52,7 +51,7 @@ class DangerObstacleSyncResult:
 
 @dataclass(frozen=True)
 class RegisteredCloudFrame:
-    """供地标匹配和 RGB-D 候选距离修正使用的同坐标系有限历史。"""
+    """供入口几何和稀疏地标匹配使用的同坐标系有限历史。"""
 
     stamp: float
     floor: int
@@ -152,12 +151,14 @@ class MapUpdateRuntime:
             map_epoch=int(map_epoch),
             localization_epoch=int(localization_epoch),
         )
+        # 开门后的动态门板清理只作用于历史地图；新鲜点云必须始终进入正障碍
+        # 制动链，不能用门洞棱柱整块屏蔽门框、门后实体或真实碰撞物。
         forward = nearest_forward_obstacle_observation(
             frozen_points,
             robot_pose,
             floor_index=floor_index,
             mapper=self.mapper,
-            opened_door_exclusion=opened_door_exclusion,
+            opened_door_exclusion=None,
         )
         radial = nearest_radial_obstacle_distance(
             frozen_points,
@@ -175,23 +176,7 @@ class MapUpdateRuntime:
         now: float,
         floor_index: int | None = None,
         robot_xy: tuple[float, float] | None = None,
-        image_stamp: float | None = None,
-        localization_epoch: int | None = None,
     ) -> ImageDetectionResult:
-        recent_cloud = None
-        matched_frame = None
-        if image_stamp is not None and math.isfinite(image_stamp) and localization_epoch is not None:
-            eligible = [
-                frame for frame in self.recent_cloud_frames
-                if frame.floor == floor_index
-                and frame.localization_epoch == localization_epoch
-                and math.isfinite(frame.stamp)
-                and abs(frame.stamp - image_stamp) <= self.detector.lidar_max_time_delta
-            ]
-            if eligible:
-                matched_frame = min(eligible, key=lambda frame: abs(frame.stamp - image_stamp))
-                recent_cloud = matched_frame.points
-
         diagnostics = [] if now - self._last_candidate_diagnostic_time >= 2.0 else None
         candidates = self.detector.detect_messages(
             bundle.rgb_msg,
@@ -199,7 +184,6 @@ class MapUpdateRuntime:
             bundle.camera_info_msg,
             camera_to_world,
             require_world_transform=True,
-            cloud_points=recent_cloud,
             diagnostics=diagnostics,
         )
         if diagnostics:
@@ -228,7 +212,6 @@ class MapUpdateRuntime:
             )
         return ImageDetectionResult(
             observations, danger_obstacle_sync,
-            matched_cloud_stamp=matched_frame.stamp if matched_frame is not None else None,
             candidate_diagnostics=tuple(diagnostics or ()),
             candidate_count=len(candidates),
         )

@@ -2023,7 +2023,7 @@ class TakeElevatorTest(unittest.TestCase):
             controller=controller,
         )
         task = TakeElevator(0, 1)
-        # 朝向存在偏角（>0.80rad），进入常规 ALIGN 流程验证 POSITION/ALIGN 一致性
+        # 朝向存在偏角，进入常规 ALIGN 流程验证 POSITION/ALIGN 一致性。
         yaw = math.atan2(target_wait[1] - robot[1], target_wait[0] - robot[0]) + 0.81
         pose = (robot[0], robot[1], yaw)
         manager.controller._test_pose = pose
@@ -2695,8 +2695,8 @@ class TakeElevatorTest(unittest.TestCase):
             [((0.85, 2.60), {"max_angular": 0.65})],
         )
 
-    def test_cabin_transit_enter_fast_path_accepts_080_boundary(self):
-        """STAGE24：门前航向误差等于 0.80rad 时同 tick 进入 CROSS。"""
+    def test_cabin_transit_enter_centered_position_still_requires_align(self):
+        """门外站位已满足时仍须先朝轿厢中心对准，不能直接进入CROSS。"""
         grid = MultiFloorGridMap(
             resolution=0.1,
             width=6.0,
@@ -2743,12 +2743,12 @@ class TakeElevatorTest(unittest.TestCase):
             door_id="lift_door_0",
         )
         self.assertEqual(status, RUNNING)
-        self.assertEqual(task.cabin_transit_stage, "CROSS")
-        controller.set_path.assert_called_once()
+        self.assertEqual(task.cabin_transit_stage, "ALIGN")
+        controller.set_path.assert_not_called()
         controller.begin_heading_alignment.assert_not_called()
 
-    def test_cabin_transit_enter_above_080_falls_back_to_align(self):
-        """STAGE24：门前航向误差超过 0.80rad 时保留 ALIGN 安全流程。"""
+    def test_cabin_transit_enter_large_heading_error_requires_align(self):
+        """门前航向误差较大时同样进入ALIGN，不允许旧直入分支。"""
         grid = MultiFloorGridMap(
             resolution=0.1,
             width=6.0,

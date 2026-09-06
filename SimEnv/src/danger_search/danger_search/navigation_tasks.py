@@ -100,22 +100,36 @@ class OpenDoorAndPass(NavigationTask):
     _PASS_ALIGN_TIMEOUT = 12.0
     # 细对准期间允许的位置漂移半径：原地转向不应移动，超出即认为锚点失效。
     _PASS_ALIGN_ANCHOR_RADIUS = 0.30
+    _MAIN_ENTRANCE_CENTERLINE_TOLERANCE = 0.25
+    _MAIN_ENTRANCE_CENTERING_TIMEOUT = 30.0
     _SERVICE_TIMEOUT = 30.0
     _SERVICE_WALL_TIMEOUT = 180.0
 
-    def __init__(self, door_id: str, *, pass_offset: float = 0.8, commit_distance: float = 1.8):
+    def __init__(
+        self,
+        door_id: str,
+        *,
+        pass_offset: float = 0.8,
+        commit_distance: float = 1.8,
+        wait_offset: float | None = None,
+    ):
         door_id = str(door_id).strip()
         if not door_id:
             raise ValueError("过门任务必须提供公开门 ID")
         if not all(
             math.isfinite(float(value)) and float(value) > 0.0
-            for value in (pass_offset, commit_distance)
+            for value in (
+                pass_offset,
+                commit_distance,
+                pass_offset if wait_offset is None else wait_offset,
+            )
         ):
             raise ValueError("过门偏移和深入距离必须是正有限数")
         super().__init__(f"OpenDoorAndPass({door_id})")
         self.door_id = door_id
         self.pass_offset = float(pass_offset)
         self.commit_distance = float(commit_distance)
+        self.wait_offset = self.pass_offset if wait_offset is None else float(wait_offset)
         self.phase = "GO_WAIT_POINT"
         self._wait_point: tuple[float, float] | None = None
         self._pass_point: tuple[float, float] | None = None
@@ -142,6 +156,9 @@ class OpenDoorAndPass(NavigationTask):
         self._wait_navigation_blocked_since: float | None = None
         self._wait_navigation_timeout = 3.0
         self._landmark_relocalization_attempted = False
+        self._main_entrance_centering_started_at: float | None = None
+        self._main_entrance_centering_started_wall: float | None = None
+        self._main_entrance_recenter_count = 0
 
     @property
     def wait_point(self) -> tuple[float, float] | None:
@@ -159,6 +176,25 @@ class OpenDoorAndPass(NavigationTask):
     def opening_sensor_confirmed(self) -> bool:
         return self._opening_sensor_confirmed
 
+    @property
+    def door_center(self) -> tuple[float, float] | None:
+        """由非对称等待/通过点还原传感器注册的门中心。"""
+        if self._wait_point is None or self._pass_point is None:
+            return None
+        total = self.wait_offset + self.pass_offset
+        return (
+            (
+                self.pass_offset * self._wait_point[0]
+                + self.wait_offset * self._pass_point[0]
+            )
+            / total,
+            (
+                self.pass_offset * self._wait_point[1]
+                + self.wait_offset * self._pass_point[1]
+            )
+            / total,
+        )
+
     def mark_opening_sensor_confirmed(self) -> None:
         """记录开放门洞已由近场传感器连续确认。"""
         self._opening_sensor_confirmed = True
@@ -166,6 +202,16 @@ class OpenDoorAndPass(NavigationTask):
     def tick(self, context: NavigationTaskContext, pose: tuple[float, float, float]) -> str:
         """按当前 ``phase`` 推进一步，所有服务等待期间保持零速。"""
         client = context.building_client
+        if (
+            self.door_id == "main_entrance"
+            and not self._pass_path_started
+            and self.phase in {
+                "GO_OPEN_WAIT_POINT", "REFRESH_OPENING", "GO_REFRESHED_WAIT_POINT", "GO_PASS_POINT",
+            }
+        ):
+            self._start_main_entrance_centering()
+            if self._main_entrance_centering_timed_out():
+                return self._fail_crossing(context, "主入口站位与对准总超时")
 
         if self._wait_point is None or self._pass_point is None or self._commit_point is None:
             try:
@@ -174,6 +220,7 @@ class OpenDoorAndPass(NavigationTask):
                     (pose[0], pose[1]),
                     pass_offset=self.pass_offset,
                     commit_distance=self.commit_distance,
+                    wait_offset=self.wait_offset,
                 )
             except ValueError as e:
                 if rospy is not None:
@@ -293,6 +340,7 @@ class OpenDoorAndPass(NavigationTask):
                         (pose[0], pose[1]),
                         pass_offset=self.pass_offset,
                         commit_distance=self.commit_distance,
+                        wait_offset=self.wait_offset,
                     )
                 )
             except ValueError as exc:
@@ -302,13 +350,23 @@ class OpenDoorAndPass(NavigationTask):
             self._pass_path_started = False
             self._pass_align_start_time = None
             self._pass_alignment_done = False
+            centerline_error = self._door_centerline_error(pose)
             wait_distance = math.hypot(
-                self._wait_point[0] - pose[0],
-                self._wait_point[1] - pose[1],
+                self._wait_point[0] - pose[0], self._wait_point[1] - pose[1]
             )
-            if wait_distance <= 0.30:
+            if (
+                centerline_error <= self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE
+                and wait_distance <= 0.30
+            ):
                 self.phase = "GO_PASS_POINT"
             else:
+                if rospy is not None:
+                    rospy.loginfo(
+                        "[%s] 主入口重新站位：横向偏差 %.3fm，等待点距离 %.3fm",
+                        self.name,
+                        centerline_error,
+                        wait_distance,
+                    )
                 self.phase = "GO_REFRESHED_WAIT_POINT"
             return RUNNING
 
@@ -320,6 +378,7 @@ class OpenDoorAndPass(NavigationTask):
                 allow_direct_fallback=True,
                 planning_max_iterations=None,
                 max_linear=context.door_pass_max_linear,
+                goal_tolerance=self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE,
             ):
                 context.controller.clear_path(reason="door_refreshed_wait_reached")
                 self.phase = "GO_PASS_POINT"
@@ -383,6 +442,20 @@ class OpenDoorAndPass(NavigationTask):
         crossing_tolerance = min(goal_tolerance, corner_tolerance)
 
         if not self._pass_path_started:
+            if (
+                self.door_id == "main_entrance"
+                and self._door_centerline_error(pose)
+                > self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE
+            ):
+                self._main_entrance_recenter_count += 1
+                if self._main_entrance_recenter_count > 3:
+                    return self._fail_crossing(context, "主入口重新站位次数耗尽")
+                context.controller.clear_path(reason="main_entrance_centerline_drift")
+                self._pass_alignment_done = False
+                self._pass_alignment_count = 0
+                self._pass_align_start_time = None
+                self.phase = "GO_REFRESHED_WAIT_POINT"
+                return RUNNING
             align_status, watching = self._tick_pass_alignment(context, pose)
             if align_status == FAILED:
                 return self._fail_crossing(context, "门洞细对准失败")
@@ -589,10 +662,16 @@ class OpenDoorAndPass(NavigationTask):
         allow_direct_fallback: bool = False,
         planning_max_iterations: int | None = DEFAULT_MAX_ITERATIONS,
         max_linear: float | None = None,
+        goal_tolerance: float | None = None,
     ) -> bool:
         self._last_navigation_blocked = False
         self._last_navigation_stuck = False
-        if math.hypot(target_xy[0] - pose[0], target_xy[1] - pose[1]) <= context.controller.goal_tolerance:
+        effective_tolerance = (
+            float(context.controller.goal_tolerance)
+            if goal_tolerance is None
+            else min(float(context.controller.goal_tolerance), float(goal_tolerance))
+        )
+        if math.hypot(target_xy[0] - pose[0], target_xy[1] - pose[1]) <= effective_tolerance:
             context.controller.clear_path()
             return True
 
@@ -605,9 +684,21 @@ class OpenDoorAndPass(NavigationTask):
                 max_iterations=planning_max_iterations,
             )
             if result.reached:
+                path_tolerance = None
+                if goal_tolerance is not None:
+                    # A* 可能量化或替换终点；扣除实际偏差，保证到点后仍在任务站位窗内。
+                    endpoint_offset = math.hypot(
+                        result.path[-1][0] - target_xy[0],
+                        result.path[-1][1] - target_xy[1],
+                    )
+                    path_tolerance = effective_tolerance - endpoint_offset
+                    if path_tolerance <= 0.0:
+                        self._last_navigation_blocked = True
+                        return False
                 context.controller.set_path(
                     result.path,
                     max_linear=max_linear,
+                    goal_tolerance=path_tolerance,
                     reason="door_navigate_planned_path",
                 )
             elif result.unreachable:
@@ -617,6 +708,11 @@ class OpenDoorAndPass(NavigationTask):
                     context.controller.set_path(
                         [(pose[0], pose[1]), target_xy],
                         max_linear=max_linear,
+                        goal_tolerance=(
+                            effective_tolerance
+                            if goal_tolerance is not None
+                            else None
+                        ),
                         reason="door_navigate_direct_path",
                     )
                 else:
@@ -632,7 +728,40 @@ class OpenDoorAndPass(NavigationTask):
                 self._last_navigation_stuck = True
             else:
                 context.controller.recover()
-        return status == DONE
+        # 宽松站位窗由下一 tick 的合法位姿验收，不能仅凭栅格终点的 DONE。
+        return status == DONE and goal_tolerance is None
+
+    def _door_centerline_error(
+        self,
+        pose: tuple[float, float, float],
+    ) -> float:
+        """返回当前位置到实测门中心轴的横向距离。"""
+        if self._wait_point is None or self._pass_point is None:
+            return math.inf
+        axis_x = self._pass_point[0] - self._wait_point[0]
+        axis_y = self._pass_point[1] - self._wait_point[1]
+        axis_norm = math.hypot(axis_x, axis_y)
+        if axis_norm <= 1e-6:
+            return math.inf
+        offset_x = pose[0] - self._wait_point[0]
+        offset_y = pose[1] - self._wait_point[1]
+        return abs(offset_x * axis_y - offset_y * axis_x) / axis_norm
+
+    def _start_main_entrance_centering(self) -> None:
+        if self._main_entrance_centering_started_at is None:
+            self._main_entrance_centering_started_at = get_time()
+            self._main_entrance_centering_started_wall = time.monotonic()
+
+    def _main_entrance_centering_timed_out(self) -> bool:
+        if self._main_entrance_centering_started_at is None:
+            return False
+        return (
+            get_time() - self._main_entrance_centering_started_at
+            >= self._MAIN_ENTRANCE_CENTERING_TIMEOUT
+            or self._main_entrance_centering_started_wall is not None
+            and time.monotonic() - self._main_entrance_centering_started_wall
+            >= self._SERVICE_WALL_TIMEOUT
+        )
 
     def _can_open_from_safe_approach(
         self,
@@ -641,8 +770,10 @@ class OpenDoorAndPass(NavigationTask):
         """等待点被栅格隔离时，允许在同侧且足够近的位置原地开门。"""
         if self._wait_point is None or self._pass_point is None:
             return False
-        center_x = 0.5 * (self._wait_point[0] + self._pass_point[0])
-        center_y = 0.5 * (self._wait_point[1] + self._pass_point[1])
+        center = self.door_center
+        if center is None:
+            return False
+        center_x, center_y = center
         wait_x = self._wait_point[0] - center_x
         wait_y = self._wait_point[1] - center_y
         wait_norm = math.hypot(wait_x, wait_y)
@@ -661,11 +792,11 @@ class OpenDoorAndPass(NavigationTask):
         lateral_limit = max(0.25, self.pass_offset)
         distance_to_center = math.hypot(pose[0] - center_x, pose[1] - center_y)
         safe_approach_limit = max(
-            self.commit_distance + self.pass_offset,
-            2.0 * self.pass_offset,
+            self.commit_distance + self.wait_offset,
+            2.0 * self.wait_offset,
         )
         return (
-            signed_wait_side >= self.pass_offset
+            signed_wait_side >= self.wait_offset
             and lateral_offset <= lateral_limit
             and distance_to_center <= safe_approach_limit
         )
@@ -817,7 +948,9 @@ class TakeElevator(NavigationTask):
     _CABIN_TRANSIT_ALIGN_TOLERANCE = 0.10
     _CABIN_TRANSIT_ALIGN_RELEASE_TOLERANCE = 0.15
     _CABIN_TRANSIT_ALIGN_CONFIRMATIONS = 2
-    _CABIN_TRANSIT_DIRECT_ENTRY_HEADING_TOLERANCE = 0.80
+    _CABIN_TRANSIT_POSITION_ACCEPTANCE = 0.25
+    _CABIN_TRANSIT_CENTERLINE_TOLERANCE = 0.25
+    _CABIN_TRANSIT_PREPARE_TIMEOUT = 30.0
     # POSITION/ALIGN 翻转次数上限：栅格量化终点与精确 cabin center 的完成语义
     # 不一致时会出现每 tick 翻转的零速死循环；acceptance 已对齐二者，这里仅作
     # 安全网，避免今后其他语义退化再次形成永久振荡。
@@ -865,8 +998,13 @@ class TakeElevator(NavigationTask):
         self._cabin_transit_door_clear_refreshed = False
         self._cabin_transit_position_door_cleared = False
         self._cabin_transit_goal_grace = 0
+        self._cabin_transit_align_started_at: float | None = None
+        self._cabin_transit_align_started_wall: float | None = None
+        self._cabin_transit_prepare_started_at: float | None = None
+        self._cabin_transit_prepare_started_wall: float | None = None
         self._cabin_turn_completed = False
         self._cabin_turn_wait_start: float | None = None
+        self._current_open_wait_wall = 0.0
         self._door_alignment_phase: str | None = None
         self._door_alignment_started_at = 0.0
         self._door_alignment_started_wall = 0.0
@@ -1113,6 +1251,7 @@ class TakeElevator(NavigationTask):
             if status == DONE:
                 self.phase = "WAIT_CURRENT_DOOR_OPEN"
                 self._wait_start_time = get_time()
+                self._current_open_wait_wall = time.monotonic()
             return RUNNING
 
         if self.phase == "RETRY_CURRENT_DOOR_SENSOR_REFRESH":
@@ -1148,6 +1287,11 @@ class TakeElevator(NavigationTask):
 
         if self.phase == "WAIT_CURRENT_DOOR_OPEN":
             context.controller.stop()
+            if time.monotonic() - self._current_open_wait_wall > self._SERVICE_WALL_TIMEOUT:
+                return self._fail_navigation(
+                    context, "elevator_current_entry_blocked_timeout",
+                    "源层开门后的通行等待超过墙钟上限",
+                )
             if not self._door_opening_is_confirmed(
                 context,
                 current_door_id,
@@ -1164,27 +1308,29 @@ class TakeElevator(NavigationTask):
                         context, current_door_id, target=False
                     )
                 return RUNNING
+            if context.elevator_local_crossing_geometry_enabled:
+                # 与目标层一致：由新鲜局部几何负责穿越检查，不等待旧地图先连通。
+                self._reset_cabin_transit()
+                self.phase = "REFRESH_CURRENT_OPEN_CROSSING"
+                return RUNNING
             grid = context.mapper.floor(context.current_floor)
             # 门已由局部传感器确认打开后，轿厢内部仍可能因尚未进入而保持
             # UNKNOWN。普通 A* 只接受 FREE/VISITED，会形成“先进入才能建图、
             # 先建图才能进入”的循环。主动跨越阶段仍会重新检查实际起点到
             # 目标间的 OCC/BLACK，并保留局部正障碍制动。
             if not _segment_crosses_blocked_cell(
-                grid,
+                grid.without_negative_obstacles(),
                 current_wait,
                 cabin_center,
-                constraints=context.planning_constraints,
+                constraints=None,
             ):
                 self._reset_cabin_transit()
-                self.phase = (
-                    "REFRESH_CURRENT_OPEN_CROSSING"
-                    if context.elevator_local_crossing_geometry_enabled
-                    else "ENTER_CABIN"
+                self.phase = "ENTER_CABIN"
+            elif get_time() - self._wait_start_time > self._SERVICE_TIMEOUT:
+                return self._fail_navigation(
+                    context, "elevator_current_entry_blocked_timeout",
+                    "源层门已开放，但进梯正障碍检查持续不通过",
                 )
-            elif get_time() - self._wait_start_time > 10.0:
-                if rospy is not None:
-                    rospy.logwarn("[%s] 等待当前楼层电梯门可通行超时，继续等待地图连通", self.name)
-                self._wait_start_time = get_time()
             return RUNNING
 
         if self.phase == "REFRESH_CURRENT_OPEN_CROSSING":
@@ -1843,6 +1989,16 @@ class TakeElevator(NavigationTask):
 
         返回 RUNNING（进入 CROSS 或等待路径解除阻塞）。
         """
+        if not self._cabin_position_ready(
+            pose,
+            position_xy,
+            target_xy,
+            self._cabin_transit_position_acceptance(context),
+            self._CABIN_TRANSIT_CENTERLINE_TOLERANCE,
+        ):
+            return self._retry_cabin_position(
+                context, pose, position_xy, target_xy
+            )
         if not self._cabin_transit_door_clear_refreshed:
             _clear_opened_door_area(context, target_door_id)
             self._cabin_transit_door_clear_refreshed = True
@@ -1927,14 +2083,20 @@ class TakeElevator(NavigationTask):
         if self._cabin_transit_mode != mode or self.cabin_transit_stage is None:
             self._begin_cabin_transit(mode, position_xy, target_xy)
 
+        if self.cabin_transit_stage in {"POSITION", "ALIGN"}:
+            if (
+                get_time() - self._cabin_transit_prepare_started_at
+                >= self._CABIN_TRANSIT_PREPARE_TIMEOUT
+                or time.monotonic() - self._cabin_transit_prepare_started_wall
+                >= self._SERVICE_WALL_TIMEOUT
+            ):
+                return self._fail_navigation(
+                    context, "elevator_cabin_prepare_timeout", "电梯站位与对准总超时"
+                )
+
         position_tolerance = self._cabin_transit_position_tolerance(context)
-        # PathFollower 以 A* 栅格量化终点判断 POSITION 到达，该终点与精确 cabin center
-        # 最多相差半格对角线 0.5*sqrt(2)*resolution。ALIGN 的漂移检查却以精确 cabin center
-        # 为准，若二者容差相同，会在临界距离上形成“POSITION 认为到达->ALIGN 认为漂移
-        # ->回 POSITION”的零速死循环。修复方式是非对称：POSITION 保持严格
-        # position_tolerance（保证 snapped 到达时精确距离 <= position_tolerance + 半格对角线），
-        # ALIGN 的漂移检查放宽到把栅格量化误差计入的 position_acceptance。CROSS 的完整
-        # 通过判定仍保留严格 position_tolerance。
+        # 历史成功进梯样本距等待点约0.21m、横向最大约0.20m；
+        # POSITION只需落入宽松站位窗，随后由ALIGN完成朝向收敛。
         position_acceptance = self._cabin_transit_position_acceptance(context)
 
         if self.cabin_transit_stage == "POSITION":
@@ -1948,26 +2110,16 @@ class TakeElevator(NavigationTask):
                 # 膨胀半径设计，正是为此场景准备。
                 _clear_opened_door_area(context, door_id)
                 self._cabin_transit_position_door_cleared = True
-            if math.hypot(position_xy[0] - pose[0], position_xy[1] - pose[1]) <= position_acceptance:
-                target_yaw = math.atan2(target_xy[1] - pose[1], target_xy[0] - pose[0])
-                heading_err = _angle_wrap(target_yaw - pose[2])
-                if (
-                    mode == "enter"
-                    and abs(heading_err)
-                    <= self._CABIN_TRANSIT_DIRECT_ENTRY_HEADING_TOLERANCE
-                ):
-                    # 历史入厢最大航向误差约 0.788rad；不超过 0.80rad 时直接
-                    # 提交直线进厢，超过阈值仍由 ALIGN 收敛后再跨越。
-                    return self._commit_cabin_cross(
-                        context,
-                        pose,
-                        position_xy,
-                        target_xy,
-                        target_door_id=door_id,
-                        position_tolerance=position_tolerance,
-                        max_linear=max_linear,
-                    )
+            if self._cabin_position_ready(
+                pose,
+                position_xy,
+                target_xy,
+                position_acceptance,
+                self._CABIN_TRANSIT_CENTERLINE_TOLERANCE,
+            ):
+                context.controller.clear_path(reason="elevator_centered_position_reached")
                 self.cabin_transit_stage = "ALIGN"
+                self._start_cabin_transit_alignment_timer()
                 self._cabin_transit_alignment_count = 0
                 self._log_cabin_transit_stage(
                     "ALIGN",
@@ -1980,47 +2132,25 @@ class TakeElevator(NavigationTask):
                 context,
                 pose,
                 position_xy,
-                goal_tolerance=position_tolerance,
+                goal_tolerance=min(
+                    position_acceptance, self._CABIN_TRANSIT_CENTERLINE_TOLERANCE
+                ),
             )
             if status == DONE:
-                target_yaw = math.atan2(target_xy[1] - pose[1], target_xy[0] - pose[0])
-                heading_err = _angle_wrap(target_yaw - pose[2])
-                if (
-                    mode == "enter"
-                    and abs(heading_err)
-                    <= self._CABIN_TRANSIT_DIRECT_ENTRY_HEADING_TOLERANCE
-                ):
-                    # 历史入厢最大航向误差约 0.788rad；不超过 0.80rad 时直接
-                    # 提交直线进厢，超过阈值仍由 ALIGN 收敛后再跨越。
-                    return self._commit_cabin_cross(
-                        context,
-                        pose,
-                        position_xy,
-                        target_xy,
-                        target_door_id=door_id,
-                        position_tolerance=position_tolerance,
-                        max_linear=max_linear,
-                    )
-                self.cabin_transit_stage = "ALIGN"
-                self._cabin_transit_alignment_count = 0
-                self._log_cabin_transit_stage(
-                    "ALIGN",
-                    pose,
-                    position_xy,
-                    target_xy,
-                )
+                # 控制器终态使用控制频率的新位姿，当前 tick 的 pose 可能更旧。
+                # 下一 tick 用刷新后的位姿重新验收位置和中心线，再决定是否 ALIGN。
                 return RUNNING
             return status
 
         if self.cabin_transit_stage == "ALIGN":
-            if mode == "exit" and not self._cabin_transit_position_door_cleared:
-                # 离厢直接进入 ALIGN 时优先清理开门区域，确保直线跨越路径畅通。
-                _clear_opened_door_area(context, door_id)
-                self._cabin_transit_position_door_cleared = True
-            # 固定频率对准模式：SETTLE 停稳 -> ALIGN 旋转 -> CONFIRM 释放，
-            # 由 PathFollower 控制定时器每 0.1s 新鲜决策；本函数只幂等
-            # 进入与轮询结果。锚点=轿厢中心（exit 模式不设锚点约束，直接对准门口），
-            # 漂移由控制器锁存 STUCK(alignment_drift)。
+            self._start_cabin_transit_alignment_timer()
+            if self._cabin_transit_alignment_timed_out():
+                return self._fail_navigation(
+                    context, "elevator_cabin_alignment_timeout", "电梯中心线朝向对准超时"
+                )
+            # 固定频率对准模式：SETTLE 停稳 -> ALIGN 旋转 -> CONFIRM 释放。
+            # 进梯锚定门外中心线站位并朝轿厢中心；出梯锚定轿厢中心线站位
+            # 并朝厅外等待点。漂移由控制器锁存 STUCK 后退回 POSITION。
             if math.hypot(target_xy[0] - pose[0], target_xy[1] - pose[1]) <= position_tolerance:
                 context.controller.clear_path(reason="elevator_transit_already_complete")
                 return DONE
@@ -2038,30 +2168,9 @@ class TakeElevator(NavigationTask):
                     max_linear=max_linear,
                 )
             if result.status == STUCK and result.reason == "alignment_drift":
-                if mode == "exit":
-                    context.controller.stop(reason="elevator_exit_alignment_drift")
-                    return STUCK
-                self._cabin_transit_position_align_flips += 1
-                if self._cabin_transit_position_align_flips > self._CABIN_TRANSIT_POSITION_ALIGN_FLIP_LIMIT:
-                    context.controller.stop(reason="elevator_transit_position_align_oscillation")
-                    if rospy is not None:
-                        rospy.logerr(
-                            "[%s] 电梯轿厢 POSITION/ALIGN 反复翻转超过上限，判定为确定性失败："
-                            "mode=%s acceptance=%.3f",
-                            self.name,
-                            self._cabin_transit_mode,
-                            position_acceptance,
-                        )
-                    return STUCK
-                self.cabin_transit_stage = "POSITION"
-                self._cabin_transit_alignment_count = 0
-                self._log_cabin_transit_stage(
-                    "POSITION",
-                    pose,
-                    position_xy,
-                    target_xy,
+                return self._retry_cabin_position(
+                    context, pose, position_xy, target_xy
                 )
-                return RUNNING
             if result.status == STUCK:
                 # 其他 STUCK（settle 超时等）不能当 drift 吞掉：显式失败。
                 if rospy is not None:
@@ -2073,10 +2182,9 @@ class TakeElevator(NavigationTask):
                     )
                 return STUCK
             if result.status == IDLE:
-                align_anchor = None if mode == "exit" else position_xy
                 context.controller.begin_heading_alignment(
                     target_xy,
-                    anchor_xy=align_anchor,
+                    anchor_xy=position_xy,
                     max_anchor_error=position_acceptance,
                 )
             return RUNNING
@@ -2210,8 +2318,9 @@ class TakeElevator(NavigationTask):
         target_xy: tuple[float, float],
     ) -> None:
         self._cabin_transit_mode = mode
-        # 离厢模式下直接进入 ALIGN 对准门口，跳过反向回轿厢中心 POSITION，避免多转 180°+180°
-        self.cabin_transit_stage = "ALIGN" if mode == "exit" else "POSITION"
+        # 进厢先到门外中心线站位，离厢先回到轿厢中心线站位；两者都在
+        # POSITION 满足后才朝穿越目标对准，禁止从偏心位置斜穿门框。
+        self.cabin_transit_stage = "POSITION"
         self._cabin_transit_alignment_count = 0
         self._cabin_transit_position_align_flips = 0
         self._cabin_transit_start_xy = None
@@ -2219,6 +2328,10 @@ class TakeElevator(NavigationTask):
         self._cabin_transit_door_clear_refreshed = False
         self._cabin_transit_position_door_cleared = False
         self._cabin_transit_goal_grace = 0
+        self._cabin_transit_align_started_at = None
+        self._cabin_transit_align_started_wall = None
+        self._cabin_transit_prepare_started_at = get_time()
+        self._cabin_transit_prepare_started_wall = time.monotonic()
         self._crossing_blocked_since = None
         self._log_cabin_transit_stage(
             self.cabin_transit_stage,
@@ -2237,7 +2350,66 @@ class TakeElevator(NavigationTask):
         self._cabin_transit_door_clear_refreshed = False
         self._cabin_transit_position_door_cleared = False
         self._cabin_transit_goal_grace = 0
+        self._cabin_transit_align_started_at = None
+        self._cabin_transit_align_started_wall = None
+        self._cabin_transit_prepare_started_at = None
+        self._cabin_transit_prepare_started_wall = None
         self._crossing_blocked_since = None
+
+    def _retry_cabin_position(
+        self,
+        context: NavigationTaskContext,
+        pose: tuple[float, float, float],
+        position_xy: tuple[float, float],
+        target_xy: tuple[float, float],
+    ) -> str:
+        self._cabin_transit_position_align_flips += 1
+        if self._cabin_transit_position_align_flips > self._CABIN_TRANSIT_POSITION_ALIGN_FLIP_LIMIT:
+            return self._fail_navigation(
+                context, "elevator_transit_position_align_oscillation", "电梯重新站位次数耗尽"
+            )
+        context.controller.clear_path(reason="elevator_centerline_drift")
+        self.cabin_transit_stage = "POSITION"
+        self._cabin_transit_alignment_count = 0
+        self._log_cabin_transit_stage("POSITION", pose, position_xy, target_xy)
+        return RUNNING
+
+    def _start_cabin_transit_alignment_timer(self) -> None:
+        if self._cabin_transit_align_started_at is None:
+            self._cabin_transit_align_started_at = get_time()
+            self._cabin_transit_align_started_wall = time.monotonic()
+
+    def _cabin_transit_alignment_timed_out(self) -> bool:
+        if self._cabin_transit_align_started_at is None:
+            return False
+        return (
+            get_time() - self._cabin_transit_align_started_at
+            >= self._CABIN_TURN_TIMEOUT
+            or self._cabin_transit_align_started_wall is not None
+            and time.monotonic() - self._cabin_transit_align_started_wall
+            >= self._SERVICE_WALL_TIMEOUT
+        )
+
+    @staticmethod
+    def _cabin_position_ready(
+        pose: tuple[float, float, float],
+        position_xy: tuple[float, float],
+        target_xy: tuple[float, float],
+        distance_tolerance: float,
+        centerline_tolerance: float,
+    ) -> bool:
+        """检查站位既接近目标点，又位于目标穿越中心线上。"""
+        if math.hypot(position_xy[0] - pose[0], position_xy[1] - pose[1]) > distance_tolerance:
+            return False
+        axis_x = target_xy[0] - position_xy[0]
+        axis_y = target_xy[1] - position_xy[1]
+        axis_norm = math.hypot(axis_x, axis_y)
+        if axis_norm <= 1e-6:
+            return False
+        offset_x = pose[0] - position_xy[0]
+        offset_y = pose[1] - position_xy[1]
+        cross_track = abs(offset_x * axis_y - offset_y * axis_x) / axis_norm
+        return cross_track <= centerline_tolerance
 
     @staticmethod
     def _door_center(
@@ -2267,19 +2439,9 @@ class TakeElevator(NavigationTask):
 
     @staticmethod
     def _cabin_transit_position_acceptance(context: NavigationTaskContext) -> float:
-        """ALIGN 漂移检查用的接受半径。
-
-        PathFollower 以 A* 栅格量化终点判断 POSITION 到达，该终点与精确 cabin center
-        最多相差半格对角线 0.5*sqrt(2)*resolution。POSITION 仍用严格 position_tolerance，
-        因此“snapped 到达”时精确距离必 <= position_tolerance + 半格对角线；ALIGN 的漂移
-        检查改用本接受半径，保证不会把已到达的机器人退回 POSITION。
-        """
-        position_tolerance = TakeElevator._cabin_transit_position_tolerance(context)
-        grid = context.mapper.floor(context.current_floor)
-        resolution = max(1e-6, float(getattr(grid, "resolution", 0.1)))
-        grid_snap_radius = 0.5 * math.sqrt(2.0) * resolution
+        """历史成功站位窗；横向另限0.25m，不要求精确踩中目标坐标。"""
         goal_tolerance = max(1e-3, float(context.controller.goal_tolerance))
-        return min(goal_tolerance, position_tolerance + grid_snap_radius)
+        return min(goal_tolerance, TakeElevator._CABIN_TRANSIT_POSITION_ACCEPTANCE)
 
     @staticmethod
     def _cabin_transit_complete(
@@ -2535,14 +2697,26 @@ class TakeElevator(NavigationTask):
                 max_iterations=max_iterations,
             )
             if result.reached:
+                path_tolerance = (
+                    effective_goal_tolerance if goal_tolerance is not None else None
+                )
+                if self.cabin_transit_stage == "POSITION" and path_tolerance is not None:
+                    # 只调整站位路径的终点容差，不放宽任务站位窗或修改其他导航阶段。
+                    endpoint_offset = math.hypot(
+                        result.path[-1][0] - target_xy[0],
+                        result.path[-1][1] - target_xy[1],
+                    )
+                    path_tolerance -= endpoint_offset
+                    if path_tolerance <= 0.0:
+                        return self._fail_navigation(
+                            context,
+                            "elevator_position_goal_outside_acceptance",
+                            "规划替代终点超出电梯站位窗",
+                        )
                 context.controller.set_path(
                     result.path,
                     max_linear=max_linear,
-                    goal_tolerance=(
-                        effective_goal_tolerance
-                        if goal_tolerance is not None
-                        else None
-                    ),
+                    goal_tolerance=path_tolerance,
                     reason="elevator_navigate_planned_path",
                 )
                 self._navigation_unreachable_count = 0
