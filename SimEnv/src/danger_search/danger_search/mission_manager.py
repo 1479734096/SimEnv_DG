@@ -4263,32 +4263,67 @@ class MissionManager:
         context = self._frontier_inertia_context()
 
         now = get_time()
-        # 永久过滤只覆盖按入口门宽推导的近门区域，远处采用连续衰减。
-        entrance_xy = getattr(self, "main_entrance_xy", None)
-        entrance_vec = getattr(self, "main_entrance_pass_vector", None)
-        if entrance_xy is not None and entrance_vec is not None:
-            permanent_radius, permanent_decay, gate_half_width = self._permanent_door_context_parameters()
+        # 永久过滤：0 层为建筑物正门；高层（非 0 层）为该楼层电梯门（作为该楼层探索起点入口）。
+        # 该楼层整个探索生命周期内持续生效，直到下一次换层/返航。
+        perm_origin = None
+        perm_vec = None
+        perm_radius = 3.0
+        perm_decay = 6.0
+        perm_gate_width = 0.0
+        perm_door_id = None
+
+        if int(self.current_floor) == 0:
+            entrance_xy = getattr(self, "main_entrance_xy", None)
+            entrance_vec = getattr(self, "main_entrance_pass_vector", None)
+            if entrance_xy is not None and entrance_vec is not None:
+                perm_radius, perm_decay, perm_gate_width = self._permanent_door_context_parameters()
+                perm_origin = entrance_xy
+                perm_vec = entrance_vec
+                perm_door_id = "main_entrance"
+        else:
+            try:
+                elevator_door_id = str(self.building_client.elevator_door_id(self.current_floor))
+                doors = getattr(self.building_client, "doors", {})
+                door = doors.get(elevator_door_id) if isinstance(doors, dict) else None
+                if door is not None:
+                    perm_origin = (float(door.x), float(door.y))
+                    yaw = float(door.yaw)
+                    perm_vec = (math.cos(yaw), math.sin(yaw))
+                    perm_radius = max(3.0, float(self.explorer.door_front_half_plane_radius))
+                    perm_decay = 6.0
+                    perm_door_id = elevator_door_id
+            except (AttributeError, TypeError, ValueError):
+                pass
+            if perm_origin is None and self._door_navigation.last_door_id:
+                if "elevator" in str(self._door_navigation.last_door_id) or "lift" in str(self._door_navigation.last_door_id):
+                    perm_origin = self._door_navigation.last_door_xy
+                    perm_vec = self._door_navigation.last_pass_vector
+                    perm_radius = max(3.0, float(self.explorer.door_front_half_plane_radius))
+                    perm_decay = 6.0
+                    perm_door_id = str(self._door_navigation.last_door_id)
+
+        if perm_origin is not None and perm_vec is not None:
             if context is None:
                 context = FrontierSelectionContext(
-                    permanent_forbidden_half_plane_origin=entrance_xy,
-                    permanent_forbidden_half_plane_normal=entrance_vec,
-                    permanent_forbidden_radius=permanent_radius,
+                    permanent_forbidden_half_plane_origin=perm_origin,
+                    permanent_forbidden_half_plane_normal=perm_vec,
+                    permanent_forbidden_radius=perm_radius,
                     permanent_forbidden_penalty=self.permanent_forbidden_penalty,
-                    permanent_forbidden_decay_distance=permanent_decay,
-                    permanent_gate_half_width=gate_half_width,
-                    door_id="main_entrance",
+                    permanent_forbidden_decay_distance=perm_decay,
+                    permanent_gate_half_width=perm_gate_width,
+                    door_id=perm_door_id,
                     context_time=now,
                 )
             else:
                 context = replace(
                     context,
-                    permanent_forbidden_half_plane_origin=entrance_xy,
-                    permanent_forbidden_half_plane_normal=entrance_vec,
-                    permanent_forbidden_radius=permanent_radius,
+                    permanent_forbidden_half_plane_origin=perm_origin,
+                    permanent_forbidden_half_plane_normal=perm_vec,
+                    permanent_forbidden_radius=perm_radius,
                     permanent_forbidden_penalty=self.permanent_forbidden_penalty,
-                    permanent_forbidden_decay_distance=permanent_decay,
-                    permanent_gate_half_width=gate_half_width,
-                    door_id="main_entrance",
+                    permanent_forbidden_decay_distance=perm_decay,
+                    permanent_gate_half_width=perm_gate_width,
+                    door_id=perm_door_id,
                     context_time=now,
                 )
 
@@ -4305,11 +4340,23 @@ class MissionManager:
             if distance_to_door > self.door_transition_hold_distance:
                 return context
 
+        is_elevator = bool(
+            self._door_navigation.last_door_id
+            and (
+                "elevator" in str(self._door_navigation.last_door_id)
+                or "lift" in str(self._door_navigation.last_door_id)
+            )
+        )
+        forbidden_radius = (
+            max(3.0, float(self.explorer.door_front_half_plane_radius))
+            if is_elevator
+            else float(self.explorer.door_front_half_plane_radius)
+        )
         if context is None:
             context = FrontierSelectionContext(
                 forbidden_half_plane_origin=self._door_navigation.last_door_xy,
                 forbidden_half_plane_normal=self._door_navigation.last_pass_vector,
-                forbidden_radius=self.explorer.door_front_half_plane_radius,
+                forbidden_radius=forbidden_radius,
                 skip_in_forbidden_half_plane=True,
                 preferred_origin=self._door_navigation.last_door_xy,
                 preferred_direction=self._door_navigation.last_pass_vector,
@@ -4323,12 +4370,12 @@ class MissionManager:
                 context,
                 forbidden_half_plane_origin=self._door_navigation.last_door_xy,
                 forbidden_half_plane_normal=self._door_navigation.last_pass_vector,
-                forbidden_radius=self.explorer.door_front_half_plane_radius,
+                forbidden_radius=forbidden_radius,
                 skip_in_forbidden_half_plane=True,
                 preferred_origin=self._door_navigation.last_door_xy,
                 preferred_direction=self._door_navigation.last_pass_vector,
                 temporary_revisit_penalty=self.explorer.door_front_half_plane_penalty,
-                door_id=self._door_navigation.last_door_id,
+                door_id=self._door_navigation.last_door_id or context.door_id,
                 temporary_context_expires_at=self._door_navigation.context_until,
                 context_time=now,
             )

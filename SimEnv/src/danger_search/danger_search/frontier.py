@@ -1959,7 +1959,19 @@ class FrontierExplorer:
             origin = selection_context.forbidden_half_plane_origin
             if origin is not None:
                 distance_to_origin = math.hypot(target_xy[0] - origin[0], target_xy[1] - origin[1])
-                if selection_context.skip_in_forbidden_half_plane and distance_to_origin <= max(0.0, selection_context.forbidden_radius):
+                is_elevator = bool(
+                    selection_context.door_id
+                    and (
+                        "elevator" in str(selection_context.door_id)
+                        or "lift" in str(selection_context.door_id)
+                    )
+                )
+                hard_radius = (
+                    max(3.0, float(selection_context.forbidden_radius))
+                    if is_elevator
+                    else max(0.0, float(selection_context.forbidden_radius))
+                )
+                if selection_context.skip_in_forbidden_half_plane and distance_to_origin <= hard_radius:
                     return 0.0, True, None
                 # penalty 随距离衰减：门附近全罚，5m 外不罚，避免远处前沿被误压。
                 decay = max(0.0, 1.0 - distance_to_origin / 5.0)

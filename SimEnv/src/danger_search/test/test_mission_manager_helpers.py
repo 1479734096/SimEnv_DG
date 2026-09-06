@@ -1112,9 +1112,14 @@ class MissionManagerHelperTest(unittest.TestCase):
         self.assertEqual(lobby_penalty, 0.0)
 
         with patch.object(mission_manager_module, "get_time", return_value=108.1):
-            self.assertIsNone(
-                manager._frontier_selection_context((0.87, 2.70, math.pi))
-            )
+            expired_temp_context = manager._frontier_selection_context((0.87, 2.70, math.pi))
+        self.assertIsNotNone(expired_temp_context)
+        assert expired_temp_context is not None
+        # 临时抑制与前向加分虽已过期，但高层电梯门作为该楼层探索期的永久禁区，轿厢深处依然被过滤
+        _, cabin_still_filtered, _ = (
+            manager.explorer._selection_context_effect((1.5, 2.6), expired_temp_context)
+        )
+        self.assertTrue(cabin_still_filtered)
 
     def test_elevator_exit_context_does_not_disable_unknown_support_hold(self):
         values = []
