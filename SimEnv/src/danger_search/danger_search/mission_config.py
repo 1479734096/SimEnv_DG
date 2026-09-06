@@ -536,7 +536,7 @@ class _MissionConfigBuilder:
         self.last_floor_uses_global_budget = bool(
             _param("mission/last_floor_uses_global_budget", True)
         )
-        self.min_floor_explore_time = float(_param("mission/min_floor_explore_time", 150.0))
+        self.min_floor_explore_time = float(_param("mission/min_floor_explore_time", 60.0))
 
         # 方案 C：全局时间预算参数
         self.return_safety_buffer = float(_param("mission/return_safety_buffer", 30.0))

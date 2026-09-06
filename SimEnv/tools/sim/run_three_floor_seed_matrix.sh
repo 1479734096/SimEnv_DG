@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 串行运行预登记的三层完整闭环 seed 矩阵，并在每轮结束后归档离线证据。
+# 串行运行预登记的三层完整闭环 seed 矩阵（底层调用 run_elevator_gui_test.sh），并在每轮结束后归档离线证据。
 
 set -Eeuo pipefail
 
@@ -236,6 +236,7 @@ for index in "${!SEEDS[@]}"; do
     printf '[三层矩阵] 开始 %d/%d seed=%s attempt=%s，证据=%s\n' \
       "$((index + 1))" "${#SEEDS[@]}" "$seed" "$attempt" "$run_dir"
 
+    # 显式覆盖底层 runner 参数：使用三层矩阵紧凑预算（280s/840s/60s探索），并显式关闭耗时的高负荷诊断与 RGB-D 录包
     set +e
     RUN_ACTIVE=1
     env \

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Phase 1: 验证 PATH 死区补偿修复效果
-# 运行 5 个 seed 的 2 层闭环测试
+# Phase 1: 验证 PATH 死区补偿修复效果（底层调用 run_elevator_gui_test.sh）
+# 运行 5 个 seed 的 2 层闭环测试，专用于历史 commit 1096603 的回归测试
 
 set -Eeuo pipefail
 
@@ -90,6 +90,7 @@ for seed in "${SEEDS[@]}"; do
   started_at="$(date --iso-8601=seconds)"
   started_monotonic="$SECONDS"
 
+  # 显式传递 Phase 1 固定参数（2层、280s单层/60s探索/560s总预算），底层 runner 自动按新默认值录制完整诊断与真值
   set +e
   env \
     SEED="$seed" \

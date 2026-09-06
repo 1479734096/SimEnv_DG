@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 串行运行预登记定位 seed 矩阵；生产算法不读取本脚本生成的离线证据。
+# 串行运行预登记定位 seed 矩阵（底层调用 run_elevator_gui_test.sh）；生产算法不读取本脚本生成的离线证据。
 
 set -Eeuo pipefail
 
@@ -120,6 +120,7 @@ for index in "${!SEEDS[@]}"; do
     attempt_dir="$seed_dir/attempt_$attempt"
     mkdir -p "$attempt_dir"
     printf '[定位矩阵] 开始 %d/20 seed=%s attempt=%s\n' "$((index + 1))" "$seed" "$attempt"
+    # 显式传递定位评估专用参数：无GUI、2层极短驻留（33s单层/5s探索/180s总预算）、记录漂移与离线真值、关闭大容量RGB-D
     set +e
     env \
       SEED="$seed" \

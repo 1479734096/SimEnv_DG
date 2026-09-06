@@ -21,13 +21,13 @@ class ElevatorRunnerContractTest(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0)
-        self.assertIn("ELEVATOR_TEST_FLOOR_COUNT=2", result.stdout)
-        self.assertIn("ELEVATOR_TEST_FLOOR_TIMEOUT=310.0", result.stdout)
+        self.assertIn("ELEVATOR_TEST_FLOOR_COUNT=3", result.stdout)
+        self.assertIn("ELEVATOR_TEST_FLOOR_TIMEOUT=360.0", result.stdout)
         self.assertIn(
-            "ELEVATOR_TEST_MAX_RUNTIME=按楼层：2层720.0、3层900.0",
+            "ELEVATOR_TEST_MAX_RUNTIME=按楼层：1层540.0、2层840.0、3层1280.0",
             result.stdout,
         )
-        self.assertIn("ELEVATOR_TEST_WALL_TIMEOUT=7200", result.stdout)
+        self.assertIn("ELEVATOR_TEST_WALL_TIMEOUT=10800", result.stdout)
         self.assertIn("ELEVATOR_TEST_FULL_CYCLE=1", result.stdout)
         self.assertIn(
             "ELEVATOR_TEST_LANDMARK_DRIFT_DIAGNOSTICS=1",
@@ -62,15 +62,15 @@ class ElevatorRunnerContractTest(unittest.TestCase):
         source = RUNNER.read_text(encoding="utf-8")
 
         self.assertIn(
-            'ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-310.0}"',
+            'ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-360.0}"',
             source,
         )
         self.assertIn(
-            'ELEVATOR_TEST_WALL_TIMEOUT="${ELEVATOR_TEST_WALL_TIMEOUT:-7200}"',
+            'ELEVATOR_TEST_WALL_TIMEOUT="${ELEVATOR_TEST_WALL_TIMEOUT:-10800}"',
             source,
         )
-        self.assertIn('2) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="720.0" ;;', source)
-        self.assertIn('3) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="900.0" ;;', source)
+        self.assertIn('2) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="840.0" ;;', source)
+        self.assertIn('3) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="1280.0" ;;', source)
         self.assertIn(
             'ELEVATOR_TEST_MAX_RUNTIME="${ELEVATOR_TEST_MAX_RUNTIME:-$ELEVATOR_TEST_DEFAULT_MAX_RUNTIME}"',
             source,

@@ -99,7 +99,7 @@ mission:
   # 非最后一层仍以 floor_timeout 保护后续楼层；最后一层由全局返航预算收口。
   # 设为 false 可立即恢复“所有楼层到时即结束”的旧语义。
   last_floor_uses_global_budget: true
-  min_floor_explore_time: 150.0
+  min_floor_explore_time: 60.0
   min_floor_travel_distance: 6.0
   min_known_area: 44.0
   no_reachable_frontier_confirmations: 2
