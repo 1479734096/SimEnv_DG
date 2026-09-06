@@ -258,6 +258,8 @@ _CONFIG_GROUP_FIELDS = {
             "elevator_geometry_refresh_max_yaw_change",
             "elevator_geometry_refresh_standoff",
             "elevator_geometry_refresh_timeout",
+            "elevator_wait_position_tolerance",
+            "elevator_wait_heading_tolerance",
             "elevator_navigation_timeout",
             "elevator_opening_confirmation_timeout",
             "elevator_opening_confirmation_retry_limit",
@@ -1308,7 +1310,7 @@ class _MissionConfigBuilder:
             _param("local_semantic/elevator_geometry_refresh_enabled", True)
         )
         self.elevator_geometry_refresh_timeout = float(
-            _param("local_semantic/elevator_geometry_refresh_timeout", 6.0)
+            _param("local_semantic/elevator_geometry_refresh_timeout", 1.5)
         )
         self.elevator_geometry_refresh_standoff = float(
             _param("local_semantic/elevator_geometry_refresh_standoff", 1.2)
@@ -1318,6 +1320,12 @@ class _MissionConfigBuilder:
         )
         self.elevator_geometry_refresh_max_yaw_change = float(
             _param("local_semantic/elevator_geometry_refresh_max_yaw_change", 0.35)
+        )
+        self.elevator_wait_position_tolerance = float(
+            _param("local_semantic/elevator_wait_position_tolerance", 0.45)
+        )
+        self.elevator_wait_heading_tolerance = float(
+            _param("local_semantic/elevator_wait_heading_tolerance", 0.15)
         )
         self.elevator_visual_scan_duration = float(
             _param("local_semantic/elevator_visual_scan_duration", 18.0)
@@ -1471,6 +1479,10 @@ class _MissionConfigBuilder:
             and self.elevator_geometry_refresh_max_shift > 0.0
             and math.isfinite(self.elevator_geometry_refresh_max_yaw_change)
             and 0.0 < self.elevator_geometry_refresh_max_yaw_change <= math.pi
+            and math.isfinite(self.elevator_wait_position_tolerance)
+            and self.elevator_wait_position_tolerance > 0.0
+            and math.isfinite(self.elevator_wait_heading_tolerance)
+            and 0.0 < self.elevator_wait_heading_tolerance <= math.pi
             and math.isfinite(self.elevator_visual_scan_duration)
             and self.elevator_visual_scan_duration > 0.0
             and math.isfinite(self.elevator_visual_scan_angular_speed)

@@ -499,11 +499,14 @@ local_semantic:
   elevator_opening_confirmation_sensor_refresh: 0.5
   # 呼梯前在当前漂移坐标系内重观测关闭门板；只刷新任务语义几何，不移动地图或 odom。
   elevator_geometry_refresh_enabled: true
-  elevator_geometry_refresh_timeout: 6.0
+  elevator_geometry_refresh_timeout: 1.5
   # 机身等待点 0.8m 对前置相机过近；刷新时先停在 1.2m，避免门板被视场裁切。
   elevator_geometry_refresh_standoff: 1.2
   elevator_geometry_refresh_max_shift: 0.75
   elevator_geometry_refresh_max_yaw_change: 0.35
+  # 候梯站位与对准容差门禁（避免微小偏差重复寻路和对准）
+  elevator_wait_position_tolerance: 0.45
+  elevator_wait_heading_tolerance: 0.15
   # 进入主入口并建立足够安全已知区后只执行一次，约覆盖一整圈；发现后立即结束。
   # 命令角速度不等于四足机体的实际 yaw 速度；按定位累计转角闭环，时间仅兜底。
   elevator_visual_scan_duration: 18.0

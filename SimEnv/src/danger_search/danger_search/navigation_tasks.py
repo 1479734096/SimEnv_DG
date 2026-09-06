@@ -1163,12 +1163,22 @@ class TakeElevator(NavigationTask):
             if outcome is not None and getattr(outcome, "status", IDLE) == RUNNING:
                 return RUNNING
             self._landmark_relocalization_attempted = True
-            if outcome is not None and bool(getattr(outcome, "applied", False)):
-                self._current_crossing_geometry = None
-                self._target_crossing_geometry = None
-                context.controller.clear_path(reason="elevator_landmark_relocalized")
-                self._reset_navigation_watchdog(clear_failure=True)
-                self.phase = "GO_TO_ELEVATOR_DOOR"
+            lidar_matched = outcome is not None and outcome.status == DONE
+            if lidar_matched:
+                if rospy is not None:
+                    rospy.loginfo(
+                        "[%s] 电梯激光点云地标匹配成功(applied=%s)，通过几何校验",
+                        self.name,
+                        bool(getattr(outcome, "applied", False)),
+                    )
+                if bool(getattr(outcome, "applied", False)):
+                    self._current_crossing_geometry = None
+                    self._target_crossing_geometry = None
+                    context.controller.clear_path(reason="elevator_landmark_relocalized")
+                    self._reset_navigation_watchdog(clear_failure=True)
+                self._transition_after_elevator_geometry_confirmed(
+                    context, pose, current_wait, cabin_center, source="Livox激光地标"
+                )
             else:
                 self.phase = (
                     "REFRESH_CURRENT_ELEVATOR_GEOMETRY"
@@ -1198,14 +1208,18 @@ class TakeElevator(NavigationTask):
                     reason="elevator_geometry_refresh_unavailable"
                 )
                 self._reset_navigation_watchdog(clear_failure=True)
-                self.phase = "GO_TO_REFRESHED_ELEVATOR_DOOR"
+                self._transition_after_elevator_geometry_confirmed(
+                    context, pose, current_wait, cabin_center, source="RGB-D超时保留"
+                )
                 return RUNNING
             if status != DONE:
                 self.failure_reason = "elevator_geometry_refresh_failed"
                 return FAILED
             context.controller.clear_path(reason="elevator_geometry_refreshed")
             self._reset_navigation_watchdog(clear_failure=True)
-            self.phase = "GO_TO_REFRESHED_ELEVATOR_DOOR"
+            self._transition_after_elevator_geometry_confirmed(
+                context, pose, current_wait, cabin_center, source="RGB-D刷新成功"
+            )
             return RUNNING
 
         if self.phase == "GO_TO_REFRESHED_ELEVATOR_DOOR":
@@ -1845,6 +1859,61 @@ class TakeElevator(NavigationTask):
                 self.failure_reason,
             )
         return FAILED
+
+    def _is_elevator_wait_pose_within_tolerance(
+        self,
+        context: NavigationTaskContext,
+        pose: tuple[float, float, float],
+        wait_point: tuple[float, float],
+        cabin_center: tuple[float, float],
+    ) -> tuple[bool, bool]:
+        """判定当前机器人位姿是否在候梯位置容差和正对轿厢中心朝向容差内。"""
+        dist = math.hypot(wait_point[0] - pose[0], wait_point[1] - pose[1])
+        pos_tol = float(getattr(context, "elevator_wait_position_tolerance", 0.45))
+        pos_ok = dist <= pos_tol
+
+        target_yaw = math.atan2(cabin_center[1] - pose[1], cabin_center[0] - pose[0])
+        heading_tol = float(getattr(context, "elevator_wait_heading_tolerance", 0.15))
+        heading_ok = abs(_angle_wrap(pose[2] - target_yaw)) <= heading_tol
+        return pos_ok, heading_ok
+
+    def _transition_after_elevator_geometry_confirmed(
+        self,
+        context: NavigationTaskContext,
+        pose: tuple[float, float, float],
+        current_wait: tuple[float, float],
+        cabin_center: tuple[float, float],
+        source: str,
+    ) -> None:
+        """几何确认后，依据容差门禁决定下一阶段（避免微小偏差重复寻路与对准）。"""
+        pos_ok, heading_ok = self._is_elevator_wait_pose_within_tolerance(
+            context, pose, current_wait, cabin_center
+        )
+        if pos_ok and heading_ok:
+            if rospy is not None:
+                rospy.loginfo(
+                    "[%s] %s 确认后位姿在容差内(pos_ok=True, heading_ok=True)，直接呼梯",
+                    self.name,
+                    source,
+                )
+            self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+        elif pos_ok:
+            if rospy is not None:
+                rospy.loginfo(
+                    "[%s] %s 确认后位置在容差内但朝向需微调，跳过阶段5直接对准",
+                    self.name,
+                    source,
+                )
+            self._exit_alignment_count = 0
+            self.phase = "ALIGN_TO_REFRESHED_ELEVATOR_DOOR"
+        else:
+            if rospy is not None:
+                rospy.loginfo(
+                    "[%s] %s 确认后位置超出容差，前往候梯点",
+                    self.name,
+                    source,
+                )
+            self.phase = "GO_TO_REFRESHED_ELEVATOR_DOOR"
 
     def _begin_door_open_confirmation(self, context: NavigationTaskContext, door_id: str) -> None:
         if door_id in self._door_confirmation_started:

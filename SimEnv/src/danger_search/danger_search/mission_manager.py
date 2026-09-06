@@ -573,6 +573,12 @@ class MissionManager:
                 getattr(self, "elevator_opening_confirmation_sensor_refresh", 0.5)
             ),
             entrance_geometry_correction_fn=self.correct_entrance_geometry,
+            elevator_wait_position_tolerance=float(
+                getattr(self, "elevator_wait_position_tolerance", 0.45)
+            ),
+            elevator_wait_heading_tolerance=float(
+                getattr(self, "elevator_wait_heading_tolerance", 0.15)
+            ),
         )
 
     def _planning_constraints(self):

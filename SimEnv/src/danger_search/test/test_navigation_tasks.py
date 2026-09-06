@@ -1225,17 +1225,11 @@ class TakeElevatorTest(unittest.TestCase):
         self.assertEqual(elevator_calls, [("elevator_main", 0, False)])
         self.assertEqual(open_calls, [])
 
-        # 完成近场几何刷新、重新到候梯点并对准后，才允许进入显式开门阶段。
+        # 完成近场几何刷新后，若位姿在容差内，直接跳过冗余碎步与二次对准，进入呼梯阶段。
         with patch.object(task, "_tick_target_door_alignment", return_value=True):
             self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.phase, "REFRESH_CURRENT_ELEVATOR_GEOMETRY")
         self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
-        self.assertEqual(task.phase, "GO_TO_REFRESHED_ELEVATOR_DOOR")
-        with patch.object(task, "_navigate_to", return_value=True):
-            self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
-        self.assertEqual(task.phase, "ALIGN_TO_REFRESHED_ELEVATOR_DOOR")
-        with patch.object(task, "_tick_target_door_alignment", return_value=True):
-            self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
         self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
         self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
@@ -1246,6 +1240,56 @@ class TakeElevatorTest(unittest.TestCase):
 
         self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
         self.assertEqual(open_calls, ["lift_door_ground"])
+
+    def test_take_elevator_lidar_relocalization_fast_path_skips_refresh_and_align_when_within_tolerance(self):
+        """Livox 激光地标匹配成功且在容差内，直接跃迁至呼梯，跳过阶段4/5/6。"""
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        manager.relocalize_landmark = lambda *args, **kwargs: SimpleNamespace(status=DONE, applied=False)
+        refresh_called = []
+        manager.refresh_elevator_geometry = lambda *args, **kwargs: refresh_called.append(True) or DONE
+        task = TakeElevator(0, 1)
+        task.phase = "RELOCALIZE_CURRENT_ELEVATOR"
+        context = _task_context(manager)
+
+        # 候梯点为 (0.85, 2.60)，当前在 (0.85, 2.60, 0.0) 处，位姿完全吻合
+        self.assertEqual(task.tick(context, (0.85, 2.60, 0.0)), RUNNING)
+        # 直接进入呼梯阶段，且没有调用过视觉刷新
+        self.assertEqual(task.phase, "CALL_ELEVATOR_TO_CURRENT_FLOOR")
+        self.assertEqual(refresh_called, [])
+
+    def test_take_elevator_tolerance_routes_correctly_when_offset(self):
+        """测试位姿超出容差时的正确分流：位置超标去阶段5，仅角度超标跳过阶段5去阶段6。"""
+        grid = MultiFloorGridMap(
+            resolution=0.1,
+            width=5.0,
+            length=5.0,
+            origin_x=0.0,
+            origin_y=0.0,
+        ).floor(0)
+        manager = self._exit_manager(grid)
+        manager.current_floor = 0
+        manager.relocalize_landmark = lambda *args, **kwargs: SimpleNamespace(status=DONE, applied=False)
+        context = _task_context(manager)
+
+        # 场景 1：位置误差 > 0.45m（候梯点在 0.85, 2.60，机器人在 0.0, 2.60，距离 0.85m）
+        task1 = TakeElevator(0, 1)
+        task1.phase = "RELOCALIZE_CURRENT_ELEVATOR"
+        self.assertEqual(task1.tick(context, (0.0, 2.60, 0.0)), RUNNING)
+        self.assertEqual(task1.phase, "GO_TO_REFRESHED_ELEVATOR_DOOR")
+
+        # 场景 2：位置在 0.45m 内，但朝向误差 > 0.15rad（机器人朝向 pi/2，即 90 度，正对电梯目标应为 0.0）
+        task2 = TakeElevator(0, 1)
+        task2.phase = "RELOCALIZE_CURRENT_ELEVATOR"
+        self.assertEqual(task2.tick(context, (0.85, 2.60, math.pi / 2.0)), RUNNING)
+        self.assertEqual(task2.phase, "ALIGN_TO_REFRESHED_ELEVATOR_DOOR")
 
     def test_confirmed_current_door_refreshes_live_crossing_before_enter(self):
         grid = MultiFloorGridMap(
@@ -1672,13 +1716,13 @@ class TakeElevatorTest(unittest.TestCase):
         task = TakeElevator(0, 1)
         task.phase = "REFRESH_CURRENT_ELEVATOR_GEOMETRY"
 
-        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.6, 0.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.0, 2.6, 0.0)), RUNNING)
         self.assertEqual(task.phase, "GO_TO_REFRESHED_ELEVATOR_DOOR")
         self.assertEqual(len(refresh_calls), 1)
         self.assertIn("elevator_geometry_refreshed", manager.controller.clear_reasons)
 
         with patch.object(task, "_navigate_to", return_value=True):
-            self.assertEqual(task.tick(_task_context(manager), (0.85, 2.6, 0.0)), RUNNING)
+            self.assertEqual(task.tick(_task_context(manager), (0.0, 2.6, 0.0)), RUNNING)
         self.assertEqual(task.phase, "ALIGN_TO_REFRESHED_ELEVATOR_DOOR")
 
     def test_elevator_refresh_timeout_preserves_registered_geometry(self):
@@ -1695,7 +1739,7 @@ class TakeElevatorTest(unittest.TestCase):
         task = TakeElevator(0, 1)
         task.phase = "REFRESH_CURRENT_ELEVATOR_GEOMETRY"
 
-        self.assertEqual(task.tick(_task_context(manager), (0.85, 2.6, 0.0)), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager), (0.0, 2.6, 0.0)), RUNNING)
 
         self.assertEqual(task.phase, "GO_TO_REFRESHED_ELEVATOR_DOOR")
         self.assertIsNone(task.failure_reason)
@@ -1705,7 +1749,7 @@ class TakeElevatorTest(unittest.TestCase):
         )
 
         with patch.object(task, "_navigate_to", return_value=True):
-            self.assertEqual(task.tick(_task_context(manager), (0.85, 2.6, 0.0)), RUNNING)
+            self.assertEqual(task.tick(_task_context(manager), (0.0, 2.6, 0.0)), RUNNING)
         self.assertEqual(task.phase, "ALIGN_TO_REFRESHED_ELEVATOR_DOOR")
 
     def test_elevator_refresh_viewpoint_keeps_camera_farther_from_door(self):
