@@ -440,6 +440,8 @@ detection:
   # RGB-D 反投影使用 OpenCV 光学坐标：x 右、y 下、z 前。
   # Gazebo 插件 frameName 通常写 robot link 名，因此默认转换到 ROS link 坐标后再走 TF。
   depth_frame_is_optical: true
+  # 距离惩罚起点：推迟到 6.5m，避免 5~6m 处高质量真球被过度打折
+  distance_penalty_start: 6.5
 
 local_semantic:
   # 仅使用局部点云/RGB-D 注册门和电梯几何；公开 JSON 只提供可调用 ID。
@@ -531,6 +533,13 @@ tracker:
   max_position_std: 0.25
   min_confidence: 0.75
   max_average_rmse: 0.04
+  # 多阶梯确认门槛：解除远距离真球漏检死锁
+  tier1_max_rmse: 0.005
+  tier1_min_hits: 1
+  tier1_min_confidence: 0.70
+  tier2_max_rmse: 0.015
+  tier2_min_hits: 2
+  tier2_min_confidence: 0.70
   nms_radius: 0.9
   stale_after: 30.0
   # 正式结果仍保持四帧确认；以下仅保护运动路径。两个独立高质量帧先写入

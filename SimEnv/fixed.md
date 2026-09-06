@@ -679,3 +679,23 @@ Stage15～17 当前结论：
 - **未关闭的阶段门**：`sha256sum -c OFFICIAL_FILES.sha256` 仍有 6 个历史不一致项；本轮未覆盖
   受保护文件，因此当前候选尚不能创建迁移阶段提交或标签。
 - 详情见 [STAGE33_SPARSE_LANDMARK_RELOCALIZATION_REPORT.md](reports/STAGE33_SPARSE_LANDMARK_RELOCALIZATION_REPORT.md)。
+
+## 33. 2026-09-06 远距离危险源解耦与三级确认阶梯（STAGE34）
+
+- **问题现象（走廊高速巡航路过危险源 100% 漏检）**：机器狗以约 $0.63\text{ m/s}$ 巡航经过危险源（红球）时（如 simtime 1min40s~47s 及 2min 左右路过危险源），未能触发靠近核验（`danger_approach_verification`），导致危险源被彻底遗漏。
+- **根本原因排查与分析**：
+  1. **远距离置信度硬截断（数学死锁）**：旧版 `_score_detection` 在目标距离 $>5.0\text{ m}$ 时强行施加距离折减（每米扣 $0.15$），将置信度打压至 $<0.75$（例如 $5.82\text{ m}$ 处的真球即使几何形状高度吻合也被压制至 $0.69$），直接低于跟踪器确认门限 `min_confidence=0.75` 及任务层抢占门限 $0.75$，无法完成确认；
+  2. **固定 4 帧确认门禁与相机窄 FOV（$\pm 30^\circ$）时空冲突**：机器狗在走廊以 $0.63\text{ m/s}$ 巡航时，侧前方红球穿过视锥的时间窗口极短（约 $0.4\sim 0.6\text{ s}$，仅获 1~2 帧有效 RGB-D 样本），无法满足硬编码的 `min_hits=4`，被跟踪器作为孤立离散帧淘汰；
+  3. **急停扫描方案否定**：四足机器狗在高速行进中急停会引发足端打滑与位姿漂移，且惯性滑跑（约 $0.2\sim 0.3\text{ m}$）极易导致停下后目标反而脱离视锥，不可行。
+- **修改方案与修改后现状**：
+  1. **距离惩罚解耦**：在 `danger_search.yaml` 引入 `detection/distance_penalty_start: 6.5`，使 $6.5\text{ m}$ 内红球不施加硬性距离扣分，真实红球在远距离仍可保留 $0.88\sim 0.98$ 的高几何置信度；
+  2. **基于球面物理残差 RMSE 的三级确认阶梯（Tiered Confirmation）**：
+     - **Tier 1（极高精度）**：$\text{RMSE} \le 0.005\text{ m}$（$5\text{ mm}$），置信度 $\ge 0.70$，只需 **1 帧** 命中即可立即 `CONFIRMED`；
+     - **Tier 2（高精度）**：$\text{RMSE} \le 0.015\text{ m}$（$15\text{ mm}$），置信度 $\ge 0.70$，只需 **2 帧** 命中即可 `CONFIRMED`；
+     - **Tier 3（常规兜底）**：$\text{RMSE} \le 0.035\text{ m}$（$35\text{ mm}$），置信度 $\ge 0.75$，维持 **4 帧** 命中才 `CONFIRMED`。
+  3. **任务层核验抢占门限对齐**：`MissionManager._pending_danger_inspection_target` 的置信度门限与 `tier1_min_confidence`（$0.70$）对齐，确保极低 RMSE 单帧即能抢占巡航并转入靠近核验；
+  4. **实测数据与离线回放验证**：
+     - Gazebo 仿真中真实红球点云拟合实测 RMSE 极低（普遍为 $0.20\text{ mm}\sim 1.33\text{ mm}$，最大不超过 $3.5\text{ mm}$）；
+     - 场景内红色干扰方块（`distractor_red_box`，边长 0.3m）在拟合 $R=0.15\text{ m}$ 球面时实测 RMSE 均在 $21.8\text{ mm}\sim 22.8\text{ mm}$；
+     - $5\text{ mm}$ 与 $15\text{ mm}$ 阈值精准切入真球上限与干扰物下限之间的绝对空白带；
+     - 离线回放验证：`9.6.12.08` 真实漏检真球（$5.82\text{ m}$，RMSE $0.197\text{ mm}$）单帧即被 CONFIRMED 并激活核验；`attempt01` 真实红色方块干扰物连续 21 帧均被阻断在 Tentative（零误报）。

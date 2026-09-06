@@ -3151,8 +3151,8 @@ class MissionManager:
         if not callable(selector):
             return None
 
-        minimum_confidence = max(
-            0.70,
+        minimum_confidence = min(
+            float(getattr(tracker, "tier1_min_confidence", 0.70)),
             float(getattr(tracker, "min_confidence", 0.70)),
         )
         return selector(

@@ -241,6 +241,12 @@ class DetectionTracker:
         obstacle_max_age: float = 0.75,
         obstacle_min_observation_span: float = 0.08,
         inspection_max_attempts: int = 3,
+        tier1_max_rmse: float = 0.005,
+        tier1_min_hits: int = 1,
+        tier1_min_confidence: float = 0.70,
+        tier2_max_rmse: float = 0.015,
+        tier2_min_hits: int = 2,
+        tier2_min_confidence: float = 0.70,
     ):
         self.association_radius = float(association_radius)
         self.confirmation_window = float(confirmation_window)
@@ -257,6 +263,12 @@ class DetectionTracker:
         self.obstacle_min_observation_span = float(
             obstacle_min_observation_span
         )
+        self.tier1_max_rmse = float(tier1_max_rmse)
+        self.tier1_min_hits = int(tier1_min_hits)
+        self.tier1_min_confidence = float(tier1_min_confidence)
+        self.tier2_max_rmse = float(tier2_max_rmse)
+        self.tier2_min_hits = int(tier2_min_hits)
+        self.tier2_min_confidence = float(tier2_min_confidence)
         if (
             isinstance(inspection_max_attempts, bool)
             or not isinstance(inspection_max_attempts, int)
@@ -270,6 +282,8 @@ class DetectionTracker:
             self.nms_radius,
             self.obstacle_max_average_rmse,
             self.obstacle_min_observation_span,
+            self.tier1_max_rmse,
+            self.tier2_max_rmse,
         )
         if (
             not math.isfinite(self.association_radius)
@@ -278,6 +292,8 @@ class DetectionTracker:
             or self.confirmation_window <= 0.0
             or self.min_hits <= 0
             or self.obstacle_min_hits <= 0
+            or self.tier1_min_hits <= 0
+            or self.tier2_min_hits <= 0
             or not all(
                 math.isfinite(value) and value >= 0.0
                 for value in finite_nonnegative
@@ -286,6 +302,10 @@ class DetectionTracker:
             or not 0.0 <= self.min_confidence <= 1.0
             or not math.isfinite(self.obstacle_min_confidence)
             or not 0.0 <= self.obstacle_min_confidence <= 1.0
+            or not math.isfinite(self.tier1_min_confidence)
+            or not 0.0 <= self.tier1_min_confidence <= 1.0
+            or not math.isfinite(self.tier2_min_confidence)
+            or not 0.0 <= self.tier2_min_confidence <= 1.0
             or not math.isfinite(self.stale_after)
             or self.stale_after <= 0.0
             or not math.isfinite(self.obstacle_max_age)
@@ -675,12 +695,35 @@ class DetectionTracker:
             if now - track.last_seen > self.stale_after and track.status != CONFIRMED:
                 track.status = REJECTED
                 continue
-            if (
-                track.recent_hit_count(now, self.confirmation_window) >= self.min_hits
-                and track.position_std() <= self.max_position_std
-                and track.average_confidence() >= self.min_confidence
-                and track.average_rmse() <= self.max_average_rmse
-            ):
+            recent_hits = track.recent_hit_count(now, self.confirmation_window)
+            avg_rmse = track.average_rmse()
+            avg_conf = track.average_confidence()
+            pos_std = track.position_std()
+
+            # Tier 1: 极低残差 (<= 5mm) 极速通道，1 帧即确认
+            tier1_ok = (
+                recent_hits >= self.tier1_min_hits
+                and avg_rmse <= self.tier1_max_rmse
+                and avg_conf >= self.tier1_min_confidence
+            )
+
+            # Tier 2: 较低残差 (<= 15mm) 快速通道，2 帧确认
+            tier2_ok = (
+                recent_hits >= self.tier2_min_hits
+                and avg_rmse <= self.tier2_max_rmse
+                and avg_conf >= self.tier2_min_confidence
+                and pos_std <= self.max_position_std
+            )
+
+            # Tier 3: 标准基线保守通道，4 帧确认
+            tier3_ok = (
+                recent_hits >= self.min_hits
+                and avg_rmse <= self.max_average_rmse
+                and avg_conf >= self.min_confidence
+                and pos_std <= self.max_position_std
+            )
+
+            if tier1_ok or tier2_ok or tier3_ok:
                 track.status = CONFIRMED
 
 

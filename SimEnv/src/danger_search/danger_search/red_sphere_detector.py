@@ -58,6 +58,7 @@ class RedSphereDetector:
         max_depth: float = 8.0,
         ransac_iterations: int = 80,
         ransac_sample_size: int = 4,
+        distance_penalty_start: float = 6.5,
         random_seed: int = 202602,
     ):
         self.min_area = int(min_area)
@@ -72,6 +73,7 @@ class RedSphereDetector:
         self.max_depth = float(max_depth)
         self.ransac_iterations = int(ransac_iterations)
         self.ransac_sample_size = int(ransac_sample_size)
+        self.distance_penalty_start = float(distance_penalty_start)
         if (
             self.min_area <= 0
             or not math.isfinite(self.min_circularity)
@@ -87,6 +89,7 @@ class RedSphereDetector:
                     self.max_rmse,
                     self.min_depth,
                     self.max_depth,
+                    self.distance_penalty_start,
                 )
             )
             or self.min_aspect > self.max_aspect
@@ -337,12 +340,13 @@ class RedSphereDetector:
         radius_center = (self.min_radius + self.max_radius) / 2.0
         radius_error = abs(sphere.radius - radius_center) / max(radius_center, 1e-6)
         rmse_score = max(0.0, 1.0 - sphere.rmse / max(self.max_rmse, 1e-6))
-        score = 0.45 * min(circularity, 1.0) + 0.35 * rmse_score + 0.20 * max(0.0, 1.0 - radius_error)
+        geo_score = 0.45 * min(circularity, 1.0) + 0.35 * rmse_score + 0.20 * max(0.0, 1.0 - radius_error)
         dist = float(np.linalg.norm(sphere.center))
-        if dist > 4.0:
-            dist_factor = max(0.2, 1.0 - (dist - 4.0) / 4.0)
-            score *= dist_factor
-        return float(max(0.0, min(1.0, score)))
+        if dist > self.distance_penalty_start:
+            decay_span = max(self.max_depth - self.distance_penalty_start, 0.5)
+            dist_factor = max(0.3, 1.0 - (dist - self.distance_penalty_start) / decay_span)
+            geo_score *= dist_factor
+        return float(max(0.0, min(1.0, geo_score)))
 
 
 def _fit_sphere_geometric(
