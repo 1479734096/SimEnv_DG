@@ -127,8 +127,10 @@ python3 tools/offline/check_production_boundary.py
   接近完成后必须原地对准并取得核验阶段的新鲜多帧证据，接近失败不会把候选永久标记为已核验。
 - 前沿最终评分以真实 A* 路径首段和累计拐角计算转向代价；正式
   `yaw_cost_weight=0.40`、`path_turn_cost_weight=0.70`，并将最高角速度限制为
-  `0.90rad/s`。距离超过 `3.5m` 且预期收益低于 `4` 格的前沿在 A* 前后均被跳过，不能
+  `0.90rad/s`。距离超过 `3.5m` 且预期收益低于 `16` 格的前沿在 A* 前后均被跳过（基于危险源物理尺寸及避让净空推导，避免机器人舍近求远回头探索绝无藏球可能的微小阴影），不能
   重新进入候选。
+- 高层电梯门探索禁区（防轿厢回头振荡）：在非 0 层探索期间，当前楼层电梯门被注册为整个楼层探索周期的永久禁止半平面（`permanent_forbidden_half_plane`，半径 $\ge 3.0\text{m}$），前沿评估直接剪枝（`skip_in_forbidden_half_plane`）轿厢内部残留候选，杜绝出电梯后刚走几步又折返重新进梯的振荡。
+- 前向避障梯形收腰通道（防转角擦边误刹停）：前向障碍物检测采用动态梯形半宽 `forward_obstacle_lateral_limit`。近身段（$forward \le 0.35\text{m}$）侧向半宽收缩至 $0.16\text{m}$，完美贴合 A1 机器狗机身轮廓，排除门框立柱与转角墙皮的擦边误检；远端（$forward \ge 0.60\text{m}$）保持 $0.22\text{m}$ 充足避障预警，根治拐角误急停卡死（corner freeze）。
 
 运行日志中的 `danger_obstacle_sync`、`danger_obstacle_reprojected`、
 `danger_source_overlap` 与 `frontier_selection` 候选分项用于复核上述策略；它们均不读取
