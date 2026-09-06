@@ -1061,7 +1061,7 @@ class _MissionConfigBuilder:
             ),
             "goal_tolerance": float(_param("controller/goal_tolerance", 0.35)),
             "min_far_expected_gain": float(
-                _param("frontier/min_far_expected_gain", 4.0)
+                _param("frontier/min_far_expected_gain", 16.0)
             ),
             "far_prune_distance": float(
                 _param("frontier/far_prune_distance", 3.5)

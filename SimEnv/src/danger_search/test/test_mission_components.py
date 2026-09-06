@@ -119,7 +119,7 @@ def test_frontier_scoring_defaults_include_real_path_turn_penalty():
 
     assert params["yaw_cost_weight"] == 0.4
     assert params["path_turn_cost_weight"] == 0.7
-    assert params["min_far_expected_gain"] == 4.0
+    assert params["min_far_expected_gain"] == 16.0
 
 
 def test_global_frame_is_wired_to_map_and_path_diagnostics():

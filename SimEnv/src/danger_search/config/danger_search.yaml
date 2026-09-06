@@ -312,9 +312,10 @@ frontier:
   max_planning_candidates: 8
   max_goal_candidates_per_frontier: 2
   max_fallback_planning_candidates: 8
-  # 远距离封闭孤岛前沿剪枝：收益低于 4 格才直接剪枝。R=0.15m 红球的
-  # 局部未知投影可接近这一量级，不能再以 8 格阈值漏掉小房间或壁龛。
-  min_far_expected_gain: 4.0
+  # 远距离封闭孤岛前沿剪枝：收益低于 16 格才直接剪枝。结合危险源物理尺寸(D=0.3m,
+  # 约 7 格)与墙体/家具避让安全间距(>=0.35m~0.45m)，远距离小阴影低于 16 格
+  # 在物理与规则上不可能容纳危险源，直接剪枝避免无效折返。
+  min_far_expected_gain: 16.0
   far_prune_distance: 3.5
 
 controller:
