@@ -100,7 +100,7 @@ class OpenDoorAndPass(NavigationTask):
     _PASS_ALIGN_TIMEOUT = 12.0
     # 细对准期间允许的位置漂移半径：原地转向不应移动，超出即认为锚点失效。
     _PASS_ALIGN_ANCHOR_RADIUS = 0.30
-    _MAIN_ENTRANCE_CENTERLINE_TOLERANCE = 0.25
+    _MAIN_ENTRANCE_CENTERLINE_TOLERANCE = 0.35
     _MAIN_ENTRANCE_CENTERING_TIMEOUT = 30.0
     _SERVICE_TIMEOUT = 30.0
     _SERVICE_WALL_TIMEOUT = 180.0
@@ -356,7 +356,7 @@ class OpenDoorAndPass(NavigationTask):
             )
             if (
                 centerline_error <= self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE
-                and wait_distance <= 0.30
+                and wait_distance <= 0.45
             ):
                 self.phase = "GO_PASS_POINT"
             else:
@@ -371,16 +371,29 @@ class OpenDoorAndPass(NavigationTask):
             return RUNNING
 
         if self.phase == "GO_REFRESHED_WAIT_POINT":
-            if self._navigate_to(
+            target_pt = (
+                self._compute_forward_aligned_wait_point(pose)
+                if self.door_id == "main_entrance"
+                else self._wait_point
+            )
+            if (
+                self.door_id == "main_entrance"
+                and self._door_centerline_error(pose)
+                <= self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE
+            ) or self._navigate_to(
                 context,
                 pose,
-                self._wait_point,
+                target_pt,
                 allow_direct_fallback=True,
                 planning_max_iterations=None,
                 max_linear=context.door_pass_max_linear,
                 goal_tolerance=self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE,
             ):
                 context.controller.clear_path(reason="door_refreshed_wait_reached")
+                self._pass_alignment_count = 0
+                self._pass_path_started = False
+                self._pass_align_start_time = None
+                self._pass_alignment_done = False
                 self.phase = "GO_PASS_POINT"
             elif self._last_navigation_blocked:
                 return self._fail_crossing(context, "更新后的门洞等待点不可达")
@@ -746,6 +759,34 @@ class OpenDoorAndPass(NavigationTask):
         offset_x = pose[0] - self._wait_point[0]
         offset_y = pose[1] - self._wait_point[1]
         return abs(offset_x * axis_y - offset_y * axis_x) / axis_norm
+
+    def _compute_forward_aligned_wait_point(
+        self,
+        pose: tuple[float, float, float],
+    ) -> tuple[float, float]:
+        """计算主入口中轴线上不向后倒退的前向站位目标。
+
+        当门已敞开且机器人在门前准备区时，严禁向机器人身后旧等待点倒退或大角度掉头；
+        站位点取中轴线上与机器人当前位置平齐且略微前倾的点，确保控制器以正向弧线推进。
+        """
+        if self._wait_point is None or self._pass_point is None:
+            return self._wait_point if self._wait_point is not None else (pose[0], pose[1])
+        axis_x = self._pass_point[0] - self._wait_point[0]
+        axis_y = self._pass_point[1] - self._wait_point[1]
+        axis_norm = math.hypot(axis_x, axis_y)
+        if axis_norm <= 1e-6:
+            return self._wait_point
+        ux = axis_x / axis_norm
+        uy = axis_y / axis_norm
+        # 机器人在门中轴线方向上的纵向投影进度（以 _wait_point 为原点）
+        proj = (pose[0] - self._wait_point[0]) * ux + (pose[1] - self._wait_point[1]) * uy
+        # 限制纵向深度：不落后于当前位置，且在门前保留至少 0.8m 净空（门面位于 self.wait_offset 处）
+        max_forward = max(0.0, float(self.wait_offset) - 0.8)
+        safe_proj = max(0.0, min(proj + 0.15, max_forward))
+        return (
+            self._wait_point[0] + safe_proj * ux,
+            self._wait_point[1] + safe_proj * uy,
+        )
 
     def _start_main_entrance_centering(self) -> None:
         if self._main_entrance_centering_started_at is None:
