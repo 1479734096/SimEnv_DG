@@ -447,6 +447,10 @@ class GroundSupportCoordinator:
             base_to_sensor_xyz=params["base_to_livox_xyz"],
             base_to_sensor_rpy=params["base_to_livox_rpy"],
         )
+        sensor_to_world = np.array(sensor_to_world, dtype=float, copy=True)
+        expected_floor_z = float(floor_index) * float(grid.config.floor_height)
+        if sensor_to_world[2, 3] < expected_floor_z:
+            sensor_to_world[2, 3] += expected_floor_z
         sensor_origin = sensor_to_world[:3, 3]
         sensor_rotation = sensor_to_world[:3, :3]
         followed_path = [

@@ -2372,12 +2372,16 @@ class MissionManager:
             stride=self.cloud_stride,
         )
         points = self._floor_coordinates.logical_points(points, self.current_floor)
+        logical_pose_sample = replace(
+            pose_sample,
+            xyz=tuple(float(v) for v in xyz),
+        )
         self._ground_support.assess_frame(
             controller=self.controller,
             pose_provider=self.pose_provider,
             floor_index=self.current_floor,
             pose=pose,
-            pose_sample=pose_sample,
+            pose_sample=logical_pose_sample,
             points=points,
             cloud_stamp=cloud_stamp,
             cloud_generation=cloud_generation,
