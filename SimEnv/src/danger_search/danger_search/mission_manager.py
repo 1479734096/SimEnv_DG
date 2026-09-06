@@ -105,6 +105,7 @@ from danger_search.perception_runtime import (
 from danger_search.map_update_runtime import (
     ForwardObstacleObservation,
     MapUpdateRuntime,
+    forward_obstacle_lateral_limit,
     nearest_forward_obstacle_distance,
     nearest_forward_obstacle_observation,
     nearest_radial_obstacle_distance,

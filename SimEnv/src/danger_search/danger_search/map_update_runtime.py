@@ -390,6 +390,20 @@ def _valid_robot_xy(
     return (x, y)
 
 
+def forward_obstacle_lateral_limit(forward: float) -> float:
+    """计算前向障碍物观察走廊的梯形侧向半宽阈值。
+
+    近身段（forward <= 0.35m）收腰至 0.16m，贴合 A1 机器狗机身与肩关节物理包络，
+    彻底排除转角与窄道擦边回波（如 forward~0.20m, lateral~0.21m）造成的误急停；
+    中远距离（0.35m ~ 0.60m）线性过渡至 0.22m，保持前向充分的减速预警裕度。
+    """
+    if forward <= 0.35:
+        return 0.16
+    if forward >= 0.60:
+        return 0.22
+    return 0.16 + (0.22 - 0.16) * ((forward - 0.35) / (0.60 - 0.35))
+
+
 def nearest_forward_obstacle_observation(
     points,
     pose: tuple[float, float, float],
@@ -421,7 +435,8 @@ def nearest_forward_obstacle_observation(
         forward = dx * cos_yaw + dy * sin_yaw
         lateral = abs(-dx * sin_yaw + dy * cos_yaw)
         distance = math.hypot(dx, dy)
-        if forward < 0.20 or lateral > 0.22 or distance > max_distance:
+        lateral_limit = forward_obstacle_lateral_limit(forward)
+        if forward < 0.20 or lateral > lateral_limit or distance > max_distance:
             continue
         if distance < best:
             best = distance

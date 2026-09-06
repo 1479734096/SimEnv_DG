@@ -96,6 +96,7 @@ from danger_search.mission_manager import (
     MISSION_FAILED,
     RETURN_HOME,
     WRITE_RESULT,
+    forward_obstacle_lateral_limit,
     nearest_forward_obstacle_distance,
     nearest_forward_obstacle_observation,
 )
@@ -2972,7 +2973,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             # 已开门洞内的门槛回波，不应阻止已经对准的直线过门。
             (0.20, 0.45, 0.20),
             # 门框外缘仍位于机器人前向走廊内，必须继续作为障碍。
-            (0.25, 0.65, 0.50),
+            (0.25, 0.58, 0.50),
         ]
 
         distance = nearest_forward_obstacle_distance(
@@ -2983,7 +2984,47 @@ class MissionManagerHelperTest(unittest.TestCase):
             opened_door_exclusion=(0.30, 0.0, 0.0, 0.55, 0.80),
         )
 
-        self.assertAlmostEqual(distance, math.hypot(0.25, 0.20))
+        self.assertAlmostEqual(distance, math.hypot(0.25, 0.13))
+
+    def test_forward_obstacle_lateral_limit_profile(self):
+        self.assertAlmostEqual(forward_obstacle_lateral_limit(0.10), 0.16)
+        self.assertAlmostEqual(forward_obstacle_lateral_limit(0.20), 0.16)
+        self.assertAlmostEqual(forward_obstacle_lateral_limit(0.35), 0.16)
+        self.assertAlmostEqual(forward_obstacle_lateral_limit(0.475), 0.19)
+        self.assertAlmostEqual(forward_obstacle_lateral_limit(0.60), 0.22)
+        self.assertAlmostEqual(forward_obstacle_lateral_limit(1.00), 0.22)
+
+    def test_forward_obstacle_tapered_corridor_prevents_corner_freeze(self):
+        """方案一测试：梯形前向走廊有效避免转角墙皮擦边误判急停，同时保持正向碰撞防护。"""
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=4.0,
+            length=4.0,
+            origin_x=-2.0,
+            origin_y=-2.0,
+            obstacle_min_z=0.15,
+            obstacle_max_z=1.4,
+        )
+        # 现场实测导致卡死的转角点 (forward~0.2001m, lateral~0.2078m) 必须被安全忽略
+        corner_point = (0.2001, 0.2078, 0.50)
+        obs_corner = nearest_forward_obstacle_observation(
+            [corner_point],
+            (0.0, 0.0, 0.0),
+            floor_index=0,
+            mapper=mapper,
+        )
+        self.assertIsNone(obs_corner)
+
+        # 真正正前方的障碍物 (forward=0.20m, lateral=0.10m) 必须灵敏检出
+        direct_obstacle = (0.20, 0.10, 0.50)
+        obs_direct = nearest_forward_obstacle_observation(
+            [direct_obstacle],
+            (0.0, 0.0, 0.0),
+            floor_index=0,
+            mapper=mapper,
+        )
+        self.assertIsNotNone(obs_direct)
+        self.assertAlmostEqual(obs_direct.distance, math.hypot(0.20, 0.10))
 
     def test_opened_door_exclusion_only_activates_after_pass_path_commit(self):
         manager = _make_test_manager()
