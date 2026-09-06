@@ -58,7 +58,8 @@ localization:
   sparse_maximum_angular_speed: 0.10
   sparse_correction_timeout: 2.0
   # 固定主入口合同：只用于入口外墙点云的有界 XY 纠偏，不读取生成场景文件。
-  entrance_geometry_enabled: true
+  # 实测里程计漂移仅 3~5cm，单侧外墙点云易产生假极小值，已由配置彻底停用。
+  entrance_geometry_enabled: false
   # 缺少实测闭环证据，默认只观察候选，不停车、不注入绝对位姿。
   entrance_geometry_apply_correction: false
   entrance_geometry_center_x: 0.0

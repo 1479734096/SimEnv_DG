@@ -1156,14 +1156,20 @@ class PathFollower:
             zero_reason="rotate_in_place_zero",
         )
 
-    def reverse_straight(self, *, reason: str = "reverse_straight") -> bool:
-        """按既有倒车配置发布直线速度；由上层负责空间与距离约束。"""
+    def reverse_straight(
+        self,
+        *,
+        speed: float | None = None,
+        reason: str = "reverse_straight",
+    ) -> bool:
+        """按既有倒车配置或指定速度发布直线速度；由上层负责空间与距离约束。"""
         self._debug_recover_reason = str(reason)
-        speed = _clamp(float(self.reverse_speed), -abs(self.max_linear), 0.0)
-        if speed >= -1e-4:
+        target_speed = float(self.reverse_speed) if speed is None else float(speed)
+        actual_speed = _clamp(target_speed, -abs(self.max_linear), 0.0)
+        if actual_speed >= -1e-4:
             self.stop(reason=f"{reason}_invalid_speed")
             return False
-        self._publish(speed, 0.0)
+        self._publish(actual_speed, 0.0)
         return True
 
     def stop(self, repeat: int = 1, interval: float = 0.02, *, reason: str = "stop") -> None:
