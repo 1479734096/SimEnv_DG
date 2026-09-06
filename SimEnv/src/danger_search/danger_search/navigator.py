@@ -903,7 +903,12 @@ class PathFollower:
                     if stamp is not None
                     else None
                 )
-                if age is None or not math.isfinite(age) or age < 0.0 or age > self.pose_max_age:
+                effective_max_age = (
+                    1.5
+                    if getattr(self, "_path_reason", None) == "return_home_entry_trace_path"
+                    else self.pose_max_age
+                )
+                if age is None or not math.isfinite(age) or age < 0.0 or age > effective_max_age:
                     self._debug_pose_age = age
                     self._publish_locked(
                         0.0, 0.0, zero_reason="controller_pose_stale"

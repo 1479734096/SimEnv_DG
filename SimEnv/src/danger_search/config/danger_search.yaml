@@ -108,7 +108,7 @@ mission:
   # 主入口过门后先沿门轴推进到该距离，确保机身完全离开门框；普通门仍只用于前沿偏置。
   post_door_min_distance: 1.4
   post_door_min_known_area: 5.0
-  home_tolerance: 1.0
+  home_tolerance: 1.5
   # 返航局部层已确认首段不可执行时，有限次否决同一路径；耗尽后显式失败，禁止活锁。
   return_home_max_stuck_retries: 4
   return_home_max_candidate_rejects: 3

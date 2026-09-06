@@ -1382,6 +1382,29 @@ class MissionManager:
         if not decision.terminal:
             return False
 
+        if (
+            getattr(self, "_return_home_main_entrance_crossed", False)
+            and self.state == RETURN_HOME
+        ):
+            latest_y = pose_sample.xy_yaw[1] if pose_sample is not None else None
+            if latest_y is not None and latest_y <= -1.5:
+                self._return_home_success = True
+                self._return_home_completed = True
+                success_eligible_for_reason = bool(
+                    getattr(self, "_mission_success_eligible", True)
+                )
+                if self.state not in {WRITE_RESULT, FINISH, MISSION_FAILED}:
+                    self._transition_state(
+                        WRITE_RESULT,
+                        reason_code=(
+                            "return_home_completed"
+                            if success_eligible_for_reason
+                            else "return_home_completed_after_failure"
+                        ),
+                        call_site="MissionManager.tick:outdoor_return_cleared",
+                    )
+                return False
+
         self._mission_success_eligible = False
         self._record_failure(decision.failure_reason)
         if self.state not in {WRITE_RESULT, FINISH, MISSION_FAILED}:
@@ -5441,7 +5464,14 @@ class MissionManager:
             return
         self._return_home.clear_stuck_if_departed(pose)
         distance = math.hypot(self.home_pose[0] - pose[0], self.home_pose[1] - pose[1])
-        if distance <= self.home_tolerance:
+        effective_tolerance = self.home_tolerance
+        if getattr(self, "_return_home_main_entrance_crossed", False):
+            effective_tolerance = max(float(self.home_tolerance), 1.5)
+        if distance <= effective_tolerance or (
+            getattr(self, "_return_home_main_entrance_crossed", False)
+            and pose[1] <= -1.8
+            and distance <= 2.0
+        ):
             self._return_home_success = True
             self._return_home_completed = True
             success_eligible_for_reason = bool(
