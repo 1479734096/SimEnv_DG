@@ -262,9 +262,9 @@ for index in "${!SEEDS[@]}"; do
   marker="$OUTPUT_ROOT/.seed_${seed}_started_marker"
   touch "$marker"
 
-  # 如果公共 results/ 中存在未归档的历史遗留文件，安全移动至 backup 目录，绝不直接删除
+  # 如果公共 results/ 中存在未归档的历史遗留文件，安全移动至 backup 目录，绝不直接删除（按 seed 隔离避免同名覆盖）
   if compgen -G "$WORKSPACE_ROOT/results/*.json" >/dev/null; then
-    legacy_backup="$OUTPUT_ROOT/legacy_results_backup"
+    legacy_backup="$OUTPUT_ROOT/legacy_results_backup/seed_${seed}_idx${current_idx}"
     mkdir -p "$legacy_backup"
     mv -f "$WORKSPACE_ROOT/results/"*.json "$legacy_backup/" 2>/dev/null || true
   fi
@@ -299,14 +299,26 @@ for index in "${!SEEDS[@]}"; do
   RUN_DURATIONS["$seed"]="${elapsed_wall}s"
 
   # 将本轮生成的选手结果文件与裁判真值完整移动归档保存至当前 seed 目录
-  if [[ -f "$WORKSPACE_ROOT/results/danger_truth.json" ]]; then
+  # 严格依据启动标记时间戳校验，杜绝陈旧遗留文件伪装成本轮结果参与评分
+  if [[ -f "$WORKSPACE_ROOT/results/danger_truth.json" && ( ! -f "$marker" || "$WORKSPACE_ROOT/results/danger_truth.json" -nt "$marker" ) ]]; then
     mv -f "$WORKSPACE_ROOT/results/danger_truth.json" "$seed_dir/danger_truth.json" 2>/dev/null || true
   fi
   if [[ -f "$WORKSPACE_ROOT/results/detected_danger.json" && ( ! -f "$marker" || "$WORKSPACE_ROOT/results/detected_danger.json" -nt "$marker" ) ]]; then
     mv -f "$WORKSPACE_ROOT/results/detected_danger.json" "$seed_dir/detected_danger.json" 2>/dev/null || true
   fi
+  # 遍历移动其余辅助 json，防止通配符将未通过时间戳检验的陈旧检测/真值文件再次卷入 seed_dir
   if compgen -G "$WORKSPACE_ROOT/results/*.json" >/dev/null; then
-    mv -f "$WORKSPACE_ROOT/results/"*.json "$seed_dir/" 2>/dev/null || true
+    for json_file in "$WORKSPACE_ROOT/results/"*.json; do
+      [[ -e "$json_file" ]] || continue
+      base_json="$(basename "$json_file")"
+      if [[ "$base_json" == "detected_danger.json" || "$base_json" == "danger_truth.json" ]]; then
+        stale_backup="$OUTPUT_ROOT/stale_results_quarantine/seed_${seed}"
+        mkdir -p "$stale_backup"
+        mv -f "$json_file" "$stale_backup/" 2>/dev/null || true
+      else
+        mv -f "$json_file" "$seed_dir/" 2>/dev/null || true
+      fi
+    done
   fi
   rm -f "$marker" 2>/dev/null || true
 

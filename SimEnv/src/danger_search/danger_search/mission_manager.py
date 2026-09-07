@@ -4590,6 +4590,19 @@ class MissionManager:
                         "region_radius": round(progress_monitor.region_radius, 3),
                     })
                     self._log_structured(diagnostic)
+                    # 触发退化拉黑后，立即撤销该退化候选并尝试从剩余未拉黑前沿重选；
+                    # 若无其他前沿可用，置为 None 进入后续动态门寻径或无前沿探测，切断控制流漏洞。
+                    if frontiers:
+                        frontier, path = self.explorer.select_frontier(
+                            grid,
+                            pose,
+                            selection_context=selection_context,
+                            frontiers=frontiers,
+                            planning_constraints=self._planning_constraints(),
+                        )
+                    else:
+                        frontier = None
+                        path = None
 
             self._log_post_door_frontier_debug(frontier, path, pose)
 
