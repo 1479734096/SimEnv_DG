@@ -427,6 +427,8 @@ class MissionManager:
             maximum_center_correction=float(
                 self.elevator_local_crossing_max_center_correction
             ),
+            min_door_width=float(self.elevator_local_crossing_min_width),
+            max_door_width=float(self.elevator_local_crossing_max_width),
             sweep_half_width=float(
                 self.config.mapping["ground_support_params"]["sweep_half_width"]
             ),
@@ -591,10 +593,19 @@ class MissionManager:
             ),
             entrance_geometry_correction_fn=self.correct_entrance_geometry,
             elevator_wait_position_tolerance=float(
-                getattr(self, "elevator_wait_position_tolerance", 0.45)
+                getattr(self, "elevator_wait_position_tolerance", 0.30)
             ),
             elevator_wait_heading_tolerance=float(
                 getattr(self, "elevator_wait_heading_tolerance", 0.15)
+            ),
+            elevator_wait_lateral_tolerance=float(
+                getattr(self, "elevator_wait_lateral_tolerance", 0.15)
+            ),
+            elevator_lateral_search_extra_overshoot=float(
+                getattr(self, "elevator_lateral_search_extra_overshoot", 0.15)
+            ),
+            elevator_lateral_search_speed=float(
+                getattr(self, "elevator_lateral_search_speed", 0.15)
             ),
         )
 

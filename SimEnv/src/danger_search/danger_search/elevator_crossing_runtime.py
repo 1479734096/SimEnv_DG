@@ -30,6 +30,8 @@ class ElevatorCrossingConfig:
     yaw_search_step: float = 0.05
     maximum_center_correction: float = 0.80
     sweep_half_width: float = 0.435393
+    min_door_width: float = 1.00
+    max_door_width: float = 1.50
 
     def __post_init__(self) -> None:
         values = (
@@ -43,9 +45,12 @@ class ElevatorCrossingConfig:
             self.yaw_search_step,
             self.maximum_center_correction,
             self.sweep_half_width,
+            self.min_door_width,
+            self.max_door_width,
         )
         if (
             not all(math.isfinite(value) and value > 0.0 for value in values)
+            or self.min_door_width >= self.max_door_width
             or self.confirmations <= 0
             or self.exit_empty_fallback_frames <= 0
             or self.exit_empty_fallback_timeout > self.timeout
@@ -172,9 +177,12 @@ class ElevatorCrossingRuntime:
                 floor_height=floor_height,
                 minimum_distance=minimum_opening_distance,
                 maximum_distance=maximum_opening_distance,
+                min_opening_width=config.min_door_width,
+                max_opening_width=config.max_door_width,
             )
             if observation is not None:
-                observations.append(observation)
+                if config.min_door_width <= observation.width <= config.max_door_width:
+                    observations.append(observation)
         if not observations:
             self._candidate = None
             self._confirmations = 0

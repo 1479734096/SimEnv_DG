@@ -1249,6 +1249,21 @@ class PathFollower:
         self._publish(actual_speed, 0.0)
         return True
 
+    def move_lateral(
+        self,
+        speed: float,
+        *,
+        reason: str = "move_lateral",
+    ) -> bool:
+        """按指定侧向速度（左正右负）发布纯侧移速度指令，线速度与角速度为零。"""
+        self._debug_recover_reason = str(reason)
+        actual_speed = _clamp(float(speed), -abs(self.max_lateral), abs(self.max_lateral))
+        if abs(actual_speed) < 1e-4:
+            self.stop(reason=f"{reason}_invalid_speed")
+            return False
+        self._publish(0.0, 0.0, linear_y=actual_speed)
+        return True
+
     def stop(self, repeat: int = 1, interval: float = 0.02, *, reason: str = "stop") -> None:
         count = max(1, int(repeat))
         for index in range(count):

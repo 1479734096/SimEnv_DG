@@ -260,6 +260,9 @@ _CONFIG_GROUP_FIELDS = {
             "elevator_geometry_refresh_timeout",
             "elevator_wait_position_tolerance",
             "elevator_wait_heading_tolerance",
+            "elevator_wait_lateral_tolerance",
+            "elevator_lateral_search_extra_overshoot",
+            "elevator_lateral_search_speed",
             "elevator_navigation_timeout",
             "elevator_opening_confirmation_timeout",
             "elevator_opening_confirmation_retry_limit",
@@ -277,6 +280,8 @@ _CONFIG_GROUP_FIELDS = {
             "elevator_local_crossing_yaw_search_half_range",
             "elevator_local_crossing_yaw_search_step",
             "elevator_local_crossing_max_center_correction",
+            "elevator_local_crossing_min_width",
+            "elevator_local_crossing_max_width",
             "elevator_planning_retry_limit",
             "elevator_stuck_retry_limit",
             "elevator_visual_confirmation_max_gap",
@@ -1322,6 +1327,12 @@ class _MissionConfigBuilder:
         self.elevator_local_crossing_max_center_correction = float(
             _param("mission/elevator_local_crossing_max_center_correction", 0.80)
         )
+        self.elevator_local_crossing_min_width = float(
+            _param("mission/elevator_local_crossing_min_width", 1.00)
+        )
+        self.elevator_local_crossing_max_width = float(
+            _param("mission/elevator_local_crossing_max_width", 1.50)
+        )
         self.elevator_geometry_refresh_enabled = bool(
             _param("local_semantic/elevator_geometry_refresh_enabled", True)
         )
@@ -1338,10 +1349,19 @@ class _MissionConfigBuilder:
             _param("local_semantic/elevator_geometry_refresh_max_yaw_change", 0.35)
         )
         self.elevator_wait_position_tolerance = float(
-            _param("local_semantic/elevator_wait_position_tolerance", 0.45)
+            _param("local_semantic/elevator_wait_position_tolerance", 0.30)
         )
         self.elevator_wait_heading_tolerance = float(
             _param("local_semantic/elevator_wait_heading_tolerance", 0.15)
+        )
+        self.elevator_wait_lateral_tolerance = float(
+            _param("local_semantic/elevator_wait_lateral_tolerance", 0.15)
+        )
+        self.elevator_lateral_search_extra_overshoot = float(
+            _param("local_semantic/elevator_lateral_search_extra_overshoot", 0.15)
+        )
+        self.elevator_lateral_search_speed = float(
+            _param("local_semantic/elevator_lateral_search_speed", 0.15)
         )
         self.elevator_visual_scan_duration = float(
             _param("local_semantic/elevator_visual_scan_duration", 18.0)
@@ -1487,6 +1507,10 @@ class _MissionConfigBuilder:
             <= 2.0 * self.elevator_local_crossing_yaw_search_half_range
             and math.isfinite(self.elevator_local_crossing_max_center_correction)
             and self.elevator_local_crossing_max_center_correction > 0.0
+            and math.isfinite(self.elevator_local_crossing_min_width)
+            and self.elevator_local_crossing_min_width > 0.0
+            and math.isfinite(self.elevator_local_crossing_max_width)
+            and self.elevator_local_crossing_min_width < self.elevator_local_crossing_max_width
             and math.isfinite(self.elevator_geometry_refresh_timeout)
             and self.elevator_geometry_refresh_timeout > 0.0
             and math.isfinite(self.elevator_geometry_refresh_standoff)
@@ -1499,6 +1523,12 @@ class _MissionConfigBuilder:
             and self.elevator_wait_position_tolerance > 0.0
             and math.isfinite(self.elevator_wait_heading_tolerance)
             and 0.0 < self.elevator_wait_heading_tolerance <= math.pi
+            and math.isfinite(self.elevator_wait_lateral_tolerance)
+            and self.elevator_wait_lateral_tolerance > 0.0
+            and math.isfinite(self.elevator_lateral_search_extra_overshoot)
+            and self.elevator_lateral_search_extra_overshoot >= 0.0
+            and math.isfinite(self.elevator_lateral_search_speed)
+            and self.elevator_lateral_search_speed > 0.0
             and math.isfinite(self.elevator_visual_scan_duration)
             and self.elevator_visual_scan_duration > 0.0
             and math.isfinite(self.elevator_visual_scan_angular_speed)

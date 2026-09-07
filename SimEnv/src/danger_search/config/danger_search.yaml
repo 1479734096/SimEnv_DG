@@ -95,7 +95,7 @@ mission:
   # 正式总预算按公开 served_floors 数量选择；专项配置可用更短 max_runtime。
   max_runtime: 900.0
   runtime_by_floor: [[1, 520.0], [2, 900.0], [3, 1360.0]]
-  floor_timeout: 320.0
+  floor_timeout: 360.0
   # 非最后一层仍以 floor_timeout 保护后续楼层；最后一层由全局返航预算收口。
   # 设为 false 可立即恢复“所有楼层到时即结束”的旧语义。
   last_floor_uses_global_budget: true
@@ -131,6 +131,8 @@ mission:
   elevator_local_crossing_yaw_search_half_range: 0.20
   elevator_local_crossing_yaw_search_step: 0.05
   elevator_local_crossing_max_center_correction: 0.80
+  elevator_local_crossing_min_width: 1.00
+  elevator_local_crossing_max_width: 1.50
   # 目标层出厢后是否异步非阻塞关门（出厢后立刻开始探索规划，不阻塞原地等关门）
   elevator_async_target_door_close_enabled: true
   # 2层及多层测试覆盖率采用 0.65 快速换层；单层测试采用 0.80 深度覆盖。
@@ -508,8 +510,11 @@ local_semantic:
   elevator_geometry_refresh_max_shift: 0.75
   elevator_geometry_refresh_max_yaw_change: 0.35
   # 候梯站位与对准容差门禁（避免微小偏差重复寻路和对准）
-  elevator_wait_position_tolerance: 0.45
+  elevator_wait_position_tolerance: 0.30
   elevator_wait_heading_tolerance: 0.15
+  elevator_wait_lateral_tolerance: 0.15
+  elevator_lateral_search_extra_overshoot: 0.15
+  elevator_lateral_search_speed: 0.15
   # 进入主入口并建立足够安全已知区后只执行一次，约覆盖一整圈；发现后立即结束。
   # 命令角速度不等于四足机体的实际 yaw 速度；按定位累计转角闭环，时间仅兜底。
   elevator_visual_scan_duration: 18.0

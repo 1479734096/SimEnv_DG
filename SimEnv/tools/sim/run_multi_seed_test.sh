@@ -34,6 +34,8 @@ usage() {
   --gui                       开启 Gazebo GUI（默认无头模式关闭 GUI）
   --no-gui                    关闭 Gazebo GUI（默认）
   --record-rgbd               开启全任务 RGB-D 录包（默认关闭，防止多 seed 磁盘耗尽）
+  --diag                      开启逐帧深度定位诊断（默认关闭以加速收尾，仅按需开启）
+  --no-diag                   关闭逐帧深度定位诊断（默认）
   -o, --output-dir <DIR>      测试证据输出根目录，默认自动按时间戳生成
   -h, --help                  显示本帮助信息并退出
 
@@ -41,6 +43,7 @@ usage() {
   FLOOR_COUNT=3               楼层数（支持 2 或 3）
   GUI=false                   是否开启 GUI（true/false）
   RECORD_RGBD=0               是否录制 RGB-D（0/1）
+  ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=0 是否开启深度定位诊断（0/1）
   OUTPUT_ROOT=/path/...       输出证据根目录
 
 示例：
@@ -90,6 +93,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-record-rgbd)
       RECORD_RGBD="0"
+      shift
+      ;;
+    --diag|--localization-diagnostics)
+      LOCALIZATION_DIAGNOSTICS="1"
+      shift
+      ;;
+    --no-diag)
+      LOCALIZATION_DIAGNOSTICS="0"
       shift
       ;;
     -o|--output-dir)
@@ -246,7 +257,7 @@ for index in "${!SEEDS[@]}"; do
     ELEVATOR_TEST_RECORD_DRIFT=1 \
     ELEVATOR_TEST_RECORD_RGBD="$RECORD_RGBD" \
     ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=1 \
-    ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS=1 \
+    ELEVATOR_TEST_LOCALIZATION_DIAGNOSTICS="$LOCALIZATION_DIAGNOSTICS" \
     ELEVATOR_TEST_LOG_DIR="$seed_dir" \
     "$RUNNER" &
   CURRENT_CHILD_PID=$!

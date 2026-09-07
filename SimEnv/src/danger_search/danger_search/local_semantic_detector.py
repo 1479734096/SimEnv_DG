@@ -109,6 +109,8 @@ class LocalSemanticDetector:
         min_evidence_points: int | None = None,
         expected_center_xy: tuple[float, float] | None = None,
         maximum_center_error: float | None = None,
+        min_opening_width: float | None = None,
+        max_opening_width: float | None = None,
     ) -> OpeningObservation | None:
         """从前方两侧竖直结构之间确认门洞，不依赖门坐标真值。"""
         minimum_distance = float(minimum_distance)
@@ -196,8 +198,17 @@ class LocalSemanticDetector:
                 continue
             left_inner, left_evidence = min(left, key=lambda item: item[0])
             right_inner, right_evidence = max(right, key=lambda item: item[0])
-            width = left_inner - right_inner
-            if not self.opening_min_width <= width <= self.opening_max_width:
+            eff_min_width = (
+                float(min_opening_width)
+                if min_opening_width is not None
+                else self.opening_min_width
+            )
+            eff_max_width = (
+                float(max_opening_width)
+                if max_opening_width is not None
+                else self.opening_max_width
+            )
+            if not eff_min_width <= width <= eff_max_width:
                 continue
             lateral_center = 0.5 * (left_inner + right_inner)
             edge_evidence = left_evidence + right_evidence

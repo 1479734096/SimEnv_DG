@@ -1094,6 +1094,13 @@ class TakeElevator(NavigationTask):
         self._retry_sensor_baseline: float | None = None
         self._retry_sensor_started_at = 0.0
         self._retry_relocalization_completed = False
+        self._lateral_search_start_xy: tuple[float, float] | None = None
+        self._lateral_search_dir: tuple[float, float] = (0.0, 0.0)
+        self._lateral_search_body_speed: float = 0.0
+        self._lateral_search_max_distance: float = 0.0
+        self._lateral_search_started_at: float = 0.0
+        self._lateral_return_body_speed: float = 0.0
+        self._lateral_return_started_at: float = 0.0
 
     def tick(self, context: NavigationTaskContext, pose: tuple[float, float, float]) -> str:
         """推进一个乘梯阶段；任一失败都显式返回 FAILED 而不猜测所在楼层。"""
@@ -1284,6 +1291,141 @@ class TakeElevator(NavigationTask):
                 if self.failure_reason is not None:
                     return FAILED
                 self._exit_alignment_count = 0
+                self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+            return RUNNING
+
+        if self.phase == "LATERAL_SEARCH_FOR_ELEVATOR_DOOR":
+            now = get_time()
+            elapsed = now - self._lateral_search_started_at
+            speed_val = max(0.05, abs(self._lateral_search_body_speed))
+            timeout = max(10.0, (self._lateral_search_max_distance / speed_val) * 3.0)
+            if elapsed > timeout:
+                if rospy is not None:
+                    rospy.logwarn(
+                        "[%s] 侧移搜索超时(%.1fs > %.1fs)，停步并平滑降级呼梯",
+                        self.name,
+                        elapsed,
+                        timeout,
+                    )
+                context.controller.stop(reason="elevator_lateral_search_timeout")
+                self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+                return RUNNING
+
+            status = context.refresh_elevator_geometry(
+                self.elevator_id,
+                self.current_floor,
+                current_door_id,
+                pose,
+            )
+            if status == DONE:
+                context.controller.stop(reason="elevator_door_found_during_lateral_search")
+                context.controller.clear_path(reason="elevator_lateral_search_door_found")
+                self._reset_navigation_watchdog(clear_failure=True)
+                if rospy is not None:
+                    rospy.loginfo(
+                        "[%s] 侧移搜索期间成功探测到门板并锁定几何，立即进入呼梯",
+                        self.name,
+                    )
+                context.log_structured(
+                    {
+                        "event": "elevator_lateral_search_captured",
+                        "robot_pose": [round(v, 3) for v in pose],
+                        "elapsed": round(elapsed, 3),
+                    }
+                )
+                self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+                return RUNNING
+
+            start_xy = self._lateral_search_start_xy or (pose[0], pose[1])
+            disp = (pose[0] - start_xy[0]) * self._lateral_search_dir[0] + (
+                pose[1] - start_xy[1]
+            ) * self._lateral_search_dir[1]
+            if disp >= self._lateral_search_max_distance:
+                context.controller.stop(reason="elevator_lateral_search_reached_limit")
+                if rospy is not None:
+                    rospy.loginfo(
+                        "[%s] 侧移搜索达到最大行程(disp=%.3fm >= %.3fm)，开始退回中轴线正中",
+                        self.name,
+                        disp,
+                        self._lateral_search_max_distance,
+                    )
+                self._start_lateral_return_to_center(
+                    context, pose, current_wait, cabin_center
+                )
+                return RUNNING
+
+            move_fn = getattr(context.controller, "move_lateral", None)
+            if callable(move_fn):
+                move_fn(
+                    self._lateral_search_body_speed,
+                    reason="elevator_lateral_search",
+                )
+            else:
+                context.controller.stop(reason="elevator_lateral_move_unsupported")
+                self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+            return RUNNING
+
+        if self.phase == "LATERAL_RETURN_TO_CENTER":
+            now = get_time()
+            elapsed = now - self._lateral_return_started_at
+            if elapsed > 8.0:
+                if rospy is not None:
+                    rospy.logwarn(
+                        "[%s] 侧移退回中轴线超时(%.1fs)，停步并平滑降级呼梯",
+                        self.name,
+                        elapsed,
+                    )
+                context.controller.stop(reason="elevator_lateral_return_timeout")
+                self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+                return RUNNING
+
+            status = context.refresh_elevator_geometry(
+                self.elevator_id,
+                self.current_floor,
+                current_door_id,
+                pose,
+            )
+            if status == DONE:
+                context.controller.stop(reason="elevator_door_found_during_lateral_return")
+                context.controller.clear_path(reason="elevator_lateral_return_door_found")
+                self._reset_navigation_watchdog(clear_failure=True)
+                if rospy is not None:
+                    rospy.loginfo(
+                        "[%s] 侧移回退期间成功探测到门板，立即进入呼梯",
+                        self.name,
+                    )
+                self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+                return RUNNING
+
+            lateral_signed, _, _ = self._compute_lateral_signed_error(
+                pose, current_wait, cabin_center
+            )
+            if abs(lateral_signed) <= 0.05:
+                context.controller.stop(reason="elevator_lateral_returned_to_center")
+                if rospy is not None:
+                    rospy.loginfo(
+                        "[%s] 已成功退回中轴线正中(|lateral|=%.3fm <= 0.05m)，平滑降级呼梯",
+                        self.name,
+                        abs(lateral_signed),
+                    )
+                context.log_structured(
+                    {
+                        "event": "elevator_lateral_returned_to_center",
+                        "robot_pose": [round(v, 3) for v in pose],
+                        "final_lateral_error": round(lateral_signed, 3),
+                    }
+                )
+                self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+                return RUNNING
+
+            move_fn = getattr(context.controller, "move_lateral", None)
+            if callable(move_fn):
+                move_fn(
+                    self._lateral_return_body_speed,
+                    reason="elevator_lateral_return",
+                )
+            else:
+                context.controller.stop(reason="elevator_lateral_move_unsupported")
                 self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
             return RUNNING
 
@@ -1909,22 +2051,56 @@ class TakeElevator(NavigationTask):
             )
         return FAILED
 
+    def _compute_lateral_signed_error(
+        self,
+        pose: tuple[float, float, float],
+        wait_point: tuple[float, float],
+        cabin_center: tuple[float, float],
+    ) -> tuple[float, tuple[float, float], tuple[float, float]]:
+        """计算机器人相对电梯门中轴线的横向偏离（带符号）、中轴线前向单位向量及左法向单位向量。
+
+        返回 (lateral_signed, forward_unit, lateral_unit)
+        其中 forward_unit 从候梯点指向轿厢中心，lateral_unit 为 (-forward_unit[1], forward_unit[0])。
+        lateral_signed > 0 表示偏向中轴线左侧，< 0 表示偏向右侧。
+        """
+        ux = cabin_center[0] - wait_point[0]
+        uy = cabin_center[1] - wait_point[1]
+        length = math.hypot(ux, uy)
+        if length < 1e-4:
+            return 0.0, (1.0, 0.0), (0.0, 1.0)
+        forward_unit = (ux / length, uy / length)
+        lateral_unit = (-forward_unit[1], forward_unit[0])
+        dx = pose[0] - wait_point[0]
+        dy = pose[1] - wait_point[1]
+        lateral_signed = dx * lateral_unit[0] + dy * lateral_unit[1]
+        return lateral_signed, forward_unit, lateral_unit
+
     def _is_elevator_wait_pose_within_tolerance(
         self,
         context: NavigationTaskContext,
         pose: tuple[float, float, float],
         wait_point: tuple[float, float],
         cabin_center: tuple[float, float],
-    ) -> tuple[bool, bool]:
-        """判定当前机器人位姿是否在候梯位置容差和正对轿厢中心朝向容差内。"""
+    ) -> tuple[bool, bool, bool, float]:
+        """判定当前机器人位姿是否在候梯位置容差、朝向容差和横向对中容差内。
+
+        返回 (pos_ok, heading_ok, lateral_ok, lateral_signed)
+        """
         dist = math.hypot(wait_point[0] - pose[0], wait_point[1] - pose[1])
-        pos_tol = float(getattr(context, "elevator_wait_position_tolerance", 0.45))
+        pos_tol = float(getattr(context, "elevator_wait_position_tolerance", 0.30))
         pos_ok = dist <= pos_tol
 
         target_yaw = math.atan2(cabin_center[1] - pose[1], cabin_center[0] - pose[0])
         heading_tol = float(getattr(context, "elevator_wait_heading_tolerance", 0.15))
         heading_ok = abs(_angle_wrap(pose[2] - target_yaw)) <= heading_tol
-        return pos_ok, heading_ok
+
+        lateral_signed, _, _ = self._compute_lateral_signed_error(
+            pose, wait_point, cabin_center
+        )
+        lateral_tol = float(getattr(context, "elevator_wait_lateral_tolerance", 0.15))
+        lateral_ok = abs(lateral_signed) <= lateral_tol
+
+        return pos_ok, heading_ok, lateral_ok, lateral_signed
 
     def _transition_after_elevator_geometry_confirmed(
         self,
@@ -1934,35 +2110,161 @@ class TakeElevator(NavigationTask):
         cabin_center: tuple[float, float],
         source: str,
     ) -> None:
-        """几何确认后，依据容差门禁决定下一阶段（避免微小偏差重复寻路与对准）。"""
-        pos_ok, heading_ok = self._is_elevator_wait_pose_within_tolerance(
-            context, pose, current_wait, cabin_center
+        """几何确认后，依据容差门禁决定下一阶段。"""
+        pos_ok, heading_ok, lateral_ok, lateral_signed = (
+            self._is_elevator_wait_pose_within_tolerance(
+                context, pose, current_wait, cabin_center
+            )
         )
-        if pos_ok and heading_ok:
+
+        # 规则 1：若探测到门板（RGB-D 刷新成功），真实门几何已对齐
+        # 只要机器狗在候梯区域（pos_ok），即使横向偏差 > 0.15m 也直接进入开门呼梯或原地对准
+        if source == "RGB-D刷新成功":
+            if pos_ok:
+                if rospy is not None:
+                    rospy.loginfo(
+                        "[%s] %s 探测到门板锁定几何，直接呼梯进梯(heading_ok=%s)",
+                        self.name,
+                        source,
+                        heading_ok,
+                    )
+                if not heading_ok:
+                    self._exit_alignment_count = 0
+                    self.phase = "ALIGN_TO_REFRESHED_ELEVATOR_DOOR"
+                else:
+                    self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+                return
+            else:
+                if rospy is not None:
+                    rospy.loginfo(
+                        "[%s] %s 确认后位置超出候梯容差，前往候梯点",
+                        self.name,
+                        source,
+                    )
+                self.phase = "GO_TO_REFRESHED_ELEVATOR_DOOR"
+                return
+
+        # 规则 2：若为激光雷达全局地标匹配成功
+        if source == "Livox激光地标":
+            if pos_ok and heading_ok:
+                self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
+            elif pos_ok:
+                self._exit_alignment_count = 0
+                self.phase = "ALIGN_TO_REFRESHED_ELEVATOR_DOOR"
+            else:
+                self.phase = "GO_TO_REFRESHED_ELEVATOR_DOOR"
+            return
+
+        # 规则 3：未探测到门板（RGB-D 超时保留）
+        # 3.1: 位置、横向及朝向均在容差内，直接呼梯
+        if pos_ok and lateral_ok and heading_ok:
             if rospy is not None:
                 rospy.loginfo(
-                    "[%s] %s 确认后位姿在容差内(pos_ok=True, heading_ok=True)，直接呼梯",
+                    "[%s] %s 位姿在容差内(pos_ok=True, lateral_ok=True, heading_ok=True)，直接呼梯",
                     self.name,
                     source,
                 )
             self.phase = "CALL_ELEVATOR_TO_CURRENT_FLOOR"
-        elif pos_ok:
+            return
+
+        # 3.2: 位置与横向在容差内但朝向需微调，原地对准后呼梯
+        if pos_ok and lateral_ok and not heading_ok:
             if rospy is not None:
                 rospy.loginfo(
-                    "[%s] %s 确认后位置在容差内但朝向需微调，跳过阶段5直接对准",
+                    "[%s] %s 位置与横向在容差内但朝向需微调，原地对准后呼梯",
                     self.name,
                     source,
                 )
             self._exit_alignment_count = 0
             self.phase = "ALIGN_TO_REFRESHED_ELEVATOR_DOOR"
-        else:
+            return
+
+        # 3.3: 距离在候梯区域内但横向偏差 > 0.15m：启用四足纯侧移向中轴线平移搜索
+        if pos_ok and not lateral_ok:
             if rospy is not None:
-                rospy.loginfo(
-                    "[%s] %s 确认后位置超出容差，前往候梯点",
+                rospy.logwarn(
+                    "[%s] %s 横向偏差超出容差(|lateral|=%.3fm > %.3fm)，启动侧移搜索电梯门",
                     self.name,
                     source,
+                    abs(lateral_signed),
+                    getattr(context, "elevator_wait_lateral_tolerance", 0.15),
                 )
-            self.phase = "GO_TO_REFRESHED_ELEVATOR_DOOR"
+            self._start_lateral_search(
+                context, pose, current_wait, cabin_center, lateral_signed
+            )
+            return
+
+        # 3.4: 距离超出候梯区域（离门太远）
+        if rospy is not None:
+            rospy.loginfo(
+                "[%s] %s 距离超出容差，前往候梯点",
+                self.name,
+                source,
+            )
+        self.phase = "GO_TO_REFRESHED_ELEVATOR_DOOR"
+
+    def _start_lateral_search(
+        self,
+        context: NavigationTaskContext,
+        pose: tuple[float, float, float],
+        wait_point: tuple[float, float],
+        cabin_center: tuple[float, float],
+        lateral_signed: float,
+    ) -> None:
+        """初始化向电梯中轴线平移搜索的状态。"""
+        _, _, lateral_unit = self._compute_lateral_signed_error(
+            pose, wait_point, cabin_center
+        )
+        sgn = 1.0 if lateral_signed < 0.0 else -1.0
+        search_dir_world = (sgn * lateral_unit[0], sgn * lateral_unit[1])
+
+        yaw = pose[2]
+        body_y_unit = (-math.sin(yaw), math.cos(yaw))
+        dot_body_y = (
+            search_dir_world[0] * body_y_unit[0]
+            + search_dir_world[1] * body_y_unit[1]
+        )
+        body_sgn = 1.0 if dot_body_y >= 0.0 else -1.0
+
+        speed = float(getattr(context, "elevator_lateral_search_speed", 0.15))
+        extra_overshoot = float(
+            getattr(context, "elevator_lateral_search_extra_overshoot", 0.15)
+        )
+
+        self._lateral_search_start_xy = (pose[0], pose[1])
+        self._lateral_search_dir = search_dir_world
+        self._lateral_search_body_speed = body_sgn * speed
+        self._lateral_search_max_distance = abs(lateral_signed) + extra_overshoot
+        self._lateral_search_started_at = get_time()
+        self.phase = "LATERAL_SEARCH_FOR_ELEVATOR_DOOR"
+        context.log_structured(
+            {
+                "event": "elevator_lateral_search_started",
+                "robot_pose": [round(v, 3) for v in pose],
+                "initial_lateral_signed": round(lateral_signed, 3),
+                "max_search_distance": round(self._lateral_search_max_distance, 3),
+                "search_speed": round(self._lateral_search_body_speed, 3),
+            }
+        )
+
+    def _start_lateral_return_to_center(
+        self,
+        context: NavigationTaskContext,
+        pose: tuple[float, float, float],
+        wait_point: tuple[float, float],
+        cabin_center: tuple[float, float],
+    ) -> None:
+        """从越过中轴线的超调位置反向平移退回中轴线正中。"""
+        self._lateral_return_body_speed = -self._lateral_search_body_speed
+        self._lateral_return_started_at = get_time()
+        self.phase = "LATERAL_RETURN_TO_CENTER"
+        context.log_structured(
+            {
+                "event": "elevator_lateral_return_started",
+                "robot_pose": [round(v, 3) for v in pose],
+                "return_speed": round(self._lateral_return_body_speed, 3),
+            }
+        )
 
     def _begin_door_open_confirmation(self, context: NavigationTaskContext, door_id: str) -> None:
         if door_id in self._door_confirmation_started:

@@ -49,8 +49,11 @@ class NavigationTaskContext:
     elevator_opening_confirmation_retry_timeout: float = 10.0
     elevator_opening_confirmation_sensor_refresh: float = 0.5
     entrance_geometry_correction_fn: Callable[..., object] | None = None
-    elevator_wait_position_tolerance: float = 0.45
+    elevator_wait_position_tolerance: float = 0.30
     elevator_wait_heading_tolerance: float = 0.15
+    elevator_wait_lateral_tolerance: float = 0.15
+    elevator_lateral_search_extra_overshoot: float = 0.15
+    elevator_lateral_search_speed: float = 0.15
 
     def clear_opened_door_area(self, door_id: str) -> None:
         self.clear_opened_door_area_fn(door_id)
