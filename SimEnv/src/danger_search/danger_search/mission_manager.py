@@ -357,9 +357,9 @@ class MissionManager:
         self._step_back_safe_state: str = "idle"
         self._step_back_safe_start_pose: tuple[float, float, float] | None = None
         self._step_back_safe_start_time: float = 0.0
-        self._step_back_safe_target_distance: float = 0.20
+        self._step_back_safe_target_distance: float = 0.40
         self._step_back_safe_linear_speed: float = -0.35
-        self._step_back_safe_timeout: float = 3.0
+        self._step_back_safe_timeout: float = 2.0
         self._step_back_safe_target_yaw: float = 0.0
         self._step_back_safe_turn_start_time: float = 0.0
         self._step_back_safe_turn_timeout: float = 7.0
@@ -2569,75 +2569,12 @@ class MissionManager:
         )
 
 
-    def _build_trail_backtrack_path(
-        self,
-        pose: tuple[float, float, float],
-        target_backtrack_dist: float = 1.0,
-    ) -> list[tuple[float, float]] | None:
-        """从已走过的安全历史轨迹中提取反向回撤路径。"""
-        traces = getattr(self, "_floor_navigation_traces", None)
-        if traces is None:
-            return None
-        trace = traces.get(int(self.current_floor), [])
-        if len(trace) < 2:
-            return None
-
-        current_xy = (float(pose[0]), float(pose[1]))
-        closest_idx = min(
-            range(len(trace)),
-            key=lambda i: math.hypot(trace[i][0] - current_xy[0], trace[i][1] - current_xy[1]),
-        )
-        backtrack_points: list[tuple[float, float]] = [current_xy]
-        accumulated_dist = 0.0
-        curr_pt = current_xy
-        for i in range(closest_idx, -1, -1):
-            pt = trace[i]
-            d = math.hypot(pt[0] - curr_pt[0], pt[1] - curr_pt[1])
-            if d < 0.05:
-                continue
-            backtrack_points.append(pt)
-            accumulated_dist += d
-            curr_pt = pt
-            if accumulated_dist >= target_backtrack_dist:
-                break
-
-        if len(backtrack_points) >= 2 and accumulated_dist >= 0.25:
-            return backtrack_points
-        return None
-
     def _trigger_step_back_safe(
         self,
         pose: tuple[float, float, float],
         drop_point: tuple[float, float] | None = None,
     ) -> bool:
-        """针对前向负障碍/悬崖触发微退与掉头脱困，二次触发改沿安全轨迹回撤 1.0m。"""
-        # 二次脱困策略：若已执行过首次脱困，不再执行微退+调头（防止重新转向悬崖），改为沿安全历史轨迹反向回撤 1.0m
-        if self._step_back_safe_executed_count >= 1:
-            backtrack_path = self._build_trail_backtrack_path(pose, target_backtrack_dist=1.0)
-            if backtrack_path:
-                self._step_back_safe_state = "trail_backtrack"
-                self._step_back_safe_start_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
-                self._step_back_safe_start_time = float(get_time())
-                self._step_back_safe_active = True
-                self._step_back_safe_last_trigger_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
-                self._step_back_safe_executed_count += 1
-                self.controller.set_path(backtrack_path, reason="step_back_safe_trail_backtrack")
-                self._log_structured(
-                    {
-                        "event": "step_back_safe_backtrack_started",
-                        "elapsed": round(float(self._elapsed()), 3),
-                        "floor": int(self.current_floor),
-                        "pose": [round(float(v), 3) for v in pose],
-                        "backtrack_length": len(backtrack_path),
-                    }
-                )
-                return True
-            else:
-                # 历史轨迹受阻无法回撤，转入就地重新规划
-                self._step_back_safe_state = "idle"
-                self._step_back_safe_active = False
-                return False
-
+        """针对前向负障碍/悬崖触发直线倒车脱困，拉黑危险区域并就地重规划。"""
         self._step_back_safe_state = "retreat"
         self._step_back_safe_start_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
         self._step_back_safe_start_time = float(get_time())
@@ -2664,6 +2601,10 @@ class MissionManager:
                 self.explorer.blacklist_region(grid, estimated_drop, radius=1.0)
 
         self.controller.clear_path(reason="step_back_safe_path_cleared")
+        self.controller.reverse_straight(
+            speed=self._step_back_safe_linear_speed,
+            reason="step_back_safe_retreat",
+        )
         self._log_structured(
             {
                 "event": "step_back_safe_started",
@@ -2678,11 +2619,7 @@ class MissionManager:
         return True
 
     def _tick_step_back_safe(self, pose: tuple[float, float, float]) -> bool:
-        """非阻塞推进脱困动作：
-        - retreat: 直线后退 0.20m 拉开安全裕度
-        - turn_around: 原地掉头 180 度背对悬崖
-        - trail_backtrack: 沿历史安全轨迹反向回撤 1.0m
-        """
+        """非阻塞推进脱困动作：直线后退 0.40m 拉开安全裕度后就地由 A* 重新规划。"""
         if self._step_back_safe_state == "idle":
             return False
 
@@ -2696,176 +2633,47 @@ class MissionManager:
         if self._step_back_safe_state == "retreat":
             moved = math.hypot(pose[0] - start_pose[0], pose[1] - start_pose[1])
             elapsed = now - self._step_back_safe_start_time
-            # 位移达标：成功完成直线微退
+            # 位移达标：成功完成直线倒车脱困
             if moved >= self._step_back_safe_target_distance:
                 self.controller.stop(reason="step_back_safe_retreat_stop")
-                self._step_back_safe_state = "turn_around"
-                self._step_back_safe_turn_start_time = now
-                self._step_back_safe_target_yaw = math.atan2(
-                    math.sin(start_pose[2] + math.pi),
-                    math.cos(start_pose[2] + math.pi),
-                )
+                self._step_back_safe_state = "idle"
+                self._step_back_safe_active = False
+                self.current_frontier = None
+                self._exploration.last_frontier_target = None
+                self._exploration.last_frontier_score = None
+                self._exploration.last_frontier_used_fallback = False
                 self._log_structured(
                     {
                         "event": "step_back_safe_retreat_completed",
                         "elapsed": round(float(self._elapsed()), 3),
                         "moved_distance": round(moved, 3),
                         "duration": round(elapsed, 3),
-                        "target_yaw": round(self._step_back_safe_target_yaw, 3),
                     }
                 )
-                return True
-            # 超时分支：做实判据，禁止将受阻掩耳盗铃当成成功
+                return False
+            # 超时分支：做实判据，直接就地释放交由 A* 重规划
             if elapsed >= self._step_back_safe_timeout:
                 self.controller.stop(reason="step_back_safe_retreat_timeout")
-                if moved < 0.05:
-                    self._step_back_safe_state = "idle"
-                    self._step_back_safe_active = False
-                    self._log_structured(
-                        {
-                            "event": "step_back_safe_retreat_blocked",
-                            "elapsed": round(float(self._elapsed()), 3),
-                            "moved_distance": round(moved, 3),
-                            "duration": round(elapsed, 3),
-                        }
-                    )
-                    return False
-                self._step_back_safe_state = "turn_around"
-                self._step_back_safe_turn_start_time = now
-                self._step_back_safe_target_yaw = math.atan2(
-                    math.sin(start_pose[2] + math.pi),
-                    math.cos(start_pose[2] + math.pi),
+                self._step_back_safe_state = "idle"
+                self._step_back_safe_active = False
+                self.current_frontier = None
+                self._exploration.last_frontier_target = None
+                self._exploration.last_frontier_score = None
+                self._exploration.last_frontier_used_fallback = False
+                self._log_structured(
+                    {
+                        "event": "step_back_safe_retreat_blocked",
+                        "elapsed": round(float(self._elapsed()), 3),
+                        "moved_distance": round(moved, 3),
+                        "duration": round(elapsed, 3),
+                    }
                 )
-                return True
+                return False
 
             self.controller.reverse_straight(
                 speed=self._step_back_safe_linear_speed,
                 reason="step_back_safe_retreat",
             )
-            return True
-
-        if self._step_back_safe_state == "turn_around":
-            yaw_error = math.atan2(
-                math.sin(self._step_back_safe_target_yaw - pose[2]),
-                math.cos(self._step_back_safe_target_yaw - pose[2]),
-            )
-            elapsed = now - self._step_back_safe_turn_start_time
-            if abs(yaw_error) <= 0.45:
-                self.controller.stop(reason="step_back_safe_turn_stop")
-                self._step_back_safe_state = "idle"
-                self._step_back_safe_active = False
-
-                gate = getattr(self, "_ground_support_gate", None)
-                if gate is not None:
-                    _ = gate.hole_detection_exempt
-
-                self.current_frontier = None
-                self._exploration.last_frontier_target = None
-                self._exploration.last_frontier_score = None
-                self._exploration.last_frontier_used_fallback = False
-
-                self._log_structured(
-                    {
-                        "event": "step_back_safe_completed",
-                        "elapsed": round(float(self._elapsed()), 3),
-                        "final_pose": [round(float(v), 3) for v in pose],
-                        "yaw_error": round(float(yaw_error), 3),
-                        "turn_duration": round(elapsed, 3),
-                    }
-                )
-                return True
-            if elapsed >= self._step_back_safe_turn_timeout:
-                self.controller.stop(reason="step_back_safe_turn_timeout")
-                self._step_back_safe_state = "idle"
-                self._step_back_safe_active = False
-                self._log_structured(
-                    {
-                        "event": "step_back_safe_turn_timeout",
-                        "elapsed": round(float(self._elapsed()), 3),
-                        "yaw_error": round(float(yaw_error), 3),
-                        "turn_duration": round(elapsed, 3),
-                    }
-                )
-                return False
-
-            angular_z = 0.80 if yaw_error > 0.0 else -0.80
-            self.controller.rotate_in_place(angular_z)
-            return True
-
-        if self._step_back_safe_state == "trail_backtrack":
-            elapsed = now - self._step_back_safe_start_time
-            moved = math.hypot(pose[0] - start_pose[0], pose[1] - start_pose[1])
-            status = self.controller.poll_status()
-
-            if status == DONE:
-                self._step_back_safe_state = "idle"
-                self._step_back_safe_active = False
-                self.current_frontier = None
-                self._exploration.last_frontier_target = None
-                self._exploration.last_frontier_score = None
-                self._exploration.last_frontier_used_fallback = False
-                if moved >= 0.70:
-                    self.controller.stop(reason="step_back_safe_backtrack_completed")
-                    self._log_structured(
-                        {
-                            "event": "step_back_safe_backtrack_completed",
-                            "elapsed": round(float(self._elapsed()), 3),
-                            "final_pose": [round(float(v), 3) for v in pose],
-                            "moved_distance": round(moved, 3),
-                            "duration": round(elapsed, 3),
-                        }
-                    )
-                else:
-                    self.controller.stop(reason="step_back_safe_backtrack_incomplete")
-                    self._log_structured(
-                        {
-                            "event": "step_back_safe_backtrack_incomplete",
-                            "elapsed": round(float(self._elapsed()), 3),
-                            "final_pose": [round(float(v), 3) for v in pose],
-                            "moved_distance": round(moved, 3),
-                            "duration": round(elapsed, 3),
-                        }
-                    )
-                return False
-
-            if status == STUCK:
-                self.controller.stop(reason="step_back_safe_backtrack_stuck")
-                self._step_back_safe_state = "idle"
-                self._step_back_safe_active = False
-                self.current_frontier = None
-                self._exploration.last_frontier_target = None
-                self._exploration.last_frontier_score = None
-                self._exploration.last_frontier_used_fallback = False
-                self._log_structured(
-                    {
-                        "event": "step_back_safe_backtrack_stuck",
-                        "elapsed": round(float(self._elapsed()), 3),
-                        "final_pose": [round(float(v), 3) for v in pose],
-                        "moved_distance": round(moved, 3),
-                        "duration": round(elapsed, 3),
-                    }
-                )
-                return False
-
-            if elapsed >= 10.0:
-                self.controller.stop(reason="step_back_safe_backtrack_timeout")
-                self._step_back_safe_state = "idle"
-                self._step_back_safe_active = False
-                self.current_frontier = None
-                self._exploration.last_frontier_target = None
-                self._exploration.last_frontier_score = None
-                self._exploration.last_frontier_used_fallback = False
-                self._log_structured(
-                    {
-                        "event": "step_back_safe_backtrack_timeout",
-                        "elapsed": round(float(self._elapsed()), 3),
-                        "final_pose": [round(float(v), 3) for v in pose],
-                        "moved_distance": round(moved, 3),
-                        "duration": round(elapsed, 3),
-                    }
-                )
-                return False
-
             return True
 
         return False

@@ -326,7 +326,7 @@ stateDiagram-v2
 
 - **危险源走近核验抢占机制（Approach Verification）**：作为 `EXPLORE_FLOOR` 内部的高优先级子任务。当检测器产生置信度 $\ge 0.70$ 的远距离候选目标时，任务管理器主动挂起普通前沿探索，规划安全路径靠近至约 1.3m 的最佳观测视距进行驻留复核；复核完成或达到 30s 单次上限后恢复常规探索；
 - **多层时间预算体系与收尾期限界定**：
-  - **名义探索预算**：由 `effective_max_runtime` 结合配置与场景楼层数确定（默认配置现已统一至 1360.0s，单层生效 520s、两层 900s、三层 1360s）。机器人实时根据位置与保守速度（0.4m/s）预估回程时间，触碰阈值即转入 `RETURN_HOME`；
+  - **名义探索预算**：由 `effective_max_runtime` 结合配置与场景楼层数确定（默认配置现已统一至 1440.0s，单层生效 520s、两层 1000s、三层 1440s）。机器人实时根据位置与保守速度（0.4m/s）预估回程时间，触碰阈值即转入 `RETURN_HOME`；
   - **超时与收尾期限**：若名义预算耗尽仍未到家，系统锁存 `timeout_triggered` 并进入独立收尾保护期（额外预留最多 180 秒任务时间或 600 秒墙钟时间）。在此期间不再开启新任务，专注于安全返航与写出结果；
   - **成功资格判定**：若触发了名义超时才完成返航，即使最终安全到家，任务的最终 `terminal_outcome` 仍被标记为 `failed`（但此前已确认并记录的危险源坐标结果仍完整落盘有效）。
 
@@ -425,7 +425,7 @@ SEED=42 GUI=true ELEVATOR_TEST_FLOOR_COUNT=3 bash tools/sim/run_elevator_gui_tes
 | 参数键路径 | 默认值 | 物理含义 | 所属模块 |
 |---|---|---|---|
 | `runtime/profile` | `formal` | 系统运行模式配置（formal 强制开启严格接口与健康审查） | 全局运行时 |
-| `mission/max_runtime` | `1360.0` | 任务名义总最大运行时限上限（秒，由楼层映射表裁决） | 任务编排层 |
+| `mission/max_runtime` | `1440.0` | 任务名义总最大运行时限上限（秒，由楼层映射表裁决） | 任务编排层 |
 | `mission/explore_coverage_ratio` | `0.65` | 单层前沿覆盖率达标阈值（多层默认 0.65 触发换层） | 任务编排层 |
 | `controller/max_linear` | `0.65` | 四足机器人巡航最高线速度限制（m/s） | 运动控制层 |
 | `controller/max_lateral` | `0.01` | 四足机器人侧向平移速度上限（m/s，防转向耦合） | 运动控制层 |
@@ -466,9 +466,9 @@ SEED=42 GUI=true ELEVATOR_TEST_FLOOR_COUNT=3 bash tools/sim/run_elevator_gui_tes
   - **影响机制**：开启后，系统在主入口和 0 层电梯区域回访时通过点云锚点匹配计算并注入 $XY$ 平移修正量。
 
 #### 3. 任务全局时钟与流程控制 (`mission`)
-- `mission/max_runtime`（默认：`1360.0` 秒）
+- `mission/max_runtime`（默认：`1440.0` 秒）
   - **物理含义**：任务总名义预算时间上限。
-  - **影响机制**：与 `runtime_by_floor` 配合由 `effective_max_runtime` 取较小值，使 1 层场景自动取 520s、2 层取 900s、3 层取 1360s。
+  - **影响机制**：与 `runtime_by_floor` 配合由 `effective_max_runtime` 取较小值，使 1 层场景自动取 520s、2 层取 1000s、3 层取 1440s。
 - `mission/return_safety_buffer`（默认：`5.0` 秒）
   - **物理含义**：在模型估算的返航理论耗时之外额外预留的安全时间冗余量。
   - **影响机制**：提前触发返航状态转移，防止在回程终点前因微小扰动耗尽时间。

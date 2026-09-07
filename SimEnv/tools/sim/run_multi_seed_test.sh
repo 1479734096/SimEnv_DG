@@ -391,23 +391,33 @@ except Exception:
     summary_result="$(grep -E '^result=' "$seed_dir/TEST_SUMMARY.txt" | cut -d= -f2- || true)"
     summary_detail="$(grep -E '^detail=' "$seed_dir/TEST_SUMMARY.txt" | cut -d= -f2- || true)"
   fi
+  raw_result="$summary_result"
+
+  local_runner_success=0
+  if [[ "$raw_result" == "成功" || "$raw_result" == "通过" ]]; then
+    local_runner_success=1
+  elif (( runner_exit == 0 )) && [[ "$raw_result" != "失败" && "$raw_result" != "未完成" && "$raw_result" != "中止" ]]; then
+    local_runner_success=1
+  fi
 
   if (( INTERRUPTED == 1 )); then
     summary_result="⏹️ 中断"
     summary_detail="用户按 Ctrl-C 中断"
-  elif (( runner_exit == 0 )); then
+  elif (( local_runner_success == 1 )); then
     if [[ "$eval_status" == "ok" ]]; then
       if (( eval_truth > 0 && eval_missed == 0 && eval_false_alarms == 0 )); then
-        summary_result="✔ 满分通过"
+        summary_result="✔ 满分成功"
         summary_detail="换层闭环成功且全部危险源识别满分"
         success_count=$((success_count + 1))
       else
-        summary_result="⚠️ 流程完成(识别不达标: ${eval_correct}/${eval_truth})"
-        summary_detail="流程闭环完成但危险源识别未达标(漏检: ${eval_missed}, 误报: ${eval_false_alarms}, 得分: ${eval_score}分)"
+        summary_result="⚠️ 流程成功(识别不达标: ${eval_correct}/${eval_truth})"
+        summary_detail="换层闭环成功但危险源识别未达标(漏检: ${eval_missed}, 误报: ${eval_false_alarms}, 得分: ${eval_score}分)"
       fi
     else
-      summary_result="✔ 流程完成"
-      summary_detail="底层流程正常完成，但无有效评测数据"
+      summary_result="✔ 成功"
+      if [[ -z "$summary_detail" || "$summary_detail" == "无详情" ]]; then
+        summary_detail="底层流程正常成功完成"
+      fi
       success_count=$((success_count + 1))
     fi
   else
@@ -434,7 +444,7 @@ SUMMARY_MD="$OUTPUT_ROOT/BATCH_SUMMARY.md"
   printf -- '- **界面模式**: %s\n' "$([[ "$GUI" == "true" ]] && printf "GUI 开启" || printf "无头模式 (GUI 关闭)")"
   printf -- '- **RGB-D 录包**: %s\n' "$([[ "$RECORD_RGBD" == "1" ]] && printf "开启" || printf "关闭")"
   printf -- '- **完成进度**: %d / %d 个 Seed\n' "$completed_count" "$total_seeds"
-  printf -- '- **满分通过率**: %d / %d (%s%%)\n' \
+  printf -- '- **成功率**: %d / %d (%s%%)\n' \
     "$success_count" "$completed_count" \
     "$([ "$completed_count" -gt 0 ] && awk -v s="$success_count" -v c="$completed_count" 'BEGIN { printf "%.1f", (s/c)*100 }' || printf '0.0')"
   printf '\n## 明细结果\n\n'
@@ -459,7 +469,7 @@ SUMMARY_MD="$OUTPUT_ROOT/BATCH_SUMMARY.md"
 
 printf '\n==========================================================\n'
 printf '[多Seed测试] 批次测试结束\n'
-printf '  总计: %d | 完成: %d | 通过: %d | 失败: %d\n' \
+printf '  总计: %d | 完成: %d | 成功: %d | 失败: %d\n' \
   "$total_seeds" "$completed_count" "$success_count" "$((completed_count - success_count))"
 printf '  汇总报告已写出: %s\n' "$SUMMARY_MD"
 printf '==========================================================\n'

@@ -749,7 +749,7 @@ while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
      grep -F '"event": "mission_result_write"' "$MISSION_LOG" 2>/dev/null | \
      grep -F '"terminal_outcome": "success"' | \
      grep -Fq '"return_home_completed": true'; then
-    RESULT="通过"
+    RESULT="成功"
     if [[ "$ELEVATOR_TEST_FLOOR_COUNT" == "3" ]]; then
       DETAIL="电梯视觉注册、0→1→2 换层、2→0 返程和主入口返航闭环成功"
     else
@@ -806,7 +806,7 @@ while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
         fi
       fi
     else
-      RESULT="通过"
+      RESULT="成功"
       if [[ "$ELEVATOR_TEST_FLOOR_COUNT" == "3" ]]; then
         DETAIL="电梯视觉注册与 0→1→2 换层闭环成功"
       else
