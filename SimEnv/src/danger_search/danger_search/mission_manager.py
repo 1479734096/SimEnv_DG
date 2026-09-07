@@ -231,6 +231,7 @@ class DangerInspectionContext:
     started_at: float = 0.0
     verification_started_at: float = 0.0
     path_generation: int | None = None
+    replan_count: int = 0
 
     def reset(self) -> None:
         self.phase = DANGER_INSPECTION_IDLE
@@ -240,6 +241,7 @@ class DangerInspectionContext:
         self.started_at = 0.0
         self.verification_started_at = 0.0
         self.path_generation = None
+        self.replan_count = 0
 
 
 @dataclass(frozen=True)
@@ -2282,7 +2284,59 @@ class MissionManager:
                         self._segment_is_traversable(grid, start, end)
                         for start, end in zip(remaining, remaining[1:])
                     ):
-                        self._fail_danger_inspection("danger_obstacle_path_blocked", get_time())
+                        replan_ok = False
+                        if (
+                            inspection.replan_count < 1
+                            and inspection.target_xy is not None
+                        ):
+                            inspection.replan_count += 1
+                            new_approach_pose = compute_danger_approach_pose(
+                                grid,
+                                pose,
+                                inspection.target_xy,
+                                standoff_distance=float(
+                                    getattr(self, "danger_approach_standoff_distance", 1.3)
+                                ),
+                            )
+                            if new_approach_pose is not None:
+                                new_plan = self._plan_path(
+                                    grid,
+                                    (pose[0], pose[1]),
+                                    (new_approach_pose[0], new_approach_pose[1]),
+                                )
+                                if (
+                                    new_plan is not None
+                                    and bool(getattr(new_plan, "reached", False))
+                                    and bool(getattr(new_plan, "path", None))
+                                ):
+                                    self.controller.set_path(
+                                        list(new_plan.path),
+                                        reason=DANGER_INSPECTION_PATH_REASON,
+                                    )
+                                    new_progress = self.controller.planning_progress_snapshot()
+                                    inspection.approach_xy = (
+                                        float(new_approach_pose[0]),
+                                        float(new_approach_pose[1]),
+                                    )
+                                    inspection.path_generation = int(new_progress.path_generation)
+                                    replan_ok = True
+                                    MissionReportingRuntime.loginfo(
+                                        "危险源接近路径受障碍物刷新干涉，原地局部重规划成功：track_id=%s approach=(%.2f, %.2f)",
+                                        inspection.track_id,
+                                        new_approach_pose[0],
+                                        new_approach_pose[1],
+                                    )
+                                    self._log_structured(
+                                        {
+                                            "event": "danger_approach_replan_success",
+                                            "elapsed": round(float(self._elapsed()), 3),
+                                            "track_id": inspection.track_id,
+                                            "replan_count": inspection.replan_count,
+                                            "approach_xy": inspection.approach_xy,
+                                        }
+                                    )
+                        if not replan_ok:
+                            self._fail_danger_inspection("danger_obstacle_path_blocked", get_time())
         if self.rgbd_door_detector is not None:
             door_observations = list(detection_result.door_observations)
             registration = self._elevator_observation.registration
@@ -3594,6 +3648,7 @@ class MissionManager:
         target_position = tuple(float(value) for value in target.position)
         self._danger_inspection.phase = DANGER_INSPECTION_APPROACHING
         self._danger_inspection.track_id = int(track_id)
+        self._danger_inspection.replan_count = 0
         self._danger_inspection.target_xy = (
             target_position[0],
             target_position[1],

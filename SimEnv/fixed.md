@@ -795,3 +795,17 @@ Stage15～17 当前结论：
   1. **安全归档不删除**：在 `run_multi_seed_test.sh` 中，将每轮生成的选手结果与离线评测真值直接移动（`mv`）归档到对应 `seed_${seed}/` 独立目录下；对公共目录的历史残留文件自动归档至 `legacy_results_backup/`，杜绝跨 seed 污染且完整保留全部历史证据；
   2. **孤儿进程强力清理**：在脚本开头、每轮测试前后、以及 `EXIT` / `INT` / `TERM` 的 trap 钩子中，统一加入强力清理命令 `killall -9 gzserver gzclient rosmaster roscore junior_ctrl danger_search 2>/dev/null || true`，确保测试环境绝对干净；
   3. **标记文件路径隔离**：将时间戳标记由 `$seed_dir/.seed_started_marker` 移至 `$OUTPUT_ROOT/.seed_${seed}_started_marker`，避免污染 `seed_dir`。
+
+## 42. 2026-09-07 危险源接近动态落图干涉原地 A* 重规划与消除回马枪（STAGE43）
+
+- **问题现象（9分30秒 3次大角度掉头、折返打结与回马枪震荡）**：2026-09-07 实测中机器狗在 9min30s（570s）左右出现连续 3 次 180°/120°/160° 原地大掉头与急刹折返，在走廊与门框狭窄处走出严重扭曲打结轨迹，额外消耗 25 秒探索时间。
+- **根本原因排查与分析**：
+  1. **地图落图与老路径时序倒挂**：550s 规划时红球尚未落图，老路径在平地上直连距球 1.3m 处；555s 走近后红球质心微调并作为 0.40m 膨胀障碍物（51 cell）落图，老路径末端与新障碍物产生几何干涉，触发 `_segment_is_traversable` 阻挡；
+  2. **断崖式判负一刀切退出**：旧代码在检测到路径与动态更新的红球干涉时，未尝试在原地用新地图重新调用 A* 规划绕障路径，直接调用 `_fail_danger_inspection` 宣告失败退回 IDLE，将红球置入 5 秒冷却；
+  3. **冷却后保底机制杀回马枪**：机器狗掉头离场走开不到 1 米，5 秒冷却已过，视线再次捕捉到未核验红球，高优先级抢占强行刹车，但目标在正后方，被迫再次原地大掉头折返回去核验，核验完成后又第三次掉头恢复探索。
+- **修改方案与修改后现状**：
+  1. **上下文扩展**：在 `DangerInspectionContext` 中增加 `replan_count`，并在 `reset()` 与 `_start_danger_inspection` 中置零；
+  2. **原地局部重规划**：在 `mission_manager.py` 的 `danger_obstacle_sync` 阻挡判定分支中，当剩余路径受阻时，若 `replan_count < 1` 且有目标坐标，优先在当前最新地图上调用 `compute_danger_approach_pose` 和 `_plan_path`，重新规划绕开红球障碍物的新路径并无缝加载至控制器，原地自愈继续推进；
+  3. **保留冷却保底**：仅当原地重规划彻底不可达时才触发 `_fail_danger_inspection` 退回 5 秒冷却保底，确保极端死角下的召回率绝对不倒退；
+  4. **诊断日志**：新增 `danger_approach_replan_success` 结构化事件。
+  现状：`mission_manager.py` 已修改完毕并通过 Python 静态语法编译检查。
