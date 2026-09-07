@@ -1403,7 +1403,7 @@ class MissionManager:
                 if latest_xy is not None
                 else math.inf
             )
-            tolerance = getattr(self, "home_tolerance", 1.5)
+            tolerance = max(float(getattr(self, "home_tolerance", 0.6)), 1.5)
             if dist_to_home <= tolerance:
                 self._return_home_success = True
                 self._return_home_completed = True
@@ -5699,14 +5699,7 @@ class MissionManager:
             return
         self._return_home.clear_stuck_if_departed(pose)
         distance = math.hypot(self.home_pose[0] - pose[0], self.home_pose[1] - pose[1])
-        effective_tolerance = self.home_tolerance
-        if getattr(self, "_return_home_main_entrance_crossed", False):
-            effective_tolerance = max(float(self.home_tolerance), 1.5)
-        if distance <= effective_tolerance or (
-            getattr(self, "_return_home_main_entrance_crossed", False)
-            and pose[1] <= -1.8
-            and distance <= 2.0
-        ):
+        if distance <= self.home_tolerance:
             self._return_home_success = True
             self._return_home_completed = True
             success_eligible_for_reason = bool(

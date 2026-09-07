@@ -560,7 +560,7 @@ class _MissionConfigBuilder:
         self.min_corridor_progress_distance = float(_param("mission/min_corridor_progress_distance", 0.0))
         self.post_door_min_known_area = float(_param("mission/post_door_min_known_area", 8.0))
         self.post_door_min_distance = float(_param("mission/post_door_min_distance", 2.0))
-        self.home_tolerance = float(_param("mission/home_tolerance", 0.7))
+        self.home_tolerance = float(_param("mission/home_tolerance", 0.6))
         self.danger_approach_verification_enabled = bool(
             _param("mission/danger_approach_verification_enabled", True)
         )

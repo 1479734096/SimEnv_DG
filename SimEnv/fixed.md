@@ -809,3 +809,16 @@ Stage15～17 当前结论：
   3. **保留冷却保底**：仅当原地重规划彻底不可达时才触发 `_fail_danger_inspection` 退回 5 秒冷却保底，确保极端死角下的召回率绝对不倒退；
   4. **诊断日志**：新增 `danger_approach_replan_success` 结构化事件。
   现状：`mission_manager.py` 已修改完毕并通过 Python 静态语法编译检查。
+
+## 43. 2026-09-07 出大门返航正常终局到达与异常断流兜底职责分离（STAGE44）
+
+- **问题现象（穿出主大门后在 y=-1.78m 处提前急刹断电停机）**：机器狗在完成 0→1→0 双层探索与危险源识别后成功下楼穿出主大门，雷达匹配点充裕（350~400点，定位健康），以 0.35m/s 高速朝出生点奔跑，但在刚出大门走到 `y = -1.78m`（距出生点 `(0.0, -3.2)` 约 1.42m，视觉上表现为刚出大门两步就“卡住不动”）时，主任务直接触发 `return_home_completed` 并切换到 `WRITE_RESULT` 断电停机。
+- **根本原因排查与分析**：
+  1. **主循环提前截断**：此前 STAGE38 为规避室外空旷激光点云退化导致的 3 秒超时判负，在 `_tick_return_home` 主导航循环中加入了粗暴的 `pose[1] <= -1.8` 和 `effective_tolerance = 1.5m` 提前截断逻辑；
+  2. **健康状态误触发收尾**：在定位完全正常（雷达无退化）的情况下，机器狗刚迈出大门踏入 `y = -1.78m`（欧氏距离 1.42m $\le$ 1.5m），直接满足了完成条件，导致主状态机在机器狗尚未抵达物理出生点时就提前切断路径跟踪并关机；
+  3. **职责混淆**：正常沿着反向入场轨迹跑回物理出生点（`distance <= 0.6m`）与室外退化丢点时的异常容错兜底（`decision.terminal` 时 $\le 1.5\text{m}$ 判定优雅收尾）没有解耦。
+- **修改方案与修改后现状**：
+  1. **主循环恢复精准物理到达**：在 `mission_manager.py` 的 `_tick_return_home` 中彻底删除 `pose[1] <= -1.8` 与 `effective_tolerance = 1.5`，正常导航严格遵循 `distance <= self.home_tolerance`（`0.6m`），确保机器狗完整沿轨迹跑回真实出生点邻域；
+  2. **配置统一**：在 `danger_search.yaml` 中将 `mission/home_tolerance` 从 `1.5` 改回 `0.6`，`mission_config.py` 默认参数同步调整为 `0.6`；
+  3. **异常断流独立兜底**：在 `_apply_localization_progress_decision` 中，当且仅当发生定位超时中断（`decision.terminal == True`）且机器狗已出大门处于室外开阔区近场时，使用 `tolerance = max(float(getattr(self, "home_tolerance", 0.6)), 1.5)` 触发优雅收尾，严禁正常奔跑时提前收敛。
+  现状：代码与配置已修改完毕并通过 Python 静态语法编译检查。
