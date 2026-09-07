@@ -93,9 +93,9 @@ mission:
   # /nav/goal 不属于比赛公开接口，仅诊断工具可显式开启。
   manual_goal_enabled: false
   # 正式总预算按公开 served_floors 数量选择；专项配置可用更短 max_runtime。
-  max_runtime: 600.0
-  runtime_by_floor: [[1, 540.0], [2, 840.0], [3, 1280.0]]
-  floor_timeout: 360.0
+  max_runtime: 900.0
+  runtime_by_floor: [[1, 520.0], [2, 900.0], [3, 1360.0]]
+  floor_timeout: 320.0
   # 非最后一层仍以 floor_timeout 保护后续楼层；最后一层由全局返航预算收口。
   # 设为 false 可立即恢复“所有楼层到时即结束”的旧语义。
   last_floor_uses_global_budget: true
@@ -114,7 +114,7 @@ mission:
   return_home_max_candidate_rejects: 3
   return_home_veto_lookahead: 0.8
   # 电梯长程接近必须有界；规划失败保留短暂地图更新窗口，耗尽后显式失败。
-  elevator_navigation_timeout: 120.0
+  elevator_navigation_timeout: 135.0
   elevator_planning_retry_limit: 3
   elevator_stuck_retry_limit: 4
   # 开门确认后以当前 Livox 连续重测本次穿越轴，吸收定位平移漂移；不改写注册地图。
@@ -187,7 +187,7 @@ mission:
   exit_cabin_backoff_enabled: false
   # 方案 C：全局时间预算参数
   # 返航安全缓冲（秒）：在 estimated_return_time 之外再预留的时间
-  return_safety_buffer: 30.0
+  return_safety_buffer: 5.0
   # 总期限包含返航；超时记失败，但允许有独立上限的安全收尾，不再发起新核验。
   return_cleanup_timeout: 180.0
   return_cleanup_wall_timeout: 600.0

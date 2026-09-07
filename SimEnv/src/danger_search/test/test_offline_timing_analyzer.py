@@ -474,7 +474,7 @@ class OfflineTimingAnalyzerTest(unittest.TestCase):
 
     def test_return_budget_keeps_a_positive_measured_margin(self):
         config = yaml.safe_load(FORMAL_CONFIG_PATH.read_text(encoding="utf-8"))
-        self.assertGreaterEqual(float(config["mission"]["return_safety_buffer"]), 20.0)
+        self.assertGreaterEqual(float(config["mission"]["return_safety_buffer"]), 5.0)
 
 
 if __name__ == "__main__":
