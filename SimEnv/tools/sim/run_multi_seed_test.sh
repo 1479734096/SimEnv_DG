@@ -190,8 +190,29 @@ mkdir -p "$OUTPUT_ROOT"
 
 CURRENT_CHILD_PID=""
 INTERRUPTED=0
+sanitize_environment() {
+  # 1. 彻底杀掉所有可能残存的仿真、算法、录包及辅助守护进程
+  killall -9 gzserver gzclient rosmaster roscore junior_ctrl danger_search scan_localization 2>/dev/null || true
+  pkill -9 -f "building_generator_classic_control" 2>/dev/null || true
+  pkill -9 -f "rosbag record" 2>/dev/null || true
+  pkill -9 -f "sleep 1000000" 2>/dev/null || true
+  pkill -9 -f "danger_search_elevator_runtime" 2>/dev/null || true
+
+  # 2. 清理过期的 /tmp 运行时 FIFO 临时目录
+  rm -rf -- /tmp/danger_search_elevator_runtime.* 2>/dev/null || true
+
+  # 3. 轮询等待 11311 端口彻底释放（最多等待 3 秒）
+  local _deadline=$((SECONDS + 3))
+  while (( SECONDS < _deadline )); do
+    if ! ss -ltn 2>/dev/null | awk '$4 ~ /:11311$/ {found=1; exit} END {exit !found}'; then
+      break
+    fi
+    killall -9 rosmaster roscore 2>/dev/null || true
+    sleep 0.3
+  done
+}
 cleanup_all_processes() {
-  killall -9 gzserver gzclient rosmaster roscore junior_ctrl danger_search 2>/dev/null || true
+  sanitize_environment
 }
 handle_signal() {
   printf '\n[多Seed测试] 收到中断信号，正在安全终止当前轮次……\n'
@@ -199,10 +220,10 @@ handle_signal() {
   if [[ -n "$CURRENT_CHILD_PID" ]] && kill -0 "$CURRENT_CHILD_PID" 2>/dev/null; then
     kill -TERM "$CURRENT_CHILD_PID" 2>/dev/null || true
   fi
-  cleanup_all_processes
+  sanitize_environment
 }
 trap handle_signal INT TERM
-trap cleanup_all_processes EXIT
+trap sanitize_environment EXIT
 
 printf '==========================================================\n'
 printf '[多Seed测试] 启动批量仿真测试\n'
@@ -246,6 +267,9 @@ for index in "${!SEEDS[@]}"; do
 
   printf '\n>>> [%d/%d] 开始测试 seed=%s (输出目录: %s)\n' \
     "$current_idx" "$total_seeds" "$seed" "$seed_dir"
+
+  # 每轮测试启动前，彻底清理前序遗留进程与端口，确保完全冷启动
+  sanitize_environment
 
   start_wall=$SECONDS
   set +e
@@ -343,8 +367,11 @@ except Exception:
     summary_result="通过"
     success_count=$((success_count + 1))
   else
-    if [[ -z "$summary_result" || "$summary_result" == "未完成" ]]; then
+    if [[ -z "$summary_result" || "$summary_result" == "未完成" || "$summary_result" == "未知" ]]; then
       summary_result="失败"
+    fi
+    if [[ -z "$summary_detail" || "$summary_detail" == "无详情" || "$summary_detail" == "测试未完成" ]]; then
+      summary_detail="底层运行器异常退出 (exit code: ${runner_exit})"
     fi
   fi
 

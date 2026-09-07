@@ -226,6 +226,8 @@ stop_rgbd_recording() {
 cleanup() {
   local exit_code=$?
   trap - EXIT
+  set +e
+
   terminate_node_list "$MISSION_NODE_PIDS" INT
   terminate_group "$MISSION_PID" INT
   terminate_group "$BAG_PID" INT
@@ -261,44 +263,32 @@ cleanup() {
       --json "$LOG_DIR/landmark_drift.json" \
       > "$LOG_DIR/landmark_drift.log" 2>&1 || true
   fi
+
+  # 先向仿真与控制器发送温和终止信号
+  terminate_node_list "$GAZEBO_PID" INT
   terminate_node_list "$MISSION_NODE_PIDS" TERM
   terminate_group "$MISSION_PID" TERM
   terminate_group "$AUTO_PID" TERM
-  if [[ "$AUTO_PID" =~ ^[0-9]+$ ]]; then
-    for _attempt in 1 2 3 4 5; do
-      if ! kill -0 "$AUTO_PID" 2>/dev/null; then
-        break
-      fi
-      sleep 1
-    done
-    terminate_node_list "$MISSION_NODE_PIDS" KILL
-    terminate_group "$MISSION_PID" KILL
-    terminate_group "$AUTO_PID" KILL
-    wait "$AUTO_PID" 2>/dev/null || true
-  fi
   terminate_group "$KEEPER_PID" TERM
-  if [[ "$KEEPER_PID" =~ ^[0-9]+$ ]]; then
-    for _attempt in 1 2 3; do
-      if ! kill -0 "$KEEPER_PID" 2>/dev/null; then
-        break
-      fi
-      sleep 1
-    done
-    terminate_group "$KEEPER_PID" KILL
-    wait "$KEEPER_PID" 2>/dev/null || true
-  fi
-  terminate_node_list "$GAZEBO_PID" INT
   if [[ "$MASTER_PID" =~ ^[0-9]+$ ]] && kill -0 "$MASTER_PID" 2>/dev/null; then
     kill -TERM "$MASTER_PID" 2>/dev/null || true
-    for _attempt in 1 2 3 4 5; do
-      if ! kill -0 "$MASTER_PID" 2>/dev/null; then
-        break
-      fi
-      sleep 1
-    done
-    terminate_node_list "$GAZEBO_PID" KILL
+  fi
+  sleep 1
+
+  # 强制彻底清理所有残余仿真与后台辅助进程
+  terminate_node_list "$GAZEBO_PID" KILL
+  terminate_node_list "$MISSION_NODE_PIDS" KILL
+  terminate_group "$MISSION_PID" KILL
+  terminate_group "$AUTO_PID" KILL
+  terminate_group "$KEEPER_PID" KILL
+  if [[ "$MASTER_PID" =~ ^[0-9]+$ ]] && kill -0 "$MASTER_PID" 2>/dev/null; then
     kill -KILL "$MASTER_PID" 2>/dev/null || true
   fi
+  killall -9 gzserver gzclient rosmaster roscore junior_ctrl danger_search scan_localization 2>/dev/null || true
+  pkill -9 -f "building_generator_classic_control" 2>/dev/null || true
+  pkill -9 -f "sleep 1000000" 2>/dev/null || true
+  pkill -9 -f "danger_search_elevator_runtime" 2>/dev/null || true
+
   if [[ -n "$RUNTIME_DIR" && -d "$RUNTIME_DIR" ]]; then
     rm -rf -- "$RUNTIME_DIR"
   fi
@@ -309,8 +299,6 @@ cleanup() {
   if [[ -f "$WORKSPACE_ROOT/results/detected_danger.json" ]]; then
     cp -f "$WORKSPACE_ROOT/results/detected_danger.json" "$LOG_DIR/detected_danger.json" 2>/dev/null || true
   fi
-  # 无论成功还是失败，结束后都彻底清理所有仿真和 ROS 进程残留
-  killall -9 gzserver gzclient rosmaster roscore junior_ctrl danger_search 2>/dev/null || true
   write_summary
   log "$RESULT：$DETAIL"
   log "证据目录：$LOG_DIR"
@@ -320,6 +308,7 @@ cleanup() {
 fail() {
   RESULT="失败"
   DETAIL="$1"
+  log "前置/运行失败：$1"
   return "${2:-1}"
 }
 
@@ -485,14 +474,26 @@ if ! grep -Fq "  max_runtime: $ELEVATOR_TEST_MAX_RUNTIME" "$TEST_CONFIG" || \
 fi
 
 source "$DEVEL_SETUP"
-if [[ -n "$(ss -ltn 2>/dev/null | awk '$4 ~ /:11311$/ {print; exit}')" ]]; then
-  fail "ROS master 端口 11311 已被占用，拒绝干扰现有仿真" 2
-  exit $?
-fi
-existing_mission_nodes="$(rosnode list 2>/dev/null | \
-  grep -E '^/(danger_search|scan_localization)$' || true)"
-if [[ -n "$existing_mission_nodes" ]]; then
-  fail "检测到已有任务节点（$existing_mission_nodes），拒绝污染现有仿真" 2
+
+# 启动前主动检查与清理前序残余进程与端口（冷启动保障）
+log "正在进行启动前环境检查与清理……"
+killall -9 gzserver gzclient rosmaster roscore junior_ctrl danger_search scan_localization 2>/dev/null || true
+pkill -9 -f "building_generator_classic_control" 2>/dev/null || true
+pkill -9 -f "rosbag record" 2>/dev/null || true
+pkill -9 -f "sleep 1000000" 2>/dev/null || true
+pkill -9 -f "danger_search_elevator_runtime" 2>/dev/null || true
+
+# 轮询等待 11311 端口彻底释放（最多等待 3 秒）
+port_clean=0
+for _try in {1..6}; do
+  if ! ss -ltn 2>/dev/null | awk '$4 ~ /:11311$/ {found=1; exit} END {exit !found}'; then
+    port_clean=1
+    break
+  fi
+  sleep 0.5
+done
+if (( port_clean == 0 )); then
+  fail "ROS master 端口 11311 经清理后仍被外部非仿真进程持续占用，拒绝继续" 2
   exit $?
 fi
 
@@ -522,13 +523,34 @@ if ! wait_for_log "$AUTO_LOG" "12 路 Gazebo 关节状态和机身 IMU 均已有
   fail "Gazebo 或关节控制链未在 180 秒内就绪" 2
   exit $?
 fi
-MASTER_PID="$(ss -ltnp 2>/dev/null | awk '$4 ~ /:11311$/ {if (match($0, /pid=[0-9]+/)) {print substr($0, RSTART + 4, RLENGTH - 4); exit}}')"
+
+MASTER_PID=""
+for _attempt in {1..5}; do
+  MASTER_PID="$(ss -ltnp 2>/dev/null | awk '$4 ~ /:11311$/ {if (match($0, /pid=[0-9]+/)) {print substr($0, RSTART + 4, RLENGTH - 4); exit}}' || true)"
+  if [[ ! "$MASTER_PID" =~ ^[0-9]+$ ]]; then
+    MASTER_PID="$(pgrep -n -f "rosmaster.*11311" 2>/dev/null || pgrep -n -f "rosmaster" 2>/dev/null || true)"
+  fi
+  if [[ "$MASTER_PID" =~ ^[0-9]+$ ]]; then
+    break
+  fi
+  sleep 0.5
+done
 if [[ ! "$MASTER_PID" =~ ^[0-9]+$ ]]; then
   fail "无法记录本轮 rosmaster PID，拒绝继续以免留下残余进程" 2
   exit $?
 fi
-GAZEBO_PID="$(rosnode info /gazebo 2>/dev/null | \
-  awk '$1 == "Pid:" && $2 ~ /^[0-9]+$/ { print $2; exit }' || true)"
+
+GAZEBO_PID=""
+for _attempt in {1..5}; do
+  GAZEBO_PID="$(rosnode info /gazebo 2>/dev/null | awk '$1 == "Pid:" && $2 ~ /^[0-9]+$/ { print $2; exit }' || true)"
+  if [[ ! "$GAZEBO_PID" =~ ^[0-9]+$ ]]; then
+    GAZEBO_PID="$(pgrep -n -f "gzserver" 2>/dev/null || true)"
+  fi
+  if [[ "$GAZEBO_PID" =~ ^[0-9]+$ ]]; then
+    break
+  fi
+  sleep 0.5
+done
 
 # 在站立和 RL 切换之前录包，保留初始化前的姿态与点云证据。
 if [[ "$ELEVATOR_TEST_RECORD_DRIFT" == "1" ]]; then

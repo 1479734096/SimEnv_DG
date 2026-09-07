@@ -198,6 +198,7 @@ class LocalSemanticDetector:
                 continue
             left_inner, left_evidence = min(left, key=lambda item: item[0])
             right_inner, right_evidence = max(right, key=lambda item: item[0])
+            width = left_inner - right_inner
             eff_min_width = (
                 float(min_opening_width)
                 if min_opening_width is not None

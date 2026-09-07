@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from threading import Event, Thread
 import time
+import traceback
 
 try:
     import rospy
@@ -159,14 +160,14 @@ class MissionNodeRuntime:
         try:
             self._manager.tick()
         except Exception as exc:  # 业务异常必须在 ROS 边缘转成显式失败
-            rospy.logerr("danger_search 状态机异常：%s", exc)
+            rospy.logerr("danger_search 状态机异常：%s\n%s", exc, traceback.format_exc())
             self._manager.handle_unexpected_exception(exc)
 
     def _on_ground_support_timer(self, event) -> None:
         try:
             self._manager.tick_ground_support(event)
         except Exception as exc:
-            rospy.logerr("地面支撑评估异常：%s", exc)
+            rospy.logerr("地面支撑评估异常：%s\n%s", exc, traceback.format_exc())
             self._manager.handle_unexpected_exception(exc)
 
     def _ground_support_wall_watch(self) -> None:
