@@ -101,6 +101,11 @@ class PathFollower:
     turn_release_heading: float = 0.20
     turn_release_rate: float = 0.20
     turn_release_samples: int = 3
+    # 原地自转全向贴障微退脱离参数（A1 物理旋转包络保护）
+    turn_retreat_trigger_distance: float = 0.38
+    turn_retreat_target_clearance: float = 0.42
+    turn_retreat_max_displacement: float = 0.18
+    turn_retreat_timeout: float = 0.80
     _publisher: object | None = field(default=None, init=False)
     _raw_path_publisher: object | None = field(default=None, init=False)
     _followed_path_publisher: object | None = field(default=None, init=False)
@@ -128,6 +133,10 @@ class PathFollower:
     _path_generation: int = field(default=0, init=False)
     _turn_in_place_active: bool = field(default=False, init=False)
     _turn_release_count: int = field(default=0, init=False)
+    _nearest_radial_obstacle_distance: float | None = field(default=None, init=False)
+    _turn_retreat_active: bool = field(default=False, init=False)
+    _turn_retreat_start_pose: tuple[float, float, float] | None = field(default=None, init=False)
+    _turn_retreat_start_time: float | None = field(default=None, init=False)
     _control_decision_count: int = field(default=0, init=False)
     _last_decision_period: float | None = field(default=None, init=False)
     _last_decision_wall: float | None = field(default=None, init=False)
@@ -238,6 +247,10 @@ class PathFollower:
             self.obstacle_slow_distance,
             self.no_progress_timeout,
             self.progress_distance,
+            self.turn_retreat_trigger_distance,
+            self.turn_retreat_target_clearance,
+            self.turn_retreat_max_displacement,
+            self.turn_retreat_timeout,
         )
         if (
             not all(math.isfinite(float(value)) and float(value) >= 0.0 for value in nonnegative)
@@ -250,6 +263,7 @@ class PathFollower:
             or self.goal_tolerance <= 0.0
             or self.pure_pursuit_lookahead <= 0.0
             or self.obstacle_slow_distance <= self.obstacle_stop_distance
+            or self.turn_retreat_target_clearance <= self.turn_retreat_trigger_distance
             or self.no_progress_timeout <= 0.0
             or self.progress_distance <= 0.0
         ):
@@ -361,6 +375,9 @@ class PathFollower:
         self._debug_stuck_elapsed = 0.0
         self._turn_in_place_active = False
         self._turn_release_count = 0
+        self._turn_retreat_active = False
+        self._turn_retreat_start_pose = None
+        self._turn_retreat_start_time = None
         self._tracking_status = RUNNING
         self._terminal_pending = False
         self._terminal_reason = None
@@ -431,6 +448,12 @@ class PathFollower:
         else:
             self._nearest_obstacle_distance = max(0.0, float(distance))
 
+    def set_nearest_radial_obstacle_distance(self, distance: float | None) -> None:
+        if distance is None or not math.isfinite(distance):
+            self._nearest_radial_obstacle_distance = None
+        else:
+            self._nearest_radial_obstacle_distance = max(0.0, float(distance))
+
     def set_command_gate(self, gate: object | None) -> None:
         """设置最终速度出口的可选安全门；None 保持原有命令链完全透明。"""
         with self._command_transaction_lock:
@@ -472,6 +495,9 @@ class PathFollower:
         self._align_settle_samples = 0
         self._turn_in_place_active = False
         self._turn_release_count = 0
+        self._turn_retreat_active = False
+        self._turn_retreat_start_pose = None
+        self._turn_retreat_start_time = None
         self._tracking_status = IDLE
         self._path_generation += 1
         self._route_remaining = None
@@ -792,15 +818,61 @@ class PathFollower:
         if self._path_max_lateral is not None:
             lateral_limit = min(lateral_limit, max(0.0, float(self._path_max_lateral)))
 
-        # 转向滞回：进入立即、退出需连续配置数量的新鲜样本满足释放条件；
-        # yaw_rate 缺失/过期时禁止退出转向状态。
+        # 转向滞回与死角贴障微退脱离（A1 物理旋转包络保护）：
         abs_error = abs(yaw_error)
+        if self._turn_retreat_active:
+            if (
+                self._turn_retreat_start_pose is not None
+                and self._turn_retreat_start_time is not None
+            ):
+                retreat_dx = x - self._turn_retreat_start_pose[0]
+                retreat_dy = y - self._turn_retreat_start_pose[1]
+                retreat_dist = math.hypot(retreat_dx, retreat_dy)
+                retreat_elapsed = now - self._turn_retreat_start_time
+            else:
+                retreat_dist = 0.0
+                retreat_elapsed = 0.0
+
+            radial_safe = (
+                self._nearest_radial_obstacle_distance is not None
+                and self._nearest_radial_obstacle_distance >= self.turn_retreat_target_clearance
+            )
+            dist_reached = retreat_dist >= self.turn_retreat_max_displacement
+            time_reached = retreat_elapsed >= self.turn_retreat_timeout
+
+            if radial_safe or dist_reached or time_reached:
+                self._turn_retreat_active = False
+                self._turn_retreat_start_pose = None
+                self._turn_retreat_start_time = None
+                self._turn_in_place_active = True
+                self._turn_release_count = 0
+            else:
+                self._debug_turn_in_place = False
+                self._last_progress_time = now
+                self._debug_stuck_elapsed = 0.0
+                linear_x = float(self.reverse_speed)
+                self._publish_locked(linear_x, 0.0, linear_y=0.0)
+                return RUNNING
+
         if not self._turn_in_place_active:
             if abs_error >= self.turn_in_place_heading or (
                 yaw_rate_valid and abs(yaw_rate) >= self.turn_in_place_rate
             ):
-                self._turn_in_place_active = True
-                self._turn_release_count = 0
+                if (
+                    self._nearest_radial_obstacle_distance is not None
+                    and self._nearest_radial_obstacle_distance < self.turn_retreat_trigger_distance
+                ):
+                    self._turn_retreat_active = True
+                    self._turn_retreat_start_pose = (x, y, yaw)
+                    self._turn_retreat_start_time = now
+                    self._last_progress_time = now
+                    self._debug_stuck_elapsed = 0.0
+                    linear_x = float(self.reverse_speed)
+                    self._publish_locked(linear_x, 0.0, linear_y=0.0)
+                    return RUNNING
+                else:
+                    self._turn_in_place_active = True
+                    self._turn_release_count = 0
         else:
             if (
                 yaw_rate_valid
@@ -1591,6 +1663,7 @@ class PathFollower:
             "path_turn_angle": _finite_or_none(self._debug_path_turn_angle),
             "path_curvature": _finite_or_none(self._debug_path_curvature),
             "nearest_obstacle_distance": _finite_or_none(self._nearest_obstacle_distance),
+            "nearest_radial_obstacle_distance": _finite_or_none(self._nearest_radial_obstacle_distance),
             "linear_command": linear_x,
             "lateral_command": linear_y,
             "angular_command": angular_z,
@@ -1626,6 +1699,7 @@ class PathFollower:
             "yaw_rate_valid": self._debug_yaw_rate_valid,
             "turn_in_place_active": self._turn_in_place_active,
             "turn_release_count": self._turn_release_count,
+            "turn_retreat_active": self._turn_retreat_active,
             "tracking_status": self._tracking_status,
             "status_sequence": self._status_sequence,
             "terminal_pending": self._terminal_pending,

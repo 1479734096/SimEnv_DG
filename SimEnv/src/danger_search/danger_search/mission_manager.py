@@ -2144,6 +2144,9 @@ class MissionManager:
                     set_obstacle_distance(
                         observation.distance if observation is not None else None
                     )
+                set_radial_distance = getattr(self.controller, "set_nearest_radial_obstacle_distance", None)
+                if callable(set_radial_distance):
+                    set_radial_distance(cloud_result.radial_obstacle_distance)
 
         self._report_floor_transition_alignment_timeout(estimated_floor)
 

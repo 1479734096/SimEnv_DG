@@ -1152,6 +1152,18 @@ class _MissionConfigBuilder:
             "obstacle_slow_distance": float(_param("controller/obstacle_slow_distance", 1.00)),
             "no_progress_timeout": float(_param("frontier/no_progress_timeout", 8.0)),
             "progress_distance": float(_param("controller/progress_distance", 0.25)),
+            "turn_retreat_trigger_distance": float(
+                _param("controller/turn_retreat_trigger_distance", 0.38)
+            ),
+            "turn_retreat_target_clearance": float(
+                _param("controller/turn_retreat_target_clearance", 0.42)
+            ),
+            "turn_retreat_max_displacement": float(
+                _param("controller/turn_retreat_max_displacement", 0.18)
+            ),
+            "turn_retreat_timeout": float(
+                _param("controller/turn_retreat_timeout", 0.80)
+            ),
         }
         # 任务层最小进度监督参数
         self.progress_monitor_window = float(_param("mission/progress_monitor_window", 5.0))
