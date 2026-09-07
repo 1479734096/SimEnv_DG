@@ -554,6 +554,8 @@ class FrontierExplorer:
                 expected_unknown_gain=candidate_debug.expected_unknown_gain,
             )
             score = score_terms.score + context_adjustment
+            if self._is_near_negative_obstacle(grid, target_xy, threshold=0.50):
+                score -= 100.0
             candidate_debug_records.append(
                 replace(
                     candidate_debug,
@@ -977,6 +979,24 @@ class FrontierExplorer:
         for cell in expired:
             self._blacklist.pop(cell, None)
 
+    def _is_near_negative_obstacle(
+        self,
+        grid: FloorGrid,
+        target: tuple[float, float],
+        threshold: float = 0.50,
+    ) -> bool:
+        """检查候选目标点是否与已知负障碍距离小于指定阈值。"""
+        if not hasattr(grid, "negative_cells") or not grid.negative_cells:
+            return False
+        tgx, tgy = grid.world_to_grid(float(target[0]), float(target[1]))
+        radius_cells = int(math.ceil(threshold / grid.resolution))
+        for dx in range(-radius_cells, radius_cells + 1):
+            for dy in range(-radius_cells, radius_cells + 1):
+                if math.hypot(dx * grid.resolution, dy * grid.resolution) < threshold:
+                    if (tgx + dx, tgy + dy) in grid.negative_cells:
+                        return True
+        return False
+
     def _prepare_frontier_targets(
         self,
         grid: FloorGrid,
@@ -1026,13 +1046,16 @@ class FrontierExplorer:
             if self._is_far_small_pocket(target, robot_xy, gain):
                 continue
             expected_gains[target] = gain
-            optimistic_scores[target] = self._optimistic_score(
+            score = self._optimistic_score(
                 frontier,
                 robot_pose,
                 target_xy=target,
                 expected_unknown_gain=gain,
                 context_adjustment=context_adjustment,
             )
+            if self._is_near_negative_obstacle(grid, target, threshold=0.50):
+                score -= 100.0
+            optimistic_scores[target] = score
             valid_count += 1
             if valid_count >= self.max_goal_candidates_per_frontier:
                 break

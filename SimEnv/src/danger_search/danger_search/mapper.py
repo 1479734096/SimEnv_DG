@@ -293,6 +293,9 @@ class FloorGrid:
         self.negative_cluster_confirmations: dict[
             str, frozenset[tuple[int, int]]
         ] = {}
+        self.negative_cluster_inflated_cells: dict[
+            str, set[tuple[int, int]]
+        ] = {}
 
         # 批量刷新优化：标记脏格子，延迟刷新
         self._dirty_cells: set[tuple[int, int]] = set()
@@ -1041,6 +1044,7 @@ class MultiFloorGridMap:
         obstacle_min_z: float = 0.15,
         obstacle_max_z: float = 1.40,
         obstacle_inflation_radius: float = 0.25,
+        negative_obstacle_inflation_radius: float = 0.40,
         raycast_max_range: float = 12.0,
         point_free_clear_max_range: float = 8.0,
         visited_radius: float = 0.45,
@@ -1076,6 +1080,7 @@ class MultiFloorGridMap:
         self.obstacle_min_z = float(obstacle_min_z)
         self.obstacle_max_z = float(obstacle_max_z)
         self.obstacle_inflation_radius = float(obstacle_inflation_radius)
+        self.negative_obstacle_inflation_radius = float(negative_obstacle_inflation_radius)
         self.raycast_max_range = float(raycast_max_range)
         self.point_free_clear_max_range = float(point_free_clear_max_range)
         self.visited_radius = float(visited_radius)
@@ -1125,6 +1130,7 @@ class MultiFloorGridMap:
             self.obstacle_min_z,
             self.obstacle_max_z,
             self.obstacle_inflation_radius,
+            self.negative_obstacle_inflation_radius,
             self.raycast_max_range,
             self.point_free_clear_max_range,
             self.visited_radius,
@@ -1148,6 +1154,7 @@ class MultiFloorGridMap:
             or self.floor_height <= 0.0
             or self.obstacle_max_z < self.obstacle_min_z
             or self.obstacle_inflation_radius < 0.0
+            or self.negative_obstacle_inflation_radius < 0.0
             or self.raycast_max_range < 0.0
             or self.visited_radius < 0.0
             or self.free_clear_max_range < 0.0
@@ -1540,14 +1547,26 @@ class MultiFloorGridMap:
                 ids,
                 self._negative_cluster_revision,
             )
+        inflation_radius = getattr(self, "negative_obstacle_inflation_radius", 0.40)
+        radius_cells = max(0, int(math.ceil(inflation_radius / grid.resolution)))
         for record in additions:
             grid.negative_cluster_records[record.cluster_id] = record
             grid.negative_cluster_confirmations[record.cluster_id] = frozenset()
-            for cell in record.source_cells:
-                owners = grid.negative_cell_owners.setdefault(cell, set())
-                owners.add(record.cluster_id)
-                grid.negative_cells.add(cell)
-                grid._refresh_cell(*cell)
+            inflated_for_record = set()
+            for cx, cy in record.source_cells:
+                for dx in range(-radius_cells, radius_cells + 1):
+                    for dy in range(-radius_cells, radius_cells + 1):
+                        if math.hypot(dx * grid.resolution, dy * grid.resolution) <= inflation_radius + 1e-6:
+                            nx, ny = cx + dx, cy + dy
+                            if grid._in_bounds(nx, ny):
+                                cell = (nx, ny)
+                                inflated_for_record.add(cell)
+                                owners = grid.negative_cell_owners.setdefault(cell, set())
+                                owners.add(record.cluster_id)
+                                grid.negative_cells.add(cell)
+                                grid._refresh_cell(*cell)
+            if hasattr(grid, "negative_cluster_inflated_cells"):
+                grid.negative_cluster_inflated_cells[record.cluster_id] = inflated_for_record
         self._negative_cluster_revision += 1
         return NegativeClusterCommit(
             True, "committed", ids, self._negative_cluster_revision
@@ -1608,7 +1627,12 @@ class MultiFloorGridMap:
         for record in removable:
             grid.negative_cluster_records.pop(record.cluster_id, None)
             grid.negative_cluster_confirmations.pop(record.cluster_id, None)
-            for cell in record.source_cells:
+            affected_cells = set(record.source_cells)
+            if hasattr(grid, "negative_cluster_inflated_cells"):
+                affected_cells.update(
+                    grid.negative_cluster_inflated_cells.pop(record.cluster_id, set())
+                )
+            for cell in affected_cells:
                 owners = grid.negative_cell_owners.get(cell, set())
                 owners.discard(record.cluster_id)
                 if owners:

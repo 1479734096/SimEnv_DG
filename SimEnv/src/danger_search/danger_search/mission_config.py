@@ -807,6 +807,7 @@ class _MissionConfigBuilder:
             "obstacle_min_z": float(_param("map/obstacle_min_z", 0.20)),
             "obstacle_max_z": float(_param("map/obstacle_max_z", 1.40)),
             "obstacle_inflation_radius": float(_param("map/obstacle_inflation_radius", 0.25)),
+            "negative_obstacle_inflation_radius": float(_param("map/negative_obstacle_inflation_radius", 0.40)),
             "raycast_max_range": float(_param("map/raycast_max_range", 12.0)),
             "point_free_clear_max_range": float(
                 _param("map/point_free_clear_max_range", 1.5)

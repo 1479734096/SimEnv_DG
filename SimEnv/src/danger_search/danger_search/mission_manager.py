@@ -351,12 +351,12 @@ class MissionManager:
         self._step_back_safe_state: str = "idle"
         self._step_back_safe_start_pose: tuple[float, float, float] | None = None
         self._step_back_safe_start_time: float = 0.0
-        self._step_back_safe_target_distance: float = 0.25
-        self._step_back_safe_linear_speed: float = -0.12
+        self._step_back_safe_target_distance: float = 0.20
+        self._step_back_safe_linear_speed: float = -0.35
         self._step_back_safe_timeout: float = 3.0
         self._step_back_safe_target_yaw: float = 0.0
         self._step_back_safe_turn_start_time: float = 0.0
-        self._step_back_safe_turn_timeout: float = 5.0
+        self._step_back_safe_turn_timeout: float = 7.0
         self._step_back_safe_active: bool = False
         self._step_back_safe_executed_count: int = 0
         self._step_back_safe_last_trigger_pose: tuple[float, float, float] | None = None
@@ -1386,8 +1386,23 @@ class MissionManager:
             getattr(self, "_return_home_main_entrance_crossed", False)
             and self.state == RETURN_HOME
         ):
-            latest_y = pose_sample.xy_yaw[1] if pose_sample is not None else None
-            if latest_y is not None and latest_y <= -1.5:
+            latest_xy = (
+                (pose_sample.xy_yaw[0], pose_sample.xy_yaw[1])
+                if pose_sample is not None
+                else None
+            )
+            home_target = (
+                (self.home_pose[0], self.home_pose[1])
+                if getattr(self, "home_pose", None) is not None
+                else (getattr(self, "_return_home_target", None) or (0.0, -10.0))
+            )
+            dist_to_home = (
+                math.hypot(latest_xy[0] - home_target[0], latest_xy[1] - home_target[1])
+                if latest_xy is not None
+                else math.inf
+            )
+            tolerance = getattr(self, "home_tolerance", 1.5)
+            if dist_to_home <= tolerance:
                 self._return_home_success = True
                 self._return_home_completed = True
                 success_eligible_for_reason = bool(
@@ -2428,19 +2443,73 @@ class MissionManager:
         )
 
 
+    def _build_trail_backtrack_path(
+        self,
+        pose: tuple[float, float, float],
+        target_backtrack_dist: float = 1.0,
+    ) -> list[tuple[float, float]] | None:
+        """从已走过的安全历史轨迹中提取反向回撤路径。"""
+        traces = getattr(self, "_floor_navigation_traces", None)
+        if traces is None:
+            return None
+        trace = traces.get(int(self.current_floor), [])
+        if len(trace) < 2:
+            return None
+
+        current_xy = (float(pose[0]), float(pose[1]))
+        closest_idx = min(
+            range(len(trace)),
+            key=lambda i: math.hypot(trace[i][0] - current_xy[0], trace[i][1] - current_xy[1]),
+        )
+        backtrack_points: list[tuple[float, float]] = [current_xy]
+        accumulated_dist = 0.0
+        curr_pt = current_xy
+        for i in range(closest_idx, -1, -1):
+            pt = trace[i]
+            d = math.hypot(pt[0] - curr_pt[0], pt[1] - curr_pt[1])
+            if d < 0.05:
+                continue
+            backtrack_points.append(pt)
+            accumulated_dist += d
+            curr_pt = pt
+            if accumulated_dist >= target_backtrack_dist:
+                break
+
+        if len(backtrack_points) >= 2 and accumulated_dist >= 0.25:
+            return backtrack_points
+        return None
+
     def _trigger_step_back_safe(
         self,
         pose: tuple[float, float, float],
         drop_point: tuple[float, float] | None = None,
     ) -> bool:
-        """针对前向负障碍/悬崖触发沿已踩安全硬地面的低速直线微退与掉头脱困。"""
-        # 防死循环：如果距离上次触发位置位移小于 0.4m 且已经执行过脱困，禁止连续原地重复触发
-        if self._step_back_safe_last_trigger_pose is not None:
-            dist_to_last = math.hypot(
-                pose[0] - self._step_back_safe_last_trigger_pose[0],
-                pose[1] - self._step_back_safe_last_trigger_pose[1],
-            )
-            if dist_to_last < 0.4 and self._step_back_safe_executed_count >= 1:
+        """针对前向负障碍/悬崖触发微退与掉头脱困，二次触发改沿安全轨迹回撤 1.0m。"""
+        # 二次脱困策略：若已执行过首次脱困，不再执行微退+调头（防止重新转向悬崖），改为沿安全历史轨迹反向回撤 1.0m
+        if self._step_back_safe_executed_count >= 1:
+            backtrack_path = self._build_trail_backtrack_path(pose, target_backtrack_dist=1.0)
+            if backtrack_path:
+                self._step_back_safe_state = "trail_backtrack"
+                self._step_back_safe_start_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
+                self._step_back_safe_start_time = float(get_time())
+                self._step_back_safe_active = True
+                self._step_back_safe_last_trigger_pose = (float(pose[0]), float(pose[1]), float(pose[2]))
+                self._step_back_safe_executed_count += 1
+                self.controller.set_path(backtrack_path, reason="step_back_safe_trail_backtrack")
+                self._log_structured(
+                    {
+                        "event": "step_back_safe_backtrack_started",
+                        "elapsed": round(float(self._elapsed()), 3),
+                        "floor": int(self.current_floor),
+                        "pose": [round(float(v), 3) for v in pose],
+                        "backtrack_length": len(backtrack_path),
+                    }
+                )
+                return True
+            else:
+                # 历史轨迹受阻无法回撤，转入就地重新规划
+                self._step_back_safe_state = "idle"
+                self._step_back_safe_active = False
                 return False
 
         self._step_back_safe_state = "retreat"
@@ -2460,13 +2529,13 @@ class MissionManager:
             if self.current_frontier is not None:
                 self.explorer.record_stuck_failure(grid, self.current_frontier.centroid)
             if drop_point is not None:
-                self.explorer.blacklist_region(grid, drop_point, radius=1.5)
+                self.explorer.blacklist_region(grid, drop_point, radius=1.0)
             else:
                 estimated_drop = (
-                    float(pose[0] + 0.6 * math.cos(pose[2])),
-                    float(pose[1] + 0.6 * math.sin(pose[2])),
+                    float(pose[0] + 0.5 * math.cos(pose[2])),
+                    float(pose[1] + 0.5 * math.sin(pose[2])),
                 )
-                self.explorer.blacklist_region(grid, estimated_drop, radius=1.5)
+                self.explorer.blacklist_region(grid, estimated_drop, radius=1.0)
 
         self.controller.clear_path(reason="step_back_safe_path_cleared")
         self._log_structured(
@@ -2483,7 +2552,11 @@ class MissionManager:
         return True
 
     def _tick_step_back_safe(self, pose: tuple[float, float, float]) -> bool:
-        """非阻塞推进脱困动作：后退 0.25m 拉开缓冲区 -> 原地掉头 180 度背对悬崖。"""
+        """非阻塞推进脱困动作：
+        - retreat: 直线后退 0.20m 拉开安全裕度
+        - turn_around: 原地掉头 180 度背对悬崖
+        - trail_backtrack: 沿历史安全轨迹反向回撤 1.0m
+        """
         if self._step_back_safe_state == "idle":
             return False
 
@@ -2497,7 +2570,8 @@ class MissionManager:
         if self._step_back_safe_state == "retreat":
             moved = math.hypot(pose[0] - start_pose[0], pose[1] - start_pose[1])
             elapsed = now - self._step_back_safe_start_time
-            if moved >= self._step_back_safe_target_distance or elapsed >= self._step_back_safe_timeout:
+            # 位移达标：成功完成直线微退
+            if moved >= self._step_back_safe_target_distance:
                 self.controller.stop(reason="step_back_safe_retreat_stop")
                 self._step_back_safe_state = "turn_around"
                 self._step_back_safe_turn_start_time = now
@@ -2515,6 +2589,28 @@ class MissionManager:
                     }
                 )
                 return True
+            # 超时分支：做实判据，禁止将受阻掩耳盗铃当成成功
+            if elapsed >= self._step_back_safe_timeout:
+                self.controller.stop(reason="step_back_safe_retreat_timeout")
+                if moved < 0.05:
+                    self._step_back_safe_state = "idle"
+                    self._step_back_safe_active = False
+                    self._log_structured(
+                        {
+                            "event": "step_back_safe_retreat_blocked",
+                            "elapsed": round(float(self._elapsed()), 3),
+                            "moved_distance": round(moved, 3),
+                            "duration": round(elapsed, 3),
+                        }
+                    )
+                    return False
+                self._step_back_safe_state = "turn_around"
+                self._step_back_safe_turn_start_time = now
+                self._step_back_safe_target_yaw = math.atan2(
+                    math.sin(start_pose[2] + math.pi),
+                    math.cos(start_pose[2] + math.pi),
+                )
+                return True
 
             self.controller.reverse_straight(
                 speed=self._step_back_safe_linear_speed,
@@ -2528,7 +2624,7 @@ class MissionManager:
                 math.cos(self._step_back_safe_target_yaw - pose[2]),
             )
             elapsed = now - self._step_back_safe_turn_start_time
-            if abs(yaw_error) <= 0.20 or elapsed >= self._step_back_safe_turn_timeout:
+            if abs(yaw_error) <= 0.45:
                 self.controller.stop(reason="step_back_safe_turn_stop")
                 self._step_back_safe_state = "idle"
                 self._step_back_safe_active = False
@@ -2537,7 +2633,6 @@ class MissionManager:
                 if gate is not None:
                     _ = gate.hole_detection_exempt
 
-                # 复位前沿规划缓存，引导其面向开阔区域重新规划
                 self.current_frontier = None
                 self._exploration.last_frontier_target = None
                 self._exploration.last_frontier_score = None
@@ -2553,9 +2648,44 @@ class MissionManager:
                     }
                 )
                 return True
+            if elapsed >= self._step_back_safe_turn_timeout:
+                self.controller.stop(reason="step_back_safe_turn_timeout")
+                self._step_back_safe_state = "idle"
+                self._step_back_safe_active = False
+                self._log_structured(
+                    {
+                        "event": "step_back_safe_turn_timeout",
+                        "elapsed": round(float(self._elapsed()), 3),
+                        "yaw_error": round(float(yaw_error), 3),
+                        "turn_duration": round(elapsed, 3),
+                    }
+                )
+                return False
 
             angular_z = 0.80 if yaw_error > 0.0 else -0.80
             self.controller.rotate_in_place(angular_z)
+            return True
+
+        if self._step_back_safe_state == "trail_backtrack":
+            elapsed = now - self._step_back_safe_start_time
+            path_done = getattr(self.controller, "path_completed", False) or not bool(getattr(self.controller, "current_path", None))
+            if path_done or elapsed >= 10.0:
+                self.controller.stop(reason="step_back_safe_backtrack_completed")
+                self._step_back_safe_state = "idle"
+                self._step_back_safe_active = False
+                self.current_frontier = None
+                self._exploration.last_frontier_target = None
+                self._exploration.last_frontier_score = None
+                self._exploration.last_frontier_used_fallback = False
+                self._log_structured(
+                    {
+                        "event": "step_back_safe_backtrack_completed",
+                        "elapsed": round(float(self._elapsed()), 3),
+                        "final_pose": [round(float(v), 3) for v in pose],
+                        "duration": round(elapsed, 3),
+                    }
+                )
+                return True
             return True
 
         return False
@@ -2603,7 +2733,7 @@ class MissionManager:
                     pose[0] - self._step_back_safe_last_trigger_pose[0],
                     pose[1] - self._step_back_safe_last_trigger_pose[1],
                 )
-                if dist_to_last > 1.0:
+                if dist_to_last >= 1.0:
                     self._step_back_safe_executed_count = 0
                     self._step_back_safe_last_trigger_pose = None
             return False
@@ -2619,6 +2749,11 @@ class MissionManager:
             drop_point = None
             if gate is not None:
                 drop_point = getattr(gate, "latched_drop_point_world", None)
+            dist_to_drop = (
+                math.hypot(pose[0] - drop_point[0], pose[1] - drop_point[1])
+                if drop_point is not None
+                else 0.50
+            )
             persisted = self._ground_support.persist_latched_drop_clusters(
                 controller=self.controller,
                 mapper=self.mapper,
@@ -2628,28 +2763,60 @@ class MissionManager:
                 ordinary_states=frozenset({EXPLORE_FLOOR, RETURN_HOME}),
             )
 
-            # 优先触发 STEP_BACK_SAFE 沿安全足迹回退并掉头脱困
-            if self._trigger_step_back_safe(pose, drop_point=drop_point):
-                return True
+            # 主流程（四足旋转包络安全）：若距离悬崖 >= 0.40m，机身中心及四足均在安全硬地面上，
+            # 优先落图 0.40m 膨胀并由 A* 重新规划绕行线路，原地无需倒车与掉头
+            if dist_to_drop >= 0.40:
+                if persisted is not None:
+                    self.current_frontier = None
+                    self._exploration.last_frontier_target = None
+                    self._exploration.last_frontier_score = None
+                    self._exploration.last_frontier_used_fallback = False
+                    self.controller.clear_path(reason="negative_obstacle_replan")
+                    self._log_structured(
+                        {
+                            "event": "negative_clusters_persisted",
+                            "elapsed": round(float(self._elapsed()), 3),
+                            "floor": persisted.floor,
+                            "mission_state": self.state,
+                            "cluster_ids": list(persisted.cluster_ids),
+                            "source_cell_count": persisted.source_cell_count,
+                            "map_revision": persisted.map_revision,
+                            "ordinary_recover_called": False,
+                            "strategy": "primary_in_place_replan",
+                            "dist_to_drop": round(dist_to_drop, 3),
+                        }
+                    )
+                    return True
+                # 若落图失败或超配额，降级尝试备用脱困
+                if self._trigger_step_back_safe(pose, drop_point=drop_point):
+                    return True
+            else:
+                # 备用兜底（贴近悬崖边缘 < 0.40m）：原地旋转存在四足外摆扫空踩入负障风险，
+                # 必须先执行微退脱困拉开到安全距离
+                if self._trigger_step_back_safe(pose, drop_point=drop_point):
+                    return True
+                if persisted is not None:
+                    self.current_frontier = None
+                    self._exploration.last_frontier_target = None
+                    self._exploration.last_frontier_score = None
+                    self._exploration.last_frontier_used_fallback = False
+                    self.controller.clear_path(reason="negative_obstacle_replan")
+                    self._log_structured(
+                        {
+                            "event": "negative_clusters_persisted",
+                            "elapsed": round(float(self._elapsed()), 3),
+                            "floor": persisted.floor,
+                            "mission_state": self.state,
+                            "cluster_ids": list(persisted.cluster_ids),
+                            "source_cell_count": persisted.source_cell_count,
+                            "map_revision": persisted.map_revision,
+                            "ordinary_recover_called": False,
+                            "strategy": "fallback_replan_after_retreat_exhausted",
+                            "dist_to_drop": round(dist_to_drop, 3),
+                        }
+                    )
+                    return True
 
-            if persisted is not None:
-                self.current_frontier = None
-                self._exploration.last_frontier_target = None
-                self._exploration.last_frontier_score = None
-                self._exploration.last_frontier_used_fallback = False
-                self._log_structured(
-                    {
-                        "event": "negative_clusters_persisted",
-                        "elapsed": round(float(self._elapsed()), 3),
-                        "floor": persisted.floor,
-                        "mission_state": self.state,
-                        "cluster_ids": list(persisted.cluster_ids),
-                        "source_cell_count": persisted.source_cell_count,
-                        "map_revision": persisted.map_revision,
-                        "ordinary_recover_called": False,
-                    }
-                )
-                return True
             # 局部重规划未启用、超预算或脱困不可用时保持原 Gate 的锁存终局
             action = GROUND_SUPPORT_ACTION_TERMINAL
         if action == GROUND_SUPPORT_ACTION_TERMINAL:

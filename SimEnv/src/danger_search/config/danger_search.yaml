@@ -232,6 +232,7 @@ map:
   obstacle_min_z: 0.20
   obstacle_max_z: 1.40
   obstacle_inflation_radius: 0.25
+  negative_obstacle_inflation_radius: 0.40
   raycast_max_range: 15.0
   # 只有明确障碍命中可清到远端；地面/天花等非障碍回波只清近场。
   # P1 试点：3.0 截断导致路径两侧 >3m 的走廊口/房间口保持 UNKNOWN（seed=8127

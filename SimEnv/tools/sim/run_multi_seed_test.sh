@@ -216,6 +216,9 @@ for index in "${!SEEDS[@]}"; do
   seed_dir="$OUTPUT_ROOT/seed_${seed}"
   mkdir -p "$seed_dir"
 
+  # 清理上一轮测试遗留的选手结果与真值，避免本轮若中途失败盲拷历史残留
+  rm -f "$WORKSPACE_ROOT/results/"*.json 2>/dev/null || true
+
   printf '\n>>> [%d/%d] 开始测试 seed=%s (输出目录: %s)\n' \
     "$current_idx" "$total_seeds" "$seed" "$seed_dir"
 
