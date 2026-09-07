@@ -221,8 +221,8 @@ for index in "${!SEEDS[@]}"; do
   seed_dir="$OUTPUT_ROOT/seed_${seed}"
   mkdir -p "$seed_dir"
 
-  # 启动前建立时间戳标记，用于判断 results 是否由本轮测试生成
-  marker="$seed_dir/.seed_started_marker"
+  # 启动前建立时间戳标记于 OUTPUT_ROOT，避免污染 seed_dir 导致底层 runner 判定非空拒绝运行
+  marker="$OUTPUT_ROOT/.seed_${seed}_started_marker"
   touch "$marker"
 
   # 如果公共 results/ 中存在未归档的历史遗留文件，安全移动至 backup 目录，绝不直接删除
@@ -348,12 +348,12 @@ done
 SUMMARY_MD="$OUTPUT_ROOT/BATCH_SUMMARY.md"
 {
   printf '# 多 Seed 连续测试汇总报告\n\n'
-  printf '- **运行时间**: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
-  printf '- **测试楼层**: %s 层\n' "$FLOOR_COUNT"
-  printf '- **界面模式**: %s\n' "$([[ "$GUI" == "true" ]] && printf "GUI 开启" || printf "无头模式 (GUI 关闭)")"
-  printf '- **RGB-D 录包**: %s\n' "$([[ "$RECORD_RGBD" == "1" ]] && printf "开启" || printf "关闭")"
-  printf '- **完成进度**: %d / %d 个 Seed\n' "$completed_count" "$total_seeds"
-  printf '- **通过率**: %d / %d (%s%%)\n' \
+  printf -- '- **运行时间**: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf -- '- **测试楼层**: %s 层\n' "$FLOOR_COUNT"
+  printf -- '- **界面模式**: %s\n' "$([[ "$GUI" == "true" ]] && printf "GUI 开启" || printf "无头模式 (GUI 关闭)")"
+  printf -- '- **RGB-D 录包**: %s\n' "$([[ "$RECORD_RGBD" == "1" ]] && printf "开启" || printf "关闭")"
+  printf -- '- **完成进度**: %d / %d 个 Seed\n' "$completed_count" "$total_seeds"
+  printf -- '- **通过率**: %d / %d (%s%%)\n' \
     "$success_count" "$completed_count" \
     "$([ "$completed_count" -gt 0 ] && awk -v s="$success_count" -v c="$completed_count" 'BEGIN { printf "%.1f", (s/c)*100 }' || printf '0.0')"
   printf '\n## 明细结果\n\n'
@@ -379,7 +379,7 @@ SUMMARY_MD="$OUTPUT_ROOT/BATCH_SUMMARY.md"
     fi
   done
   printf '\n## 证据目录\n\n'
-  printf '- 根目录: `%s`\n' "$OUTPUT_ROOT"
+  printf -- '- 根目录: `%s`\n' "$OUTPUT_ROOT"
 } > "$SUMMARY_MD"
 
 printf '\n==========================================================\n'
