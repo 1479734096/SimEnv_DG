@@ -219,6 +219,10 @@ handle_signal() {
   INTERRUPTED=1
   if [[ -n "$CURRENT_CHILD_PID" ]] && kill -0 "$CURRENT_CHILD_PID" 2>/dev/null; then
     kill -TERM "$CURRENT_CHILD_PID" 2>/dev/null || true
+    local _grace_deadline=$((SECONDS + 3))
+    while kill -0 "$CURRENT_CHILD_PID" 2>/dev/null && (( SECONDS < _grace_deadline )); do
+      sleep 0.2
+    done
   fi
   sanitize_environment
 }
@@ -307,27 +311,43 @@ for index in "${!SEEDS[@]}"; do
   rm -f "$marker" 2>/dev/null || true
 
   score_str="N/A"
+  eval_status="none"
+  eval_correct=0
+  eval_truth=0
+  eval_missed=0
+  eval_false_alarms=0
+  eval_score=0.0
+
   if [[ -f "$EVALUATOR" && -f "$seed_dir/danger_truth.json" && -f "$seed_dir/detected_danger.json" ]]; then
     python3 "$EVALUATOR" \
       --truth-file "$seed_dir/danger_truth.json" \
       --detected-file "$seed_dir/detected_danger.json" \
       --output-file "$seed_dir/evaluation_result.json" \
       > "$seed_dir/evaluate_danger.log" 2>&1 || true
-    if [[ -f "$seed_dir/evaluation_result.json" ]]; then
-      score_str="$(python3 -c '
+  fi
+
+  if [[ -f "$seed_dir/evaluation_result.json" ]]; then
+    read -r eval_status eval_correct eval_truth eval_missed eval_false_alarms eval_score < <(python3 -c '
 import json, sys
 try:
     with open(sys.argv[1]) as f:
         d = json.load(f)
     m = d.get("metrics", {})
     s = d.get("scores", {})
-    correct = m.get("correct", 0)
-    truth = m.get("truth_count", 0)
-    total_score = s.get("technical_objective_total", 0.0)
-    print(f"{correct}/{truth} ({total_score:.1f}分)")
+    correct = int(m.get("correct", 0))
+    truth = int(m.get("truth_count", 0))
+    missed = int(m.get("missed", 0))
+    false_alarms = int(m.get("false_alarms", 0))
+    total_score = float(s.get("technical_objective_total", 0.0))
+    print(f"ok {correct} {truth} {missed} {false_alarms} {total_score:.1f}")
 except Exception:
-    print("解析异常")
-' "$seed_dir/evaluation_result.json" 2>/dev/null || printf 'N/A')"
+    print("error 0 0 0 0 0.0")
+' "$seed_dir/evaluation_result.json" 2>/dev/null || printf 'error 0 0 0 0 0.0')
+
+    if [[ "$eval_status" == "ok" ]]; then
+      score_str="${eval_correct}/${eval_truth} (${eval_score}分)"
+    else
+      score_str="解析异常"
     fi
   fi
   RUN_SCORES["$seed"]="$score_str"
@@ -361,15 +381,25 @@ except Exception:
   fi
 
   if (( INTERRUPTED == 1 )); then
-    summary_result="中断"
+    summary_result="⏹️ 中断"
     summary_detail="用户按 Ctrl-C 中断"
   elif (( runner_exit == 0 )); then
-    summary_result="通过"
-    success_count=$((success_count + 1))
-  else
-    if [[ -z "$summary_result" || "$summary_result" == "未完成" || "$summary_result" == "未知" ]]; then
-      summary_result="失败"
+    if [[ "$eval_status" == "ok" ]]; then
+      if (( eval_truth > 0 && eval_missed == 0 && eval_false_alarms == 0 )); then
+        summary_result="✔ 满分通过"
+        summary_detail="换层闭环成功且全部危险源识别满分"
+        success_count=$((success_count + 1))
+      else
+        summary_result="⚠️ 流程完成(识别不达标: ${eval_correct}/${eval_truth})"
+        summary_detail="流程闭环完成但危险源识别未达标(漏检: ${eval_missed}, 误报: ${eval_false_alarms}, 得分: ${eval_score}分)"
+      fi
+    else
+      summary_result="✔ 流程完成"
+      summary_detail="底层流程正常完成，但无有效评测数据"
+      success_count=$((success_count + 1))
     fi
+  else
+    summary_result="❌ 失败"
     if [[ -z "$summary_detail" || "$summary_detail" == "无详情" || "$summary_detail" == "测试未完成" ]]; then
       summary_detail="底层运行器异常退出 (exit code: ${runner_exit})"
     fi
@@ -392,7 +422,7 @@ SUMMARY_MD="$OUTPUT_ROOT/BATCH_SUMMARY.md"
   printf -- '- **界面模式**: %s\n' "$([[ "$GUI" == "true" ]] && printf "GUI 开启" || printf "无头模式 (GUI 关闭)")"
   printf -- '- **RGB-D 录包**: %s\n' "$([[ "$RECORD_RGBD" == "1" ]] && printf "开启" || printf "关闭")"
   printf -- '- **完成进度**: %d / %d 个 Seed\n' "$completed_count" "$total_seeds"
-  printf -- '- **通过率**: %d / %d (%s%%)\n' \
+  printf -- '- **满分通过率**: %d / %d (%s%%)\n' \
     "$success_count" "$completed_count" \
     "$([ "$completed_count" -gt 0 ] && awk -v s="$success_count" -v c="$completed_count" 'BEGIN { printf "%.1f", (s/c)*100 }' || printf '0.0')"
   printf '\n## 明细结果\n\n'
@@ -400,15 +430,9 @@ SUMMARY_MD="$OUTPUT_ROOT/BATCH_SUMMARY.md"
   printf '|---|---|---|---|---|---|\n'
   for seed in "${SEEDS[@]}"; do
     if [[ -n "${RUN_RESULTS[$seed]:-}" ]]; then
-      status_icon="❌ 失败"
-      if [[ "${RUN_RESULTS[$seed]}" == "通过" ]]; then
-        status_icon="✅ 通过"
-      elif [[ "${RUN_RESULTS[$seed]}" == "中断" ]]; then
-        status_icon="⏹️ 中断"
-      fi
       printf '| `%s` | %s | %s | %s | %s | %s |\n' \
         "$seed" \
-        "$status_icon" \
+        "${RUN_RESULTS[$seed]}" \
         "${RUN_DURATIONS[$seed]:-N/A}" \
         "${RUN_SCORES[$seed]:-N/A}" \
         "${RUN_DRIFTS[$seed]:-N/A}" \

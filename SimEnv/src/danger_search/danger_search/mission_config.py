@@ -145,6 +145,11 @@ class MissionConfig:
     exploration: MissionConfigSection
     return_home: MissionConfigSection
     output: MissionConfigSection
+    danger_approach_early_cutoff_enabled: bool = True
+    danger_approach_cutoff_min_dist: float = 1.10
+    danger_approach_cutoff_max_dist: float = 1.80
+    danger_approach_cutoff_min_hits: int = 2
+    danger_approach_cutoff_window: float = 0.50
 
     def install(self, target: object) -> None:
         """临时安装旧扁平消费者；职责迁移完成后删除。"""
@@ -172,6 +177,11 @@ _CONFIG_GROUP_FIELDS = {
             "danger_inspection_retry_cooldown",
             "danger_inspection_timeout",
             "danger_verification_min_observation_span",
+            "danger_approach_early_cutoff_enabled",
+            "danger_approach_cutoff_min_dist",
+            "danger_approach_cutoff_max_dist",
+            "danger_approach_cutoff_min_hits",
+            "danger_approach_cutoff_window",
         }
     ),
     "topics": frozenset(
@@ -593,6 +603,21 @@ class _MissionConfigBuilder:
         self.danger_verification_min_observation_span = float(
             _param("mission/danger_verification_min_observation_span", 0.08)
         )
+        self.danger_approach_early_cutoff_enabled = bool(
+            _param("mission/danger_approach_early_cutoff_enabled", True)
+        )
+        self.danger_approach_cutoff_min_dist = float(
+            _param("mission/danger_approach_cutoff_min_dist", 1.10)
+        )
+        self.danger_approach_cutoff_max_dist = float(
+            _param("mission/danger_approach_cutoff_max_dist", 1.80)
+        )
+        raw_danger_approach_cutoff_min_hits = _param(
+            "mission/danger_approach_cutoff_min_hits", 2
+        )
+        self.danger_approach_cutoff_window = float(
+            _param("mission/danger_approach_cutoff_window", 0.50)
+        )
         if (
             not math.isfinite(self.danger_approach_trigger_distance)
             or not math.isfinite(self.danger_approach_standoff_distance)
@@ -617,6 +642,20 @@ class _MissionConfigBuilder:
         ):
             raise ValueError("危险源接近与近场核验参数必须为有限有效值")
         self.danger_verification_min_hits = raw_danger_verification_min_hits
+        if (
+            not math.isfinite(self.danger_approach_cutoff_min_dist)
+            or self.danger_approach_cutoff_min_dist <= 0.0
+            or not math.isfinite(self.danger_approach_cutoff_max_dist)
+            or self.danger_approach_cutoff_max_dist <= 0.0
+            or self.danger_approach_cutoff_min_dist > self.danger_approach_cutoff_max_dist
+            or isinstance(raw_danger_approach_cutoff_min_hits, bool)
+            or not isinstance(raw_danger_approach_cutoff_min_hits, int)
+            or raw_danger_approach_cutoff_min_hits <= 0
+            or not math.isfinite(self.danger_approach_cutoff_window)
+            or self.danger_approach_cutoff_window <= 0.0
+        ):
+            raise ValueError("危险源接近近场截断参数必须为有限有效正数，且 min_dist <= max_dist")
+        self.danger_approach_cutoff_min_hits = raw_danger_approach_cutoff_min_hits
         raw_max_stuck_retries = _param("mission/return_home_max_stuck_retries", 4)
         raw_max_candidate_rejects = _param(
             "mission/return_home_max_candidate_rejects", 3
@@ -1591,4 +1630,12 @@ def load_mission_config(
     }
     frozen_values = MappingProxyType(dict(values))
     sections = _group_config(frozen_values)
-    return MissionConfig(values=frozen_values, **sections)
+    return MissionConfig(
+        values=frozen_values,
+        danger_approach_early_cutoff_enabled=builder.danger_approach_early_cutoff_enabled,
+        danger_approach_cutoff_min_dist=builder.danger_approach_cutoff_min_dist,
+        danger_approach_cutoff_max_dist=builder.danger_approach_cutoff_max_dist,
+        danger_approach_cutoff_min_hits=builder.danger_approach_cutoff_min_hits,
+        danger_approach_cutoff_window=builder.danger_approach_cutoff_window,
+        **sections,
+    )

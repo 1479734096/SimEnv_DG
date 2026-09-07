@@ -633,6 +633,26 @@ class DetectionTracker:
             and fresh_stamps[-1] - fresh_stamps[0] >= float(min_observation_span)
         )
 
+    def has_recent_observation(
+        self,
+        track_id: int,
+        *,
+        min_hits: int = 2,
+        window: float = 0.5,
+        now: float | None = None,
+    ) -> bool:
+        """检查指定轨迹在最近 window 时间窗口内是否至少有 min_hits 次观测命中。"""
+        timestamp = float(now if now is not None else get_time())
+        parsed_id = int(track_id)
+        track = next((item for item in self._tracks if item.track_id == parsed_id), None)
+        if track is None:
+            return False
+        recent_hits = [
+            stamp for stamp in track.hit_times
+            if stamp >= timestamp - float(window)
+        ]
+        return len(recent_hits) >= int(min_hits)
+
     def mark_inspected(
         self,
         target_xy: tuple[float, float],

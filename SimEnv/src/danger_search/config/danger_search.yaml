@@ -92,8 +92,10 @@ mission:
   startup_delay: 2.0
   # /nav/goal 不属于比赛公开接口，仅诊断工具可显式开启。
   manual_goal_enabled: false
-  # 正式总预算按公开 served_floors 数量选择；专项配置可用更短 max_runtime。
-  max_runtime: 900.0
+  # 正式总预算上限，由 effective_max_runtime() 按公开 served_floors 楼层数
+  # 与 min(max_runtime, runtime_by_floor[楼层数]) 共同裁决。设为 1360.0 可保证
+  # 1/2 层自动被 limits 截断为 520.0s/900.0s，同时 3 层场景可完整生效 1360.0s 预算。
+  max_runtime: 1360.0
   runtime_by_floor: [[1, 520.0], [2, 900.0], [3, 1360.0]]
   floor_timeout: 360.0
   # 非最后一层仍以 floor_timeout 保护后续楼层；最后一层由全局返航预算收口。
@@ -216,6 +218,12 @@ mission:
   danger_approach_trigger_distance: 2.2
   danger_approach_standoff_distance: 1.3
   danger_approach_max_anchor_error: 0.5
+  # 危险源接近近场动态提前截断：在接近途中若已进入 1.1m~1.8m 优质景深且稳定捕获，就地刹车切入对准
+  danger_approach_early_cutoff_enabled: true
+  danger_approach_cutoff_min_dist: 1.10
+  danger_approach_cutoff_max_dist: 1.80
+  danger_approach_cutoff_min_hits: 2
+  danger_approach_cutoff_window: 0.50
   danger_verification_timeout: 5.0
   danger_verification_min_hits: 2
   danger_inspection_retry_cooldown: 5.0

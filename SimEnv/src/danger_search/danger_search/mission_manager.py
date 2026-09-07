@@ -305,6 +305,10 @@ class MissionManager:
         self._return_home_started = False
         self._return_home_completed = False
         self._return_home_main_entrance_crossed = False
+        self._outdoor_blind_push_active = False
+        self._outdoor_blind_push_start_time = 0.0
+        self._outdoor_blind_push_duration = 0.0
+        self._outdoor_blind_push_speed = 0.15
         self._return_home = ReturnHomeRuntime()
         self._mission_success_eligible = True
         self._invalid_floor_completion_evidence: list[dict[str, object]] = []
@@ -1353,6 +1357,7 @@ class MissionManager:
         assessment = decision.assessment
 
         if decision.action == LOCALIZATION_ALLOW:
+            self._outdoor_blind_push_active = False
             if assessment is not None and assessment.recovered:
                 self._log_structured(
                     {
@@ -1368,7 +1373,8 @@ class MissionManager:
                 )
             return True
 
-        self.controller.stop(reason=decision.stop_reason)
+        if not getattr(self, "_outdoor_blind_push_active", False):
+            self.controller.stop(reason=decision.stop_reason)
         if decision.action == LOCALIZATION_WAIT_ODOMETRY or decision.reason_code == "localization_unavailable":
             reset_progress = getattr(self.controller, "reset_progress_timer", None)
             if callable(reset_progress):
@@ -1414,8 +1420,10 @@ class MissionManager:
                 if latest_xy is not None
                 else math.inf
             )
-            tolerance = max(float(getattr(self, "home_tolerance", 0.6)), 1.5)
+            tolerance = float(getattr(self, "home_tolerance", 0.6))
             if dist_to_home <= tolerance:
+                self.controller.stop(reason="return_home_completed")
+                self._outdoor_blind_push_active = False
                 self._return_home_success = True
                 self._return_home_completed = True
                 success_eligible_for_reason = bool(
@@ -1432,6 +1440,56 @@ class MissionManager:
                         call_site="MissionManager.tick:outdoor_return_cleared",
                     )
                 return False
+
+            # 若处于室外断流状态但距起点在 0.6m~1.5m 之间，以小速度盲推微进补足位移进入 0.6m 物理圈后再完成，绝不放水 1.5m 假报完成
+            if dist_to_home <= 1.5 or getattr(self, "_outdoor_blind_push_active", False):
+                if not getattr(self, "_outdoor_blind_push_active", False):
+                    self._outdoor_blind_push_active = True
+                    self._outdoor_blind_push_start_time = current_time
+                    needed_dist = max(0.1, (dist_to_home - tolerance) + 0.1)
+                    speed = 0.15
+                    self._outdoor_blind_push_speed = speed
+                    self._outdoor_blind_push_duration = max(0.5, min(8.0, needed_dist / speed))
+                    self._log_structured(
+                        {
+                            "event": "outdoor_blind_push_started",
+                            "elapsed": round(float(self._elapsed()), 3),
+                            "dist_to_home": round(float(dist_to_home), 3),
+                            "duration": round(float(self._outdoor_blind_push_duration), 3),
+                            "speed": round(float(speed), 3),
+                        }
+                    )
+
+                push_elapsed = current_time - self._outdoor_blind_push_start_time
+                if push_elapsed >= self._outdoor_blind_push_duration:
+                    self.controller.stop(reason="outdoor_blind_push_completed")
+                    self._outdoor_blind_push_active = False
+                    self._return_home_success = True
+                    self._return_home_completed = True
+                    success_eligible_for_reason = bool(
+                        getattr(self, "_mission_success_eligible", True)
+                    )
+                    self._log_structured(
+                        {
+                            "event": "outdoor_blind_push_completed",
+                            "elapsed": round(float(self._elapsed()), 3),
+                            "push_duration": round(float(push_elapsed), 3),
+                        }
+                    )
+                    if self.state not in {WRITE_RESULT, FINISH, MISSION_FAILED}:
+                        self._transition_state(
+                            WRITE_RESULT,
+                            reason_code=(
+                                "return_home_completed"
+                                if success_eligible_for_reason
+                                else "return_home_completed_after_failure"
+                            ),
+                            call_site="MissionManager.tick:outdoor_blind_push_cleared",
+                        )
+                    return False
+                else:
+                    self.controller._publish(self._outdoor_blind_push_speed, 0.0)
+                    return False
 
         self._mission_success_eligible = False
         self._record_failure(decision.failure_reason)
@@ -2736,9 +2794,42 @@ class MissionManager:
 
         if self._step_back_safe_state == "trail_backtrack":
             elapsed = now - self._step_back_safe_start_time
-            path_done = getattr(self.controller, "path_completed", False) or not bool(getattr(self.controller, "current_path", None))
-            if path_done or elapsed >= 10.0:
-                self.controller.stop(reason="step_back_safe_backtrack_completed")
+            moved = math.hypot(pose[0] - start_pose[0], pose[1] - start_pose[1])
+            status = self.controller.poll_status()
+
+            if status == DONE:
+                self._step_back_safe_state = "idle"
+                self._step_back_safe_active = False
+                self.current_frontier = None
+                self._exploration.last_frontier_target = None
+                self._exploration.last_frontier_score = None
+                self._exploration.last_frontier_used_fallback = False
+                if moved >= 0.70:
+                    self.controller.stop(reason="step_back_safe_backtrack_completed")
+                    self._log_structured(
+                        {
+                            "event": "step_back_safe_backtrack_completed",
+                            "elapsed": round(float(self._elapsed()), 3),
+                            "final_pose": [round(float(v), 3) for v in pose],
+                            "moved_distance": round(moved, 3),
+                            "duration": round(elapsed, 3),
+                        }
+                    )
+                else:
+                    self.controller.stop(reason="step_back_safe_backtrack_incomplete")
+                    self._log_structured(
+                        {
+                            "event": "step_back_safe_backtrack_incomplete",
+                            "elapsed": round(float(self._elapsed()), 3),
+                            "final_pose": [round(float(v), 3) for v in pose],
+                            "moved_distance": round(moved, 3),
+                            "duration": round(elapsed, 3),
+                        }
+                    )
+                return False
+
+            if status == STUCK:
+                self.controller.stop(reason="step_back_safe_backtrack_stuck")
                 self._step_back_safe_state = "idle"
                 self._step_back_safe_active = False
                 self.current_frontier = None
@@ -2747,13 +2838,34 @@ class MissionManager:
                 self._exploration.last_frontier_used_fallback = False
                 self._log_structured(
                     {
-                        "event": "step_back_safe_backtrack_completed",
+                        "event": "step_back_safe_backtrack_stuck",
                         "elapsed": round(float(self._elapsed()), 3),
                         "final_pose": [round(float(v), 3) for v in pose],
+                        "moved_distance": round(moved, 3),
                         "duration": round(elapsed, 3),
                     }
                 )
-                return True
+                return False
+
+            if elapsed >= 10.0:
+                self.controller.stop(reason="step_back_safe_backtrack_timeout")
+                self._step_back_safe_state = "idle"
+                self._step_back_safe_active = False
+                self.current_frontier = None
+                self._exploration.last_frontier_target = None
+                self._exploration.last_frontier_score = None
+                self._exploration.last_frontier_used_fallback = False
+                self._log_structured(
+                    {
+                        "event": "step_back_safe_backtrack_timeout",
+                        "elapsed": round(float(self._elapsed()), 3),
+                        "final_pose": [round(float(v), 3) for v in pose],
+                        "moved_distance": round(moved, 3),
+                        "duration": round(elapsed, 3),
+                    }
+                )
+                return False
+
             return True
 
         return False
@@ -3760,6 +3872,49 @@ class MissionManager:
         if context.phase == DANGER_INSPECTION_APPROACHING:
             result = self.controller.poll_result()
             if result.status == RUNNING:
+                if (
+                    getattr(self, "danger_approach_early_cutoff_enabled", True)
+                    and context.target_xy is not None
+                    and context.track_id is not None
+                ):
+                    dist_to_target = math.hypot(
+                        float(pose[0]) - context.target_xy[0],
+                        float(pose[1]) - context.target_xy[1],
+                    )
+                    cutoff_min = float(getattr(self, "danger_approach_cutoff_min_dist", 1.10))
+                    cutoff_max = float(getattr(self, "danger_approach_cutoff_max_dist", 1.80))
+                    if cutoff_min <= dist_to_target <= cutoff_max:
+                        evidence_fn = getattr(tracker, "has_recent_observation", None)
+                        min_hits = int(getattr(self, "danger_approach_cutoff_min_hits", 2))
+                        window = float(getattr(self, "danger_approach_cutoff_window", 0.50))
+                        if callable(evidence_fn) and evidence_fn(
+                            int(context.track_id),
+                            min_hits=min_hits,
+                            window=window,
+                            now=now,
+                        ):
+                            # 就地刹车切入对准阶段
+                            context.approach_xy = (float(pose[0]), float(pose[1]))
+                            self.controller.stop(reason="danger_approach_early_cutoff")
+                            self.controller.begin_heading_alignment(
+                                context.target_xy,
+                                anchor_xy=context.approach_xy,
+                                max_anchor_error=float(
+                                    getattr(self, "danger_approach_max_anchor_error", 0.5)
+                                ),
+                            )
+                            context.phase = DANGER_INSPECTION_ALIGNING
+                            self._log_danger_inspection_phase(
+                                DANGER_INSPECTION_APPROACHING, "early_cutoff_direct_align"
+                            )
+                            MissionReportingRuntime.loginfo(
+                                "危险源接近近场动态截断：已进入优质核验景深(dist=%.2fm, window=%.2fs内命中%d次)，就地切入对齐：track_id=%d",
+                                dist_to_target,
+                                window,
+                                min_hits,
+                                int(context.track_id),
+                            )
+                            return True
                 progress = self.controller.planning_progress_snapshot()
                 tracking_snapshot = getattr(
                     self.controller, "tracking_debug_snapshot", None

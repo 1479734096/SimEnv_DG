@@ -153,9 +153,48 @@ record_mission_node_pids() {
 }
 
 write_summary() {
+  local code="${1:-${exit_code:-0}}"
+  local score_str="N/A"
+  if [[ -f "$LOG_DIR/evaluation_result.json" ]]; then
+    score_str="$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    m = d.get("metrics", {})
+    s = d.get("scores", {})
+    correct = m.get("correct", 0)
+    truth = m.get("truth_count", 0)
+    score = s.get("technical_objective_total", 0.0)
+    print(f"{correct}/{truth} ({score:.1f}分)")
+except Exception:
+    print("N/A")
+' "$LOG_DIR/evaluation_result.json" 2>/dev/null || printf 'N/A')"
+  fi
+  local drift_str="N/A"
+  if [[ -f "$LOG_DIR/localization_drift.json" ]]; then
+    drift_str="$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    max_pos = d.get("maximum_position_error")
+    final_pos = d.get("final_position_error")
+    if max_pos is not None:
+        print(f"最大{max_pos:.2f}m / 最终{final_pos:.2f}m")
+    else:
+        print("未计算")
+except Exception:
+    print("N/A")
+' "$LOG_DIR/localization_drift.json" 2>/dev/null || printf 'N/A')"
+  fi
+
   {
     printf 'result=%s\n' "$RESULT"
     printf 'detail=%s\n' "$DETAIL"
+    printf 'exit_code=%s\n' "$code"
+    printf 'danger_score=%s\n' "$score_str"
+    printf 'drift_metric=%s\n' "$drift_str"
     printf 'seed=%s\n' "$SEED"
     printf 'floor_count=%s\n' "$ELEVATOR_TEST_FLOOR_COUNT"
     printf 'floor_timeout=%s\n' "$ELEVATOR_TEST_FLOOR_TIMEOUT"
@@ -228,6 +267,9 @@ cleanup() {
   trap - EXIT
   set +e
 
+  # 入口处立即写出基础 TEST_SUMMARY.txt（包含 exit code 与基础结果），杜绝后续分析卡死导致摘要丢失
+  write_summary "$exit_code"
+
   terminate_node_list "$MISSION_NODE_PIDS" INT
   terminate_group "$MISSION_PID" INT
   terminate_group "$BAG_PID" INT
@@ -299,7 +341,15 @@ cleanup() {
   if [[ -f "$WORKSPACE_ROOT/results/detected_danger.json" ]]; then
     cp -f "$WORKSPACE_ROOT/results/detected_danger.json" "$LOG_DIR/detected_danger.json" 2>/dev/null || true
   fi
-  write_summary
+  if [[ -f "$WORKSPACE_ROOT/src/building_obstacles/scripts/evaluate_danger.py" && \
+        -f "$LOG_DIR/danger_truth.json" && -f "$LOG_DIR/detected_danger.json" ]]; then
+    python3 "$WORKSPACE_ROOT/src/building_obstacles/scripts/evaluate_danger.py" \
+      --truth-file "$LOG_DIR/danger_truth.json" \
+      --detected-file "$LOG_DIR/detected_danger.json" \
+      --output-file "$LOG_DIR/evaluation_result.json" \
+      > "$LOG_DIR/evaluate_danger.log" 2>&1 || true
+  fi
+  write_summary "$exit_code"
   log "$RESULT：$DETAIL"
   log "证据目录：$LOG_DIR"
   exit "$exit_code"
@@ -504,6 +554,8 @@ setsid bash -c 'exec 3<>"$1"; sleep 1000000' _ "$FIFO" \
   > "$LOG_DIR/fifo_keeper.log" 2>&1 &
 KEEPER_PID=$!
 
+killall -9 rosmaster roscore 2>/dev/null || true
+
 setsid env \
   SEED="$SEED" \
   FLOOR_COUNT="$ELEVATOR_TEST_FLOOR_COUNT" \
@@ -621,8 +673,23 @@ if [[ "$ELEVATOR_TEST_RECORD_RGBD" == "1" ]]; then
   log "已启动有界全任务 RGB-D 录包：${ELEVATOR_TEST_RGBD_MAX_SIZE_MB} MB / ${ELEVATOR_TEST_RGBD_MAX_WALL_SECONDS} 墙钟秒"
 fi
 
-sleep 2
-rosnode info /danger_search > "$LOG_DIR/danger_search_node_info.txt" 2>&1 || true
+# 做实生产订阅审计：轮询等待最多 8 秒（每 0.5s 一次），直至节点成功就绪并暴露具体 topic
+log "正在执行生产节点订阅审计（等待 /danger_search 就绪并暴露订阅）……"
+node_ready=0
+for _audit_try in {1..16}; do
+  if rosnode info /danger_search > "$LOG_DIR/danger_search_node_info.txt" 2>&1; then
+    if awk '/Subscriptions:/{flag=1;next}/(Services:|Publications:|$)/{if (flag && /^[A-Za-z]/) flag=0} flag && /^\s*\*\s*\// {found=1} END{exit !found}' "$LOG_DIR/danger_search_node_info.txt"; then
+      node_ready=1
+      break
+    fi
+  fi
+  sleep 0.5
+done
+if (( node_ready == 0 )); then
+  fail "生产任务节点 /danger_search 未能在规定时间内（8秒）就绪或无订阅，审计失败" 2
+  exit $?
+fi
+
 rosnode info /scan_localization > "$LOG_DIR/scan_localization_node_info.txt" 2>&1 || true
 {
   cat "$LOG_DIR/danger_search_node_info.txt"
