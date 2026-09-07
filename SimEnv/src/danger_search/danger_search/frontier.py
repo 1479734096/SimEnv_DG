@@ -195,6 +195,7 @@ class FrontierExplorer:
         max_goal_candidates_per_frontier: int = 2,
         max_fallback_planning_candidates: int = 8,
         goal_tolerance: float = 0.35,
+        min_displacement: float = 0.0,
         min_far_expected_gain: float = 0.0,
         far_prune_distance: float = 0.0,
     ):
@@ -219,6 +220,7 @@ class FrontierExplorer:
         self.max_goal_candidates_per_frontier = int(max_goal_candidates_per_frontier)
         self.max_fallback_planning_candidates = int(max_fallback_planning_candidates)
         self.goal_tolerance = float(goal_tolerance)
+        self.min_displacement = float(min_displacement)
         self.min_far_expected_gain = float(min_far_expected_gain)
         self.far_prune_distance = float(far_prune_distance)
         finite_nonnegative = (
@@ -236,6 +238,7 @@ class FrontierExplorer:
             self.door_front_half_plane_penalty,
             self.door_front_half_plane_radius,
             self.door_preferred_direction_bonus,
+            self.min_displacement,
             self.min_far_expected_gain,
             self.far_prune_distance,
         )
@@ -250,6 +253,8 @@ class FrontierExplorer:
             or self.expected_gain_radius <= 0.0
             or not math.isfinite(self.goal_tolerance)
             or self.goal_tolerance <= 0.0
+            or not math.isfinite(self.min_displacement)
+            or self.min_displacement < 0.0
             or not all(
                 math.isfinite(value) and value >= 0.0
                 for value in finite_nonnegative
@@ -270,6 +275,11 @@ class FrontierExplorer:
             tuple[Frontier, tuple[float, float]], float
         ] = {}
         self._structured_logging_enabled = True
+
+    @property
+    def min_target_distance(self) -> float:
+        """选点有效最小距离：到达容差加最小位移门限，避免选出微小位移死循环目标。"""
+        return self.goal_tolerance + self.min_displacement
 
     def planning_copy(self) -> "FrontierExplorer":
         """创建仅供后台规划使用的独立副本。
@@ -299,6 +309,7 @@ class FrontierExplorer:
             max_goal_candidates_per_frontier=self.max_goal_candidates_per_frontier,
             max_fallback_planning_candidates=self.max_fallback_planning_candidates,
             goal_tolerance=self.goal_tolerance,
+            min_displacement=self.min_displacement,
             min_far_expected_gain=self.min_far_expected_gain,
             far_prune_distance=self.far_prune_distance,
         )
@@ -1039,7 +1050,7 @@ class FrontierExplorer:
             if (
                 self._is_blacklisted(grid, target)
                 or skip_target
-                or target_dist <= self.goal_tolerance
+                or target_dist <= self.min_target_distance
             ):
                 continue
             gain = self._expected_unknown_gain(grid, frontier, target)
@@ -1645,7 +1656,7 @@ class FrontierExplorer:
             if skip_target:
                 saw_context_skip = True
                 continue
-            if _world_distance(target_xy, robot_xy) <= self.goal_tolerance:
+            if _world_distance(target_xy, robot_xy) <= self.min_target_distance:
                 saw_inside_tolerance = True
                 continue
             gain = (

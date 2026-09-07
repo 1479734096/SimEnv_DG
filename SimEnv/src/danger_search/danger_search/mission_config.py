@@ -1061,6 +1061,9 @@ class _MissionConfigBuilder:
                 _param("frontier/max_fallback_planning_candidates", 8)
             ),
             "goal_tolerance": float(_param("controller/goal_tolerance", 0.35)),
+            "min_displacement": float(
+                _param("mission/progress_monitor_min_displacement", 0.20)
+            ),
             "min_far_expected_gain": float(
                 _param("frontier/min_far_expected_gain", 16.0)
             ),

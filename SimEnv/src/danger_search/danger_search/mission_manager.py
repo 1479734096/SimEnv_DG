@@ -4327,28 +4327,38 @@ class MissionManager:
                     planning_constraints=self._planning_constraints(),
                 )
 
-            # ProgressMonitor 仅作诊断：记录选择历史并检测退化循环，
-            # 但不执行 filter_frontiers、start_cooldown、clear_path 或主动重选。
-            # 过近落点已在 FrontierExplorer 源头通过 inside_goal_tolerance 过滤。
+            # ProgressMonitor 诊断与退化自愈：记录选择历史并检测退化循环。
+            # 若触发退化循环，立即启动短时冷却并将该前沿区域加入黑名单，打破死循环。
             if frontier is not None and path and progress_monitor is not None:
                 progress_monitor.record_selection(now, frontier.centroid)
                 is_degenerate, repeat_count, displacement, reason_code = (
                     progress_monitor.check_degenerate(now, frontier.centroid)
                 )
-                if is_degenerate and progress_monitor.should_log(now, interval=5.0):
-                    MissionReportingRuntime.logwarn(
-                        "检测到退化 frontier 循环：target=(%.2f, %.2f) "
-                        "repeat=%d displacement=%.3f reason=%s",
-                        frontier.centroid[0],
-                        frontier.centroid[1],
-                        repeat_count,
-                        displacement,
-                        reason_code,
+                if is_degenerate:
+                    progress_monitor.start_cooldown(
+                        now,
+                        frontier.centroid,
+                        reason_code or "degenerate_goal_reached_loop",
                     )
+                    self.explorer.blacklist_region(
+                        grid,
+                        frontier.centroid,
+                        radius=progress_monitor.region_radius,
+                    )
+                    if progress_monitor.should_log(now, interval=5.0):
+                        MissionReportingRuntime.logwarn(
+                            "检测到退化 frontier 循环，触发冷却拉黑：target=(%.2f, %.2f) "
+                            "repeat=%d displacement=%.3f reason=%s",
+                            frontier.centroid[0],
+                            frontier.centroid[1],
+                            repeat_count,
+                            displacement,
+                            reason_code,
+                        )
                     diagnostic = self._mission_diagnostic_snapshot()
                     diagnostic.update({
                         "event": "mission_progress_monitor",
-                        "action": "diagnostic_only",
+                        "action": "cooldown_blacklist",
                         "reason_code": reason_code,
                         "target": list(frontier.centroid),
                         "repeat_count": int(repeat_count),

@@ -766,8 +766,9 @@ class OpenDoorAndPass(NavigationTask):
     ) -> tuple[float, float]:
         """计算主入口中轴线上不向后倒退的前向站位目标。
 
-        当门已敞开且机器人在门前准备区时，严禁向机器人身后旧等待点倒退或大角度掉头；
-        站位点取中轴线上与机器人当前位置平齐且略微前倾的点，确保控制器以正向弧线推进。
+        当门已敞开且机器人在门前准备区时，严禁向机器人身后倒退或大角度掉头；
+        站位点取中轴线上在机器人当前位置前方的引导点，确保控制器以正向浅角推进。
+        若机器人已十分接近门框，直接以门内通过点为目标顺势穿门。
         """
         if self._wait_point is None or self._pass_point is None:
             return self._wait_point if self._wait_point is not None else (pose[0], pose[1])
@@ -780,12 +781,19 @@ class OpenDoorAndPass(NavigationTask):
         uy = axis_y / axis_norm
         # 机器人在门中轴线方向上的纵向投影进度（以 _wait_point 为原点）
         proj = (pose[0] - self._wait_point[0]) * ux + (pose[1] - self._wait_point[1]) * uy
-        # 限制纵向深度：不落后于当前位置，且在门前保留至少 0.8m 净空（门面位于 self.wait_offset 处）
-        max_forward = max(0.0, float(self.wait_offset) - 0.8)
-        safe_proj = max(0.0, min(proj + 0.15, max_forward))
+        door_plane_proj = float(self.wait_offset)
+
+        # 若机器人已接近门槛（距门面小于 0.4m），直接引导至门内通过点顺势穿门
+        if proj >= door_plane_proj - 0.4:
+            return self._pass_point
+
+        # 否则，站位目标始终严格取在当前进度前方 0.35m 的前视点，最远不超过门前面 0.2m
+        # 绝不向后截断，确保目标永远在当前位置正前方
+        target_proj = max(0.0, proj + 0.35)
+        target_proj = min(target_proj, door_plane_proj - 0.2)
         return (
-            self._wait_point[0] + safe_proj * ux,
-            self._wait_point[1] + safe_proj * uy,
+            self._wait_point[0] + target_proj * ux,
+            self._wait_point[1] + target_proj * uy,
         )
 
     def _start_main_entrance_centering(self) -> None:
