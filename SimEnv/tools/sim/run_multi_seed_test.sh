@@ -178,14 +178,19 @@ mkdir -p "$OUTPUT_ROOT"
 
 CURRENT_CHILD_PID=""
 INTERRUPTED=0
+cleanup_all_processes() {
+  killall -9 gzserver gzclient rosmaster roscore junior_ctrl danger_search 2>/dev/null || true
+}
 handle_signal() {
   printf '\n[多Seed测试] 收到中断信号，正在安全终止当前轮次……\n'
   INTERRUPTED=1
   if [[ -n "$CURRENT_CHILD_PID" ]] && kill -0 "$CURRENT_CHILD_PID" 2>/dev/null; then
     kill -TERM "$CURRENT_CHILD_PID" 2>/dev/null || true
   fi
+  cleanup_all_processes
 }
 trap handle_signal INT TERM
+trap cleanup_all_processes EXIT
 
 printf '==========================================================\n'
 printf '[多Seed测试] 启动批量仿真测试\n'
@@ -216,8 +221,16 @@ for index in "${!SEEDS[@]}"; do
   seed_dir="$OUTPUT_ROOT/seed_${seed}"
   mkdir -p "$seed_dir"
 
-  # 清理上一轮测试遗留的选手结果与真值，避免本轮若中途失败盲拷历史残留
-  rm -f "$WORKSPACE_ROOT/results/"*.json 2>/dev/null || true
+  # 启动前建立时间戳标记，用于判断 results 是否由本轮测试生成
+  marker="$seed_dir/.seed_started_marker"
+  touch "$marker"
+
+  # 如果公共 results/ 中存在未归档的历史遗留文件，安全移动至 backup 目录，绝不直接删除
+  if compgen -G "$WORKSPACE_ROOT/results/*.json" >/dev/null; then
+    legacy_backup="$OUTPUT_ROOT/legacy_results_backup"
+    mkdir -p "$legacy_backup"
+    mv -f "$WORKSPACE_ROOT/results/"*.json "$legacy_backup/" 2>/dev/null || true
+  fi
 
   printf '\n>>> [%d/%d] 开始测试 seed=%s (输出目录: %s)\n' \
     "$current_idx" "$total_seeds" "$seed" "$seed_dir"
@@ -240,17 +253,22 @@ for index in "${!SEEDS[@]}"; do
   runner_exit=$?
   CURRENT_CHILD_PID=""
   set -e
+  cleanup_all_processes
 
   elapsed_wall=$((SECONDS - start_wall))
   RUN_DURATIONS["$seed"]="${elapsed_wall}s"
 
-  # 归档可能生成的选手结果文件与裁判真值并评分
+  # 将本轮生成的选手结果文件与裁判真值完整移动归档保存至当前 seed 目录
   if [[ -f "$WORKSPACE_ROOT/results/danger_truth.json" ]]; then
-    cp -f "$WORKSPACE_ROOT/results/danger_truth.json" "$seed_dir/danger_truth.json" 2>/dev/null || true
+    mv -f "$WORKSPACE_ROOT/results/danger_truth.json" "$seed_dir/danger_truth.json" 2>/dev/null || true
   fi
-  if [[ -f "$WORKSPACE_ROOT/results/detected_danger.json" ]]; then
-    cp -f "$WORKSPACE_ROOT/results/detected_danger.json" "$seed_dir/detected_danger.json" 2>/dev/null || true
+  if [[ -f "$WORKSPACE_ROOT/results/detected_danger.json" && ( ! -f "$marker" || "$WORKSPACE_ROOT/results/detected_danger.json" -nt "$marker" ) ]]; then
+    mv -f "$WORKSPACE_ROOT/results/detected_danger.json" "$seed_dir/detected_danger.json" 2>/dev/null || true
   fi
+  if compgen -G "$WORKSPACE_ROOT/results/*.json" >/dev/null; then
+    mv -f "$WORKSPACE_ROOT/results/"*.json "$seed_dir/" 2>/dev/null || true
+  fi
+  rm -f "$marker" 2>/dev/null || true
 
   score_str="N/A"
   if [[ -f "$EVALUATOR" && -f "$seed_dir/danger_truth.json" && -f "$seed_dir/detected_danger.json" ]]; then

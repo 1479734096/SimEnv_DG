@@ -302,6 +302,15 @@ cleanup() {
   if [[ -n "$RUNTIME_DIR" && -d "$RUNTIME_DIR" ]]; then
     rm -rf -- "$RUNTIME_DIR"
   fi
+  # 将本次运行生成的检测结果与裁判真值安全保存至本次证据目录 LOG_DIR
+  if [[ -f "$WORKSPACE_ROOT/results/danger_truth.json" ]]; then
+    cp -f "$WORKSPACE_ROOT/results/danger_truth.json" "$LOG_DIR/danger_truth.json" 2>/dev/null || true
+  fi
+  if [[ -f "$WORKSPACE_ROOT/results/detected_danger.json" ]]; then
+    cp -f "$WORKSPACE_ROOT/results/detected_danger.json" "$LOG_DIR/detected_danger.json" 2>/dev/null || true
+  fi
+  # 无论成功还是失败，结束后都彻底清理所有仿真和 ROS 进程残留
+  killall -9 gzserver gzclient rosmaster roscore junior_ctrl danger_search 2>/dev/null || true
   write_summary
   log "$RESULT：$DETAIL"
   log "证据目录：$LOG_DIR"
