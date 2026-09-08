@@ -93,10 +93,10 @@ mission:
   # /nav/goal 不属于比赛公开接口，仅诊断工具可显式开启。
   manual_goal_enabled: false
   # 正式总预算上限，由 effective_max_runtime() 按公开 served_floors 楼层数
-  # 与 min(max_runtime, runtime_by_floor[楼层数]) 共同裁决。设为 1360.0 可保证
-  # 1/2 层自动被 limits 截断为 520.0s/900.0s，同时 3 层场景可完整生效 1360.0s 预算。
-  max_runtime: 1360.0
-  runtime_by_floor: [[1, 520.0], [2, 900.0], [3, 1360.0]]
+  # 与 min(max_runtime, runtime_by_floor[楼层数]) 共同裁决。设为 1440.0 可保证
+  # 1/2 层自动被 limits 截断为 520.0s/1000.0s，同时 3 层场景可完整生效 1440.0s 预算。
+  max_runtime: 1440.0
+  runtime_by_floor: [[1, 520.0], [2, 1000.0], [3, 1440.0]]
   floor_timeout: 360.0
   # 非最后一层仍以 floor_timeout 保护后续楼层；最后一层由全局返航预算收口。
   # 设为 false 可立即恢复“所有楼层到时即结束”的旧语义。
