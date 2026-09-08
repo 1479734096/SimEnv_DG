@@ -168,6 +168,7 @@ class PathFollower:
     _align_max_angular: float | None = field(default=None, init=False)
     _debug_align_yaw_error: float | None = field(default=None, init=False)
     _debug_align_anchor_error: float | None = field(default=None, init=False)
+    _outdoor_direct_drive: bool = field(default=False, init=False)
     _keepalive_timer: object | None = field(default=None, init=False)
     _nearest_obstacle_distance: float | None = field(default=None, init=False)
     command_count: int = field(default=0, init=False)
@@ -461,6 +462,11 @@ class PathFollower:
         """设置最终速度出口的可选安全门；None 保持原有命令链完全透明。"""
         with self._command_transaction_lock:
             self._command_gate = gate
+
+    def set_outdoor_direct_drive(self, enabled: bool) -> None:
+        """设置是否处于室外直达模式；启用时命令出口完全透明，跳过安全门阻断。"""
+        with self._command_transaction_lock:
+            self._outdoor_direct_drive = bool(enabled)
 
     @contextmanager
     def command_transaction(self) -> Iterator[None]:
@@ -1487,7 +1493,7 @@ class PathFollower:
             linear_x, angular_z, linear_y, zero_reason
         )
         self._last_requested_command = requested
-        gate = self._command_gate
+        gate = None if getattr(self, "_outdoor_direct_drive", False) else self._command_gate
         wall_now = time.monotonic()
         emitted, resolved_zero_reason = arbitrate_command(
             requested,

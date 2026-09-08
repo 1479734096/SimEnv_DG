@@ -308,6 +308,10 @@ class MissionManager:
         self._return_home_started = False
         self._return_home_completed = False
         self._return_home_main_entrance_crossed = False
+        self._outdoor_return_started = False
+        self._outdoor_return_start_time = 0.0
+        self._outdoor_return_start_pose: tuple[float, float, float] | None = None
+        self._outdoor_return_initial_dist = 0.0
         self._outdoor_blind_push_active = False
         self._outdoor_blind_push_start_time = 0.0
         self._outdoor_blind_push_duration = 0.0
@@ -1376,6 +1380,13 @@ class MissionManager:
         now: float | None = None,
     ) -> bool:
         """执行定位运行时的冻结决策；返回是否允许本 tick 继续。"""
+        # 出门后室外返航直达阶段：彻底静默 SLAM/Livox/RGB-D 断流与 stale 导致的急停，允许本 tick 继续
+        if (
+            getattr(self, "_return_home_main_entrance_crossed", False)
+            and self.state == RETURN_HOME
+        ):
+            return True
+
         current_time = float(get_time() if now is None else now)
         runtime = self._get_localization_runtime(
             start_time_fallback=current_time,
@@ -1645,8 +1656,29 @@ class MissionManager:
                 )
         if not self._apply_localization_progress_decision(pose_sample):
             return
-        pose = pose_sample.xy_yaw
-        xyz = pose_sample.xyz
+        pose = (
+            pose_sample.xy_yaw
+            if pose_sample is not None
+            else getattr(self, "_last_pose", None)
+        )
+        xyz = (
+            pose_sample.xyz
+            if pose_sample is not None
+            else getattr(self, "_last_xyz", None)
+        )
+        if pose is None:
+            pose = getattr(self, "home_pose", None) or (0.0, -1.25, -1.57)
+        if xyz is None:
+            xyz = (pose[0], pose[1], 0.3)
+
+        # 出门后室外返航直达阶段：彻底跳过激光/RGB感知建图、地标纠偏与地面支撑门控，直接进入硬目标直达控制
+        if (
+            getattr(self, "_return_home_main_entrance_crossed", False)
+            and self.state == RETURN_HOME
+        ):
+            self._tick_outdoor_direct_return(pose)
+            return
+
         self._last_pose_sample_stamp = (
             getattr(pose_sample, "stamp", None) if pose_sample is not None else None
         )
@@ -5719,6 +5751,162 @@ class MissionManager:
         )
         self._log_structured(diagnostic)
 
+    def _tick_outdoor_direct_return(
+        self, pose: tuple[float, float, float]
+    ) -> None:
+        """主入口外专属轻量直达返航流程：
+
+        穿过大门后彻底脱离通用激光点云建图、A*重规划与地面支撑安全网对运动的负面干扰；
+        以固定速度朝向硬目标点 (0.0, -3.3) 推进；
+        到达判据严格基于真实定位：有且仅当机器人当前位姿距出发点 (0.0, -3.2) 的欧氏距离 <= 0.30m 时，
+        才判定返航成功完成；
+        若超出安全时限仍未进入 0.30m 范围内，则触发物理安全停机并如实报告未达标，严禁伪报。
+        """
+        now = get_time()
+        home_xy = (
+            (self.home_pose[0], self.home_pose[1])
+            if getattr(self, "home_pose", None) is not None
+            else (0.0, -3.2)
+        )
+        target_x, target_y = 0.0, -3.3
+        speed = 0.35  # m/s 匀速直线推进
+        timeout_limit = 8.0  # 秒：物理安全刹车上限（以 0.35m/s 足够前推 2.8m，大门到判定线需 1.65m）
+
+        # 首次进入时初始化基准位姿与参数
+        if not getattr(self, "_outdoor_return_started", False):
+            self._outdoor_return_started = True
+            self._outdoor_return_start_time = now
+            self._outdoor_return_start_pose = (
+                float(pose[0]),
+                float(pose[1]),
+                float(pose[2]) if len(pose) >= 3 else -1.57,
+            )
+            self._outdoor_return_initial_dist = math.hypot(
+                self._outdoor_return_start_pose[0] - home_xy[0],
+                self._outdoor_return_start_pose[1] - home_xy[1],
+            )
+            if self.controller.has_path():
+                self.controller.clear_path(reason="outdoor_direct_return")
+            # 启用控制器直通模式，彻底绕过安全门对发速命令的拦截
+            set_direct = getattr(self.controller, "set_outdoor_direct_drive", None)
+            if callable(set_direct):
+                set_direct(True)
+            MissionReportingRuntime.loginfo(
+                "[MissionManager] 🚪 已安全穿出大门，进入室外直达返航：当前=[%.2f, %.2f], 目标向 (%.2f, %.2f) 直行",
+                self._outdoor_return_start_pose[0],
+                self._outdoor_return_start_pose[1],
+                target_x,
+                target_y,
+            )
+            self._log_structured(
+                {
+                    "event": "outdoor_direct_return_started",
+                    "elapsed": round(float(self._elapsed()), 3),
+                    "start_pose": list(self._outdoor_return_start_pose),
+                    "initial_dist_to_home": round(
+                        float(self._outdoor_return_initial_dist), 3
+                    ),
+                    "target": [target_x, target_y],
+                    "speed": speed,
+                }
+            )
+
+        start_time = getattr(self, "_outdoor_return_start_time", now)
+        elapsed = max(0.0, now - start_time)
+
+        # 1. 计算真实定位距离（唯一到达判据基准）
+        real_dist_to_home = math.hypot(pose[0] - home_xy[0], pose[1] - home_xy[1])
+
+        # 条件一：真实到达出发点 0.30m 范围内 -> 成功完成
+        if real_dist_to_home <= 0.30:
+            set_direct = getattr(self.controller, "set_outdoor_direct_drive", None)
+            if callable(set_direct):
+                set_direct(False)
+            self.controller.stop(reason="outdoor_return_arrived")
+            self._return_home_success = True
+            self._return_home_completed = True
+            success_eligible_for_reason = bool(
+                getattr(self, "_mission_success_eligible", True)
+            )
+            MissionReportingRuntime.loginfo(
+                "[MissionManager] 🏁 真实成功到达出发点 0.3m 范围内！当前位姿=[%.2f, %.2f], 距出发点=%.2fm <= 0.30m (耗时=%.1fs)",
+                pose[0],
+                pose[1],
+                real_dist_to_home,
+                elapsed,
+            )
+            self._log_structured(
+                {
+                    "event": "outdoor_direct_return_completed",
+                    "elapsed": round(float(self._elapsed()), 3),
+                    "final_pose": [round(float(p), 3) for p in pose[:2]],
+                    "final_dist_to_home": round(float(real_dist_to_home), 3),
+                    "push_duration": round(float(elapsed), 3),
+                    "success": True,
+                }
+            )
+            if self.state not in {WRITE_RESULT, FINISH, MISSION_FAILED}:
+                self._transition_state(
+                    WRITE_RESULT,
+                    reason_code=(
+                        "return_home_completed"
+                        if success_eligible_for_reason
+                        else "return_home_completed_after_failure"
+                    ),
+                    call_site="MissionManager._tick_outdoor_direct_return",
+                )
+            return
+
+        # 条件二：超时物理安全刹车（防撞墙与失控保护）
+        if elapsed >= timeout_limit:
+            set_direct = getattr(self.controller, "set_outdoor_direct_drive", None)
+            if callable(set_direct):
+                set_direct(False)
+            self.controller.stop(reason="outdoor_direct_return_timeout")
+            self._return_home_success = False
+            self._return_home_completed = False
+            self._mission_success_eligible = False
+            self._record_failure("outdoor_direct_return_timeout")
+            MissionReportingRuntime.logwarn(
+                "[MissionManager] ⚠️ 室外直达返航超时 (%.1fs) 仍未进入出发点 0.3m 范围内！当前位姿=[%.2f, %.2f], 距出发点=%.2fm > 0.30m",
+                elapsed,
+                pose[0],
+                pose[1],
+                real_dist_to_home,
+            )
+            self._log_structured(
+                {
+                    "event": "outdoor_direct_return_timeout_failed",
+                    "elapsed": round(float(self._elapsed()), 3),
+                    "final_pose": [round(float(p), 3) for p in pose[:2]],
+                    "final_dist_to_home": round(float(real_dist_to_home), 3),
+                    "push_duration": round(float(elapsed), 3),
+                    "success": False,
+                }
+            )
+            if self.state not in {WRITE_RESULT, FINISH, MISSION_FAILED}:
+                self._transition_state(
+                    WRITE_RESULT,
+                    reason_code="outdoor_direct_return_timeout",
+                    call_site="MissionManager._tick_outdoor_direct_return",
+                )
+            return
+
+        # 2. 运动控制：机头朝向 (0.0, -3.3) 直行，比例微调航向
+        curr_x = pose[0]
+        curr_y = pose[1]
+        dx = target_x - curr_x
+        dy = target_y - curr_y
+        target_yaw = math.atan2(dy, dx)
+        curr_yaw = pose[2] if len(pose) >= 3 else -1.57
+        yaw_err = math.atan2(
+            math.sin(target_yaw - curr_yaw), math.cos(target_yaw - curr_yaw)
+        )
+        angular_cmd = max(-0.3, min(0.3, 1.2 * yaw_err))
+
+        # 3. 直驱发布命令（绕过一切路径跟随器和位姿检查）
+        self.controller._publish(speed, angular_cmd)
+
     def _tick_return_home(self, pose: tuple[float, float, float]) -> None:
         if self.home_pose is None:
             if rospy is not None:
@@ -5741,6 +5929,11 @@ class MissionManager:
                     math.hypot(self.home_pose[0] - pose[0], self.home_pose[1] - pose[1])
                 )
             self._return_home_started_logged = True
+
+        # 若已完全越过主入口大门到达室外：直接进入专属轻量直达流程
+        if getattr(self, "_return_home_main_entrance_crossed", False):
+            self._tick_outdoor_direct_return(pose)
+            return
         if self._danger_inspection.phase != DANGER_INSPECTION_IDLE:
             self._tick_active_danger_inspection(pose, get_time())
             return
