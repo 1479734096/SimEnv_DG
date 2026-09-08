@@ -1077,6 +1077,13 @@ class TakeElevator(NavigationTask):
     _CABIN_TRANSIT_ALIGN_CONFIRMATIONS = 2
     _CABIN_TRANSIT_POSITION_ACCEPTANCE = 0.25
     _CABIN_TRANSIT_CENTERLINE_TOLERANCE = 0.25
+    # 中心线横向偏差滞回：进入站位收紧至 0.20m，提交跨越与漂移判定保留 0.25m 外边界，
+    # 构建 0.05m 施密特滞回区间，防止在 0.25m 临界点反复翻转。
+    _CABIN_TRANSIT_CENTERLINE_ENTRY_TOLERANCE = 0.20
+    # ALIGN 锚点漂移保护滞回裕度：站位进入需 <= acceptance(0.25m)，对准旋转期间
+    # 允许在 acceptance + margin(0.35m) 范围内微晃自转，构建 0.10m 施密特滞回区间，
+    # 彻底杜绝 0.25m 临界点反复翻转耗尽 4 次重试配额。
+    _CABIN_TRANSIT_ALIGN_DRIFT_MARGIN = 0.10
     _CABIN_TRANSIT_PREPARE_TIMEOUT = 30.0
     # POSITION/ALIGN 翻转次数上限：栅格量化终点与精确 cabin center 的完成语义
     # 不一致时会出现每 tick 翻转的零速死循环；acceptance 已对齐二者，这里仅作
@@ -1119,6 +1126,7 @@ class TakeElevator(NavigationTask):
         self.cabin_transit_stage: str | None = None
         self._cabin_transit_mode: str | None = None
         self._cabin_transit_alignment_count = 0
+        self._cabin_transit_alignment_done = False
         self._cabin_transit_position_align_flips = 0
         self._cabin_transit_start_xy: tuple[float, float] | None = None
         self._cabin_transit_target_xy: tuple[float, float] | None = None
@@ -2212,7 +2220,8 @@ class TakeElevator(NavigationTask):
             pose,
             position_xy,
             target_xy,
-            self._cabin_transit_position_acceptance(context),
+            self._cabin_transit_position_acceptance(context)
+            + self._CABIN_TRANSIT_ALIGN_DRIFT_MARGIN,
             self._CABIN_TRANSIT_CENTERLINE_TOLERANCE,
         ):
             return self._retry_cabin_position(
@@ -2334,10 +2343,11 @@ class TakeElevator(NavigationTask):
                 position_xy,
                 target_xy,
                 position_acceptance,
-                self._CABIN_TRANSIT_CENTERLINE_TOLERANCE,
+                self._CABIN_TRANSIT_CENTERLINE_ENTRY_TOLERANCE,
             ):
                 context.controller.clear_path(reason="elevator_centered_position_reached")
                 self.cabin_transit_stage = "ALIGN"
+                self._cabin_transit_alignment_done = False
                 self._start_cabin_transit_alignment_timer()
                 self._cabin_transit_alignment_count = 0
                 self._log_cabin_transit_stage(
@@ -2352,7 +2362,7 @@ class TakeElevator(NavigationTask):
                 pose,
                 position_xy,
                 goal_tolerance=min(
-                    position_acceptance, self._CABIN_TRANSIT_CENTERLINE_TOLERANCE
+                    position_acceptance, self._CABIN_TRANSIT_CENTERLINE_ENTRY_TOLERANCE
                 ),
             )
             if status == DONE:
@@ -2373,9 +2383,30 @@ class TakeElevator(NavigationTask):
             if math.hypot(target_xy[0] - pose[0], target_xy[1] - pose[1]) <= position_tolerance:
                 context.controller.clear_path(reason="elevator_transit_already_complete")
                 return DONE
+
+            # 锁存对准状态校验：若先前已完成对准且未发生漂移，重算当前实时朝向误差。
+            # 若通道阻塞等待期间机体朝向发生扰动偏离超出释放阈值（0.15rad），撤销锁存
+            # 重新进入对准收敛；原总对准与准备超时预算不刷新。
+            if self._cabin_transit_alignment_done:
+                desired_yaw = math.atan2(target_xy[1] - pose[1], target_xy[0] - pose[0])
+                if abs(_angle_wrap(desired_yaw - pose[2])) > self._CABIN_TRANSIT_ALIGN_RELEASE_TOLERANCE:
+                    self._cabin_transit_alignment_done = False
+                    self._cabin_transit_alignment_count = 0
+                else:
+                    return self._commit_cabin_cross(
+                        context,
+                        pose,
+                        position_xy,
+                        target_xy,
+                        target_door_id=door_id,
+                        position_tolerance=position_tolerance,
+                        max_linear=max_linear,
+                    )
+
             result = context.controller.poll_result()
             if result.status == DONE and result.reason == "alignment_done":
                 self._cabin_transit_alignment_count = 0
+                self._cabin_transit_alignment_done = True
                 # 对准完成：提交直线跨越路径（门区清理与阻塞检查保留）。
                 return self._commit_cabin_cross(
                     context,
@@ -2387,6 +2418,7 @@ class TakeElevator(NavigationTask):
                     max_linear=max_linear,
                 )
             if result.status == STUCK and result.reason == "alignment_drift":
+                self._cabin_transit_alignment_done = False
                 return self._retry_cabin_position(
                     context, pose, position_xy, target_xy
                 )
@@ -2404,7 +2436,9 @@ class TakeElevator(NavigationTask):
                 context.controller.begin_heading_alignment(
                     target_xy,
                     anchor_xy=position_xy,
-                    max_anchor_error=position_acceptance,
+                    max_anchor_error=(
+                        position_acceptance + self._CABIN_TRANSIT_ALIGN_DRIFT_MARGIN
+                    ),
                 )
             return RUNNING
 
@@ -2541,6 +2575,7 @@ class TakeElevator(NavigationTask):
         # POSITION 满足后才朝穿越目标对准，禁止从偏心位置斜穿门框。
         self.cabin_transit_stage = "POSITION"
         self._cabin_transit_alignment_count = 0
+        self._cabin_transit_alignment_done = False
         self._cabin_transit_position_align_flips = 0
         self._cabin_transit_start_xy = None
         self._cabin_transit_target_xy = target_xy
@@ -2563,6 +2598,7 @@ class TakeElevator(NavigationTask):
         self.cabin_transit_stage = None
         self._cabin_transit_mode = None
         self._cabin_transit_alignment_count = 0
+        self._cabin_transit_alignment_done = False
         self._cabin_transit_position_align_flips = 0
         self._cabin_transit_start_xy = None
         self._cabin_transit_target_xy = None
@@ -2590,6 +2626,7 @@ class TakeElevator(NavigationTask):
         context.controller.clear_path(reason="elevator_centerline_drift")
         self.cabin_transit_stage = "POSITION"
         self._cabin_transit_alignment_count = 0
+        self._cabin_transit_alignment_done = False
         self._log_cabin_transit_stage("POSITION", pose, position_xy, target_xy)
         return RUNNING
 
