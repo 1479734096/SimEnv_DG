@@ -244,6 +244,9 @@ _CONFIG_GROUP_FIELDS = {
             "door_transition_hold_distance",
             "initial_entry_corridor_half_width",
             "initial_entry_geometry_tolerance",
+            "initial_entry_align_start_tolerance",
+            "initial_entry_align_exit_tolerance",
+            "initial_entry_align_settle_duration",
             "initial_entry_max_distance",
             "initial_entry_opening_confirmations",
             "initial_entry_opening_max_distance",
@@ -747,6 +750,15 @@ class _MissionConfigBuilder:
         self.initial_entry_wait_timeout = float(
             _param("mission/initial_entry_wait_timeout", 5.0)
         )
+        self.initial_entry_align_start_tolerance = float(
+            _param("mission/initial_entry_align_start_tolerance", 0.25)
+        )
+        self.initial_entry_align_exit_tolerance = float(
+            _param("mission/initial_entry_align_exit_tolerance", 0.14)
+        )
+        self.initial_entry_align_settle_duration = float(
+            _param("mission/initial_entry_align_settle_duration", 0.30)
+        )
         if (
             not math.isfinite(self.initial_entry_max_distance)
             or self.initial_entry_max_distance <= 0.0
@@ -760,6 +772,13 @@ class _MissionConfigBuilder:
             or self.initial_entry_geometry_tolerance <= 0.0
             or not math.isfinite(self.initial_entry_wait_timeout)
             or self.initial_entry_wait_timeout <= 0.0
+            or not math.isfinite(self.initial_entry_align_start_tolerance)
+            or self.initial_entry_align_start_tolerance <= 0.0
+            or not math.isfinite(self.initial_entry_align_exit_tolerance)
+            or self.initial_entry_align_exit_tolerance <= 0.0
+            or self.initial_entry_align_exit_tolerance >= self.initial_entry_align_start_tolerance
+            or not math.isfinite(self.initial_entry_align_settle_duration)
+            or self.initial_entry_align_settle_duration < 0.0
         ):
             raise ValueError("初始入口探测参数必须为有限正值")
         self.door_pass_offset = float(_param("mission/door_pass_offset", 0.8))

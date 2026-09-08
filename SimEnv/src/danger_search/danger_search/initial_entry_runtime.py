@@ -30,6 +30,9 @@ class InitialEntryConfig:
     wait_timeout: float = 5.0
     center_tolerance: float = 0.60
     approach_max_linear: float = 0.44
+    align_start_tolerance: float = 0.25
+    align_exit_tolerance: float = 0.14
+    align_settle_duration: float = 0.30
 
     @classmethod
     def from_section(cls, section) -> "InitialEntryConfig":
@@ -57,6 +60,15 @@ class InitialEntryConfig:
                 section.get("initial_entry_center_tolerance", 0.60)
             ),
             approach_max_linear=float(section["door_pass_max_linear"]),
+            align_start_tolerance=float(
+                section.get("initial_entry_align_start_tolerance", 0.25)
+            ),
+            align_exit_tolerance=float(
+                section.get("initial_entry_align_exit_tolerance", 0.14)
+            ),
+            align_settle_duration=float(
+                section.get("initial_entry_align_settle_duration", 0.30)
+            ),
         )
 
 
@@ -100,6 +112,12 @@ class InitialEntryRuntime:
     service_started_wall: float | None = None
     alignment_started_at: float | None = None
     alignment_started_wall: float | None = None
+    preparation_started_at: float | None = None
+    preparation_started_wall: float | None = None
+    alignment_settling_active: bool = False
+    settle_first_sample_stamp: float | None = None
+    settle_last_sample_stamp: float | None = None
+    settle_sample_count: int = 0
     approach_started_at: float | None = None
     approach_started_wall: float | None = None
     observation_reached_at: float | None = None
@@ -107,6 +125,68 @@ class InitialEntryRuntime:
     observation_wait_started_at: float | None = None
     observation_wait_started_wall: float | None = None
     opening_seen: bool = False
+
+    def _reset_settle_evidence(self) -> None:
+        self.settle_first_sample_stamp = None
+        self.settle_last_sample_stamp = None
+        self.settle_sample_count = 0
+
+    def _update_settle_evidence(
+        self,
+        controller,
+        pose_sample: object | None,
+        now_time: float,
+        config: InitialEntryConfig,
+    ) -> bool:
+        """根据真实新鲜里程计快照连续累积停稳证据；重复样本不推进，过期/超限立即清除。"""
+        if pose_sample is None:
+            self._reset_settle_evidence()
+            return False
+
+        stamp = getattr(pose_sample, "stamp", None)
+        if stamp is None or not math.isfinite(stamp):
+            self._reset_settle_evidence()
+            return False
+
+        pose_max_age = float(getattr(controller, "pose_max_age", 0.30))
+        sample_age = now_time - float(stamp)
+        if sample_age < -0.05 or sample_age > pose_max_age:
+            self._reset_settle_evidence()
+            return False
+
+        angular_xyz = getattr(pose_sample, "angular_xyz", None)
+        linear_xyz = getattr(pose_sample, "linear_xyz", None)
+        if (
+            angular_xyz is None
+            or len(angular_xyz) < 3
+            or linear_xyz is None
+            or len(linear_xyz) < 2
+        ):
+            self._reset_settle_evidence()
+            return False
+
+        yaw_rate = abs(float(angular_xyz[2]))
+        planar_speed = math.hypot(float(linear_xyz[0]), float(linear_xyz[1]))
+        if yaw_rate >= 0.08 or planar_speed > 0.05:
+            self._reset_settle_evidence()
+            return False
+
+        sample_stamp = float(stamp)
+        if self.settle_first_sample_stamp is None:
+            self.settle_first_sample_stamp = sample_stamp
+            self.settle_last_sample_stamp = sample_stamp
+            self.settle_sample_count = 1
+        else:
+            if sample_stamp > float(self.settle_last_sample_stamp):
+                self.settle_last_sample_stamp = sample_stamp
+                self.settle_sample_count += 1
+            # 重复时间戳不推进计数也不重置
+
+        return (
+            self.settle_sample_count >= 2
+            and (self.settle_last_sample_stamp - self.settle_first_sample_stamp)
+            >= config.align_settle_duration
+        )
 
     def schedule_clearance(
         self,
@@ -210,6 +290,7 @@ class InitialEntryRuntime:
         floor_height: float,
         config: InitialEntryConfig,
         segment_is_traversable=None,
+        pose_sample: object | None = None,
     ) -> InitialEntryTickResult:
         """推进完整主入口进入策略，不读写顶层任务状态。"""
         if self.completed or self.failed:
@@ -266,8 +347,12 @@ class InitialEntryRuntime:
             if distance <= tolerance:
                 controller.poll_status()
                 controller.clear_path(reason="initial_entry_observation_reached")
-                self.observation_reached_at = get_time()
-                self.observation_not_before = self.observation_reached_at + 0.5
+                now_reached = get_time()
+                self.observation_reached_at = now_reached
+                self.preparation_started_at = now_reached
+                self.preparation_started_wall = time.monotonic()
+                self.alignment_settling_active = True
+                self.observation_not_before = now_reached + 0.5
                 self.free_corridor_wait_started_at = None
                 self.free_corridor_wait_started_wall = None
                 self.observation_retry_count = 0
@@ -328,42 +413,109 @@ class InitialEntryRuntime:
             if self.observation_reached_at is not None
             else math.atan2(target[1] - pose[1], target[0] - pose[0])
         )
-        was_aligning = self.alignment_started_at is not None
-        if not controller.has_path() and self.align_heading(
-            controller,
-            pose,
-            heading,
-        ):
-            if self.alignment_started_at is None:
-                self.alignment_started_at = get_time()
-                self.alignment_started_wall = time.monotonic()
-            elif (
-                get_time() - self.alignment_started_at >= 12.0
-                or time.monotonic() - self.alignment_started_wall >= 180.0
-            ):
-                return self._fail(controller, "主入口接近朝向对准超时")
-            return InitialEntryTickResult(True)
-        if was_aligning and self.observation_reached_at is not None:
-            controller.stop(reason="initial_entry_alignment_completed")
-            # 姿态扰动只重置证据起点，不续期观察预算或增加重试机会。
-            self.observation_not_before = get_time() + 0.5
+        if self.observation_reached_at is not None:
+            # 1. 首次到达观察点后的准备总预算（覆盖首次转向与停稳，阶段切换不得刷新）
             if self.observation_wait_started_at is None:
-                self.observation_wait_started_at = get_time()
-                self.observation_wait_started_wall = time.monotonic()
-            door_tracker.confirmations = 0
-            door_tracker.observation = None
+                if self.preparation_started_at is None:
+                    self.preparation_started_at = get_time()
+                    self.preparation_started_wall = time.monotonic()
+                if (
+                    get_time() - self.preparation_started_at >= 12.0
+                    or time.monotonic() - self.preparation_started_wall >= 180.0
+                ):
+                    return self._fail(controller, "主入口观察准备超时")
+
+            # 2. 施密特滞回控制与停稳状态机
+            is_actively_aligning = self.alignment_started_at is not None
+            current_align_tolerance = (
+                config.align_exit_tolerance
+                if is_actively_aligning
+                else config.align_start_tolerance
+            )
+            needs_align = not controller.has_path() and self.align_heading(
+                controller,
+                pose,
+                heading,
+                tolerance=current_align_tolerance,
+            )
+            if needs_align:
+                if not is_actively_aligning:
+                    self.alignment_started_at = get_time()
+                    self.alignment_started_wall = time.monotonic()
+                    self.alignment_settling_active = False
+                    self._reset_settle_evidence()
+                    if self.observation_wait_started_at is not None:
+                        door_tracker.confirmations = 0
+                        door_tracker.observation = None
+                elif self.observation_wait_started_at is not None:
+                    # 观察阶段内再次纠偏的单次超时保护
+                    if (
+                        get_time() - self.alignment_started_at >= 12.0
+                        or time.monotonic() - self.alignment_started_wall >= 180.0
+                    ):
+                        return self._fail(controller, "主入口接近朝向对准超时")
+                return InitialEntryTickResult(True)
+
+            was_aligning = self.alignment_started_at is not None
             self.alignment_started_at = None
             self.alignment_started_wall = None
-            MissionReportingRuntime.loginfo(
-                "主入口观察朝向已稳定，重新等待0.5秒后累计点云"
-            )
-            return InitialEntryTickResult(True)
-        self.alignment_started_at = None
-        self.alignment_started_wall = None
 
-        if self.observation_reached_at is not None and self.observation_wait_started_at is None:
-            self.observation_wait_started_at = get_time()
-            self.observation_wait_started_wall = time.monotonic()
+            must_settle = (
+                self.observation_wait_started_at is None
+                or was_aligning
+                or self.alignment_settling_active
+            )
+            if must_settle:
+                self.alignment_settling_active = True
+                controller.stop(reason="initial_entry_alignment_settling")
+                now_time = get_time()
+                now_wall = time.monotonic()
+                if not self._update_settle_evidence(
+                    controller, pose_sample, now_time, config
+                ):
+                    return InitialEntryTickResult(True)
+
+                # 新鲜里程计连续满足停稳条件，完成物理稳定
+                self.alignment_settling_active = False
+                self._reset_settle_evidence()
+                controller.stop(reason="initial_entry_alignment_completed")
+                self.observation_not_before = max(
+                    self.observation_not_before or 0.0, now_time + 0.20
+                )
+                if self.observation_wait_started_at is None:
+                    self.observation_wait_started_at = now_time
+                    self.observation_wait_started_wall = now_wall
+                    door_tracker.confirmations = 0
+                    door_tracker.observation = None
+                    MissionReportingRuntime.loginfo(
+                        "主入口观察朝向已稳定（新鲜里程计连续满足停稳条件），开始累计门洞点云"
+                    )
+                else:
+                    door_tracker.confirmations = 0
+                    door_tracker.observation = None
+                    MissionReportingRuntime.loginfo(
+                        "主入口纠偏后已重新物理停稳，恢复累计门洞点云"
+                    )
+                return InitialEntryTickResult(True)
+        else:
+            # 尚未到达固定观察点（接近阶段）的转向对准处理
+            if not controller.has_path() and self.align_heading(
+                controller,
+                pose,
+                heading,
+                tolerance=0.18,
+            ):
+                if self.alignment_started_at is None:
+                    self.alignment_started_at = get_time()
+                    self.alignment_started_wall = time.monotonic()
+                elif (
+                    get_time() - self.alignment_started_at >= 12.0
+                    or time.monotonic() - self.alignment_started_wall >= 180.0
+                ):
+                    return self._fail(controller, "主入口接近朝向对准超时")
+                return InitialEntryTickResult(True)
+            self.alignment_started_at = None
+            self.alignment_started_wall = None
 
         door_result = self.try_start_door_task(
             pose=pose,
@@ -436,12 +588,14 @@ class InitialEntryRuntime:
         controller,
         pose: tuple[float, float, float],
         heading: float,
+        *,
+        tolerance: float = 0.18,
     ) -> bool:
         error = math.atan2(
             math.sin(float(heading) - float(pose[2])),
             math.cos(float(heading) - float(pose[2])),
         )
-        if abs(error) <= 0.18:
+        if abs(error) <= float(tolerance):
             return False
         rotate = getattr(controller, "rotate_in_place", None)
         if not callable(rotate):

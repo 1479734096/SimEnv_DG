@@ -132,6 +132,10 @@ mission:
   # 每轮观察5秒，最多重试一次；耗尽后记录失败并返航。
   initial_entry_wait_timeout: 5.0
   initial_entry_geometry_tolerance: 0.3
+  # 主入口对准施密特滞回与停稳参数：启动阈值 0.25rad(14.3°)，退出阈值 0.14rad(8.0°)，阻尼衰减 0.30s
+  initial_entry_align_start_tolerance: 0.25
+  initial_entry_align_exit_tolerance: 0.14
+  initial_entry_align_settle_duration: 0.30
   # 过门后先深入到门后，避免刚过门就把 frontier 选择权交回门口。
   door_pass_offset: 0.8
   # 主入口等待点单独后撤；门内通过点仍由 door_pass_offset 控制。

@@ -163,7 +163,7 @@ def _make_test_manager() -> MissionManager:
 
 
 def _initial_entry_config_for(manager) -> InitialEntryConfig:
-    return InitialEntryConfig(
+    kwargs = dict(
         max_distance=float(manager.initial_entry_max_distance),
         corridor_half_width=float(manager.initial_entry_corridor_half_width),
         probe_distance=float(manager.probe_distance),
@@ -173,6 +173,13 @@ def _initial_entry_config_for(manager) -> InitialEntryConfig:
         door_pass_offset=float(manager.door_pass_offset),
         door_commit_distance=float(manager.door_commit_distance),
     )
+    if hasattr(manager, "initial_entry_align_start_tolerance"):
+        kwargs["align_start_tolerance"] = float(manager.initial_entry_align_start_tolerance)
+    if hasattr(manager, "initial_entry_align_exit_tolerance"):
+        kwargs["align_exit_tolerance"] = float(manager.initial_entry_align_exit_tolerance)
+    if hasattr(manager, "initial_entry_align_settle_duration"):
+        kwargs["align_settle_duration"] = float(manager.initial_entry_align_settle_duration)
+    return InitialEntryConfig(**kwargs)
 
 
 def _try_start_entry_door(manager, pose, entrance) -> bool:
@@ -6474,6 +6481,182 @@ class MissionManagerHelperTest(unittest.TestCase):
             )
         )
         self.assertEqual(rotations, [])
+
+    def test_initial_entry_heading_schmidt_hysteresis_and_settle(self):
+        rotations = []
+        stops = []
+        current_yaw_rate = 0.0
+        controller = SimpleNamespace(
+            max_angular=1.2,
+            rotate_in_place=lambda angular: rotations.append(angular),
+            stop=lambda reason=None: stops.append(reason),
+            poll_status=lambda: 'IDLE',
+            has_path=lambda: False,
+            yaw_rate=current_yaw_rate,
+        )
+        entry = InitialEntryRuntime()
+        entry.observation_reached_at = 10.0
+        entry.service_task = SimpleNamespace(done=lambda: True, ok=lambda: True)
+        config = InitialEntryConfig(
+            max_distance=5.0,
+            corridor_half_width=0.25,
+            probe_distance=1.0,
+            opening_confirmations=2,
+            opening_max_distance=3.0,
+            geometry_tolerance=0.3,
+            door_pass_offset=0.8,
+            door_commit_distance=1.8,
+            align_start_tolerance=0.25,
+            align_exit_tolerance=0.14,
+            align_settle_duration=0.30,
+        )
+        entrance = SimpleNamespace(door_id="main_entrance", kind="main_entrance", floor_index=0)
+        door_tracker = SimpleNamespace(confirmations=0, observation=None)
+
+        with patch("danger_search.initial_entry_runtime.get_time", return_value=10.0):
+            # 1. 误差为 0.20 rad (<= 0.25 start)，未对准前不应触发旋转
+            # heading 设为 pi/2 (1.5708)，当前 yaw 设为 1.5708 - 0.20 = 1.3708
+            res = entry.tick(
+                pose=(0.0, -1.6, 1.3708),
+                grid=None,
+                entrance=entrance,
+                current_floor=0,
+                controller=controller,
+                building_client=SimpleNamespace(doors={}),
+                local_detector=SimpleNamespace(detect_opening_ahead=lambda **kw: None),
+                door_tracker=door_tracker,
+                cloud_stamp=10.0,
+                cloud_points=[],
+                floor_height=2.6,
+                config=config,
+            )
+            self.assertTrue(res.handled)
+            self.assertEqual(len(rotations), 0)
+            self.assertIsNone(entry.alignment_started_at)
+
+        with patch("danger_search.initial_entry_runtime.get_time", return_value=10.1):
+            # 2. 误差增至 0.28 rad (> 0.25 start)，触发对准旋转
+            res = entry.tick(
+                pose=(0.0, -1.6, 1.5708 - 0.28),
+                grid=None,
+                entrance=entrance,
+                current_floor=0,
+                controller=controller,
+                building_client=SimpleNamespace(doors={}),
+                local_detector=SimpleNamespace(detect_opening_ahead=lambda **kw: None),
+                door_tracker=door_tracker,
+                cloud_stamp=10.1,
+                cloud_points=[],
+                floor_height=2.6,
+                config=config,
+            )
+            self.assertTrue(res.handled)
+            self.assertEqual(len(rotations), 1)
+            self.assertIsNotNone(entry.alignment_started_at)
+
+        rotations.clear()
+        with patch("danger_search.initial_entry_runtime.get_time", return_value=10.2):
+            # 3. 旋转中误差缩小到 0.20 rad (> 0.14 exit)，在滞回区间内继续旋转，不提前退出
+            res = entry.tick(
+                pose=(0.0, -1.6, 1.5708 - 0.20),
+                grid=None,
+                entrance=entrance,
+                current_floor=0,
+                controller=controller,
+                building_client=SimpleNamespace(doors={}),
+                local_detector=SimpleNamespace(detect_opening_ahead=lambda **kw: None),
+                door_tracker=door_tracker,
+                cloud_stamp=10.2,
+                cloud_points=[],
+                floor_height=2.6,
+                config=config,
+            )
+            self.assertTrue(res.handled)
+            self.assertEqual(len(rotations), 1)
+
+        stops.clear()
+        with patch("danger_search.initial_entry_runtime.get_time", return_value=10.3):
+            # 4. 误差收敛到 0.10 rad (<= 0.14 exit)，停止旋转并进入 settling
+            res = entry.tick(
+                pose=(0.0, -1.6, 1.5708 - 0.10),
+                grid=None,
+                entrance=entrance,
+                current_floor=0,
+                controller=controller,
+                building_client=SimpleNamespace(doors={}),
+                local_detector=SimpleNamespace(detect_opening_ahead=lambda **kw: None),
+                door_tracker=door_tracker,
+                cloud_stamp=10.3,
+                cloud_points=[],
+                floor_height=2.6,
+                config=config,
+            )
+            self.assertTrue(res.handled)
+            self.assertIn("initial_entry_alignment_settling", stops)
+            self.assertIsNotNone(entry.alignment_settling_started_at)
+
+        stops.clear()
+        with patch("danger_search.initial_entry_runtime.get_time", return_value=10.4):
+            # 5. 时间仅过去 0.1s (< 0.3s settle duration)，继续保持 settling
+            res = entry.tick(
+                pose=(0.0, -1.6, 1.5708 - 0.10),
+                grid=None,
+                entrance=entrance,
+                current_floor=0,
+                controller=controller,
+                building_client=SimpleNamespace(doors={}),
+                local_detector=SimpleNamespace(detect_opening_ahead=lambda **kw: None),
+                door_tracker=door_tracker,
+                cloud_stamp=10.4,
+                cloud_points=[],
+                floor_height=2.6,
+                config=config,
+            )
+            self.assertTrue(res.handled)
+            self.assertIsNotNone(entry.alignment_settling_started_at)
+
+        with patch("danger_search.initial_entry_runtime.get_time", return_value=10.65):
+            # 6. 时间过去 0.35s (>= 0.3s settle duration)，角速度为 0，完成稳定
+            res = entry.tick(
+                pose=(0.0, -1.6, 1.5708 - 0.10),
+                grid=None,
+                entrance=entrance,
+                current_floor=0,
+                controller=controller,
+                building_client=SimpleNamespace(doors={}),
+                local_detector=SimpleNamespace(detect_opening_ahead=lambda **kw: None),
+                door_tracker=door_tracker,
+                cloud_stamp=10.65,
+                cloud_points=[],
+                floor_height=2.6,
+                config=config,
+            )
+            self.assertTrue(res.handled)
+            self.assertIsNone(entry.alignment_settling_started_at)
+            self.assertIsNone(entry.alignment_started_at)
+            self.assertIn("initial_entry_alignment_completed", stops)
+            self.assertEqual(entry.observation_not_before, 10.85)
+
+        rotations.clear()
+        with patch("danger_search.initial_entry_runtime.get_time", return_value=10.9):
+            # 7. 停稳后四足发生物理反弹，误差反弹至 0.20 rad (<= 0.25 start)，滞回生效，绝不再次触发旋转
+            res = entry.tick(
+                pose=(0.0, -1.6, 1.5708 - 0.20),
+                grid=None,
+                entrance=entrance,
+                current_floor=0,
+                controller=controller,
+                building_client=SimpleNamespace(doors={}),
+                local_detector=SimpleNamespace(detect_opening_ahead=lambda **kw: None),
+                door_tracker=door_tracker,
+                cloud_stamp=10.9,
+                cloud_points=[],
+                floor_height=2.6,
+                config=config,
+            )
+            self.assertTrue(res.handled)
+            self.assertEqual(len(rotations), 0)
+            self.assertIsNone(entry.alignment_started_at)
 
     def test_return_home_reverses_actual_initial_entry_trace_after_main_door(self):
         paths = []

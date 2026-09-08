@@ -1878,7 +1878,7 @@ class MissionManager:
                 )
             return
         if self.state == EXPLORE_FLOOR:
-            self._tick_explore(pose)
+            self._tick_explore(pose, pose_sample=pose_sample)
 
         elif self.state == RETURN_HOME:
             self._tick_return_home(pose)
@@ -4041,7 +4041,11 @@ class MissionManager:
             started = self._start_danger_inspection(target, approach_pose, plan, now)
         return DangerInspectionArbitration(handled=started)
 
-    def _tick_explore(self, pose: tuple[float, float, float]) -> None:
+    def _tick_explore(
+        self,
+        pose: tuple[float, float, float],
+        pose_sample: object | None = None,
+    ) -> None:
         self._explored_floor_ids.add(int(self.current_floor))
         grid = self.mapper.floor(self.current_floor)
         now = get_time()
@@ -4084,7 +4088,7 @@ class MissionManager:
                 return
             if correction.status == "running" or correction.applied:
                 return
-        if self._run_initial_entry(pose, grid):
+        if self._run_initial_entry(pose, grid, pose_sample=pose_sample):
             return
 
         self._elevator_observation.log_visual_preparation_result()
@@ -5263,7 +5267,12 @@ class MissionManager:
             return True
         return False
 
-    def _run_initial_entry(self, pose, grid) -> bool:
+    def _run_initial_entry(
+        self,
+        pose,
+        grid,
+        pose_sample: object | None = None,
+    ) -> bool:
         """应用主入口运行时的一次冻结决策。"""
         features = getattr(self, "building_features", None)
         entrance = (
@@ -5285,6 +5294,7 @@ class MissionManager:
             floor_height=self.mapper.floor_height,
             config=self._entry_config,
             segment_is_traversable=self._segment_is_traversable,
+            pose_sample=pose_sample,
         )
         if result.failure is not None:
             self._record_failure(result.failure)
@@ -5758,9 +5768,9 @@ class MissionManager:
 
         穿过大门后彻底脱离通用激光点云建图、A*重规划与地面支撑安全网对运动的负面干扰；
         以固定速度朝向硬目标点 (0.0, -3.3) 推进；
-        到达判据严格基于真实定位：有且仅当机器人当前位姿距出发点 (0.0, -3.2) 的欧氏距离 <= 0.30m 时，
+        到达判据严格基于真实定位：有且仅当机器人当前位姿距出发点 (0.0, -3.2) 的欧氏距离 <= self.home_tolerance (0.6m) 时，
         才判定返航成功完成；
-        若超出安全时限仍未进入 0.30m 范围内，则触发物理安全停机并如实报告未达标，严禁伪报。
+        若超出安全时限仍未进入容差范围内，则触发物理安全停机并如实报告未达标，严禁伪报。
         """
         now = get_time()
         home_xy = (
@@ -5770,7 +5780,8 @@ class MissionManager:
         )
         target_x, target_y = 0.0, -3.3
         speed = 0.35  # m/s 匀速直线推进
-        timeout_limit = 8.0  # 秒：物理安全刹车上限（以 0.35m/s 足够前推 2.8m，大门到判定线需 1.65m）
+        timeout_limit = 8.0  # 秒：物理安全刹车上限（以 0.35m/s 足够前推 2.8m，大门到判定线需 1.35m）
+        tolerance = float(getattr(self, "home_tolerance", 0.6))  # 动态读取全局配置 (0.6m)
 
         # 首次进入时初始化基准位姿与参数
         if not getattr(self, "_outdoor_return_started", False):
@@ -5792,11 +5803,12 @@ class MissionManager:
             if callable(set_direct):
                 set_direct(True)
             MissionReportingRuntime.loginfo(
-                "[MissionManager] 🚪 已安全穿出大门，进入室外直达返航：当前=[%.2f, %.2f], 目标向 (%.2f, %.2f) 直行",
+                "[MissionManager] 🚪 已安全穿出大门，进入室外直达返航：当前=[%.2f, %.2f], 目标向 (%.2f, %.2f) 直行 (容差=%.2fm)",
                 self._outdoor_return_start_pose[0],
                 self._outdoor_return_start_pose[1],
                 target_x,
                 target_y,
+                tolerance,
             )
             self._log_structured(
                 {
@@ -5807,6 +5819,7 @@ class MissionManager:
                         float(self._outdoor_return_initial_dist), 3
                     ),
                     "target": [target_x, target_y],
+                    "tolerance": round(float(tolerance), 3),
                     "speed": speed,
                 }
             )
@@ -5817,8 +5830,8 @@ class MissionManager:
         # 1. 计算真实定位距离（唯一到达判据基准）
         real_dist_to_home = math.hypot(pose[0] - home_xy[0], pose[1] - home_xy[1])
 
-        # 条件一：真实到达出发点 0.30m 范围内 -> 成功完成
-        if real_dist_to_home <= 0.30:
+        # 条件一：真实到达出发点容差范围内 -> 成功完成
+        if real_dist_to_home <= tolerance:
             set_direct = getattr(self.controller, "set_outdoor_direct_drive", None)
             if callable(set_direct):
                 set_direct(False)
@@ -5829,10 +5842,11 @@ class MissionManager:
                 getattr(self, "_mission_success_eligible", True)
             )
             MissionReportingRuntime.loginfo(
-                "[MissionManager] 🏁 真实成功到达出发点 0.3m 范围内！当前位姿=[%.2f, %.2f], 距出发点=%.2fm <= 0.30m (耗时=%.1fs)",
+                "[MissionManager] 🏁 真实成功到达出发点！当前位姿=[%.2f, %.2f], 距出发点=%.2fm <= %.2fm (耗时=%.1fs)",
                 pose[0],
                 pose[1],
                 real_dist_to_home,
+                tolerance,
                 elapsed,
             )
             self._log_structured(
@@ -5841,6 +5855,7 @@ class MissionManager:
                     "elapsed": round(float(self._elapsed()), 3),
                     "final_pose": [round(float(p), 3) for p in pose[:2]],
                     "final_dist_to_home": round(float(real_dist_to_home), 3),
+                    "tolerance": round(float(tolerance), 3),
                     "push_duration": round(float(elapsed), 3),
                     "success": True,
                 }
@@ -5868,11 +5883,12 @@ class MissionManager:
             self._mission_success_eligible = False
             self._record_failure("outdoor_direct_return_timeout")
             MissionReportingRuntime.logwarn(
-                "[MissionManager] ⚠️ 室外直达返航超时 (%.1fs) 仍未进入出发点 0.3m 范围内！当前位姿=[%.2f, %.2f], 距出发点=%.2fm > 0.30m",
+                "[MissionManager] ⚠️ 室外直达返航超时 (%.1fs) 仍未进入出发点容差范围！当前位姿=[%.2f, %.2f], 距出发点=%.2fm > %.2fm",
                 elapsed,
                 pose[0],
                 pose[1],
                 real_dist_to_home,
+                tolerance,
             )
             self._log_structured(
                 {
@@ -5880,6 +5896,7 @@ class MissionManager:
                     "elapsed": round(float(self._elapsed()), 3),
                     "final_pose": [round(float(p), 3) for p in pose[:2]],
                     "final_dist_to_home": round(float(real_dist_to_home), 3),
+                    "tolerance": round(float(tolerance), 3),
                     "push_duration": round(float(elapsed), 3),
                     "success": False,
                 }
