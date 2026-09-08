@@ -1053,7 +1053,7 @@ class MultiFloorGridMap:
         free_clear_angle_step: float = 0.1745,
         free_clear_obstacle_margin: float = 0.25,
         free_clear_min_points_per_bin: int = 2,
-        negative_minimum_drop: float = 0.30,
+        negative_minimum_drop: float = 0.20,
         evidence_lifecycle_enabled: bool = True,
         low_height_max_z: float = 0.30,
         low_confirm_generations: int = 2,

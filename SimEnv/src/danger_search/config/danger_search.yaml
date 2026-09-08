@@ -378,7 +378,8 @@ ground_support:
   maximum_lookahead: 0.80
   footprint_front_reach: 0.30
   support_band: 0.08
-  minimum_drop: 0.30
+  # 跌落判定高度门限：收敛至 0.20m，物理对齐 0.13m 楼梯单阶高度（保留裕度），防止楼梯边缘跌落
+  minimum_drop: 0.20
   minimum_cell_hits: 2
   required_consecutive_frames: 2
   minimum_alert_cells: 3

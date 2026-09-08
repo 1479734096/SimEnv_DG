@@ -13,7 +13,7 @@ except ImportError:
     rospy = None
 
 def get_time() -> float:
-    """返回当前任务时间；ROS 运行时失败时拒绝混入墙钟。"""
+    """返回当前任务时间；ROS 运行时失败时拒绝混入墙钟（shutdown 时降级到墙钟）。"""
     core = getattr(rospy, "core", None) if rospy is not None else None
     ros_initialized = (
         bool(core.is_initialized())
@@ -21,9 +21,13 @@ def get_time() -> float:
         else rospy is not None
     )
     if ros_initialized:
+        if rospy is not None and bool(rospy.is_shutdown()):
+            return time.time()
         try:
             value = float(rospy.Time.now().to_sec())
         except Exception as exc:
+            if rospy is not None and bool(rospy.is_shutdown()):
+                return time.time()
             raise RuntimeError("ROS 任务时间不可用，拒绝切换到墙钟") from exc
         if not math.isfinite(value) or value < 0.0:
             raise RuntimeError(f"ROS 任务时间非法: {value!r}")

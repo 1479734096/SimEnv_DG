@@ -988,7 +988,7 @@ class _MissionConfigBuilder:
                 _param("ground_support/footprint_front_reach", 0.30)
             ),
             "support_band": float(_param("ground_support/support_band", 0.08)),
-            "minimum_drop": float(_param("ground_support/minimum_drop", 0.30)),
+            "minimum_drop": float(_param("ground_support/minimum_drop", 0.20)),
             "minimum_cell_hits": int(
                 _param("ground_support/minimum_cell_hits", 2)
             ),

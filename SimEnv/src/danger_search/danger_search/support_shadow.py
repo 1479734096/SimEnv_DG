@@ -39,7 +39,7 @@ class ShadowSupportConfig:
     cloud_stride: int = 3
     cloud_max_points: int = 18000
     support_band: float = 0.08
-    minimum_drop: float = 0.30
+    minimum_drop: float = 0.20
     minimum_cell_hits: int = 2
     required_consecutive_frames: int = 2
     minimum_alert_cells: int = 3

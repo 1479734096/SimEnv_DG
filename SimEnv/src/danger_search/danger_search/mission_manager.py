@@ -1322,7 +1322,12 @@ class MissionManager:
         )
         self._last_shutdown_diagnostic = diagnostic
         self._log_structured(diagnostic)
-        self.controller.stop(repeat=5)
+        try:
+            self.controller.stop(repeat=5)
+        except Exception as exc:
+            MissionReportingRuntime.logwarn(
+                "停机阶段发送停止指令失败（可能底层发布者已关闭）：%s", exc
+            )
         if not bool(getattr(self, "_finished", False)):
             self._write_result(
                 reason_code=write_reason,

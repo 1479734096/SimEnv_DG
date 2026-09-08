@@ -567,7 +567,6 @@ class GroundSupportSafetyGate:
                     or (
                         not self._controlled_elevator_crossing
                         and assessment.support_boundary_detected
-                        and not assessment.current_footprint_supported
                     )
                 )
             )
