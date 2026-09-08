@@ -289,8 +289,6 @@ class ObstacleEvidenceLedger:
             if (
                 core.kind == LOW_CANDIDATE
                 and len(core.hit_generations) >= int(low_confirm_generations)
-                and len(core.hit_world_poses)
-                >= min(2, int(low_confirm_generations))
             ):
                 core.kind = LOW_CONFIRMED
 

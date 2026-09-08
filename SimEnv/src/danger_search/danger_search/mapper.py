@@ -1056,7 +1056,7 @@ class MultiFloorGridMap:
         negative_minimum_drop: float = 0.30,
         evidence_lifecycle_enabled: bool = True,
         low_height_max_z: float = 0.30,
-        low_confirm_generations: int = 3,
+        low_confirm_generations: int = 2,
         low_confirm_window_generations: int = 20,
         low_candidate_counter_generations: int = 3,
         low_candidate_counter_positions: int = 2,
@@ -1307,27 +1307,30 @@ class MultiFloorGridMap:
                     )
                 else:
                     nominal_z_rel = float(_pz) - floor_base_z
+                    # 方案 2：低高度障碍分类与近身自腿豁免解耦
+                    # 1. 严格自腿过滤：
+                    # 低高度且在自腿豁免半径内，坚决不在脚下记账，彻底消除起步自绊自锁风险。
+                    # （视线遮挡语义保留，该点已在 obstacle_hit_cells 中截断自由射线）
+                    if (
+                        nominal_z_rel < self.low_height_max_z
+                        and self.low_near_exempt_radius > 0.0
+                        and _distance < self.low_near_exempt_radius
+                    ):
+                        continue
+
+                    # 2. 障碍物分类裁决：
                     if nominal_z_rel < self.low_height_max_z:
-                        # 低回波候选记账的距离语境：
-                        # - 近距（< low_near_exempt_radius）：来源是自腿/紧贴物体等物理
-                        #   稳定的伪影（bag 取证：机身前上方 Mid360 每帧上千自腿低回波点
-                        #   命中站位格，3 代次+2 位姿秒确认成 LOW_CONFIRMED，直接导致
-                        #   start_cell_obstacle_core）；由 0.5m stop envelope 执行层物理兜底，
-                        #   不记账不会造成穿越。视线遮挡语义保留（该点仍在
-                        #   obstacle_hit_cells 中截断自由射线）。
-                        # - 远距（> low_candidate_max_range）：点稀疏、高度混叠，多帧
-                        #   "稳定命中"不可靠，只信高回波（HIGH_HARD 不受限）。
+                        # 生产模式（low_near_exempt_radius > 0）：近身自腿已被过滤，前方视距内的低矮点
+                        # 物理上 100% 为真实障碍物（0.24m 托盘），直接判定为 HIGH_HARD 首帧阻挡并膨胀，避免切角踏上托盘；
+                        # 未开启豁免（如纯生命周期单测）或远距不可靠回波保持 LOW_CANDIDATE 候选账本。
                         if (
                             self.low_near_exempt_radius > 0.0
-                            and _distance < self.low_near_exempt_radius
+                            and (self.point_free_clear_max_range <= 0.0 or _distance <= self.point_free_clear_max_range)
+                            and (self.low_candidate_max_range <= 0.0 or _distance <= self.low_candidate_max_range)
                         ):
-                            continue
-                        if (
-                            self.low_candidate_max_range > 0.0
-                            and _distance > self.low_candidate_max_range
-                        ):
-                            continue
-                        kind = LOW_CANDIDATE
+                            kind = HIGH_HARD
+                        else:
+                            kind = LOW_CANDIDATE
                     else:
                         if (
                             self.point_free_clear_max_range > 0.0

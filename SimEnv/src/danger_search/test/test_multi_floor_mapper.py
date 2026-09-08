@@ -553,7 +553,7 @@ class MultiFloorMapperTest(unittest.TestCase):
         assert core is not None
         grid.set_base_state(*core, VISITED)
 
-        for generation, robot_x in ((1, -0.4), (2, -0.4), (3, -0.4)):
+        for generation, robot_x in ((1, -0.4), (2, -0.4)):
             mapper.update_from_cloud(
                 floor_index=0,
                 robot_xyz=(robot_x, 0.0, 0.4),
@@ -565,7 +565,7 @@ class MultiFloorMapperTest(unittest.TestCase):
         self.assertEqual(grid.occ_cores[core].kind, "LOW_CANDIDATE")
         self.assertEqual(int(grid.data[core[1], core[0]]), VISITED)
 
-        for generation, robot_x in ((4, -0.2), (5, 0.0)):
+        for generation, robot_x in ((3, -0.4),):
             mapper.update_from_cloud(
                 floor_index=0,
                 robot_xyz=(robot_x, 0.0, 0.4),

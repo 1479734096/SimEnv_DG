@@ -886,7 +886,7 @@ class _MissionConfigBuilder:
             ),
             "low_height_max_z": float(_param("map/low_height_max_z", 0.26)),
             "low_confirm_generations": int(
-                _param("map/low_confirm_generations", 3)
+                _param("map/low_confirm_generations", 2)
             ),
             "low_confirm_window_generations": int(
                 _param("map/low_confirm_window_generations", 20)
