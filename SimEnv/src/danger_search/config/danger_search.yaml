@@ -57,35 +57,8 @@ localization:
   sparse_maximum_linear_speed: 0.08
   sparse_maximum_angular_speed: 0.10
   sparse_correction_timeout: 2.0
-  # 固定主入口合同：只用于入口外墙点云的有界 XY 纠偏，不读取生成场景文件。
-  # 实测里程计漂移仅 3~5cm，单侧外墙点云易产生假极小值，已由配置彻底停用。
-  entrance_geometry_enabled: false
-  # 缺少实测闭环证据，默认只观察候选，不停车、不注入绝对位姿。
-  entrance_geometry_apply_correction: false
-  entrance_geometry_center_x: 0.0
-  entrance_geometry_wall_y: 0.09
-  entrance_geometry_opening_width: 2.0
-  entrance_geometry_wall_half_length: 5.51
-  entrance_geometry_wall_thickness: 0.18
-  entrance_geometry_voxel_size: 0.08
-  entrance_geometry_minimum_points: 80
-  entrance_geometry_required_frames: 3
-  entrance_geometry_maximum_frame_spread: 0.08
-  entrance_geometry_minimum_correction: 0.08
-  entrance_geometry_maximum_correction: 0.50
-  entrance_geometry_coarse_step: 0.05
-  entrance_geometry_maximum_residual_p70: 0.12
-  entrance_geometry_minimum_uniqueness_margin: 0.04
-  entrance_geometry_maximum_yaw_correction: 0.12
-  entrance_geometry_yaw_coarse_step: 0.02
-  entrance_geometry_maximum_yaw_spread: 0.03
-  entrance_geometry_minimum_yaw_correction: 0.01
-  entrance_geometry_minimum_residual_improvement: 0.03
-  entrance_geometry_minimum_side_points: 16
-  entrance_geometry_timeout: 3.0
-  entrance_geometry_maximum_frame_age: 1.0
-  entrance_geometry_maximum_linear_speed: 0.08
-  entrance_geometry_maximum_angular_speed: 0.10
+  # 历史大门外墙几何纠偏模块已完全停用（实测里程计精度满足要求，单侧平直墙体缺乏法向特征易产生假极小值）。
+  # 为杜绝未公开建筑先验，已从配置和参数面彻底移除外墙几何参数。
 
 mission:
   # 顶层状态机、单层完成判据、返航预算、过门上下文和任务输出策略。

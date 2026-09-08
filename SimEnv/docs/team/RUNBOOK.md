@@ -203,8 +203,7 @@ SETUPTOOLS_USE_DISTUTILS=stdlib catkin_make install
 
 新增配置与观察合同：
 
-- `localization/entrance_geometry_apply_correction=false`：默认只观察候选，不等待、不注入。
-  `entrance_geometry_correction_evaluated` 的 accepted 不等于 applied；缺少帧会记录 insufficient_frames。
+- 大门外墙几何纠偏模块已完全停用（`enabled=False, apply_correction=False`），相关 27 项外墙尺寸参数已从 YAML 和配置解析中彻底移除，消除未公开建筑先验；开局与穿门位姿完全由合法里程计推演，过门中心和穿越轴向始终且唯一来自运行期雷达实测。
 - 危险源候选不再使用 Livox 球心修正。查看限频事件 `danger_perception_summary` 的
   RGB/深度/pose stamp、RGB-D 球心、RMSE、置信度和 Tracker 状态；不要期待
   `rgbd_livox_time_match` 或候选修正前后字段。Livox 仍须按定位、地图和门/电梯用途取证。
@@ -238,9 +237,7 @@ SETUPTOOLS_USE_DISTUTILS=stdlib catkin_make install
 
 ### 续审修复与构建记录
 
-主入口诊断时不要把 `entrance_geometry_center_x=0` 理解为机器人定位目标；该参数仅是
-初始 yaw 观察合同。确认门洞时检查左右门框、内部中高位占用和扫掠净宽；开门后的地图
-清理不应导致新鲜正障碍距离变为 `null`。若净空证据不足，停车并在有限时限内失败降级。
+主入口已彻底清除任何绝对世界坐标与外墙几何参数先验；门洞确认完全由激光雷达在正前横向中轴走廊（$|x_{\text{door}} - x_0| \le 0.60\text{m}$）内在线实测两框与净宽，纵向深度完全由传感器实测。开门后的地图清理不应导致新鲜正障碍距离变为 `null`。若净空证据不足，停车并在有限时限内失败降级。
 
 已构建 `scan_localization_node`（未执行任何测试目标）：
 

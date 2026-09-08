@@ -13,9 +13,7 @@ from danger_search.time_utils import get_time
 
 
 PROBE_LATERAL_OFFSETS = (0.0, -1.0, 1.0, -2.0, 2.0)
-# 依据 SimEnv初始.zip 内 building_generator_core/README.md 的生成语义；
-# 只用于观察站位和候选身份筛选，不写入定位或替代实测穿门几何。
-MAIN_ENTRANCE_CENTER = (0.0, 0.0)
+# 主入口检测不硬编码任何绝对坐标先验；以机器狗出生中轴线作为横向对准基准，纵向深度完全由雷达在线探测决定。
 
 
 @dataclass(frozen=True)
@@ -482,14 +480,19 @@ class InitialEntryRuntime:
             )
         ):
             return InitialEntryTickResult(False)
+        expected_lateral_x = (
+            float(self.origin_pose[0])
+            if self.origin_pose is not None
+            else float(pose[0])
+        )
         observation = local_detector.detect_opening_ahead(
             robot_pose=pose,
             floor_index=int(current_floor),
             cloud_points=cloud_points,
             floor_height=float(floor_height),
             maximum_distance=config.opening_max_distance,
-            expected_center_xy=MAIN_ENTRANCE_CENTER,
-            maximum_center_error=config.center_tolerance,
+            expected_lateral_x=expected_lateral_x,
+            maximum_lateral_error=config.center_tolerance,
         )
         if not door_tracker.observe(
             stamp=cloud_stamp,

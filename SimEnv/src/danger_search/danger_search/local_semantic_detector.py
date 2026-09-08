@@ -109,6 +109,8 @@ class LocalSemanticDetector:
         min_evidence_points: int | None = None,
         expected_center_xy: tuple[float, float] | None = None,
         maximum_center_error: float | None = None,
+        expected_lateral_x: float | None = None,
+        maximum_lateral_error: float | None = None,
         min_opening_width: float | None = None,
         max_opening_width: float | None = None,
     ) -> OpeningObservation | None:
@@ -133,6 +135,13 @@ class LocalSemanticDetector:
             or maximum_center_error <= 0.0
         ):
             raise ValueError("门洞预期中心必须有限且位置容差必须为正有限数")
+        if expected_lateral_x is not None and (
+            not math.isfinite(expected_lateral_x)
+            or maximum_lateral_error is None
+            or not math.isfinite(maximum_lateral_error)
+            or maximum_lateral_error <= 0.0
+        ):
+            raise ValueError("门洞预期横向基准必须有限且容差必须为正有限数")
         heading = (math.cos(robot_pose[2]), math.sin(robot_pose[2]))
         lateral_axis = (-heading[1], heading[0])
         floor_z = floor_index * floor_height
@@ -229,6 +238,10 @@ class LocalSemanticDetector:
                 world_xy[0] - expected_center_xy[0],
                 world_xy[1] - expected_center_xy[1],
             ) > maximum_center_error:
+                continue
+            if expected_lateral_x is not None and abs(
+                world_xy[0] - expected_lateral_x
+            ) > maximum_lateral_error:
                 continue
             left_forward = sum(sample[0] for sample in left_evidence) / len(left_evidence)
             right_forward = sum(sample[0] for sample in right_evidence) / len(right_evidence)

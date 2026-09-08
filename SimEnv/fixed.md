@@ -1,8 +1,53 @@
 # SimEnv 已完成与历史归档
 
-最后更新：2026-09-07
+最后更新：2026-09-08
 
 本文归档已经完成的机制、有效验证和历史失败结论。尚未完成的事项只维护在 [fix.md](fix.md)。
+
+## 0. 2026-09-08 接口合规与空间先验消除专项（静态完成，待实测）
+
+针对静态代码审计意见，彻底清除未公开空间先验，封堵 ROS 话题重映射安全缺口，并消除测试脚本中的真值物理耦合：
+
+### 0.1 ROS 话题与服务重映射（Remap）双端防御
+- **问题**：Launch 文件或命令行若配置 `<remap from="/scan" to="/ground_truth/base_w"/>`，节点可能暗中订阅仿真真值，违规获取外部作弊输入。
+- **原因**：`interface_policy.py`（Python）与 `scan_localization_node.cpp`（C++）先前仅对输入字符串做字面量白名单对比，未解析 ROS 底层运行时真实重映射名称。
+- **修改了什么**：
+  1. Python 端（`src/danger_search/danger_search/interface_policy.py:155`）：新增 `_resolve_ros_topic` 函数，调用 `rospy.names.resolve_name` 展开真实通信名称，对原始名与解析名双重进行黑白名单校验；离线纯单测时安全降级回退。
+  2. C++ 端（`src/danger_search_localization/src/scan_localization_node.cpp:476, 506, 650`）：引入 `ros::names::resolve` 解析 `raw_cloud_topic` 与 `depth_cloud_topic`，双重断言原始名与解析名严格等于 `"/scan"` 与 `"/real_sense/depth/points"`，并在 `nh_.subscribe` 时绑定解析后的安全名称。
+- **构建结论**：Python 编译无错，`catkin_make --pkg danger_search_localization` 100% 编译链接成功。
+
+### 0.2 主入口观察点自适应与门洞候选先验彻底清除
+- **问题**：
+  1. 初始观察目标点写死为 `(0.0, -1.8)`，存在世界坐标大楼原点位于 `(0,0)` 的未公开先验；
+  2. 门洞候选检测强制与常量 `MAIN_ENTRANCE_CENTER = (0.0, 0.0)` 计算欧氏距离，存在对大楼具体绝对坐标的先验依赖。
+- **原因**：旧实现假定大楼位置永远在世界坐标 `(0,0)` 且狗出生在 `(0, -3.2)`。
+- **修改了什么**：
+  1. 观察目标点（`initial_entry_runtime.py:225-233`）：改为从机器狗初始出生位姿 $(x_0, y_0, \theta_0)$ 沿正朝向前向延伸安全距离 $\text{target} = (x_0 + d_{\text{approach}}\cos\theta_0, y_0 + d_{\text{approach}}\sin\theta_0)$；
+  2. 门洞检测先验消除（`initial_entry_runtime.py:18, 483-496` 与 `local_semantic_detector.py:109, 242`）：彻底删除 `MAIN_ENTRANCE_CENTER = (0,0)` 常量；在 `detect_opening_ahead` 中新增 `expected_lateral_x` 支持，以机器狗出生点横向基准 $x_0 = \text{self.origin\_pose}[0]$ 约束横向偏差 $|x_{\text{door}} - x_0| \le 0.60\text{m}$，纵向深度 $y$ 完全由激光雷达在线探测决定，彻底解除空间绝对坐标依赖且免疫原地转向偏航角。
+
+### 0.3 1 层空洞激光在线测高与 [2.5m, 2.7m] 物理安全门限拦截
+- **问题**：电梯在 Gazebo 中通过 `set_model_state` 瞬间传送（0 秒瞬移，无加减速），IMU 积分物理失效；代码原先硬编码标称 `2.6m` 计算高层红球坐标，缺少传感器在线感知支撑。
+- **原因**：电梯仿真无连续加减速运动；且室内受 0.22m 楼板厚度影响，室内净高（2.38m）不等于建筑层高（2.60m），直接测天花板存在固定偏差。
+- **修改了什么**：
+  1. 在 `floor_transition_runtime.py` 新增 `estimate_floor_height_from_cloud`，利用机器狗在 1 层巡航时前下倾 45° 雷达穿透楼梯间空洞下视 0 层地表的几何特性，提取双水平地面高程差；
+  2. 严格执行 $[2.5\text{m}, 2.7\text{m}]$ 物理安全门限拦截（过滤半层 1.3m 楼梯平台与噪点），超出门限或未观测时安全回退至标称 2.6m；
+  3. 在 `mission_manager.py` 点云主循环中动态更新 `floor_height` 与 `mapper.floor_height`。
+
+### 0.4 测试脚本中真值诊断录包与底盘物理支撑解耦
+- **问题**：在 `run_elevator_gui_test.sh` 中显式设置 `ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=0` 关闭离线真值录包时，仿真启动后机器狗底盘瞬间瘫痪趴地。
+- **原因**：脚本第 573 行误将 Gazebo 的 `ENABLE_GROUND_TRUTH` 与诊断开关绑定，关闭录包导致 Gazebo 不加载四足步态控制器（`IOROS.cpp`）必需的 `/ground_truth/*` 足端物理插件。
+- **修改了什么**：
+  - 脚本解耦（`tools/sim/run_elevator_gui_test.sh:573`）：将传给 `./auto.sh` 的 `ENABLE_GROUND_TRUTH` 改为 `${ENABLE_GROUND_TRUTH:-1}`，与离线录包开关彻底解耦，底盘物理引擎插件始终保持就绪，`ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH` 仅独立控制是否启动外部 `rosbag record`。
+
+### 0.5 大门外墙几何硬编码先验清理与模块硬锁死
+- **问题**：`danger_search.yaml` 配置与 `mission_config.py` 中显式硬编码了外墙具体尺寸（`center_x: 0.0`、`wall_y: 0.09`、`wall_half_length: 5.51`、`wall_thickness: 0.18` 等 27 项参数），在静态代码审查中构成未公开建筑几何先验的合规靶子。
+- **原因**：早期设计试图通过点云体素匹配外墙模板纠偏机器人定位；但实测里程计精度极高（过门漂移仅 $3.9 \sim 5.5\text{cm}$），单侧平直墙体缺乏法向约束易产生 $0.20\text{m}$ 虚假配准极小值，该模块在实际生产中已废弃。
+- **修改了什么**：
+  1. 配置清理（`src/danger_search/config/danger_search.yaml:60`）：彻底删除全部 27 个 `entrance_geometry_*` 参数，杜绝先验暴露；
+  2. 配置锁死（`src/danger_search/danger_search/mission_config.py:1482`）：将 `entrance_geometry_config` 硬锁死为 `enabled=False, apply_correction=False`，并彻底移除外墙参数读取代码；
+  3. 状态机安全（`entrance_geometry_corrector.py:209`）：通过保留空桩接口保持 `tick()` 首句微秒级快速返回 `done`，既零风险保障过门任务状态机流转，又从根本上拔除了建筑先验。
+
+---
 
 范围更正：本文此前所称“生产节点订阅审计”实际只覆盖 `danger_search` 和参赛定位节点，
 不覆盖完整机器人控制闭包。官方 ZIP 自带的 `junior_ctrl`、环境 converter/relay、TF

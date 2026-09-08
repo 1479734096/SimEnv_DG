@@ -98,14 +98,14 @@ python3 tools/offline/check_production_boundary.py
 
 本次修复针对静态代码审计意见，彻底清除未公开空间先验，封堵 ROS 话题重映射安全缺口，并消除测试脚本中的真值物理耦合：
 
-1. **ROS 话题与服务重映射防御**（`interface_policy.py`）：
-   - **问题**：旧实现仅基于 Python 字符串字面量比对白名单，若 Launch 文件使用 `<remap from="/scan" to="/ground_truth/base_w"/>`，代码会误判通过而暗中消费禁用真值。
-   - **原因**：未在 ROS 客户端层面解析名称重映射规则。
-   - **修改**：增加 `_resolve_ros_topic`，通过 `rospy.names.resolve_name` 取得展开重映射后的全局真实名称，双重校验原始名与解析名，彻底封堵 remap 绕过。
-2. **初始进入观察点前向自适应**（`initial_entry_runtime.py`）：
-   - **问题**：初始观察点直接硬编码世界坐标原点 `(0.0, -1.8)`，存在利用未公开大楼绝对坐标的先验嫌疑。
+1. **ROS 话题与服务重映射双端防御**（`interface_policy.py` 与 `scan_localization_node.cpp`）：
+   - **问题**：旧实现仅基于字符串字面量比对白名单，若 Launch 文件或命令行使用 `<remap from="/scan" to="/ground_truth/base_w"/>`，Python 或 C++ 节点会误判通过而暗中消费禁用真值。
+   - **原因**：未在 ROS 客户端底层解析名称重映射规则。
+   - **修改**：Python 端增加 `_resolve_ros_topic`（基于 `rospy.names.resolve_name`），C++ 定位节点引入 `ros::names::resolve`，双端均在白名单比对前先取得全局真实名称，双重校验原始名与解析名，彻底封堵 remap 绕过。
+2. **初始进入观察点前向自适应与门洞先验彻底清除**（`initial_entry_runtime.py`、`local_semantic_detector.py`）：
+   - **问题**：初始观察点直接硬编码世界坐标原点 `(0.0, -1.8)`，且门洞检测与硬编码的 `MAIN_ENTRANCE_CENTER = (0.0, 0.0)` 做绝对坐标对比，存在利用未公开大楼绝对坐标的先验嫌疑。
    - **原因**：旧逻辑假设大楼永远位于世界坐标 `(0,0)` 且狗固定在 `(0, -3.2)` 出生。
-   - **修改**：将目标点改为基于机器狗出生位姿 $(x_0, y_0, \theta_0)$ 沿初始朝向正前方延伸安全接近距离 $\text{target} = (x_0 + d_{\text{approach}}\cos\theta_0, y_0 + d_{\text{approach}}\sin\theta_0)$，消除绝对原点先验；原有门洞候选过滤保持不变。
+   - **修改**：1. 将目标点改为基于机器狗出生位姿 $(x_0, y_0, \theta_0)$ 沿初始朝向正前方延伸安全接近距离 $\text{target} = (x_0 + d_{\text{approach}}\cos\theta_0, y_0 + d_{\text{approach}}\sin\theta_0)$；2. 彻底删除 `MAIN_ENTRANCE_CENTER = (0.0, 0.0)` 常量，门洞候选过滤改为仅根据机器狗出生点横向坐标 $x_0$ 校验横向偏差 $|x_{\text{door}} - x_0| \le 0.60\text{m}$，纵向坐标完全由激光雷达在线探测决定，不依赖任何世界绝对坐标先验。
 3. **1 层空洞激光在线测高与物理门限拦截**（`floor_transition_runtime.py`、`mission_manager.py`）：
    - **问题**：电梯在 Gazebo 中通过 `set_model_state` 瞬间传送（0 秒瞬移，无加减速），IMU 积分物理失效；代码原先写死标称 `2.6m` 计算高层红球坐标，缺少传感器在线感知支撑。
    - **原因**：电梯仿真无连续加减速运动；且室内受 0.22m 楼板厚度影响，净高（2.38m）不等于层高（2.60m），直接测天花板存在固定偏差。
@@ -178,14 +178,9 @@ python3 tools/offline/check_production_boundary.py
 
 `max_runtime` 包含返航，超时记失败但继续完成当前核验/门/电梯流程并返航，不启动新核验。
 安全收尾另受 180 秒任务时间和 600 秒墙钟上限约束；到家与任务超时失败分别记录。
-入口默认 `entrance_geometry_apply_correction=false`，只记录候选，不停车或注入；显式启用时，
-回执后的合法位姿负责重叠检查，回执或新位姿超时不能继续使用旧地图。
-最终速度出口读取实时 CROSS/楼层范围，异步支撑帧提交复核代次；CROSS 规划副本仅忽略负障碍。
-返航时间仍可能低估，真实门区定位、误障碍、融合时空对应、纠偏完整事务和固定层高依据仍待确认。
-本次仅语法、差异及历史日志/bag只读分析，未构建或运行；详细文件清单和四轮撞门对照见
-[接手审查报告](../../reports/DANGER_PRIORITY_STATIC_REVIEW_20260905.md)。
-入口外墙几何只用于辅助初始 yaw 评估，不提供绝对 XY 基准；即使启用纠偏，请求的平移
-也固定为零，门任务的中心和轴向始终来自运行期门观测。门洞确认将单侧点云高度跨度阈值
+入口大门外墙几何纠偏模块已完全停用（`enabled=False, apply_correction=False`），
+相关外墙几何尺寸参数已从 YAML 配置与代码参数读取中彻底移除，消除未公开外墙尺寸先验。
+过门中心和轴向始终且唯一来自运行期雷达实测点云在线确认。门洞确认将单侧点云高度跨度阈值
 调整为0.30m以适配Livox 45°俯仰下倾雷达视场；彻底移除blocked_interior内部占用一票否决，
 避免滑开在两旁的门板导致连续no_candidate超时崩溃；主入口过门阶段完全废除前向避障排除盒，
 新鲜正障碍制动全量生效，历史门板残留由地图层OCC清理单独负责。

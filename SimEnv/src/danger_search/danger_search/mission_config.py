@@ -1479,33 +1479,11 @@ class _MissionConfigBuilder:
                 _param("localization/sparse_correction_timeout", 2.0)
             ),
         )
+        # 彻底停用大门外墙几何纠偏模块（实测里程计精度满足要求，单侧平直墙体缺乏法向约束易产生假极小值）；
+        # 硬锁死为 disabled，并彻底移除外墙几何参数读取，消除任何大楼外墙尺寸硬编码先验。
         self.entrance_geometry_config = EntranceGeometryConfig(
-            enabled=bool(_param("localization/entrance_geometry_enabled", True)),
-            apply_correction=bool(_param("localization/entrance_geometry_apply_correction", False)),
-            center_x=float(_param("localization/entrance_geometry_center_x", 0.0)),
-            wall_y=float(_param("localization/entrance_geometry_wall_y", 0.09)),
-            opening_width=float(_param("localization/entrance_geometry_opening_width", 2.0)),
-            wall_half_length=float(_param("localization/entrance_geometry_wall_half_length", 5.51)),
-            wall_thickness=float(_param("localization/entrance_geometry_wall_thickness", 0.18)),
-            voxel_size=float(_param("localization/entrance_geometry_voxel_size", 0.08)),
-            minimum_points=int(_param("localization/entrance_geometry_minimum_points", 80)),
-            required_frames=int(_param("localization/entrance_geometry_required_frames", 3)),
-            maximum_frame_spread=float(_param("localization/entrance_geometry_maximum_frame_spread", 0.08)),
-            minimum_correction=float(_param("localization/entrance_geometry_minimum_correction", 0.08)),
-            maximum_correction=float(_param("localization/entrance_geometry_maximum_correction", 0.50)),
-            coarse_step=float(_param("localization/entrance_geometry_coarse_step", 0.05)),
-            maximum_residual_p70=float(_param("localization/entrance_geometry_maximum_residual_p70", 0.12)),
-            minimum_uniqueness_margin=float(_param("localization/entrance_geometry_minimum_uniqueness_margin", 0.04)),
-            maximum_yaw_correction=float(_param("localization/entrance_geometry_maximum_yaw_correction", 0.12)),
-            yaw_coarse_step=float(_param("localization/entrance_geometry_yaw_coarse_step", 0.02)),
-            maximum_yaw_spread=float(_param("localization/entrance_geometry_maximum_yaw_spread", 0.03)),
-            minimum_yaw_correction=float(_param("localization/entrance_geometry_minimum_yaw_correction", 0.01)),
-            minimum_residual_improvement=float(_param("localization/entrance_geometry_minimum_residual_improvement", 0.03)),
-            minimum_side_points=int(_param("localization/entrance_geometry_minimum_side_points", 16)),
-            timeout=float(_param("localization/entrance_geometry_timeout", 3.0)),
-            maximum_frame_age=float(_param("localization/entrance_geometry_maximum_frame_age", 1.0)),
-            maximum_linear_speed=float(_param("localization/entrance_geometry_maximum_linear_speed", 0.08)),
-            maximum_angular_speed=float(_param("localization/entrance_geometry_maximum_angular_speed", 0.10)),
+            enabled=False,
+            apply_correction=False,
         )
         if not (
             math.isfinite(self.elevator_visual_min_width)

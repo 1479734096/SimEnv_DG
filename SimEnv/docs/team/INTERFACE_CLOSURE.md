@@ -38,13 +38,14 @@
 - 参赛方 runner 调用 Gazebo 模型配置或传送服务改变机器人状态；
 - 通过 ROS launch 或命令行 `<remap>` 将白名单话题重定向至禁用真值。
 
-`interface_policy` 现已内置 `_resolve_ros_topic`（基于 `rospy.names.resolve_name`），在白名单比对前先解析实际通信话题名，双重防御原始名与重映射名；未初始化时安全兼顾纯离线环境。
+`interface_policy`（Python）与 `scan_localization_node`（C++）现已全面内置 ROS 话题解析（`rospy.names.resolve_name` 与 `ros::names::resolve`），在白名单比对前先解析实际通信话题名，双重防御原始名与重映射名，彻底封堵 `<remap>` 重定向漏洞；未初始化时安全兼顾纯离线环境。
 
 ## 空间先验消除与在线感知规范
 
-1. **主入口定位**：初始进入观察点不再依赖全局坐标原点 `(0,0)` 先验，改为基于机器狗出生位姿 $(x_0, y_0, \theta_0)$ 沿初始朝向正前方延伸安全接近距离 $\text{target} = (x_0 + d_{\text{approach}}\cos\theta_0, y_0 + d_{\text{approach}}\sin\theta_0)$；门洞由点云实时连续确认。
+1. **主入口定位与门洞检测**：初始进入观察点不再依赖全局坐标原点 `(0,0)` 先验，改为基于机器狗出生位姿 $(x_0, y_0, \theta_0)$ 沿初始朝向正前方延伸安全接近距离 $\text{target} = (x_0 + d_{\text{approach}}\cos\theta_0, y_0 + d_{\text{approach}}\sin\theta_0)$；彻底清除硬编码 `MAIN_ENTRANCE_CENTER = (0,0)` 常量，门洞候选过滤改为仅基于出生点横向中轴 $x_0$ 约束横向偏差 $|x_{\text{door}} - x_0| \le 0.60\text{m}$，纵向坐标完全由雷达在线探测决定，不依赖任何空间先验。
 2. **高层层高获取**：电梯在仿真中通过 Gazebo `set_model_state` 瞬间传送（0 秒瞬移，无加减速），IMU 积分物理失效；系统采用“空洞激光在线测高为主 + 标称 2.6m 兜底”机制。机器狗在 1 层巡航时前下倾 45° 雷达穿透楼梯间空洞下视 0 层地表，提取双水平地面高差 $\Delta z$；严格执行 $[2.5\text{m}, 2.7\text{m}]$ 物理安全门限拦截（过滤半层 1.3m 楼梯平台），超出门限或未观测时安全回退至标称 2.6m。
 3. **仿真真值解耦**：Gazebo 仿真中保持 `ENABLE_GROUND_TRUTH=1` 确保四足底层控制器（`IOROS.cpp`）足端物理反馈正常运行；`ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH` 仅用于独立控制测试脚本后台是否启动 `rosbag record` 录制离线分析包，两者彻底解耦。
+4. **外墙几何先验彻底脱敏**：历史大门外墙纠偏模块已完全停用（硬锁死为 disabled），YAML 配置与代码参数中彻底删除 27 项硬编码外墙尺寸（如 `wall_thickness`、`wall_half_length` 等），杜绝未公开建筑参数暴露；机器狗过门与建图完全依赖在线传感器实测，不依赖任何静态几何模板。
 
 ## 第 2 层内部定位接口
 

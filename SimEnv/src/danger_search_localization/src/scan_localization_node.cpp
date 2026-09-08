@@ -473,8 +473,11 @@ class ScanLocalizationNode {
         !private_nh_.getParam("base_to_livox_rpy", base_to_livox_rpy)) {
       throw std::runtime_error("缺少已公开的 base_to_livox 固定外参");
     }
-    if (raw_cloud_topic != "/scan") {
-      throw std::runtime_error("正式定位仅允许使用初始文档授权的 /scan");
+    const std::string resolved_cloud_topic =
+        ros::names::resolve(raw_cloud_topic);
+    if (raw_cloud_topic != "/scan" || resolved_cloud_topic != "/scan") {
+      throw std::runtime_error(
+          "正式定位仅允许使用初始文档授权的 /scan（禁止 remap 重定向）");
     }
     use_imu_constrained_ = localization_backend == "imu_constrained";
     use_livox_imu_local_map_ =
@@ -503,10 +506,13 @@ class ScanLocalizationNode {
     const bool requires_imu =
         use_imu_constrained_ || use_livox_imu_local_map_ ||
         use_adaptive_shared_map_ || use_rgbd_livox_ || stance_health_enabled;
+    const std::string resolved_depth_topic =
+        ros::names::resolve(depth_cloud_topic);
     if ((use_rgbd_livox_ || adaptive_rgbd_localization_enabled_) &&
-        depth_cloud_topic != "/real_sense/depth/points") {
+        (depth_cloud_topic != "/real_sense/depth/points" ||
+         resolved_depth_topic != "/real_sense/depth/points")) {
       throw std::runtime_error(
-          "RGB-D/Livox 定位仅允许使用 /real_sense/depth/points");
+          "RGB-D/Livox 定位仅允许使用 /real_sense/depth/points（禁止 remap 重定向）");
     }
     const StartPose start = ReadPublicStartPose(
         scene_info_path, require_scene_info, allow_relative_origin,
@@ -644,7 +650,7 @@ class ScanLocalizationNode {
     std_msgs::Bool not_healthy;
     not_healthy.data = false;
     health_publisher_.publish(not_healthy);
-    subscriber_ = nh_.subscribe(raw_cloud_topic, 2,
+    subscriber_ = nh_.subscribe(resolved_cloud_topic, 2,
                                 &ScanLocalizationNode::OnCloud, this);
     if (requires_imu) {
       imu_subscriber_ = nh_.subscribe(
@@ -657,7 +663,7 @@ class ScanLocalizationNode {
     }
     if (use_rgbd_livox_ || adaptive_rgbd_localization_enabled_) {
       depth_subscriber_ = nh_.subscribe(
-          depth_cloud_topic, 1, &ScanLocalizationNode::OnDepthCloud, this);
+          resolved_depth_topic, 1, &ScanLocalizationNode::OnDepthCloud, this);
     }
     ROS_INFO(
         "scan_localization 已启动：输入 /scan，后端=%s，量程=%.1f m，"
