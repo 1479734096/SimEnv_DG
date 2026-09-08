@@ -852,3 +852,31 @@ Stage15～17 当前结论：
      - 保持红球检测“二维宽筛高召回+三维几何硬排除”架构，不盲改二维形状逻辑以防真实红球漏检；
      - 修正 `fixed.md` 与 `fix.md` 中前沿候选有效下限门限为真实配置的 0.45m。
   现状：代码、测试脚本与文档已修改完毕，并通过 Python 编译与 Bash 语法检查。
+
+## 45. 2026-09-08 生产调用链鲁棒性全面加固与物理对齐（STAGE46）
+
+- **问题现象与隐患**：
+  1. **异常停机发速窗口**：状态机发生异常或超时停机切入 `WRITE_RESULT` 时，底盘在几百毫秒内仍可能沿旧折线继续发速；
+  2. **写盘竞态致进程强杀与文件损坏**：评测脚本仅监听进入 `WRITE_RESULT` 状态便立即退出并强杀节点，落盘未完成导致检测结果为空或损坏；
+  3. **空间 NMS 0.9m 误杀相邻红球**：房间内相邻真实红球间距若在 0.65m~0.90m 之间，被 NMS 强行去重为 1 个，产生漏检（FN）；
+  4. **前沿规划失败记录与黑名单跨层污染**：栅格失败计数和黑名单仅以二维网格 `(gx, gy)` 为键，下层探索碰壁拉黑导致上层相同位置正常通道被误拉黑跳过；
+  5. **稀疏地标校准回执超时自杀停机**：门前地标对齐偶发通信抖动或超时（>3.0s），系统直接切入 `WRITE_RESULT` 自杀停机导致全盘 0 分；
+  6. **位姿统一入口缺少坐标系白名单门禁**：`PoseProvider` 未校验里程计 `frame_id`，缺乏抵御非法局部坐标系的门禁。
+
+- **根本原因排查与物理/架构对齐**：
+  1. `Navigator.stop()` 仅发瞬时零速未在锁内清空 `_active_path`，20Hz 控制定时器在下个周期仍会沿残留路径计算非零速度；
+  2. 状态跃迁日志早于底层真实文件系统 `flush` 和 `os.fsync`，外部脚本以状态跃迁作为退出信号导致时序竞态；
+  3. 官方场景生成器（`generate_competition_scene.py`）中红球半径 0.15m、避让 0.35m，两球球心最小理论物理间距为 0.65m，0.9m NMS 明显大于两球物理间距；
+  4. 多层建筑二维栅格共享局部坐标索引，缺失楼层维度必然产生跨层污染；
+  5. 地标对齐仅为局部辅助校准，里程计本身依然正常，机械套用主入口“不可恢复即自杀”违背实战保活优先原则；
+  6. 里程计回调函数未建立坐标系校验逻辑。
+
+- **修改方案与修改后现状**：
+  1. **停机控制熔断机制**：`navigator.py` 中 `stop()` 锁内强制清空活动路径，新增 `disable_motion()` 熔断开关；明确调用单向性（`_clear_path_locked` 调用 `_stop_locked` 发布零速，`_stop_locked` 严格仅调用 `_publish_locked` 锁内发零速，绝不反向调用 `_clear_path_locked`，消除相互递归引发的 `RecursionError`）；控制循环入口短路锁定零速，`_publish_locked` 强制夹紧零速；`mission_manager.py` 异常与超时停机分支显式调用熔断；
+  2. **写盘事件与退出时序解耦**：`mission_manager.py` 在 `_reporting.write_result` 刷盘完成后发出 `{"event": "mission_result_written"}`；`run_elevator_gui_test.sh:755` 改为监听该落盘事件，确保文件完整落盘；
+  3. **NMS 聚类半径收紧至 0.50m**：`danger_search.yaml`、`mission_config.py` 与 `detection_tracker.py` 统一将 `nms_radius` 降至 0.50m（$0.50\text{m} < 0.65\text{m}$），既杜绝误吞相邻红球，又稳定吸收激光残差；
+  4. **前沿记忆按楼层复合键隔离**：`frontier.py` 将失败计数与黑名单键值升维为 `(floor_index, cell)`，彻底杜绝跨层污染，重返该层时记忆无损保留；`mission_manager.py` 透传当前楼层；
+  5. **稀疏地标超时保活降级**：`mission_manager.py` 与 `navigation_tasks.py` 在地标超时后输出 Warning 并发出降级事件，清空挂起对齐目标，沿用当前位姿继续推进开门与导航，绝不停机自杀；
+  6. **位姿统一入口白名单防御**：`pose_provider.py` 增加 `expected_frame_id` 过滤（默认 `world`，兼容 `danger_search_relative`），非白名单坐标系直接丢弃并限频警告；`mission_components.py` 工厂装配时透传配置。
+  现状：代码、配置与文档已修改完毕，并通过 Python 编译与 Bash 语法检查。
+

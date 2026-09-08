@@ -105,6 +105,7 @@ class PoseProvider:
         self,
         odom_topic: str,
         *,
+        expected_frame_id: str | None = None,
         correction_request_topic: str = "/danger_search/localization/correction_request",
         correction_state_topic: str = "/danger_search/localization/correction_state",
         max_samples: int = 256,
@@ -113,6 +114,12 @@ class PoseProvider:
             odom_topic,
             purpose="统一位姿入口",
         )
+        self.expected_frame_id = (
+            str(expected_frame_id).strip()
+            if expected_frame_id is not None
+            else None
+        )
+        self._invalid_frame_logged = False
         self._lock = Lock()
         self._samples: deque[PoseSample] = deque(maxlen=max(2, int(max_samples)))
         self._subscriber = None
@@ -334,10 +341,20 @@ class PoseProvider:
             linear_xyz=(float(twist.linear.x), float(twist.linear.y), float(twist.linear.z)),
             angular_xyz=(float(twist.angular.x), float(twist.angular.y), float(twist.angular.z)),
         )
-        frame_identity = (
-            str(getattr(getattr(message, "header", None), "frame_id", "")),
-            str(getattr(message, "child_frame_id", "")),
-        )
+        frame_id = str(getattr(getattr(message, "header", None), "frame_id", ""))
+        child_frame_id = str(getattr(message, "child_frame_id", ""))
+        frame_identity = (frame_id, child_frame_id)
+        if self.expected_frame_id is not None:
+            allowed_frames = {self.expected_frame_id, "world", "danger_search_relative"}
+            if frame_id not in allowed_frames:
+                if not getattr(self, "_invalid_frame_logged", False):
+                    self._invalid_frame_logged = True
+                    if rospy is not None:
+                        rospy.logwarn(
+                            "PoseProvider 收到非全局目标坐标系位姿(%s)，已拒绝丢弃",
+                            frame_id,
+                        )
+                return
         with self._lock:
             if not _is_valid_sample(sample):
                 return

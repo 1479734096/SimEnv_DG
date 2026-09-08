@@ -261,8 +261,8 @@ class FrontierExplorer:
             )
         ):
             raise ValueError("前沿提取、评分、黑名单或规划预算参数无效")
-        self._blacklist: dict[tuple[int, int], float] = {}
-        self._fail_counts: dict[tuple[int, int], int] = {}
+        self._blacklist: dict[tuple[int, tuple[int, int]], float] = {}
+        self._fail_counts: dict[tuple[int, tuple[int, int]], int] = {}
         self.last_selection_debug: FrontierSelectionDebug | None = None
         self._last_extraction_rejections: list[_FrontierExtractionRejection] = []
         self._last_planning_targets_cache: dict[
@@ -320,17 +320,20 @@ class FrontierExplorer:
 
     def apply_planning_failure_deltas(
         self,
-        deltas: tuple[tuple[tuple[int, int], int], ...],
+        deltas: tuple[tuple[tuple[int, int], int], ...] | list,
+        floor: int = 0,
     ) -> None:
         """在主线程合并一次有效普通规划产生的失败增量。"""
+        floor_idx = int(floor)
         for cell, increment in deltas:
             parsed = (int(cell[0]), int(cell[1]))
             amount = max(0, int(increment))
             if amount <= 0:
                 continue
-            self._fail_counts[parsed] = self._fail_counts.get(parsed, 0) + amount
-            if self._fail_counts[parsed] >= self.fail_limit:
-                self.blacklist_cell(parsed)
+            key = (floor_idx, parsed)
+            self._fail_counts[key] = self._fail_counts.get(key, 0) + amount
+            if self._fail_counts[key] >= self.fail_limit:
+                self.blacklist_cell(parsed, floor=floor_idx)
 
     def select_frontier(
         self,
@@ -938,9 +941,11 @@ class FrontierExplorer:
         cell = grid.world_to_grid(world_xy[0], world_xy[1])
         if cell is None:
             return
-        self._fail_counts[cell] = self._fail_counts.get(cell, 0) + 1
-        if self._fail_counts[cell] >= self.fail_limit:
-            self.blacklist_cell(cell)
+        floor = int(getattr(grid, "floor_index", 0))
+        key = (floor, cell)
+        self._fail_counts[key] = self._fail_counts.get(key, 0) + 1
+        if self._fail_counts[key] >= self.fail_limit:
+            self.blacklist_cell(cell, floor=floor)
 
     def record_stuck_failure(self, grid: FloorGrid, world_xy: tuple[float, float]) -> None:
         """对真实卡住位置使用更大半径黑名单，避免立即选择同一区域。"""
@@ -957,6 +962,7 @@ class FrontierExplorer:
         center = grid.world_to_grid(world_xy[0], world_xy[1])
         if center is None:
             return
+        floor = int(getattr(grid, "floor_index", 0))
         radius = max(grid.resolution, float(radius))
         radius_cells = int(math.ceil(radius / grid.resolution))
         expiry = get_time() + self.blacklist_ttl
@@ -966,10 +972,10 @@ class FrontierExplorer:
                     continue
                 wx, wy = grid.grid_to_world(gx, gy)
                 if math.hypot(wx - world_xy[0], wy - world_xy[1]) <= radius:
-                    self._blacklist[(gx, gy)] = expiry
+                    self._blacklist[(floor, (gx, gy))] = expiry
 
-    def blacklist_cell(self, cell: tuple[int, int]) -> None:
-        self._blacklist[cell] = get_time() + self.blacklist_ttl
+    def blacklist_cell(self, cell: tuple[int, int], floor: int = 0) -> None:
+        self._blacklist[(int(floor), (int(cell[0]), int(cell[1])))] = get_time() + self.blacklist_ttl
 
     def is_blacklisted(
         self,
@@ -982,13 +988,16 @@ class FrontierExplorer:
 
     def _is_blacklisted(self, grid: FloorGrid, world_xy: tuple[float, float]) -> bool:
         cell = grid.world_to_grid(world_xy[0], world_xy[1])
-        return cell in self._blacklist if cell is not None else True
+        if cell is None:
+            return True
+        floor = int(getattr(grid, "floor_index", 0))
+        return (floor, cell) in self._blacklist
 
     def _expire_blacklist(self) -> None:
         now = get_time()
-        expired = [cell for cell, expiry in self._blacklist.items() if expiry <= now]
-        for cell in expired:
-            self._blacklist.pop(cell, None)
+        expired = [key for key, expiry in self._blacklist.items() if expiry <= now]
+        for key in expired:
+            self._blacklist.pop(key, None)
 
     def _is_near_negative_obstacle(
         self,

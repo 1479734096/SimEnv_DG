@@ -83,6 +83,7 @@ class MissionRuntimeComponents:
         )
         pose_provider = PoseProvider(
             topics["localization_odom_topic"],
+            expected_frame_id=localization_config.get("global_frame_id", "world"),
             correction_request_topic=topics[
                 "localization_correction_request_topic"
             ],

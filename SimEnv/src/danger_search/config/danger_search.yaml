@@ -97,7 +97,7 @@ mission:
   # 1/2 层自动被 limits 截断为 520.0s/1000.0s，同时 3 层场景可完整生效 1440.0s 预算。
   max_runtime: 1440.0
   runtime_by_floor: [[1, 520.0], [2, 1000.0], [3, 1440.0]]
-  floor_timeout: 360.0
+  floor_timeout: 370.0
   # 非最后一层仍以 floor_timeout 保护后续楼层；最后一层由全局返航预算收口。
   # 设为 false 可立即恢复“所有楼层到时即结束”的旧语义。
   last_floor_uses_global_budget: true
@@ -559,7 +559,7 @@ tracker:
   tier2_max_rmse: 0.015
   tier2_min_hits: 2
   tier2_min_confidence: 0.70
-  nms_radius: 0.9
+  nms_radius: 0.50
   stale_after: 30.0
   # 正式结果仍保持四帧确认；以下仅保护运动路径。两个独立高质量帧先写入
   # 临时语义 OCC，0.75s 内没有新帧就撤销，避免单帧误检和红色干扰项永久堵图。

@@ -1588,7 +1588,7 @@ class _MissionConfigBuilder:
             "max_position_std": float(_param("tracker/max_position_std", 0.25)),
             "min_confidence": float(_param("tracker/min_confidence", 0.75)),
             "max_average_rmse": float(_param("tracker/max_average_rmse", 0.04)),
-            "nms_radius": float(_param("tracker/nms_radius", 0.9)),
+            "nms_radius": float(_param("tracker/nms_radius", 0.50)),
             "stale_after": float(_param("tracker/stale_after", 30.0)),
             "obstacle_min_hits": int(
                 _param("tracker/obstacle_min_hits", 2)

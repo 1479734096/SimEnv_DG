@@ -13,7 +13,7 @@ fi
 # 默认参数配置（支持外部环境变量覆盖）
 export SEED="${SEED:-42}"
 export GUI="${GUI:-true}"
-export ELEVATOR_TEST_FLOOR_COUNT="${FLOOR_COUNT:-1}"
+export ELEVATOR_TEST_FLOOR_COUNT="${FLOOR_COUNT:-3}"
 export ELEVATOR_TEST_FULL_CYCLE="${FULL_CYCLE:-1}"
 
 echo "================================================================"

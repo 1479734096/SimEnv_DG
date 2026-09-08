@@ -209,6 +209,7 @@ class PathFollower:
         init=False,
         repr=False,
     )
+    _motion_enabled: bool = field(default=True, init=False)
     keepalive_publish_count: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
@@ -925,6 +926,9 @@ class PathFollower:
         with self._command_transaction_lock:
             if self._publisher is None:
                 return
+            if not getattr(self, "_motion_enabled", True):
+                self._publish_locked(0.0, 0.0, zero_reason="controller_disabled")
+                return
             now_wall = time.monotonic()
             if self._last_decision_wall is not None:
                 self._last_decision_period = now_wall - self._last_decision_wall
@@ -1266,10 +1270,23 @@ class PathFollower:
 
     def stop(self, repeat: int = 1, interval: float = 0.02, *, reason: str = "stop") -> None:
         count = max(1, int(repeat))
+        with self._command_transaction_lock:
+            self._clear_path_locked(reason)
         for index in range(count):
             self._publish(0.0, 0.0, zero_reason=reason)
             if index < count - 1:
                 time.sleep(max(0.0, float(interval)))
+
+    def disable_motion(self, reason: str = "motion_disabled") -> None:
+        """显式停用运动并彻底清空路径与恢复状态，阻断控制定时器继续发速。"""
+        with self._command_transaction_lock:
+            self._motion_enabled = False
+        self.stop(repeat=3, reason=reason)
+
+    def enable_motion(self) -> None:
+        """重新启用控制器运动能力。"""
+        with self._command_transaction_lock:
+            self._motion_enabled = True
 
     def _stop_locked(self, *, reason: str) -> None:
         """锁内发送一次零速；调用方必须已持有事务锁。"""
@@ -1459,6 +1476,11 @@ class PathFollower:
         本方法只负责事务性副作用：提交请求快照、发布、以及只描述“已成功交给
         publisher 的命令”的那批统计字段。
         """
+        if not getattr(self, "_motion_enabled", True):
+            linear_x = 0.0
+            angular_z = 0.0
+            linear_y = 0.0
+            zero_reason = zero_reason or "controller_disabled"
         requested, zero_reason = sanitize_command_request(
             linear_x, angular_z, linear_y, zero_reason
         )

@@ -958,6 +958,18 @@ class MissionManager:
                 return LandmarkRelocalizationOutcome(DONE, applied=True)
             if now - float(operation["started_at"]) >= relocalizer.config.correction_timeout:
                 self._landmark_relocalization_operations.pop(key, None)
+                MissionReportingRuntime.logwarn(
+                    "稀疏地标纠偏等待回执超时 (landmark=%s, door=%s, sequence=%s)，降级沿用当前最新位姿继续执行",
+                    landmark, str(door_id), sequence,
+                )
+                self._log_structured(
+                    {
+                        "event": "sparse_landmark_correction_timeout_degraded",
+                        "landmark_id": str(landmark),
+                        "door_id": str(door_id),
+                        "sequence": sequence,
+                    }
+                )
                 return LandmarkRelocalizationOutcome(IDLE, reason="correction_ack_timeout")
             return LandmarkRelocalizationOutcome(RUNNING)
 
@@ -1239,18 +1251,28 @@ class MissionManager:
         self._tick_wall_forced_shutdown_reason = str(reason)
         self._mission_success_eligible = False
         self._record_failure(str(reason))
-        self.controller.stop(reason=str(reason))
+        if hasattr(self.controller, "disable_motion"):
+            self.controller.disable_motion(reason=str(reason))
+        else:
+            self.controller.stop(reason=str(reason))
         self._shutdown_requested = True
 
     def handle_ground_support_wall_timeout(self, reason: str) -> None:
         self._ground_support_forced_shutdown_reason = str(reason)
         self._mission_success_eligible = False
         self._record_failure(str(reason))
+        if hasattr(self.controller, "disable_motion"):
+            self.controller.disable_motion(reason=str(reason))
+        else:
+            self.controller.stop(reason=str(reason))
         self._shutdown_requested = True
 
     def handle_unexpected_exception(self, exc: Exception) -> None:
         self._record_failure(f"状态机异常: {exc}")
-        self.controller.stop()
+        if hasattr(self.controller, "disable_motion"):
+            self.controller.disable_motion(reason="state_machine_exception")
+        else:
+            self.controller.stop(reason="state_machine_exception")
         self._mission_success_eligible = False
         if self.state not in (WRITE_RESULT, FINISH, MISSION_FAILED):
             self._transition_state(
@@ -1462,6 +1484,21 @@ class MissionManager:
 
                 push_elapsed = current_time - self._outdoor_blind_push_start_time
                 if push_elapsed >= self._outdoor_blind_push_duration:
+                    gate = getattr(self, "_ground_support_gate", None)
+                    gate_blocked = gate is not None and getattr(gate, "state", "CLEAR") != "CLEAR"
+                    if gate_blocked:
+                        MissionReportingRuntime.logwarn("室外盲推期间触发安全门拦截，未达成安全进圈")
+                        self.controller.stop(reason="outdoor_blind_push_gate_blocked")
+                        self._outdoor_blind_push_active = False
+                        self._record_failure("outdoor_blind_push_gate_blocked")
+                        self._mission_success_eligible = False
+                        self._transition_state(
+                            WRITE_RESULT,
+                            reason_code="outdoor_blind_push_gate_blocked",
+                            call_site="MissionManager.tick:outdoor_blind_push_blocked",
+                        )
+                        return False
+
                     self.controller.stop(reason="outdoor_blind_push_completed")
                     self._outdoor_blind_push_active = False
                     self._return_home_success = True
@@ -4339,7 +4376,8 @@ class MissionManager:
                     live_frontier_failure_deltas(
                         grid,
                         normal_outcome.failure_deltas,
-                    )
+                    ),
+                    floor=int(getattr(grid, "floor_index", 0)),
                 )
                 candidate_path = self._validated_async_frontier_path(
                     grid,
@@ -6225,6 +6263,18 @@ class MissionManager:
             summary=summary,
         )
         self.controller.stop(repeat=5)
+        written_diagnostic = self._mission_diagnostic_snapshot()
+        written_diagnostic.update(
+            {
+                "event": "mission_result_written",
+                "result_path": str(path),
+                "detected_count": len(positions),
+                "terminal_outcome": self._terminal_outcome,
+                "terminal_reason": self._terminal_reason,
+                "return_home_completed": bool(getattr(self, "_return_home_completed", False)),
+            }
+        )
+        self._log_structured(written_diagnostic)
         self._finished = True
         MissionReportingRuntime.loginfo("已写出危险源检测结果：%s，数量=%d", path, len(positions))
 

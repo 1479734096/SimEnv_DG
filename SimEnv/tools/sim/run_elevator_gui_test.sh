@@ -10,7 +10,7 @@ DEVEL_SETUP="$WORKSPACE_ROOT/devel/setup.bash"
 SEED="${SEED:-42}"
 GUI="${GUI:-true}"
 ELEVATOR_TEST_FLOOR_COUNT="${ELEVATOR_TEST_FLOOR_COUNT:-3}"
-ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-360.0}"
+ELEVATOR_TEST_FLOOR_TIMEOUT="${ELEVATOR_TEST_FLOOR_TIMEOUT:-370.0}"
 ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME="${ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME:-60.0}"
 case "$ELEVATOR_TEST_FLOOR_COUNT" in
   1) ELEVATOR_TEST_DEFAULT_MAX_RUNTIME="520.0" ;;
@@ -76,7 +76,7 @@ usage() {
   SEED=42                              场景种子
   GUI=true                             是否打开 Gazebo GUI
   ELEVATOR_TEST_FLOOR_COUNT=3          楼层数，仅支持 2 或 3
-  ELEVATOR_TEST_FLOOR_TIMEOUT=360.0    楼层专项预算（仿真秒）
+  ELEVATOR_TEST_FLOOR_TIMEOUT=370.0    楼层专项预算（仿真秒）
   ELEVATOR_TEST_MIN_FLOOR_EXPLORE_TIME=60.0  每层最小驻留（仿真秒）
   ELEVATOR_TEST_MAX_RUNTIME=按楼层：1层520.0、2层1000.0、3层1440.0  总预算（仿真秒）
   ELEVATOR_TEST_WALL_TIMEOUT=无头10800/GUI 18000  墙钟总超时（秒）
@@ -752,7 +752,7 @@ while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
     fi
   fi
   if [[ "$ELEVATOR_TEST_FULL_CYCLE" == "1" ]] && \
-     grep -F '"event": "mission_result_write"' "$MISSION_LOG" 2>/dev/null | \
+     grep -F '"event": "mission_result_written"' "$MISSION_LOG" 2>/dev/null | \
      grep -F '"terminal_outcome": "success"' | \
      grep -Fq '"return_home_completed": true'; then
     RESULT="成功"

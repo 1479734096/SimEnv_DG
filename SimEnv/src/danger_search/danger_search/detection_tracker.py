@@ -233,7 +233,7 @@ class DetectionTracker:
         max_position_std: float = 0.25,
         min_confidence: float = 0.75,
         max_average_rmse: float = 0.04,
-        nms_radius: float = 0.9,
+        nms_radius: float = 0.50,
         stale_after: float = 30.0,
         obstacle_min_hits: int = 2,
         obstacle_min_confidence: float = 0.90,

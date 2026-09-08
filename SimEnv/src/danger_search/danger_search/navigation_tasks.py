@@ -267,13 +267,15 @@ class OpenDoorAndPass(NavigationTask):
             if outcome is not None and getattr(outcome, "status", IDLE) == RUNNING:
                 return RUNNING
             self._landmark_relocalization_attempted = True
+            self._wait_point = None
+            self._pass_point = None
+            self._commit_point = None
             if outcome is not None and bool(getattr(outcome, "applied", False)):
-                self._wait_point = None
-                self._pass_point = None
-                self._commit_point = None
                 context.controller.clear_path(reason="main_entrance_relocalized")
                 self.phase = "GO_WAIT_POINT"
             else:
+                if rospy is not None and outcome is not None and getattr(outcome, "reason", None) == "correction_ack_timeout":
+                    rospy.logwarn("[%s] 主门地标纠偏回执超时，清空旧站位点并使用当前位姿直接呼门", self.name)
                 self.phase = "CALL_OPEN"
             return RUNNING
 
