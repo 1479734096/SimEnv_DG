@@ -348,6 +348,7 @@ class MissionManager:
 
         self.main_entrance_xy: tuple[float, float] | None = None
         self.main_entrance_pass_vector: tuple[float, float] | None = None
+        self._last_pose_sample_stamp: float | None = None
 
         # 前沿惯性和进度监督状态用于抑制目标频繁切换及局部循环，不会篡改原始
         # 地图；冷却到期后目标区域可以重新参与选择。
@@ -532,8 +533,16 @@ class MissionManager:
             raise RuntimeError("MissionManager 已绑定其他节点运行时")
         self._node_runtime = runtime
 
-    def navigation_task_context(self) -> NavigationTaskContext:
+    def navigation_task_context(
+        self,
+        pose_stamp: float | None = None,
+    ) -> NavigationTaskContext:
         """冻结当前 tick 的子任务依赖，禁止任务反向读取编排器私有状态。"""
+        resolved_pose_stamp = (
+            pose_stamp
+            if pose_stamp is not None
+            else getattr(self, "_last_pose_sample_stamp", None)
+        )
         return NavigationTaskContext(
             controller=self.controller,
             mapper=self.mapper,
@@ -614,6 +623,7 @@ class MissionManager:
             elevator_lateral_search_speed=float(
                 getattr(self, "elevator_lateral_search_speed", 0.15)
             ),
+            pose_stamp=resolved_pose_stamp,
         )
 
     def _planning_constraints(self):
@@ -1637,6 +1647,9 @@ class MissionManager:
             return
         pose = pose_sample.xy_yaw
         xyz = pose_sample.xyz
+        self._last_pose_sample_stamp = (
+            getattr(pose_sample, "stamp", None) if pose_sample is not None else None
+        )
 
         self._last_xyz = xyz
         self._update_pose_progress(pose)

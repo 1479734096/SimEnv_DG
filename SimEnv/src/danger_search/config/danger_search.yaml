@@ -527,14 +527,14 @@ tracker:
   max_average_rmse: 0.04
   # 多阶梯确认门槛：解除远距离真球漏检死锁
   tier1_max_rmse: 0.005
-  tier1_min_hits: 1
+  tier1_min_hits: 2
   tier1_min_confidence: 0.70
   tier2_max_rmse: 0.015
   tier2_min_hits: 2
   tier2_min_confidence: 0.70
   nms_radius: 0.50
   stale_after: 30.0
-  # 正式结果仍保持四帧确认；以下仅保护运动路径。两个独立高质量帧先写入
+  # 正式结果按多阶梯（Tier 1/2 为2帧，基线为4帧）确认；以下仅保护运动路径。两个独立高质量帧先写入
   # 临时语义 OCC，0.75s 内没有新帧就撤销，避免单帧误检和红色干扰项永久堵图。
   obstacle_min_hits: 2
   obstacle_min_confidence: 0.90

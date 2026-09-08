@@ -1583,6 +1583,12 @@ class _MissionConfigBuilder:
             "obstacle_min_observation_span": float(
                 _param("tracker/obstacle_min_observation_span", 0.08)
             ),
+            "tier1_max_rmse": float(_param("tracker/tier1_max_rmse", 0.005)),
+            "tier1_min_hits": int(_param("tracker/tier1_min_hits", 2)),
+            "tier1_min_confidence": float(_param("tracker/tier1_min_confidence", 0.70)),
+            "tier2_max_rmse": float(_param("tracker/tier2_max_rmse", 0.015)),
+            "tier2_min_hits": int(_param("tracker/tier2_min_hits", 2)),
+            "tier2_min_confidence": float(_param("tracker/tier2_min_confidence", 0.70)),
         }
         if self.runtime_profile == "formal":
             elevator_id = next(iter(self.building_features.elevator_features))

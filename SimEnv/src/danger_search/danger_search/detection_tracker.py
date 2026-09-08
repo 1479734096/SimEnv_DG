@@ -242,7 +242,7 @@ class DetectionTracker:
         obstacle_min_observation_span: float = 0.08,
         inspection_max_attempts: int = 3,
         tier1_max_rmse: float = 0.005,
-        tier1_min_hits: int = 1,
+        tier1_min_hits: int = 2,
         tier1_min_confidence: float = 0.70,
         tier2_max_rmse: float = 0.015,
         tier2_min_hits: int = 2,
@@ -554,10 +554,9 @@ class DetectionTracker:
         self,
         track_id: int,
         *,
-        radius: float = 1.2,
         floor_filter: Callable[[Track], bool] | None = None,
     ) -> bool:
-        """在近场证据成立后标记目标及其邻近重复轨迹已核验。"""
+        """在近场证据成立后标记实际目标轨迹已核验。"""
         parsed_id = int(track_id)
         target = next((item for item in self._tracks if item.track_id == parsed_id), None)
         if target is None:
@@ -566,18 +565,7 @@ class DetectionTracker:
         if floor_filter is not None and not floor_filter(target):
             self._inspection_in_progress.discard(parsed_id)
             return False
-        target_xy = (float(target.mean_position[0]), float(target.mean_position[1]))
-        for track in self._tracks:
-            distance = math.hypot(
-                float(track.mean_position[0]) - target_xy[0],
-                float(track.mean_position[1]) - target_xy[1],
-            )
-            if distance <= float(radius):
-                if floor_filter is not None and not floor_filter(track):
-                    continue
-                track.inspected = True
-                self._inspection_in_progress.discard(int(track.track_id))
-                self._inspection_retry_after.pop(int(track.track_id), None)
+        target.inspected = True
         self._inspection_in_progress.discard(parsed_id)
         self._inspection_retry_after.pop(parsed_id, None)
         return True
@@ -720,7 +708,7 @@ class DetectionTracker:
             avg_conf = track.average_confidence()
             pos_std = track.position_std()
 
-            # Tier 1: 极低残差 (<= 5mm) 极速通道，1 帧即确认
+            # Tier 1: 极低残差 (<= 5mm) 快速通道，按配置分级确认（默认 2 帧）
             tier1_ok = (
                 recent_hits >= self.tier1_min_hits
                 and avg_rmse <= self.tier1_max_rmse

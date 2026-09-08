@@ -939,3 +939,22 @@ Stage15～17 当前结论：
   1. **主大门超时平滑降级保活**：在 `door_observation_runtime.py:314` 中，当 `precheck == TIMEOUT` 触发时，检查开局在室外冻结的高精门几何 `existing`；存在时记录结构化事件 `main_entrance_refresh_timeout_degraded` 与 Warning，重置追踪器状态，调用 `current_task.mark_opening_sensor_confirmed()` 解除过门门槛防挂起保护，平滑返回 `DoorRefreshResult(DONE)`；若 `existing` 不存在则保持 fail-closed 抛出 `FAILED`；
   2. **单测加固重构**：在 `test_mission_manager_helpers.py` 中将原超时单测重构为双向校验（有既有门几何时降级为 `DONE`、无既有门几何时 fail-closed 返回 `FAILED`）。
   现状：代码与单测已完成修改，并通过 Python 编译检查。
+
+## 47. 2026-09-08 主大门重新站位零滞回振荡死锁修复（STAGE48）
+
+- **问题现象与隐患**：
+  在 `seed_1044` 终局返航中，机器狗已成功开门并在门前测得门洞（`observed_center=(-0.04, 0.43)`），随后判定横向偏差 `0.360m` 触发重新站位；但在 1002s～1008s 之间，机器狗明明已对准大门却在门前停滞，最终抛出 `[OpenDoorAndPass(main_entrance)] 主入口重新站位次数耗尽，终止本次过门任务` 并自杀判负退出。
+
+- **根本原因排查与物理/控制流对齐**：
+  1. **零滞回区间振荡（Hysteresis = 0）**：`navigation_tasks.py` 中，`GO_REFRESHED_WAIT_POINT`（重新站位到位退出）与 `GO_PASS_POINT`（对准打断重站）共用同一个硬编码阈值 `_MAIN_ENTRANCE_CENTERLINE_TOLERANCE = 0.35m`；
+  2. **提前退出与临界点抖动死锁**：当初始偏差为 0.360m 时，机器狗稍一动至 0.349m（$\le 0.35\text{m}$），站位逻辑立即草草退出切入对准；而在原地调航向对准门外时，四足踏步产生毫米级机身微动至 0.351m（$> 0.35\text{m}$），立刻被判定偏离中轴线打断并累计失败；6 秒内反复横跳 3 次耗尽额度自杀；
+  3. **重观测物理有效性推断**：机器狗探索 1000s 后全局里程计漂移了约 0.28m，推测近场重观测测得门中心向左 0.28m 可能吸收了部分自身漂移，但该几何是否即真实物理门仍属待仿真对齐确认的推断；无论其绝对位置是否完全精准，控制层缺乏滞回区间与防抖确认是引发死锁自杀的直接根本原因。
+
+- **修改方案与修改后现状（施密特滞回 + 时间戳驱动双向2帧防抖闭环）**：
+  1. **位姿时间戳推进校验链（杜绝假双帧）**：在 `NavigationTaskContext` 增加 `pose_stamp` 字段，`MissionManager` 提取里程计 `pose_sample.stamp` 并透传；`OpenDoorAndPass` 内部维护 `_last_recenter_pose_stamp`，只有时间戳单调递增推进时才更新确认计数，彻底杜绝上层定时器空转重复消费相同位姿造成的伪双帧确认；
+  2. **门洞刷新统一入口收口与静止等待**：在 `REFRESH_OPENING` 完成后，主大门统一流转至 `GO_REFRESHED_WAIT_POINT`，坚决废除单帧直跳穿门的绕过漏洞；在 `GO_REFRESHED_WAIT_POINT` 中若横向误差已达标（$\le 0.20\text{m}$），机身保持静止等待两帧新鲜位姿确认，不调用 `_navigate_to` 产生多余踏步晃动；
+  3. **偏离待决硬门禁（阻断穿门绕过）**：在 `_tick_active_pass` 中，首次偏离（$> 0.30\text{m}$）进入待决态（Count=1）时设立硬门禁，严禁调用对准收尾，严禁下发穿门路径，直接返回 `RUNNING` 挂起等待下一帧；确认持续偏离（Count=2）才退回站位，若恢复（$\le 0.30\text{m}$）则清零计数解除门禁，彻底消除穿门路径绕过漏洞；
+  4. **0.10m 滞回带构建与超时保护**：重新站位退出门限 $0.20\text{m}$，对准打断门限 $0.30\text{m}$，构建 $0.10\text{m}$ 施密特滞回带；站位总超时 $30.0\text{s}$ 连续累计不刷新；近场障碍物与旋转包络保护完整保留；
+  5. **测试用例架构规整与加固**：将主大门测试用例规范迁移至 `OpenDoorAndPassTest`，更新 `test_open_door_refreshes_geometry_and_confirms_wait_point_when_close` 覆盖刷新后统一收口确认，并加固 `test_main_entrance_recenter_exit_tolerance_enforces_tight_recenter` 与 `test_main_entrance_drift_pending_hard_gate_blocks_pass_commitment`，全面覆盖时间戳推进、静止等待与偏离待决硬门禁。
+  现状：代码、测试与文档已同步更新，并通过全量 Python 静态编译检查（0 错误）。
+

@@ -27,7 +27,7 @@ from danger_search.navigator import STUCK, ControlResult
 from danger_search.planner import BUDGET_EXHAUSTED, PlanResult, UNREACHABLE
 
 
-def _task_context(source) -> NavigationTaskContext:
+def _task_context(source, pose_stamp: float | None = None) -> NavigationTaskContext:
     """把测试场景的显式依赖冻结为生产同款导航上下文。"""
     controller = source.controller
 
@@ -158,6 +158,7 @@ def _task_context(source) -> NavigationTaskContext:
             elevator_opening_confirmation_sensor_refresh=float(
                 getattr(source, "elevator_opening_confirmation_sensor_refresh", 0.5)
             ),
+            pose_stamp=pose_stamp if pose_stamp is not None else getattr(source, "pose_stamp", None),
         )
 
 
@@ -314,7 +315,7 @@ class OpenDoorAndPassTest(unittest.TestCase):
         self.assertEqual(stopped, ["door_opening_refresh"])
         self.assertIn("door_opening_geometry_refreshed", cleared)
 
-    def test_open_door_refreshes_geometry_and_skips_wait_point_when_close(self):
+    def test_open_door_refreshes_geometry_and_confirms_wait_point_when_close(self):
         stopped = []
         cleared = []
         path_queries = []
@@ -339,21 +340,116 @@ class OpenDoorAndPassTest(unittest.TestCase):
                 goal_tolerance=0.25,
                 stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
                 clear_path=lambda **kwargs: cleared.append(kwargs.get("reason")),
+                has_path=lambda: False,
             ),
         )
         pose = (0.0, -0.8, math.pi / 2.0)
 
-        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
-        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager, pose_stamp=0.1), pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager, pose_stamp=0.2), pose), RUNNING)
         self.assertEqual(task.phase, "GO_OPEN_WAIT_POINT")
-        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager, pose_stamp=0.3), pose), RUNNING)
         self.assertEqual(task.phase, "REFRESH_OPENING")
-        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
-        self.assertEqual(task.tick(_task_context(manager), pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager, pose_stamp=0.4), pose), RUNNING)
+        self.assertEqual(task.tick(_task_context(manager, pose_stamp=0.5), pose), RUNNING)
 
-        self.assertEqual(task.phase, "GO_PASS_POINT")
+        # 刷新完成后主大门统一收口至 GO_REFRESHED_WAIT_POINT，不单帧直跳
+        self.assertEqual(task.phase, "GO_REFRESHED_WAIT_POINT")
         self.assertEqual(task.wait_point, (0.1, -0.8))
         self.assertEqual(task.pass_point, (0.1, 0.8))
+
+        # 第 1 帧达标（0.10m <= 0.20m）：静止等待确认，保持 GO_REFRESHED_WAIT_POINT
+        self.assertEqual(task.tick(_task_context(manager, pose_stamp=0.6), pose), RUNNING)
+        self.assertEqual(task.phase, "GO_REFRESHED_WAIT_POINT")
+
+        # 第 2 帧连续达标（时间戳推进至 0.7）：确认完成，切入 GO_PASS_POINT
+        self.assertEqual(task.tick(_task_context(manager, pose_stamp=0.7), pose), RUNNING)
+        self.assertEqual(task.phase, "GO_PASS_POINT")
+
+    def test_main_entrance_recenter_exit_tolerance_enforces_tight_recenter(self):
+        stopped = []
+        cleared = []
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "GO_REFRESHED_WAIT_POINT"
+        task._wait_point = (0.0, -0.8)
+        task._pass_point = (0.0, 0.8)
+        task._commit_point = (0.0, 1.8)
+
+        manager = SimpleNamespace(
+            controller=SimpleNamespace(
+                goal_tolerance=0.25,
+                door_pass_max_linear=0.4,
+                stop=lambda **kwargs: stopped.append(kwargs.get("reason")),
+                clear_path=lambda **kwargs: cleared.append(kwargs.get("reason")),
+                set_path=lambda *args, **kwargs: None,
+                recover=lambda: None,
+                has_path=lambda: False,
+            ),
+            plan_path=lambda *args, **kwargs: [(0.0, -0.8)],
+            door_pass_max_linear=0.4,
+        )
+
+        # 偏差 0.28m：大于 0.20m，即使小于 0.35m，也不提前退出，保持 GO_REFRESHED_WAIT_POINT
+        pose_loose = (0.28, -0.8, math.pi / 2.0)
+        status = task.tick(_task_context(manager, pose_stamp=1.0), pose_loose)
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "GO_REFRESHED_WAIT_POINT")
+
+        # 偏差 0.15m：第 1 帧满足 <= 0.20m，时间戳 1.1，计数=1，仍保持 GO_REFRESHED_WAIT_POINT
+        pose_tight = (0.15, -0.8, math.pi / 2.0)
+        status = task.tick(_task_context(manager, pose_stamp=1.1), pose_tight)
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "GO_REFRESHED_WAIT_POINT")
+
+        # 时间戳未推进（重复 1.1）：计数不递增，保持 GO_REFRESHED_WAIT_POINT
+        status = task.tick(_task_context(manager, pose_stamp=1.1), pose_tight)
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "GO_REFRESHED_WAIT_POINT")
+
+        # 第 2 帧新鲜位姿（时间戳 1.2）：计数=2 达标，切入 GO_PASS_POINT
+        status = task.tick(_task_context(manager, pose_stamp=1.2), pose_tight)
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "GO_PASS_POINT")
+        self.assertIn("door_refreshed_wait_reached", cleared)
+
+    def test_main_entrance_drift_pending_hard_gate_blocks_pass_commitment(self):
+        set_paths = []
+        cleared = []
+        task = OpenDoorAndPass("main_entrance", pass_offset=0.8, commit_distance=1.8)
+        task.phase = "GO_PASS_POINT"
+        task._wait_point = (0.0, -0.8)
+        task._pass_point = (0.0, 0.8)
+        task._commit_point = (0.0, 1.8)
+        task._pass_alignment_done = True  # 模拟对准已完成
+
+        manager = SimpleNamespace(
+            controller=SimpleNamespace(
+                goal_tolerance=0.25,
+                door_pass_max_linear=0.4,
+                stop=lambda **kwargs: None,
+                clear_path=lambda **kwargs: cleared.append(kwargs.get("reason")),
+                set_path=lambda path, **kwargs: set_paths.append(path),
+                has_path=lambda: False,
+            ),
+            door_pass_max_linear=0.4,
+        )
+
+        # 首次偏差 0.32m（>0.30m），时间戳 2.0：进入偏离待决态（Count=1）
+        # 硬门禁生效：严禁下发穿门路径，不得置 pass_path_started
+        pose_drift = (0.32, -0.8, math.pi / 2.0)
+        status = task.tick(_task_context(manager, pose_stamp=2.0), pose_drift)
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "GO_PASS_POINT")
+        self.assertFalse(task._pass_path_started)
+        self.assertEqual(set_paths, [])
+
+        # 第 2 帧新鲜样本仍偏离 0.32m，时间戳 2.1：确认持续偏离（Count=2），触发退回 GO_REFRESHED_WAIT_POINT
+        status = task.tick(_task_context(manager, pose_stamp=2.1), pose_drift)
+        self.assertEqual(status, RUNNING)
+        self.assertEqual(task.phase, "GO_REFRESHED_WAIT_POINT")
+        self.assertIn("main_entrance_centerline_drift", cleared)
+        self.assertFalse(task._pass_path_started)
+        self.assertEqual(set_paths, [])
 
     def test_open_door_service_failure_returns_failed(self):
         failures = []
@@ -3397,7 +3493,6 @@ class TakeElevatorPhaseExhaustivenessTest(unittest.TestCase):
             set(),
             f"以下 phase 被赋值但 tick 未显式处理，会落进兜底：{sorted(unhandled)}",
         )
-
 
 if __name__ == "__main__":
     unittest.main()

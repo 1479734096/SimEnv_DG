@@ -54,6 +54,7 @@ class NavigationTaskContext:
     elevator_wait_lateral_tolerance: float = 0.15
     elevator_lateral_search_extra_overshoot: float = 0.15
     elevator_lateral_search_speed: float = 0.15
+    pose_stamp: float | None = None
 
     def clear_opened_door_area(self, door_id: str) -> None:
         self.clear_opened_door_area_fn(door_id)

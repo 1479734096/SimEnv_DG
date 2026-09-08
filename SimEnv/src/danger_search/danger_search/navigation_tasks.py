@@ -100,7 +100,9 @@ class OpenDoorAndPass(NavigationTask):
     _PASS_ALIGN_TIMEOUT = 12.0
     # 细对准期间允许的位置漂移半径：原地转向不应移动，超出即认为锚点失效。
     _PASS_ALIGN_ANCHOR_RADIUS = 0.30
-    _MAIN_ENTRANCE_CENTERLINE_TOLERANCE = 0.35
+    _MAIN_ENTRANCE_CENTERLINE_TOLERANCE = 0.30
+    _MAIN_ENTRANCE_RECENTER_EXIT_TOLERANCE = 0.20
+    _MAIN_ENTRANCE_RECENTER_CONFIRMATIONS_REQUIRED = 2
     _MAIN_ENTRANCE_CENTERING_TIMEOUT = 30.0
     _SERVICE_TIMEOUT = 30.0
     _SERVICE_WALL_TIMEOUT = 180.0
@@ -159,6 +161,9 @@ class OpenDoorAndPass(NavigationTask):
         self._main_entrance_centering_started_at: float | None = None
         self._main_entrance_centering_started_wall: float | None = None
         self._main_entrance_recenter_count = 0
+        self._recenter_exit_confirmations = 0
+        self._recenter_enter_confirmations = 0
+        self._last_recenter_pose_stamp: float | None = None
 
     @property
     def wait_point(self) -> tuple[float, float] | None:
@@ -356,20 +361,24 @@ class OpenDoorAndPass(NavigationTask):
             wait_distance = math.hypot(
                 self._wait_point[0] - pose[0], self._wait_point[1] - pose[1]
             )
-            if (
-                centerline_error <= self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE
-                and wait_distance <= 0.45
-            ):
-                self.phase = "GO_PASS_POINT"
-            else:
+            if self.door_id == "main_entrance":
                 if rospy is not None:
                     rospy.loginfo(
-                        "[%s] 主入口重新站位：横向偏差 %.3fm，等待点距离 %.3fm",
+                        "[%s] 主入口更新门洞几何：横向偏差 %.3fm，等待点距离 %.3fm，统一转入等待点确认",
                         self.name,
                         centerline_error,
                         wait_distance,
                     )
                 self.phase = "GO_REFRESHED_WAIT_POINT"
+            elif (
+                centerline_error <= self._MAIN_ENTRANCE_RECENTER_EXIT_TOLERANCE
+                and wait_distance <= 0.45
+            ):
+                self.phase = "GO_PASS_POINT"
+            else:
+                self.phase = "GO_REFRESHED_WAIT_POINT"
+            self._recenter_exit_confirmations = 0
+            self._recenter_enter_confirmations = 0
             return RUNNING
 
         if self.phase == "GO_REFRESHED_WAIT_POINT":
@@ -378,25 +387,61 @@ class OpenDoorAndPass(NavigationTask):
                 if self.door_id == "main_entrance"
                 else self._wait_point
             )
+            recenter_goal_tolerance = (
+                self._MAIN_ENTRANCE_RECENTER_EXIT_TOLERANCE
+                if self.door_id == "main_entrance"
+                else self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE
+            )
+            centerline_error = self._door_centerline_error(pose)
+            if self.door_id == "main_entrance":
+                is_fresh_sample = self._check_fresh_recenter_sample(context)
+                if centerline_error <= self._MAIN_ENTRANCE_RECENTER_EXIT_TOLERANCE:
+                    if is_fresh_sample:
+                        self._recenter_exit_confirmations += 1
+                else:
+                    if is_fresh_sample:
+                        self._recenter_exit_confirmations = 0
+                recenter_satisfied = (
+                    self._recenter_exit_confirmations
+                    >= self._MAIN_ENTRANCE_RECENTER_CONFIRMATIONS_REQUIRED
+                )
+            else:
+                recenter_satisfied = (
+                    centerline_error <= self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE
+                )
+
+            if recenter_satisfied:
+                context.controller.clear_path(reason="door_refreshed_wait_reached")
+                self._recenter_exit_confirmations = 0
+                self._recenter_enter_confirmations = 0
+                self._pass_alignment_count = 0
+                self._pass_path_started = False
+                self._pass_align_start_time = None
+                self._pass_alignment_done = False
+                self.phase = "GO_PASS_POINT"
+                return RUNNING
+
             if (
                 self.door_id == "main_entrance"
-                and self._door_centerline_error(pose)
-                <= self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE
-            ) or self._navigate_to(
+                and centerline_error <= self._MAIN_ENTRANCE_RECENTER_EXIT_TOLERANCE
+            ):
+                # 机器狗已经在中线容差范围内：原地保持静止等待新鲜样本确认，绝不调用 _navigate_to 造成多余晃动
+                if context.controller.has_path():
+                    context.controller.clear_path(reason="door_recenter_holding")
+                return RUNNING
+
+            nav_reached = self._navigate_to(
                 context,
                 pose,
                 target_pt,
                 allow_direct_fallback=True,
                 planning_max_iterations=None,
                 max_linear=context.door_pass_max_linear,
-                goal_tolerance=self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE,
-            ):
-                context.controller.clear_path(reason="door_refreshed_wait_reached")
-                self._pass_alignment_count = 0
-                self._pass_path_started = False
-                self._pass_align_start_time = None
-                self._pass_alignment_done = False
-                self.phase = "GO_PASS_POINT"
+                goal_tolerance=recenter_goal_tolerance,
+            )
+            if nav_reached:
+                # 导航到达但横向仍未达标：清空路径触发重新计算前向回中目标，不单独放行，保留总超时
+                context.controller.clear_path(reason="door_recenter_recalculate")
             elif self._last_navigation_blocked:
                 return self._fail_crossing(context, "更新后的门洞等待点不可达")
             return RUNNING
@@ -457,20 +502,32 @@ class OpenDoorAndPass(NavigationTask):
         crossing_tolerance = min(goal_tolerance, corner_tolerance)
 
         if not self._pass_path_started:
-            if (
-                self.door_id == "main_entrance"
-                and self._door_centerline_error(pose)
-                > self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE
-            ):
-                self._main_entrance_recenter_count += 1
-                if self._main_entrance_recenter_count > 3:
-                    return self._fail_crossing(context, "主入口重新站位次数耗尽")
-                context.controller.clear_path(reason="main_entrance_centerline_drift")
-                self._pass_alignment_done = False
-                self._pass_alignment_count = 0
-                self._pass_align_start_time = None
-                self.phase = "GO_REFRESHED_WAIT_POINT"
-                return RUNNING
+            if self.door_id == "main_entrance":
+                is_fresh_sample = self._check_fresh_recenter_sample(context)
+                if self._door_centerline_error(pose) > self._MAIN_ENTRANCE_CENTERLINE_TOLERANCE:
+                    if is_fresh_sample:
+                        self._recenter_enter_confirmations += 1
+                else:
+                    if is_fresh_sample:
+                        self._recenter_enter_confirmations = 0
+
+                if self._recenter_enter_confirmations >= self._MAIN_ENTRANCE_RECENTER_CONFIRMATIONS_REQUIRED:
+                    self._main_entrance_recenter_count += 1
+                    if self._main_entrance_recenter_count > 3:
+                        return self._fail_crossing(context, "主入口重新站位次数耗尽")
+                    context.controller.clear_path(reason="main_entrance_centerline_drift")
+                    self._recenter_enter_confirmations = 0
+                    self._recenter_exit_confirmations = 0
+                    self._pass_alignment_done = False
+                    self._pass_alignment_count = 0
+                    self._pass_align_start_time = None
+                    self.phase = "GO_REFRESHED_WAIT_POINT"
+                    return RUNNING
+
+                if self._recenter_enter_confirmations > 0:
+                    # 偏离待决态（Count=1）：中线偏差已超限，尚待第 2 帧新鲜位姿确认。
+                    # 设立硬门禁：严禁提交穿门路径或推进收尾，保持 RUNNING 等待下一帧新鲜位姿确认或恢复
+                    return RUNNING
             align_status, watching = self._tick_pass_alignment(context, pose)
             if align_status == FAILED:
                 return self._fail_crossing(context, "门洞细对准失败")
@@ -813,6 +870,25 @@ class OpenDoorAndPass(NavigationTask):
             and time.monotonic() - self._main_entrance_centering_started_wall
             >= self._SERVICE_WALL_TIMEOUT
         )
+
+    def _check_fresh_recenter_sample(self, context: NavigationTaskContext) -> bool:
+        """检查位姿时间戳是否推进。缺失、非法或非有限时间戳均视为非新鲜样本返回 False。"""
+        pose_stamp = getattr(context, "pose_stamp", None)
+        if pose_stamp is None:
+            return False
+        try:
+            current_stamp = float(pose_stamp)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(current_stamp):
+            return False
+        if (
+            self._last_recenter_pose_stamp is None
+            or current_stamp > self._last_recenter_pose_stamp
+        ):
+            self._last_recenter_pose_stamp = current_stamp
+            return True
+        return False
 
     def _can_open_from_safe_approach(
         self,

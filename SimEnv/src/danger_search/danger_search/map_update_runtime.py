@@ -188,6 +188,12 @@ class MapUpdateRuntime:
         )
         if diagnostics:
             self._last_candidate_diagnostic_time = now
+        if candidates and floor_index is not None:
+            floor_base_z = int(floor_index) * float(self.mapper.floor_height)
+            candidates = [
+                c for c in candidates
+                if 0.0 <= (float(c.position[2]) - floor_base_z) <= 0.40
+            ]
         if candidates:
             self.tracker.update(candidates, now=now)
         danger_obstacle_sync = None
