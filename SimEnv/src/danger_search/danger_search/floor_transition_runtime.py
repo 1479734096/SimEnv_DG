@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+from typing import Iterable
 
 
 FLOOR_ALIGNMENT_REQUIRED_ODOM_SAMPLES = 2
@@ -291,3 +292,57 @@ def _finite_stamp(value: float | None) -> float | None:
         return None
     value = float(value)
     return value if math.isfinite(value) else None
+
+
+def estimate_floor_height_from_cloud(
+    cloud_points: Iterable[tuple[float, float, float]],
+    current_floor: int,
+    nominal_height: float = 2.6,
+    min_valid_height: float = 2.5,
+    max_valid_height: float = 2.7,
+) -> float | None:
+    """从下试点云中检测穿透空洞打在下层地坪的回波，估计两层间的实际层高。
+
+    若测得高差在 [min_valid_height, max_valid_height] 物理门限内（默认 [2.5m, 2.7m]）
+    则返回实测值；若超出门限（例如仅探测到半层楼梯平台 1.3m 或其它噪声）
+    则返回 None（由调用方安全回退至标称层高）。
+    """
+    if int(current_floor) < 1 or not cloud_points:
+        return None
+
+    z_values = [float(p[2]) for p in cloud_points if len(p) > 2 and math.isfinite(p[2])]
+    if len(z_values) < 50:
+        return None
+
+    bin_size = 0.05
+    bins: dict[int, int] = {}
+    for z in z_values:
+        idx = int(math.floor(z / bin_size))
+        bins[idx] = bins.get(idx, 0) + 1
+
+    # 寻找水平聚集平面峰值
+    min_points = 20
+    peaks = [
+        (idx * bin_size + bin_size / 2.0, count)
+        for idx, count in bins.items()
+        if count >= min_points
+    ]
+    if len(peaks) < 2:
+        return None
+
+    # 当前层的主要水平地坪（通常是最高且密度大的一组）
+    z_high = max(peaks, key=lambda x: x[1])[0]
+
+    # 寻找比当前层地表显著更低（至少低 1.8m 以上）的穿透下层候选
+    low_candidates = [p for p in peaks if (z_high - p[0]) >= 1.8]
+    if not low_candidates:
+        return None
+
+    best_low = max(low_candidates, key=lambda x: x[1])
+    diff = float(z_high - best_low[0])
+
+    # 严格校验物理合理性门限 [min_valid_height, max_valid_height]
+    if min_valid_height <= diff <= max_valid_height:
+        return diff
+    return None
+

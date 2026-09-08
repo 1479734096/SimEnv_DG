@@ -224,9 +224,13 @@ class InitialEntryRuntime:
             return InitialEntryTickResult(False)
         if self.origin_pose is None:
             self.origin_pose = tuple(float(value) for value in pose)
-            self.heading = math.pi / 2.0
+            self.heading = float(pose[2]) if len(pose) > 2 else (math.pi / 2.0)
             self.trace = [(float(pose[0]), float(pose[1]))]
-            self.target = (MAIN_ENTRANCE_CENTER[0], -config.door_wait_offset)
+            approach_dist = max(0.5, 3.2 - float(config.door_wait_offset))
+            self.target = (
+                float(pose[0]) + approach_dist * math.cos(self.heading),
+                float(pose[1]) + approach_dist * math.sin(self.heading),
+            )
             if math.hypot(self.target[0] - pose[0], self.target[1] - pose[1]) > config.max_distance:
                 return self._fail(controller, "主入口固定观察点超出首次接近距离上限")
 

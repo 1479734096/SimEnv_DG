@@ -115,7 +115,10 @@ from danger_search.elevator_crossing_runtime import (
     ElevatorCrossingRuntime,
     crossing_corridor_obstacle,
 )
-from danger_search.floor_transition_runtime import FloorTransitionRuntime
+from danger_search.floor_transition_runtime import (
+    FloorTransitionRuntime,
+    estimate_floor_height_from_cloud,
+)
 from danger_search.navigation_context import NavigationTaskContext
 from danger_search.elevator_observation_runtime import (
     ElevatorObservationRuntime,
@@ -2139,6 +2142,28 @@ class MissionManager:
         )
         if estimated_floor == self.current_floor:
             self._map_runtime.last_floor_alignment_mismatch_key = None
+        if (
+            self.current_floor >= 1
+            and cloud_preparation.cloud_input is not None
+            and getattr(cloud_preparation.cloud_input, "points", None)
+        ):
+            measured_h = estimate_floor_height_from_cloud(
+                cloud_preparation.cloud_input.points,
+                current_floor=self.current_floor,
+                nominal_height=self._floor_coordinates.floor_height,
+                min_valid_height=2.5,
+                max_valid_height=2.7,
+            )
+            if (
+                measured_h is not None
+                and abs(measured_h - self._floor_coordinates.floor_height) > 0.005
+            ):
+                self._floor_coordinates = replace(
+                    self._floor_coordinates,
+                    floor_height=measured_h,
+                )
+                if self.mapper is not None:
+                    self.mapper.floor_height = measured_h
         if cloud_preparation.status != INPUT_NONE:
             if cloud_preparation.status == INPUT_INVALID:
                 self._perception_mapping.discard_cloud(cloud_preparation)

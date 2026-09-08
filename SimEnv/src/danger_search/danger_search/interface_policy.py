@@ -152,18 +152,36 @@ def require_public_scene_info(path: str | Path, *, purpose: str) -> Path:
     return supplied_real
 
 
+def _resolve_ros_topic(topic: str) -> str:
+    """在 ROS 环境中解析重映射后的实际名称，未初始化时安全回退规范化名称。"""
+    normalized = str(topic).strip()
+    try:
+        import rospy
+
+        resolved = rospy.names.resolve_name(normalized)
+        if resolved:
+            return str(resolved)
+    except Exception:
+        pass
+    return normalized
+
+
 def require_allowed_topic(topic: str, *, purpose: str) -> str:
     """确认生产外部话题已由初始接口文档授权，并返回规范字符串。
 
     ``purpose`` 会进入异常信息，使启动时能直接定位是哪个业务消费者申请了
-    非法接口。显式禁用列表先检查，以便真值话题得到比普通未知话题更明确的错误。
+    非法接口。同时解析 ROS 名称重映射，确保 launch remap 后的实际通信话题
+    依然在授权白名单内，彻底封堵重映射绕过。
     """
     normalized = str(topic).strip()
-    if normalized in FORBIDDEN_TOPICS:
-        raise ValueError(f"{purpose} 禁止使用 Gazebo 真值话题: {normalized}")
-    if normalized not in ALLOWED_TOPICS:
-        raise ValueError(f"{purpose} 未在初始比赛接口白名单中: {normalized}")
-    return normalized
+    resolved = _resolve_ros_topic(normalized)
+    for check_name in (normalized, resolved):
+        if check_name in FORBIDDEN_TOPICS:
+            raise ValueError(f"{purpose} 禁止使用 Gazebo 真值话题: {check_name}")
+        if check_name not in ALLOWED_TOPICS:
+            raise ValueError(f"{purpose} 未在初始比赛接口白名单中: {check_name}")
+    return resolved
+
 
 
 def require_allowed_input_topic(topic: str, *, purpose: str) -> str:
@@ -230,6 +248,8 @@ def require_manual_control_topic(topic: str, *, purpose: str) -> str:
 def require_allowed_service(service: str, *, purpose: str) -> str:
     """确认生产服务调用已由初始接口文档授权，并返回规范字符串。"""
     normalized = str(service).strip()
-    if normalized not in ALLOWED_SERVICES:
-        raise ValueError(f"{purpose} 未在初始比赛服务白名单中: {normalized}")
-    return normalized
+    resolved = _resolve_ros_topic(normalized)
+    for check_name in (normalized, resolved):
+        if check_name not in ALLOWED_SERVICES:
+            raise ValueError(f"{purpose} 未在初始比赛服务白名单中: {check_name}")
+    return resolved

@@ -35,9 +35,16 @@
 - `/Odometry_gazebo`、`/ground_truth/*`、Gazebo model/link state；
 - `layout_metadata.json`、`building_config.json`、`scene_manifest.json`、world、truth；
 - 将上述数据改名、转发或缓存后作为生产输入；
-- 参赛方 runner 调用 Gazebo 模型配置或传送服务改变机器人状态。
+- 参赛方 runner 调用 Gazebo 模型配置或传送服务改变机器人状态；
+- 通过 ROS launch 或命令行 `<remap>` 将白名单话题重定向至禁用真值。
 
-`interface_policy` 保留兼容的无方向校验函数，但新增生产代码必须使用 `require_allowed_input_topic` 或 `require_allowed_output_topic`。
+`interface_policy` 现已内置 `_resolve_ros_topic`（基于 `rospy.names.resolve_name`），在白名单比对前先解析实际通信话题名，双重防御原始名与重映射名；未初始化时安全兼顾纯离线环境。
+
+## 空间先验消除与在线感知规范
+
+1. **主入口定位**：初始进入观察点不再依赖全局坐标原点 `(0,0)` 先验，改为基于机器狗出生位姿 $(x_0, y_0, \theta_0)$ 沿初始朝向正前方延伸安全接近距离 $\text{target} = (x_0 + d_{\text{approach}}\cos\theta_0, y_0 + d_{\text{approach}}\sin\theta_0)$；门洞由点云实时连续确认。
+2. **高层层高获取**：电梯在仿真中通过 Gazebo `set_model_state` 瞬间传送（0 秒瞬移，无加减速），IMU 积分物理失效；系统采用“空洞激光在线测高为主 + 标称 2.6m 兜底”机制。机器狗在 1 层巡航时前下倾 45° 雷达穿透楼梯间空洞下视 0 层地表，提取双水平地面高差 $\Delta z$；严格执行 $[2.5\text{m}, 2.7\text{m}]$ 物理安全门限拦截（过滤半层 1.3m 楼梯平台），超出门限或未观测时安全回退至标称 2.6m。
+3. **仿真真值解耦**：Gazebo 仿真中保持 `ENABLE_GROUND_TRUTH=1` 确保四足底层控制器（`IOROS.cpp`）足端物理反馈正常运行；`ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH` 仅用于独立控制测试脚本后台是否启动 `rosbag record` 录制离线分析包，两者彻底解耦。
 
 ## 第 2 层内部定位接口
 

@@ -94,6 +94,27 @@ python3 tools/offline/check_production_boundary.py
 可能仍在执行的请求；明确失败仍只重试一次。关闭局部穿越几何时，目标门后的地图阻塞等待
 最多 30 秒，不再每 10 秒重置计时。
 
+## 2026.09.08 接口合规与空间先验消除修复
+
+本次修复针对静态代码审计意见，彻底清除未公开空间先验，封堵 ROS 话题重映射安全缺口，并消除测试脚本中的真值物理耦合：
+
+1. **ROS 话题与服务重映射防御**（`interface_policy.py`）：
+   - **问题**：旧实现仅基于 Python 字符串字面量比对白名单，若 Launch 文件使用 `<remap from="/scan" to="/ground_truth/base_w"/>`，代码会误判通过而暗中消费禁用真值。
+   - **原因**：未在 ROS 客户端层面解析名称重映射规则。
+   - **修改**：增加 `_resolve_ros_topic`，通过 `rospy.names.resolve_name` 取得展开重映射后的全局真实名称，双重校验原始名与解析名，彻底封堵 remap 绕过。
+2. **初始进入观察点前向自适应**（`initial_entry_runtime.py`）：
+   - **问题**：初始观察点直接硬编码世界坐标原点 `(0.0, -1.8)`，存在利用未公开大楼绝对坐标的先验嫌疑。
+   - **原因**：旧逻辑假设大楼永远位于世界坐标 `(0,0)` 且狗固定在 `(0, -3.2)` 出生。
+   - **修改**：将目标点改为基于机器狗出生位姿 $(x_0, y_0, \theta_0)$ 沿初始朝向正前方延伸安全接近距离 $\text{target} = (x_0 + d_{\text{approach}}\cos\theta_0, y_0 + d_{\text{approach}}\sin\theta_0)$，消除绝对原点先验；原有门洞候选过滤保持不变。
+3. **1 层空洞激光在线测高与物理门限拦截**（`floor_transition_runtime.py`、`mission_manager.py`）：
+   - **问题**：电梯在 Gazebo 中通过 `set_model_state` 瞬间传送（0 秒瞬移，无加减速），IMU 积分物理失效；代码原先写死标称 `2.6m` 计算高层红球坐标，缺少传感器在线感知支撑。
+   - **原因**：电梯仿真无连续加减速运动；且室内受 0.22m 楼板厚度影响，净高（2.38m）不等于层高（2.60m），直接测天花板存在固定偏差。
+   - **修改**：新增 `estimate_floor_height_from_cloud`，利用机器狗在 1 层巡航时前下倾 45° 雷达穿透楼梯间空洞下视 0 层地表的几何特性，拟合双水平地面高差；增加 `[2.5m, 2.7m]` 物理安全门限拦截（过滤半层 1.3m 楼梯平台），超出门限或未观测时安全回退至标称 2.6m，并在建图主循环中动态联动更新 `floor_height` 与 `mapper.floor_height`。
+4. **真值诊断录包与底盘物理支撑解耦**（`tools/sim/run_elevator_gui_test.sh`）：
+   - **问题**：当显式设置 `ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=0` 关闭离线真值录包时，仿真启动后机器狗底盘瘫痪趴地。
+   - **原因**：脚本将 Gazebo 的 `ENABLE_GROUND_TRUTH` 错误绑定到该诊断变量，关闭录包连带导致 Gazebo 不加载四足控制器（`IOROS.cpp`）必需的足端状态插件。
+   - **修改**：解耦两者，底层 `ENABLE_GROUND_TRUTH` 保持独立（默认 1），诊断开关仅控制是否启动 `rosbag record`。
+
 ## 9.5.20.25 运行后的修复
 
 详见[本轮证据报告](../../reports/RUN_20260905_2025_REVIEW.md)。控制状态统一使用小写常量，

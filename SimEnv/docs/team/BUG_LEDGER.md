@@ -1,5 +1,22 @@
 # 缺陷台账
 
+- COMPLIANCE-REMAP-001（2026.09.08 静态修复，待实测）：ROS 话题重映射白名单防御漏洞。
+  - 问题：Launch 文件或命令行若使用 `<remap from="/scan" to="/ground_truth/base_w"/>`，节点可能暗中订阅真值接口而绕过校验。
+  - 原因：`interface_policy.py` 仅对输入字符串字面量进行白名单比对，未经过 ROS 运行时名称解析。
+  - 修改：新增 `_resolve_ros_topic` 函数，调用 `rospy.names.resolve_name` 解析重映射后的全局真实名称，对原始名和解析名双重进行黑白名单校验；离线无 ROS 核心时安全回退。
+- PRIOR-ENTRANCE-001（2026.09.08 静态修复，待实测）：初始进入观察目标点硬编码世界坐标原点先验。
+  - 问题：`initial_entry_runtime.py` 将初始观察点写死为 `(MAIN_ENTRANCE_CENTER[0], -config.door_wait_offset)`，存在未公开地图原点 `(0,0)` 先验。
+  - 原因：原实现假设大楼永远位于全局坐标原点 `(0,0)` 且狗出生在 `(0, -3.2)`。
+  - 修改：将观察目标点改为根据机器狗出生位姿 $(x_0, y_0, \theta_0)$ 沿初始朝向正前方延伸安全接近距离 $\text{target} = (x_0 + d_{\text{approach}}\cos\theta_0, y_0 + d_{\text{approach}}\sin\theta_0)$，彻底移除绝对坐标依赖；保留原有门洞候选过滤不变。
+- ELEVATOR-HEIGHT-001（2026.09.08 静态修复，待实测）：电梯瞬移与高层层高先验缺失自适应感知。
+  - 问题：电梯在仿真中通过 Gazebo `set_model_state` 瞬间传送（0秒瞬移，无加减速），IMU 加速度二重积分在物理上完全失效；而代码和 YAML 硬编码标称 `2.6m` 计算高层红球坐标，存在未公开参数先验争议。
+  - 原因：电梯物理仿真机制无连续运动窗口；且室内天花板受 0.22m 楼板厚度影响，净高（2.38m）不等于层高（2.60m），直接测天花板会产生 22cm 系统偏差。
+  - 修改：在 `floor_transition_runtime.py` 新增 `estimate_floor_height_from_cloud`，利用机器狗在 1 层巡航时前下倾 45° 雷达穿透楼梯间空洞下视 0 层地表的几何特性，拟合双水平地面高差；增加 `[2.5m, 2.7m]` 物理安全门限拦截（若扫到 1.3m 楼梯休息平台或噪声则拒绝并回退标称 2.6m）；在 `mission_manager.py` 点云主循环中动态更新 `floor_height` 与 `mapper.floor_height`。
+- DIAGNOSTIC-TRUTH-001（2026.09.08 静态修复，待实测）：测试脚本中真值诊断录包与底盘物理支撑错误耦合。
+  - 问题：在 `run_elevator_gui_test.sh` 中显式设置 `ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH=0` 关闭离线真值录包时，仿真启动后机器狗底盘瞬间瘫痪趴地。
+  - 原因：脚本第 573 行误将 Gazebo 的 `ENABLE_GROUND_TRUTH` 与诊断开关绑定，关闭录包导致 Gazebo 不加载四足步态控制器（`IOROS.cpp`）必需的 `/ground_truth/*` 足端物理插件。
+  - 修改：将 `ENABLE_GROUND_TRUTH` 改为 `${ENABLE_GROUND_TRUTH:-1}`，与离线录包开关彻底解耦，底盘物理引擎插件始终保持就绪，`ELEVATOR_TEST_ENABLE_OFFLINE_TRUTH` 仅控制是否启动外部 `rosbag record`。
+
 - NAV-CORNER-001（9.6.16.50复核坐实并修复）：机器狗在走廊拐角(x=-5.05m, y=6.92m)停滞死锁。
   根因为前向避障刚性矩形走廊(lateral<=0.22m)把forward=0.2001m、lateral=0.2078m的侧向墙角误判为正前障碍，
   欧氏距离0.2885m<0.40m触发零速急停，叠加航向微调落在junior_ctrl死区导致僵死。
