@@ -1376,7 +1376,7 @@ class MultiFloorGridMap:
                         )
                         grid._refresh_cells(changed)
 
-        for px, py, _pz, distance, is_obstacle_point, target_cell in observations:
+        for px, py, pz, distance, is_obstacle_point, target_cell in observations:
             ray_target = target_cell
             if not is_obstacle_point and distance > self.point_free_clear_max_range:
                 if self.point_free_clear_max_range <= 0.0:
@@ -1409,6 +1409,11 @@ class MultiFloorGridMap:
                     ),
                     confirmed_positions=self.low_confirmed_counter_positions,
                     pose_separation=self.counter_pose_separation,
+                    robot_z=float(robot_xyz[2]),
+                    point_z=float(pz),
+                    distance=float(distance),
+                    floor_base_z=float(floor_base_z),
+                    low_height_max_z=float(self.low_height_max_z),
                 )
                 stats.low_core_removed_count += removed
                 self._low_core_removed_total += removed

@@ -2401,7 +2401,13 @@ class MissionManager:
                 inspection = self._danger_inspection
                 progress = self.controller.planning_progress_snapshot()
                 if inspection.phase == DANGER_INSPECTION_IDLE:
-                    self.controller.clear_path(reason="danger_obstacle_sync")
+                    remaining = self.controller.remaining_path_snapshot(pose[:2])
+                    grid = self.mapper.floor(self.current_floor)
+                    if remaining and not all(
+                        self._segment_is_traversable(grid, start, end)
+                        for start, end in zip(remaining, remaining[1:])
+                    ):
+                        self.controller.clear_path(reason="danger_obstacle_sync")
                 elif (
                     inspection.phase == DANGER_INSPECTION_APPROACHING
                     and progress.path_reason == DANGER_INSPECTION_PATH_REASON

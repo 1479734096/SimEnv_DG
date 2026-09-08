@@ -377,6 +377,11 @@ class ObstacleEvidenceLedger:
         confirmed_generations: int,
         confirmed_positions: int,
         pose_separation: float,
+        robot_z: float | None = None,
+        point_z: float | None = None,
+        distance: float | None = None,
+        floor_base_z: float | None = None,
+        low_height_max_z: float | None = None,
     ) -> set[tuple[int, int]]:
         ray = _bresenham(start[0], start[1], end[0], end[1])
         if len(ray) < 3:
@@ -404,6 +409,22 @@ class ObstacleEvidenceLedger:
             generation = int(cloud_generation)
             if generation <= 0:
                 continue
+            if (
+                low_height_max_z is not None
+                and robot_z is not None
+                and point_z is not None
+                and distance is not None
+                and floor_base_z is not None
+            ):
+                if distance > 1e-9:
+                    cell_x, cell_y = self.grid_to_world(cell[0], cell[1])
+                    d = math.hypot(cell_x - robot_xy[0], cell_y - robot_xy[1])
+                    z_ray = robot_z + (d / distance) * (point_z - robot_z)
+                else:
+                    z_ray = robot_z
+                z_rel_ray = z_ray - floor_base_z
+                if z_rel_ray > float(low_height_max_z):
+                    continue
             if (
                 protected_lifecycle
                 and generation != core.last_protected_counter_generation

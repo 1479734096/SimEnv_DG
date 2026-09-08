@@ -865,7 +865,7 @@ class _MissionConfigBuilder:
             "evidence_lifecycle_enabled": bool(
                 _param("map/evidence_lifecycle_enabled", True)
             ),
-            "low_height_max_z": float(_param("map/low_height_max_z", 0.40)),
+            "low_height_max_z": float(_param("map/low_height_max_z", 0.26)),
             "low_confirm_generations": int(
                 _param("map/low_confirm_generations", 3)
             ),

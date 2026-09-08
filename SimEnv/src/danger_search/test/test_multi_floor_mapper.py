@@ -1439,6 +1439,64 @@ class MultiFloorMapperTest(unittest.TestCase):
         self.assertEqual(grid.data[target[1], target[0]], OCC)
         self.assertIn(target, grid.occ_cores)
 
+    def test_counter_ray_3d_height_gate_protects_low_core_from_high_rays(self):
+        """高空光束严禁反证撤销地表低矮核心；只有贴近地面的反证射线才生效。"""
+        mapper = MultiFloorGridMap(
+            resolution=0.1,
+            width=6.0,
+            length=6.0,
+            origin_x=-3.0,
+            origin_y=-3.0,
+            obstacle_inflation_radius=0.0,
+            free_clear_enabled=False,
+            evidence_lifecycle_enabled=True,
+            low_height_max_z=0.26,
+            obstacle_min_z=0.20,
+            low_candidate_counter_generations=2,
+            low_candidate_counter_positions=2,
+            counter_pose_separation=0.15,
+        )
+        grid = mapper.floor(0)
+        core_cell = grid.world_to_grid(1.0, 0.0)
+        assert core_cell is not None
+
+        # 1. 建立地表矮障碍核心 (Z_rel = 0.22m < 0.26m)
+        mapper.update_from_cloud(
+            floor_index=0,
+            robot_xyz=(0.0, 0.0, 0.22),
+            points=[(1.0, 0.0, 0.22)],
+            cloud_generation=1,
+            map_epoch=1,
+            localization_epoch=1,
+        )
+        self.assertIn(core_cell, grid.occ_cores)
+        self.assertEqual(grid.occ_cores[core_cell].kind, "LOW_CANDIDATE")
+
+        # 2. 高空射线 (Z=1.2m > 0.26m) 穿过该栅格，严禁撤销地表低矮核心
+        for gen, rx in ((2, -0.2), (3, 0.2)):
+            mapper.update_from_cloud(
+                floor_index=0,
+                robot_xyz=(rx, 0.0, 1.2),
+                points=[(2.0, 0.0, 1.5)],  # 高处非障碍点 (1.5m > obstacle_max_z 1.4m)
+                cloud_generation=gen,
+                map_epoch=1,
+                localization_epoch=1,
+            )
+        self.assertIn(core_cell, grid.occ_cores)
+
+        # 3. 贴近地表射线 (Z=0.22m <= 0.26m) 穿过该栅格，正常反证并撤销
+        for gen, rx in ((4, -0.2), (5, 0.2)):
+            mapper.update_from_cloud(
+                floor_index=0,
+                robot_xyz=(rx, 0.0, 0.22),
+                points=[(2.0, 0.0, 0.10)],  # 低于 obstacle_min_z 0.20m 的自由点
+                cloud_generation=gen,
+                map_epoch=1,
+                localization_epoch=1,
+            )
+        self.assertNotIn(core_cell, grid.occ_cores)
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -230,7 +230,7 @@ map:
   free_clear_min_points_per_bin: 2
   # 低高度回波先进入非阻挡候选账本；不同点云代次和观测位姿共同确认后才阻挡。
   evidence_lifecycle_enabled: true
-  low_height_max_z: 0.40
+  low_height_max_z: 0.26
   low_confirm_generations: 3
   low_confirm_window_generations: 20
   low_candidate_counter_generations: 3
