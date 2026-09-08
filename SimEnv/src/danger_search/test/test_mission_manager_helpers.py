@@ -4750,7 +4750,7 @@ class MissionManagerHelperTest(unittest.TestCase):
             0.0,
         )
 
-    def test_open_main_entrance_refresh_timeout_fails_closed(self):
+    def test_open_main_entrance_refresh_timeout_degrades_with_existing_geometry(self):
         manager = _make_test_manager()
         manager._entry.origin_pose = (0.0, -3.2, math.pi / 2.0)
         manager._entry.completed = False
@@ -4805,19 +4805,62 @@ class MissionManagerHelperTest(unittest.TestCase):
                 manager.refresh_open_door_geometry(
                     "main_entrance", (0.0, -0.8, math.pi / 2.0)
                 ),
-                FAILED,
+                DONE,
             )
 
-        self.assertEqual(failures, ["主入口开放门洞近场重观测超时"])
+        self.assertEqual(failures, [])
         self.assertEqual(
             manager._door_observation_runtime.refresh.rejection_counts,
             {"width_insufficient": 1},
         )
-        self.assertEqual(events[-1]["event"], "main_entrance_refresh_timeout")
+        self.assertEqual(events[-1]["event"], "main_entrance_refresh_timeout_degraded")
         self.assertEqual(
             events[-1]["rejection_counts"], {"width_insufficient": 1}
         )
         self.assertAlmostEqual(events[-1]["last_candidate"]["width"], 0.9)
+
+    def test_open_main_entrance_refresh_timeout_fails_closed_without_existing_geometry(self):
+        manager = _make_test_manager()
+        manager._entry.origin_pose = (0.0, -3.2, math.pi / 2.0)
+        manager._entry.completed = False
+        manager._door_observation_runtime = DoorObservationRuntime()
+        manager._map_runtime.last_cloud_stamp = 1.0
+        manager._map_runtime.latest_cloud_points = [(0.0, 0.0, 0.5)]
+        manager.current_floor = 0
+        manager.door_refresh_timeout = 3.0
+        manager.door_refresh_max_center_shift = 0.60
+        manager.door_clearance_margin = 0.10
+        manager.initial_entry_opening_max_distance = 1.5
+        manager.initial_entry_geometry_tolerance = 0.3
+        manager.initial_entry_opening_confirmations = 2
+        manager.ground_support_params = {"sweep_half_width": 0.435393}
+        manager._map_runtime.mapper = SimpleNamespace(floor_height=2.6)
+        manager.building_client = SimpleNamespace(doors={})
+        manager._map_runtime.local_detector = SimpleNamespace(
+            detect_opening_ahead=lambda **kwargs: None
+        )
+        failures = []
+        events = []
+        manager._record_failure = lambda reason: failures.append(reason)
+        manager._log_structured = lambda payload: events.append(payload)
+
+        with patch.object(mission_manager_module, "get_time", side_effect=(10.0, 13.1)):
+            self.assertEqual(
+                manager.refresh_open_door_geometry(
+                    "main_entrance", (0.0, -0.8, math.pi / 2.0)
+                ),
+                RUNNING,
+            )
+            manager._map_runtime.last_cloud_stamp = 1.1
+            self.assertEqual(
+                manager.refresh_open_door_geometry(
+                    "main_entrance", (0.0, -0.8, math.pi / 2.0)
+                ),
+                FAILED,
+            )
+
+        self.assertEqual(failures, ["主入口开放门洞近场重观测超时"])
+        self.assertEqual(events[-1]["event"], "main_entrance_refresh_timeout")
 
     def test_open_main_entrance_refresh_classifies_candidate_rejections(self):
         manager = _make_test_manager()

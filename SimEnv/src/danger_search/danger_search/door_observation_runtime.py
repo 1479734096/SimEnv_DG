@@ -311,11 +311,35 @@ class DoorObservationRuntime:
             stamp=cloud_stamp,
             timeout=config.timeout,
         )
+        existing = building_client.doors.get(str(door_id))
         if precheck == TIMEOUT:
             diagnostic = self.refresh.diagnostic_snapshot(
                 door_id=door_id,
                 pose=pose,
             )
+            if existing is not None:
+                diagnostic["event"] = "main_entrance_refresh_timeout_degraded"
+                self.refresh.started_at = None
+                self.refresh.confirmations = 0
+                self.refresh.observation = None
+                if (
+                    isinstance(current_task, OpenDoorAndPass)
+                    and current_task.door_id == str(door_id)
+                ):
+                    current_task.mark_opening_sensor_confirmed()
+                MissionReportingRuntime.logwarn(
+                    "开放主入口近场重观测超时，保留既有连续确认门几何并降级放行："
+                    "door_id=%s center=(%.2f, %.2f) yaw=%.2f width=%.2f",
+                    door_id,
+                    existing.x,
+                    existing.y,
+                    existing.yaw,
+                    existing.width,
+                )
+                return DoorRefreshResult(DONE, diagnostic=diagnostic)
+            self.refresh.started_at = None
+            self.refresh.confirmations = 0
+            self.refresh.observation = None
             diagnostic["event"] = "main_entrance_refresh_timeout"
             return DoorRefreshResult(
                 FAILED,
@@ -324,7 +348,6 @@ class DoorObservationRuntime:
             )
         if precheck != PROCESS:
             return DoorRefreshResult(RUNNING)
-        existing = building_client.doors.get(str(door_id))
         if existing is None:
             return DoorRefreshResult(
                 FAILED,

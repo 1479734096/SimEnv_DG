@@ -880,3 +880,17 @@ Stage15～17 当前结论：
   6. **位姿统一入口白名单防御**：`pose_provider.py` 增加 `expected_frame_id` 过滤（默认 `world`，兼容 `danger_search_relative`），非白名单坐标系直接丢弃并限频警告；`mission_components.py` 工厂装配时透传配置。
   现状：代码、配置与文档已修改完毕，并通过 Python 编译与 Bash 语法检查。
 
+## 46. 2026-09-08 主大门返航近场重观测超时降级保活闭环（STAGE47）
+
+- **问题现象与隐患**：
+  在 `seed_1044` 全真评测中，机器狗已完成双楼层探索与乘梯，并在 981s 成功将危险源检测结果刷盘（3/4 正确、0 虚警）；但在最后终局返航阶段，机器狗在 0 层向主大门呼叫开门后，于门内 1.6m 处停滞并报告 `main_entrance_refresh_timeout`，任务状态机直接抛出 `FAILED` 自杀判负停机，未能跑出大门回到物理起点 `(0.0, -3.2)`。
+
+- **根本原因排查与架构/物理证据**：
+  1. **室内向室外视场缺陷**：机器狗身处 2.0m 宽走廊内部向室外观察大门，两侧平直墙体沿纵向平滑延伸至门外，缺乏开阔外立面背景下的独立竖直门垛立柱；`detect_opening_ahead` 无法在单一深度切片内提取出独立双立柱，连续 29 帧 `no_candidate` 耗尽 3.0s 预算；
+  2. **状态机容错不一致**：电梯近场重观测超时时具备成熟的降级保活机制（`ElevatorRefreshResult(IDLE)`），保留既有连续确认几何放行；而大门模块在超时分支硬编码了 `DoorRefreshResult(FAILED)` 自杀停机；
+  3. **出梯纠偏伪命题**：现场日志证明 0 层电梯门前因走廊缺乏凸起特征，开局时地标 ICP 即被评为 `ambiguous` 拒纠；且出梯时背对电梯并伴随异步关门，不具备配准条件；且本次返航实测最大漂移仅 0.44m（完全在竞赛 0.60m 返航指标内），真正死因是大门的超时硬自杀。
+
+- **修改方案与修改后现状**：
+  1. **主大门超时平滑降级保活**：在 `door_observation_runtime.py:314` 中，当 `precheck == TIMEOUT` 触发时，检查开局在室外冻结的高精门几何 `existing`；存在时记录结构化事件 `main_entrance_refresh_timeout_degraded` 与 Warning，重置追踪器状态，调用 `current_task.mark_opening_sensor_confirmed()` 解除过门门槛防挂起保护，平滑返回 `DoorRefreshResult(DONE)`；若 `existing` 不存在则保持 fail-closed 抛出 `FAILED`；
+  2. **单测加固重构**：在 `test_mission_manager_helpers.py` 中将原超时单测重构为双向校验（有既有门几何时降级为 `DONE`、无既有门几何时 fail-closed 返回 `FAILED`）。
+  现状：代码与单测已完成修改，并通过 Python 编译检查。
