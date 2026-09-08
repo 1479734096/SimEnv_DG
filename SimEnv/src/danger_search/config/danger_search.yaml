@@ -262,7 +262,8 @@ frontier:
   fail_limit: 3
   # STUCK 后临时排除同一前沿簇附近目标，避免质心轻微漂移后立刻重试同一路线。
   stuck_blacklist_radius: 1.0
-  no_progress_timeout: 6.0
+  # 历史无进展超时字段，现与 controller.route_progress_timeout 保持统一（默认 7.0s）。
+  no_progress_timeout: 7.0
   # 平方根收益保留高价值远目标机会，同时提高路程代价以形成收益兼顾的广度优先。
   information_gain_weight: 0.39
   path_cost_weight: 3.2
@@ -330,6 +331,8 @@ controller:
   # A1 机身前缘需要留出停车余量；近于 stop 时只转向，slow 范围内连续减速。
   obstacle_stop_distance: 0.40
   obstacle_slow_distance: 0.60
+  # 沿折线路径无有效推进卡滞超时阈值（经实测 7s 保留 1.5s 安全裕度并敏捷脱困）。
+  route_progress_timeout: 7.0
   progress_distance: 0.25
   # 中等航向误差继续使用现有 yaw/曲率混合走弧线；仅大角度或高速旋转原地转向。
   turn_in_place_heading: 1.10

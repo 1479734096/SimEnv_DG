@@ -1186,15 +1186,24 @@ class _MissionConfigBuilder:
             "turn_release_samples": int(
                 _param("controller/turn_release_samples", 3)
             ),
+            # 路线进度超时统一：优先 controller/route_progress_timeout，兼容降级 frontier/no_progress_timeout，默认 7.0
             "route_progress_timeout": float(
-                _param("controller/route_progress_timeout", 8.0)
+                _param(
+                    "controller/route_progress_timeout",
+                    _param("frontier/no_progress_timeout", 7.0),
+                )
             ),
             "route_progress_improvement": float(
                 _param("controller/route_progress_improvement", 0.10)
             ),
             "obstacle_stop_distance": float(_param("controller/obstacle_stop_distance", 0.50)),
             "obstacle_slow_distance": float(_param("controller/obstacle_slow_distance", 1.00)),
-            "no_progress_timeout": float(_param("frontier/no_progress_timeout", 8.0)),
+            "no_progress_timeout": float(
+                _param(
+                    "controller/route_progress_timeout",
+                    _param("frontier/no_progress_timeout", 7.0),
+                )
+            ),
             "progress_distance": float(_param("controller/progress_distance", 0.25)),
             "turn_retreat_trigger_distance": float(
                 _param("controller/turn_retreat_trigger_distance", 0.38)

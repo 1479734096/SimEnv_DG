@@ -829,7 +829,7 @@ while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
     fi
   fi
 
-  if grep -Fq '"event": "mission_result_write"' "$MISSION_LOG" || \
+  if grep -Fq '"event": "mission_result_written"' "$MISSION_LOG" || \
      grep -Fq "换层任务失败" "$MISSION_LOG"; then
     fail "任务在完成所需电梯闭环前进入失败结果"
     exit $?

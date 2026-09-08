@@ -6475,7 +6475,7 @@ class MissionManager:
 
         ``reason_code`` 描述机器可聚合的原因，``call_site`` 标识决策位置，额外
         上下文保存当时的规划/安全信息。进入返航时清除探索目标，进入写结果时
-        锁存写出原因，避免旧路径或后续 shutdown 覆盖真实终态。
+        停用运动（清空路径并锁住非零速度）并锁存写出原因，避免旧路径或后续 shutdown 覆盖真实终态。
         """
         old_state = getattr(self, "state", None)
         danger_context = getattr(self, "_danger_inspection", None)
@@ -6520,6 +6520,29 @@ class MissionManager:
             self._return_home_started = True
         if new_state == WRITE_RESULT:
             self._pending_result_write_reason = reason_code
+            controller = getattr(self, "controller", None)
+            disable_motion = getattr(controller, "disable_motion", None)
+            if callable(disable_motion):
+                try:
+                    disable_motion(reason=str(reason_code or "write_result"))
+                except TypeError:
+                    disable_motion()
+            else:
+                clear_path = getattr(controller, "clear_path", None)
+                if callable(clear_path):
+                    try:
+                        clear_path(reason=str(reason_code or "write_result"))
+                    except TypeError:
+                        clear_path()
+                stop = getattr(controller, "stop", None)
+                if callable(stop):
+                    try:
+                        stop(reason=str(reason_code or "write_result"))
+                    except TypeError:
+                        try:
+                            stop()
+                        except TypeError:
+                            pass
 
         diagnostic = self._mission_diagnostic_snapshot()
         if diagnostic_context:

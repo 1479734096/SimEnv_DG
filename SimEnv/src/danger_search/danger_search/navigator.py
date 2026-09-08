@@ -86,10 +86,10 @@ class PathFollower:
     direct_command_max_age: float = 0.6
     obstacle_stop_distance: float = 0.40
     obstacle_slow_distance: float = 0.60
-    no_progress_timeout: float = 8.0
+    no_progress_timeout: float = 7.0
     progress_distance: float = 0.25
     # 路线进度监督：只认"沿折线推进"，机体位移（绕圈/后退）不再算进度。
-    route_progress_timeout: float = 8.0
+    route_progress_timeout: float = 7.0
     route_progress_improvement: float = 0.10
     # 控制周期参数（固定频率控制器）。
     pose_max_age: float = 0.30
@@ -247,6 +247,7 @@ class PathFollower:
             self.obstacle_stop_distance,
             self.obstacle_slow_distance,
             self.no_progress_timeout,
+            self.route_progress_timeout,
             self.progress_distance,
             self.turn_retreat_trigger_distance,
             self.turn_retreat_target_clearance,
@@ -266,6 +267,7 @@ class PathFollower:
             or self.obstacle_slow_distance <= self.obstacle_stop_distance
             or self.turn_retreat_target_clearance <= self.turn_retreat_trigger_distance
             or self.no_progress_timeout <= 0.0
+            or self.route_progress_timeout <= 0.0
             or self.progress_distance <= 0.0
         ):
             raise ValueError("路径跟踪速度、容差、恢复或进度参数无效")
@@ -1710,7 +1712,8 @@ class PathFollower:
             "safety_gate": gate_snapshot() if callable(gate_snapshot) else None,
             "zero_command_reason": self._debug_zero_command_reason,
             "stuck_elapsed": _finite_or_none(self._debug_stuck_elapsed),
-            "no_progress_timeout": self.no_progress_timeout,
+            "no_progress_timeout": self.route_progress_timeout,
+            "route_progress_timeout": self.route_progress_timeout,
             "replan_reason": self._debug_replan_reason,
             "recover_state": self._recover_phase,
             "recover_reason": self._debug_recover_reason,
