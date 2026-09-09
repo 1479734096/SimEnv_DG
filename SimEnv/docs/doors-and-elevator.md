@@ -80,8 +80,8 @@ rosservice call /call_elevator "{elevator_id: 'elevator_main', target_floor: 0, 
 - `main_entrance` 为首层主入口门。
 - `elevator_floor_0`、`elevator_floor_1` 等为各楼层电梯厅门。
 - `elevator_main` 为当前楼栋默认电梯 ID。
-- 电梯厅门默认采用约 25 s 开门或关门过程（对应 `building_generator_core` 中的 `ELEVATOR_DOOR_MOTION_DURATION = 25.0`），控制服务会持续插值更新左右门板位置。
-- `rosservice call /set_door_state` 通常在门动作完成后返回。在自主导航任务（`danger_search`）中，机器人出电梯到达厅外安全区后，会自动通过后台异步线程请求关门（Fire-and-Forget），主状态机无需同步等待门完全关闭即可立即开始下一楼层的建图与路径规划。
+- 电梯厅门默认采用约 25 s 开门或关门过程，控制服务会持续插值更新左右门板位置。
+- `rosservice call /set_door_state` 通常在门动作完成后返回。
 - `/call_elevator` 负责移动轿厢到目标楼层。
 - 机器人进出轿厢仍由参赛算法通过 `/cmd_vel` 控制。
 - `open_doors` 字段记录电梯状态，但楼层电梯厅门建议通过 `/set_door_state` 明确开关，便于比赛流程复现。

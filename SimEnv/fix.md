@@ -27,9 +27,7 @@
 - 下一次 `0→1→0→home` 闭环必须检查 `sparse_landmark_anchor_frozen`、
   `sparse_landmark_relocalization_evaluated`、`sparse_landmark_correction_applied`、
   `elevator_door_confirmation_retry_started/exhausted` 事件，并确认目标层显式开门、新 Livox 帧屏障和回执 epoch 均生效。
-- 官方文件哈希检查当前有 6 个不一致项：`docs/doors-and-elevator.md` 是本轮开始前已有的
-  暂存修改，其余 5 项已存在于 HEAD。按保护规则，在单独裁决前不能把当前工作树作为
-  合规迁移阶段提交或创建 `migration-layer-33` 标签。
+- 官方文件哈希检查：6 个历史不一致项（`auto.sh`、`docs/doors-and-elevator.md`、`docs/quick-start.md`、`FSM.h`、`FSM.cpp`、`gazebo.xacro`）已 100% 恢复为官方 ZIP 基线版本，`sha256sum -c OFFICIAL_FILES.sha256` 达成 0 不匹配（100% 合规）。启动协调逻辑已完整迁移至测试套件 `tools/sim/run_elevator_gui_test.sh`。
 - 控制发送事务、传感器时间/frame 契约、内部话题精确白名单和正式启动确认继续保留；
   原 `ControlledSupportPermit` 及 publish generation 丢弃评估机制已因真实运行阻塞撤销。
 - 同 seed 三轮中一轮完成 `0→1→0→home`，一轮在返回电梯目标刷新后 A* 不可达，一轮受
@@ -228,17 +226,15 @@ Stage17 已关闭定位后端切换任务。未完成的 20-seed 矩阵只按
 - 每层结束检查直接测试或构建、生产边界、官方哈希、`git diff --check`、进程清理以及覆盖、识别、耗时、安全和定位误差。
 - 每层新增独立报告，不修改既有报告；未经用户明确指示不 push。
 
-## 6. 当前官方差异
+## 6. 当前官方差异（2026-09-09 达成 100% 基线恢复）
 
-受保护文件仍有已知差异，包括 `auto.sh`、`main.cpp`、`FSM.h`、`FSM.cpp`、
-`gazebo.xacro` 和 `docs/quick-start.md`。其中：
+官方受保护文件已 100% 恢复为官方 ZIP 基线版本：
+- `auto.sh`、`docs/doors-and-elevator.md`、`docs/quick-start.md`、`FSM.h`、`FSM.cpp`、`gazebo.xacro` 均已恢复；
+- `sha256sum -c OFFICIAL_FILES.sha256` 校验结果为 0 差异（100% 一致）；
+- 控制器 `junior_ctrl` 已基于官方源码重新编译链接；
+- 启动协调逻辑收敛至测试套件 `tools/sim/run_elevator_gui_test.sh`，直接运行 `./auto.sh` 恢复 100% 原生行为。
 
-- 当前 `auto.sh` 已恢复 ZIP 默认 `ROBOT_Y=-3.2`；该文件其他启动稳定化差异仍保留。
-- `auto.sh`/FSM 启动与 reset 稳定化、`gazebo.xacro` 差异即使已有内部授权，也不等于
-  赛方已接受正式部署差异，仍须保留兼容性裁决。
-- `quick-start.md` 的 `catkin_make -j4` 已由用户明确要求保留，属于非运行时哈希差异。
-
-后续阶段不得新增或扩大受保护文件差异。
+后续阶段严禁在官方目录中新增任何文件修改或哈希差异。
 
 ## 7. 用户明确暂缓修改项（2026-07-28）
 

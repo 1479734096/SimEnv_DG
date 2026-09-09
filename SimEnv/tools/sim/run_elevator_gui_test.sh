@@ -41,6 +41,9 @@ ELEVATOR_TEST_LOCALIZATION_BACKEND="${ELEVATOR_TEST_LOCALIZATION_BACKEND:-adapti
 ELEVATOR_TEST_LOCALIZATION_MAX_RANGE="${ELEVATOR_TEST_LOCALIZATION_MAX_RANGE:-15.0}"
 ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED="${ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED:-false}"
 ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED="${ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED:-true}"
+STARTUP_CALF_POSITION="${STARTUP_CALF_POSITION:--2.0}"
+SPAWN_CONFIG_SETTLE_TIMEOUT="${SPAWN_CONFIG_SETTLE_TIMEOUT:-30}"
+CONTROLLER_READY_TIMEOUT="${CONTROLLER_READY_TIMEOUT:-45}"
 DEFAULT_EVIDENCE_ROOT="/home/xbh/tzb26/evidence/simenv"
 if [ ! -d "$DEFAULT_EVIDENCE_ROOT" ]; then
   DEFAULT_EVIDENCE_ROOT="/tmp"
@@ -93,6 +96,9 @@ usage() {
   ELEVATOR_TEST_LOCALIZATION_MAX_RANGE=15.0 定位点云最大量程，必须大于 0.5 m
   ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false  是否让 RGB-D 参与共享地图定位
   ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED=true  是否启用开门后的 Livox 穿越几何刷新
+  STARTUP_CALF_POSITION=-2.0           测试准备阶段 calf 初始角，设为 none 恢复赛方原生
+  SPAWN_CONFIG_SETTLE_TIMEOUT=30       等待 spawn 延迟配置超时（秒）
+  CONTROLLER_READY_TIMEOUT=45          等待控制器首帧与关节反馈超时（秒）
   ELEVATOR_TEST_KEEP_RUNNING=1         成功后保留 GUI，按 Ctrl-C 清理
   ELEVATOR_TEST_LOG_DIR=/path/...      证据目录，默认 /home/xbh/tzb26/evidence/simenv/seed...
 
@@ -386,6 +392,121 @@ wait_for_log() {
   return 1
 }
 
+wait_for_spawn_configuration_settle() {
+  local deadline=$((SECONDS + SPAWN_CONFIG_SETTLE_TIMEOUT))
+  local gazebo_log="$WORKSPACE_ROOT/logs/competition_gazebo.log"
+  log "等待 spawn_model 完成延迟关节配置……"
+  while (( SECONDS < deadline )); do
+    if ! kill -0 "$AUTO_PID" 2>/dev/null; then
+      log "等待延迟关节配置时 auto.sh 已退出。"
+      return 1
+    fi
+    if [[ -f "$gazebo_log" ]] && grep -a -q "Set model configuration status: SetModelConfiguration: success" "$gazebo_log" 2>/dev/null; then
+      log "spawn_model 延迟关节配置已完成。"
+      return 0
+    fi
+    sleep 0.2
+  done
+  log "等待 spawn_model 延迟关节配置超时（${SPAWN_CONFIG_SETTLE_TIMEOUT}s）。"
+  if [[ -f "$gazebo_log" ]]; then
+    tail -n 40 "$gazebo_log" >&2 || true
+  fi
+  return 1
+}
+
+prepare_startup_joint_angles() {
+  if [[ "$STARTUP_CALF_POSITION" == "none" || "$STARTUP_CALF_POSITION" == "NONE" || -z "$STARTUP_CALF_POSITION" ]]; then
+    log "[AUDIT] STARTUP_CALF_POSITION 设置为 none，跳过关节微调，保持赛方原生初始姿态（-2.65 rad）"
+    return 0
+  fi
+  log "[AUDIT] 测试准备阶段执行 calf=${STARTUP_CALF_POSITION} rad 初始关节调整（与正式算法隔离）"
+  local request="model_name: 'a1_gazebo'
+urdf_param_name: 'robot_description'
+joint_names: ['FR_calf_joint', 'FL_calf_joint', 'RR_calf_joint', 'RL_calf_joint']
+joint_positions: [$STARTUP_CALF_POSITION, $STARTUP_CALF_POSITION, $STARTUP_CALF_POSITION, $STARTUP_CALF_POSITION]"
+  local response
+  response="$(timeout 5s rosservice call /gazebo/set_model_configuration "$request" 2>/dev/null || true)"
+  if ! grep -q 'success: True' <<<"$response"; then
+    log "恢复物理前的初始 calf 配置写入失败：$response"
+    return 1
+  fi
+  return 0
+}
+
+wait_for_junior_ctrl_main_loop() {
+  local deadline=$((SECONDS + CONTROLLER_READY_TIMEOUT))
+  log "等待 junior_ctrl 主循环首帧命令（确认模型与 FSM 主循环已启动）……"
+  while (( SECONDS < deadline )); do
+    if ! kill -0 "$AUTO_PID" 2>/dev/null; then
+      log "等待控制器就绪时 auto.sh 已退出。"
+      return 1
+    fi
+    if pgrep -f "junior_ctrl" >/dev/null 2>&1; then
+      if rostopic info /a1_gazebo/FR_calf_controller/command 2>/dev/null | \
+           grep -q '^[[:space:]]*\* /unitree_gazebo_servo ' && \
+         timeout 2s rostopic echo -n 1 /a1_gazebo/FR_calf_controller/command >/dev/null 2>&1; then
+        log "junior_ctrl 主循环已启动（命令话题已有首帧输出）。"
+        return 0
+      fi
+    fi
+    sleep 0.2
+  done
+  log "等待 junior_ctrl 主循环首帧超时（${CONTROLLER_READY_TIMEOUT}s）；保持物理暂停并中止。"
+  return 1
+}
+
+unpause_physics() {
+  log "正在请求恢复 Gazebo 物理仿真……"
+  if ! timeout 5s rosservice call /gazebo/unpause_physics >/dev/null 2>&1; then
+    log "Gazebo 物理恢复服务调用失败。"
+    return 1
+  fi
+  log "Gazebo 物理已成功恢复。"
+  return 0
+}
+
+wait_for_live_joint_feedback() {
+  local deadline=$((SECONDS + CONTROLLER_READY_TIMEOUT))
+  local topics=(
+    /a1_gazebo/FR_hip_controller/state
+    /a1_gazebo/FR_thigh_controller/state
+    /a1_gazebo/FR_calf_controller/state
+    /a1_gazebo/FL_hip_controller/state
+    /a1_gazebo/FL_thigh_controller/state
+    /a1_gazebo/FL_calf_controller/state
+    /a1_gazebo/RR_hip_controller/state
+    /a1_gazebo/RR_thigh_controller/state
+    /a1_gazebo/RR_calf_controller/state
+    /a1_gazebo/RL_hip_controller/state
+    /a1_gazebo/RL_thigh_controller/state
+    /a1_gazebo/RL_calf_controller/state
+    /trunk_imu
+  )
+  local topic
+  local received
+
+  log "等待 12 路 Gazebo 关节状态与机身 IMU 实时反馈……"
+  for topic in "${topics[@]}"; do
+    received="false"
+    while (( SECONDS < deadline )); do
+      if timeout 2s rostopic echo -n 1 "$topic" >/dev/null 2>&1; then
+        received="true"
+        break
+      fi
+      if ! kill -0 "$AUTO_PID" 2>/dev/null; then
+        log "等待 $topic 实时反馈时 auto.sh 已退出。"
+        return 1
+      fi
+    done
+    if [[ "$received" != "true" ]]; then
+      log "等待 $topic 实时反馈超时。"
+      return 1
+    fi
+  done
+  log "12 路 Gazebo 关节状态与机身 IMU 实时反馈均已就绪。"
+  return 0
+}
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
@@ -562,12 +683,15 @@ KEEPER_PID=$!
 
 killall -9 rosmaster roscore 2>/dev/null || true
 
+# 清理旧的 competition_gazebo.log，确保本轮 spawn 状态检测不受前序日志干扰
+rm -f "$WORKSPACE_ROOT/logs/competition_gazebo.log"
+
 setsid env \
   SEED="$SEED" \
   FLOOR_COUNT="$ELEVATOR_TEST_FLOOR_COUNT" \
   GUI="$GUI" \
   PAUSED=true \
-  AUTO_UNPAUSE=1 \
+  AUTO_UNPAUSE=0 \
   CONTROLLER_FOREGROUND=1 \
   ENABLE_REFEREE_ODOM=false \
   ENABLE_GROUND_TRUTH="${ENABLE_GROUND_TRUTH:-1}" \
@@ -577,13 +701,14 @@ setsid env \
   "$WORKSPACE_ROOT/auto.sh" > "$AUTO_LOG" 2>&1 < "$FIFO" &
 AUTO_PID=$!
 
-if ! wait_for_log "$AUTO_LOG" "12 路 Gazebo 关节状态和机身 IMU 均已有实时反馈。" 180 "$AUTO_PID"; then
-  fail "Gazebo 或关节控制链未在 180 秒内就绪" 2
+# 等待 spawn 延迟配置就绪（同时确证仿真底座已拉起）
+if ! wait_for_spawn_configuration_settle; then
+  fail "Gazebo 机器人 spawn 延迟配置未在规定时间内完成" 2
   exit $?
 fi
 
 MASTER_PID=""
-for _attempt in {1..5}; do
+for _attempt in {1..10}; do
   MASTER_PID="$(ss -ltnp 2>/dev/null | awk '$4 ~ /:11311$/ {if (match($0, /pid=[0-9]+/)) {print substr($0, RSTART + 4, RLENGTH - 4); exit}}' || true)"
   if [[ ! "$MASTER_PID" =~ ^[0-9]+$ ]]; then
     MASTER_PID="$(pgrep -n -f "rosmaster.*11311" 2>/dev/null || pgrep -n -f "rosmaster" 2>/dev/null || true)"
@@ -599,7 +724,7 @@ if [[ ! "$MASTER_PID" =~ ^[0-9]+$ ]]; then
 fi
 
 GAZEBO_PID=""
-for _attempt in {1..5}; do
+for _attempt in {1..10}; do
   GAZEBO_PID="$(rosnode info /gazebo 2>/dev/null | awk '$1 == "Pid:" && $2 ~ /^[0-9]+$/ { print $2; exit }' || true)"
   if [[ ! "$GAZEBO_PID" =~ ^[0-9]+$ ]]; then
     GAZEBO_PID="$(pgrep -n -f "gzserver" 2>/dev/null || true)"
@@ -609,6 +734,30 @@ for _attempt in {1..5}; do
   fi
   sleep 0.5
 done
+
+# 写入恢复物理前的初始 calf 配置
+if ! prepare_startup_joint_angles; then
+  fail "恢复物理前设置 calf 初始关节配置失败" 2
+  exit $?
+fi
+
+# 等待 junior_ctrl 主循环首帧
+if ! wait_for_junior_ctrl_main_loop; then
+  fail "junior_ctrl 控制器主循环首帧未在规定时间内就绪" 2
+  exit $?
+fi
+
+# 恢复 Gazebo 物理
+if ! unpause_physics; then
+  fail "恢复 Gazebo 物理仿真失败" 2
+  exit $?
+fi
+
+# 等待 12 路关节状态与机身 IMU 实时反馈
+if ! wait_for_live_joint_feedback; then
+  fail "Gazebo 关节状态或 IMU 实时反馈未在规定时间内就绪" 2
+  exit $?
+fi
 
 # 在站立和 RL 切换之前录包，保留初始化前的姿态与点云证据。
 if [[ "$ELEVATOR_TEST_RECORD_DRIFT" == "1" ]]; then

@@ -80,10 +80,7 @@
   `/cmd_vel` publisher。最终 publish 提交、DROP 锁存、active motion、keepalive 和
   wall watchdog 已使用同一事务锁；发布成功只表示本地 `publish()` 正常返回。
 
-说明：`auto.sh`、`FSM.h`、`FSM.cpp`、用户保留的 `gazebo.xacro`，以及用户明确要求保留
-`catkin_make -j4` 的 `docs/quick-start.md` 是已知官方哈希差异。内部授权只说明变更
-来源，不等于赛方接受正式部署差异。`auto.sh` 的默认出生点已恢复 ZIP 的
-`ROBOT_Y=-3.2`。
+说明：`auto.sh`、`docs/doors-and-elevator.md`、`docs/quick-start.md`、`FSM.h`、`FSM.cpp` 和 `gazebo.xacro` 6 个历史受保护文件已 100% 恢复为官方 ZIP 基线，`sha256sum -c OFFICIAL_FILES.sha256` 达成 0 差异（100% 合规）。启动协调与关节准备逻辑已完整解耦迁移至测试脚本入口 `tools/sim/run_elevator_gui_test.sh`。
 
 ## 3. MissionManager 已关闭问题
 
@@ -957,4 +954,17 @@ Stage15～17 当前结论：
   4. **0.10m 滞回带构建与超时保护**：重新站位退出门限 $0.20\text{m}$，对准打断门限 $0.30\text{m}$，构建 $0.10\text{m}$ 施密特滞回带；站位总超时 $30.0\text{s}$ 连续累计不刷新；近场障碍物与旋转包络保护完整保留；
   5. **测试用例架构规整与加固**：将主大门测试用例规范迁移至 `OpenDoorAndPassTest`，更新 `test_open_door_refreshes_geometry_and_confirms_wait_point_when_close` 覆盖刷新后统一收口确认，并加固 `test_main_entrance_recenter_exit_tolerance_enforces_tight_recenter` 与 `test_main_entrance_drift_pending_hard_gate_blocks_pass_commitment`，全面覆盖时间戳推进、静止等待与偏离待决硬门禁。
   现状：代码、测试与文档已同步更新，并通过全量 Python 静态编译检查（0 错误）。
+
+## 48. 2026-09-09 官方基线 100% 恢复与启动协调解耦迁移
+
+- **官方文件 100% 恢复**：
+  - 恢复 `auto.sh`、`docs/doors-and-elevator.md`、`docs/quick-start.md`、`FSM.h`、`FSM.cpp`、`gazebo.xacro` 共 6 个历史不一致文件至 `SimEnv初始.zip` 官方版本。
+  - 执行 `sha256sum -c OFFICIAL_FILES.sha256` 达成 **0 不匹配（100% 官方基线合规）**。
+  - 重新编译链接 `junior_ctrl`（`catkin_make --pkg unitree_guide -j2`），确证控制器二进制与官方源码完全同步。
+- **启动协调解耦迁移**：
+  - 将原修改版 `auto.sh` 中承担的延迟关节配置等待、启动 calf 姿态设定、控制器首帧确认、物理恢复及 12 路关节状态与 IMU 实时反馈检测，完整收敛至测试套件 `tools/sim/run_elevator_gui_test.sh`。
+  - 测试脚本调用原生 `auto.sh` 时显式传入 `PAUSED=true AUTO_UNPAUSE=0 CONTROLLER_FOREGROUND=1`，确保官方 `auto.sh` 在测试入口下安全暂停启动且不产生 unpause 竞争。
+  - 测试准备阶段的关节调整由 `STARTUP_CALF_POSITION` 控制，默认 -2.0 rad 并显式记录 `[AUDIT]` 隔离日志，同时支持 `STARTUP_CALF_POSITION=none` 恢复原生启动姿态。
+  - 按键 8 历史修改不迁移，随 FSM 恢复官方行为。
+  - 直接手动执行 `./auto.sh` 恢复 100% 赛方原生行为。
 
