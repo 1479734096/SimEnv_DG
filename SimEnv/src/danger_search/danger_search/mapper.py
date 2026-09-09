@@ -1201,14 +1201,36 @@ class MultiFloorGridMap:
         """返回当前已创建的楼层，避免语义层为未知楼层凭空建图。"""
         return tuple(sorted(self._floors))
 
-    def transform_planar(self, dx: float, dy: float, yaw: float) -> tuple[int, ...]:
-        """同步变换全部已实例化楼层及其世界坐标证据。"""
+    def transform_planar(
+        self,
+        dx: float,
+        dy: float,
+        yaw: float,
+        *,
+        target_floors: tuple[int, ...] | None = None,
+    ) -> tuple[int, ...]:
+        """同步变换全部或指定已实例化楼层及其世界坐标证据。"""
         values = (float(dx), float(dy), float(yaw))
         if not all(math.isfinite(value) for value in values):
             raise ValueError("地图 SE(2) 变换量必须为有限数")
-        for grid in self._floors.values():
+        floors = (
+            [self._floors[fid] for fid in target_floors if fid in self._floors]
+            if target_floors is not None
+            else list(self._floors.values())
+        )
+        for grid in floors:
             grid.transform_planar(*values)
-        return self.instantiated_floor_indices
+        return tuple(
+            sorted(
+                fid
+                for fid in (
+                    target_floors
+                    if target_floors is not None
+                    else self.instantiated_floor_indices
+                )
+                if fid in self._floors
+            )
+        )
 
     def estimate_floor_from_z(self, z: float) -> int:
         """按楼层高度把绝对 Z 量化为非负楼层编号。"""
@@ -1320,13 +1342,18 @@ class MultiFloorGridMap:
 
                     # 2. 障碍物分类裁决：
                     if nominal_z_rel < self.low_height_max_z:
+                        # 远距（> low_candidate_max_range）：点稀疏、高度混叠，多帧"稳定命中"不可靠，只信高回波，不予记账
+                        if (
+                            self.low_candidate_max_range > 0.0
+                            and _distance > self.low_candidate_max_range
+                        ):
+                            continue
                         # 生产模式（low_near_exempt_radius > 0）：近身自腿已被过滤，前方视距内的低矮点
                         # 物理上 100% 为真实障碍物（0.24m 托盘），直接判定为 HIGH_HARD 首帧阻挡并膨胀，避免切角踏上托盘；
-                        # 未开启豁免（如纯生命周期单测）或远距不可靠回波保持 LOW_CANDIDATE 候选账本。
+                        # 未开启豁免（如纯生命周期单测）保持 LOW_CANDIDATE 候选账本。
                         if (
                             self.low_near_exempt_radius > 0.0
                             and (self.point_free_clear_max_range <= 0.0 or _distance <= self.point_free_clear_max_range)
-                            and (self.low_candidate_max_range <= 0.0 or _distance <= self.low_candidate_max_range)
                         ):
                             kind = HIGH_HARD
                         else:

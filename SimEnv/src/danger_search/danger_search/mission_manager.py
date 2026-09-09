@@ -457,6 +457,7 @@ class MissionManager:
         self._landmark_relocalizer = components.landmark_relocalizer
         self._landmark_relocalization_operations: dict[str, dict[str, object]] = {}
         self._post_exit_drift_correction_op: dict[str, object] | None = None
+        self._post_exit_drift_correction_result: str | None = None
         self._reporting = components.reporting
         self._perception_runtime = components.perception
         self.pose_provider = components.pose_provider
@@ -848,141 +849,194 @@ class MissionManager:
                 self._freeze_landmark_anchor("elevator", door_id)
 
     def _observe_post_exit_elevator_door(self, pose: tuple[float, float, float]) -> bool:
-        """在出梯面向电梯门期间，驱动 RGB-D / 局部传感器重新观察与注册当前层门几何。"""
-        elevator_scan = self._elevator_observation.tick_visual_scan(
-            now=get_time(),
-            pose=pose,
-            current_floor=self.current_floor,
-            current_task_present=False,
-            building_features=self.building_features,
-            building_client=self.building_client,
-            rgbd_detector=self.rgbd_door_detector,
-            controller=self.controller,
-            last_door_id=self._door_navigation.last_door_id,
-            last_door_xy=self._door_navigation.last_door_xy,
-            post_door_context_satisfied=self._post_door_context_satisfied(pose),
-            config=self._elevator_visual_scan_config(),
+        """在出梯面向电梯门期间，驱动局部传感器重新观察与注册当前层门几何。"""
+        door_id = None
+        try:
+            door_id = self.building_client.elevator_door_id(self.current_floor)
+        except (AttributeError, ValueError):
+            door_id = None
+        if door_id is None:
+            return False
+        elevator_id = getattr(self, "_active_elevator_id", "elevator_main")
+        status = self.refresh_elevator_geometry(
+            elevator_id,
+            self.current_floor,
+            door_id,
+            pose,
         )
-        self._apply_elevator_visual_scan_result(elevator_scan)
+        return status == DONE
 
-        registration_result = self._elevator_observation.registration.try_register(
-            pose=pose,
-            current_floor=self.current_floor,
-            max_floor=self.max_floor,
-            current_task_present=False,
-            building_features=self.building_features,
-            building_client=self.building_client,
-            local_detector=self.local_detector,
-            cloud_stamp=self._map_runtime.last_cloud_stamp,
-            cloud_points=self._map_runtime.latest_cloud_points,
-            floor_height=self.mapper.floor_height,
-            entrance_xy=self.main_entrance_xy,
-            config=self._elevator_registration_config(),
-            landmark_monitor=getattr(self, "_landmark_drift_monitor", None),
-            elapsed=self._elapsed(),
-        )
-        self._apply_elevator_registration_result(registration_result)
+    def _poll_post_exit_drift_ack(self, now: float) -> tuple[str, tuple[float, float] | None]:
+        """优先轮询并消费出梯纠偏在途回执。
 
-        elevator = self.building_client.elevators.get(
-            getattr(self, "_active_elevator_id", "elevator_main")
-        )
-        if elevator is not None and self.current_floor in elevator.lobby_poses:
-            return True
-        return bool(registration_result.registered)
-
-    def _correct_post_exit_elevator_drift(self, elevator_id: str, floor: int) -> str:
-        """根据 0 层黄金基准竖井坐标，对当前层出梯后的定位进行平移纠偏并对齐竖井世界坐标。"""
-        if int(floor) == 0:
-            return "done"
-        elevator = self.building_client.elevators.get(str(elevator_id))
-        if elevator is None:
-            return "done"
-        base_pose = elevator.lobby_poses.get(0)
-        current_pose = elevator.lobby_poses.get(int(floor))
-        if base_pose is None or current_pose is None:
-            return "done"
-
+        在主循环入口处执行：若收到 ACK，在任何新点云建图前完成当前层地图与独立轨迹缓存的平移，
+        防止新坐标数据被二次平移；若超时，安全停机。
+        """
         op = getattr(self, "_post_exit_drift_correction_op", None)
-        now = get_time()
-        if op is not None and op.get("sequence") is not None:
-            sequence = int(op["sequence"])
-            ack = self.pose_provider.correction_ack(sequence)
-            if ack is not None:
-                self._post_exit_drift_correction_op = None
-                correction_runtime = getattr(self._map_runtime, "apply_planar_correction", None)
-                if callable(correction_runtime):
-                    corrected_xy = self._corrected_robot_xy((0.0, 0.0, 0.0), ack)
-                    danger_sync = correction_runtime(
-                        float(ack[0]),
-                        float(ack[1]),
-                        now=now,
-                        robot_floor=int(floor),
-                        robot_xy=corrected_xy,
-                    )
-                    self._log_danger_obstacle_sync(
-                        danger_sync,
-                        event="post_exit_danger_obstacle_reprojected",
-                        floor=int(floor),
-                        correction_xy=(float(ack[0]), float(ack[1])),
-                        sequence=sequence,
-                    )
-                self.controller.clear_path(reason="post_exit_drift_correction_applied")
-                # 物理对齐：把当前层的门坐标与 0 层基准严格对齐
-                elevator.lobby_poses[int(floor)] = (
-                    float(base_pose[0]),
-                    float(base_pose[1]),
-                    float(base_pose[2]),
+        if op is None or op.get("sequence") is None:
+            return "idle", None
+        sequence = int(op["sequence"])
+        floor = int(op.get("floor", self.current_floor))
+        elevator_id = str(op.get("elevator_id", "elevator_main"))
+        ref_center = op.get("ref_center")
+        ack = self.pose_provider.correction_ack(sequence)
+        if ack is not None:
+            self._post_exit_drift_correction_op = None
+            self._post_exit_drift_correction_result = "done"
+            correction_runtime = getattr(self._map_runtime, "apply_planar_correction", None)
+            if callable(correction_runtime):
+                corrected_xy = self._corrected_robot_xy((0.0, 0.0, 0.0), ack)
+                danger_sync = correction_runtime(
+                    float(ack[0]),
+                    float(ack[1]),
+                    now=now,
+                    robot_floor=int(floor),
+                    robot_xy=corrected_xy,
+                    target_floors=(int(floor),),
                 )
+                self._log_danger_obstacle_sync(
+                    danger_sync,
+                    event="post_exit_danger_obstacle_reprojected",
+                    floor=int(floor),
+                    correction_xy=(float(ack[0]), float(ack[1])),
+                    sequence=sequence,
+                )
+                if getattr(danger_sync, "overlap_owner_ids", ()):
+                    self._handle_danger_source_overlap(
+                        owner_ids=tuple(danger_sync.overlap_owner_ids),
+                        floor=int(floor),
+                        source="post_exit_drift_correction",
+                    )
+            # 同步平移当前楼层历史轨迹缓存
+            traces = getattr(self, "_floor_navigation_traces", None)
+            if traces and int(floor) in traces:
+                traces[int(floor)] = [
+                    (float(pt[0]) + float(ack[0]), float(pt[1]) + float(ack[1]))
+                    for pt in traces[int(floor)]
+                ]
+            self.controller.clear_path(reason="post_exit_drift_correction_applied")
+            # 物理对齐：仅将当前层门中心平移对齐 ref_center，严格保留当前层实测的 yaw 与 width
+            elevator = self.building_client.elevators.get(elevator_id)
+            if elevator is not None and ref_center is not None:
+                door_id = None
+                door = None
                 try:
                     door_id = self.building_client.elevator_door_id(int(floor))
                     door = self.building_client.doors.get(door_id)
-                    if door is not None:
-                        self.building_client.doors[door_id] = DoorInfo(
-                            door_id=door.door_id,
-                            kind=door.kind,
-                            floor_index=door.floor_index,
-                            x=float(base_pose[0]),
-                            y=float(base_pose[1]),
-                            yaw=float(base_pose[2]),
-                            width=door.width,
-                        )
                 except (AttributeError, ValueError, KeyError):
                     pass
-                MissionReportingRuntime.loginfo(
-                    "出梯后电梯竖井对齐纠偏成功：应用偏移=(%.3f, %.3f)，当前层门坐标已对齐0层基准",
-                    float(ack[0]),
-                    float(ack[1]),
+                lobby_yaw = float(door.yaw if door is not None else 0.0)
+                elevator.lobby_poses[int(floor)] = (
+                    float(ref_center[0]),
+                    float(ref_center[1]),
+                    lobby_yaw,
                 )
-                self._log_structured(
-                    {
-                        "event": "post_exit_elevator_drift_correction_applied",
-                        "elevator_id": str(elevator_id),
-                        "floor": int(floor),
-                        "sequence": sequence,
-                        "correction_xy": [float(ack[0]), float(ack[1])],
-                    }
-                )
+                if door is not None:
+                    self.building_client.doors[door_id] = DoorInfo(
+                        door_id=door.door_id,
+                        kind=door.kind,
+                        floor_index=door.floor_index,
+                        x=float(ref_center[0]),
+                        y=float(ref_center[1]),
+                        yaw=float(door.yaw),      # 纯平移纠偏，保留当前层实测朝向
+                        width=float(door.width),  # 纯平移纠偏，保留当前层实测门宽
+                    )
+            MissionReportingRuntime.loginfo(
+                "出梯后电梯竖井对齐纠偏成功：应用偏移=(%.3f, %.3f)，当前层门中心已平移对齐基准（保留当前层实测朝向与宽度）",
+                float(ack[0]),
+                float(ack[1]),
+            )
+            self._log_structured(
+                {
+                    "event": "post_exit_elevator_drift_correction_applied",
+                    "elevator_id": str(elevator_id),
+                    "floor": int(floor),
+                    "sequence": sequence,
+                    "correction_xy": [float(ack[0]), float(ack[1])],
+                }
+            )
+            return "done", ack
+        if now - float(op.get("started_at", 0.0)) > 2.5:
+            self._post_exit_drift_correction_op = None
+            self._post_exit_drift_correction_result = "failed"
+            MissionReportingRuntime.logerr(
+                "出梯后竖井对齐纠偏等待回执超时 (seq=%s)，死守坐标系一致性，停止任务",
+                sequence,
+            )
+            self.controller.stop(reason="post_exit_drift_correction_ack_timeout")
+            self._record_failure(f"post_exit_drift_correction_ack_timeout_seq_{sequence}")
+            self._mission_success_eligible = False
+            self._transition_state(
+                WRITE_RESULT,
+                reason_code="post_exit_drift_correction_ack_timeout",
+                call_site="MissionManager._poll_post_exit_drift_ack",
+                diagnostic_context={
+                    "sequence": sequence,
+                    "floor": int(floor),
+                    "elevator_id": str(elevator_id),
+                },
+            )
+            return "failed", None
+        return "running", None
+
+    def _correct_post_exit_elevator_drift(self, elevator_id: str, floor: int) -> str:
+        """根据 0 层黄金基准竖井坐标，对当前层出梯后的定位进行单层平移纠偏并对齐竖井世界坐标。"""
+        if int(floor) == 0:
+            return "done"
+        cached_result = getattr(self, "_post_exit_drift_correction_result", None)
+        if cached_result is not None:
+            self._post_exit_drift_correction_result = None
+            return str(cached_result)
+
+        if getattr(self, "_post_exit_drift_correction_op", None) is not None:
+            now = get_time()
+            status, _ = self._poll_post_exit_drift_ack(now)
+            if status == "done":
+                self._post_exit_drift_correction_result = None
                 return "done"
-            if now - float(op.get("started_at", 0.0)) > 2.5:
-                self._post_exit_drift_correction_op = None
-                MissionReportingRuntime.logwarn(
-                    "出梯后竖井对齐纠偏等待回执超时 (seq=%s)，跳过纠偏继续",
-                    sequence,
-                )
-                return "done"
+            if status == "failed":
+                self._post_exit_drift_correction_result = None
+                return "failed"
             return "running"
 
+        elevator = self.building_client.elevators.get(str(elevator_id))
+        if elevator is None:
+            return "done"
+        ref_center = getattr(elevator, "reference_door_center", None)
+        if ref_center is None:
+            base_pose = elevator.lobby_poses.get(0)
+            if base_pose is not None:
+                ref_center = (float(base_pose[0]), float(base_pose[1]))
+        if ref_center is None:
+            return "done"
+
+        observed = getattr(elevator, "observed_floors", set())
+        if int(floor) not in observed:
+            # 当前楼层尚未由物理传感器实测确认闭门几何，沿用现有里程计不强行纠偏
+            return "done"
+
+        current_door_xy = None
+        try:
+            door_id = self.building_client.elevator_door_id(int(floor))
+            door = self.building_client.doors.get(door_id)
+            if door is not None:
+                current_door_xy = (float(door.x), float(door.y))
+        except (AttributeError, ValueError, KeyError):
+            pass
+        if current_door_xy is None:
+            current_pose = elevator.lobby_poses.get(int(floor))
+            if current_pose is not None:
+                current_door_xy = (float(current_pose[0]), float(current_pose[1]))
+        if current_door_xy is None:
+            return "done"
+
+        now = get_time()
         # 首次计算并请求纠偏
-        dx = float(base_pose[0]) - float(current_pose[0])
-        dy = float(base_pose[1]) - float(current_pose[1])
+        dx = float(ref_center[0]) - float(current_door_xy[0])
+        dy = float(ref_center[1]) - float(current_door_xy[1])
         drift = math.hypot(dx, dy)
         if drift < 0.03:
-            # 漂移小于 3cm，在噪声范围内，直接对齐坐标
-            elevator.lobby_poses[int(floor)] = (
-                float(base_pose[0]),
-                float(base_pose[1]),
-                float(base_pose[2]),
-            )
+            # 漂移小于 3cm，在噪声范围内，不强制吸附，直接视为完成
             return "done"
         if drift > 0.85:
             MissionReportingRuntime.logwarn(
@@ -998,13 +1052,29 @@ class MissionManager:
             maximum_angular_speed=0.15,
         )
         if sequence is None:
-            MissionReportingRuntime.logwarn("出梯后竖井对齐纠偏请求被拒绝，跳过")
-            return "done"
+            MissionReportingRuntime.logerr("出梯后竖井对齐纠偏请求被拒绝，死守坐标系一致性，停止任务")
+            self.controller.stop(reason="post_exit_drift_correction_rejected")
+            self._record_failure("post_exit_drift_correction_request_rejected")
+            self._mission_success_eligible = False
+            self._transition_state(
+                WRITE_RESULT,
+                reason_code="post_exit_drift_correction_request_rejected",
+                call_site="MissionManager._correct_post_exit_elevator_drift",
+                diagnostic_context={
+                    "floor": int(floor),
+                    "elevator_id": str(elevator_id),
+                    "drift": float(drift),
+                },
+            )
+            return "failed"
 
         self._post_exit_drift_correction_op = {
             "sequence": int(sequence),
             "started_at": now,
             "correction_xy": (dx, dy),
+            "floor": int(floor),
+            "elevator_id": str(elevator_id),
+            "ref_center": (float(ref_center[0]), float(ref_center[1])),
         }
         MissionReportingRuntime.loginfo(
             "出梯后触发竖井对齐纠偏：漂移量=(%.3f, %.3f), 距离=%.3fm, sequence=%d",
@@ -1027,23 +1097,31 @@ class MissionManager:
             and int(frame.localization_epoch) == epoch
         ]
 
-    def _freeze_landmark_anchor(self, landmark_id: str, door_id: str) -> bool:
-        """冻结首次合法静态结构；后续语义门几何不得覆盖。"""
+    def _freeze_landmark_anchor(
+        self, landmark_id: str, door_id: str, *, overwrite: bool = False
+    ) -> bool:
+        """冻结首次合法静态结构；若显式指定 overwrite，在新帧构建成功后原子替换。"""
         relocalizer = getattr(self, "_landmark_relocalizer", None)
+        if relocalizer is None:
+            return False
+        key = str(landmark_id).strip()
+        if not overwrite and key in getattr(relocalizer, "anchors", {}):
+            return True
         door = getattr(self.building_client, "doors", {}).get(str(door_id))
-        if relocalizer is None or door is None:
+        if door is None:
             return False
         frames = self._current_landmark_frames()
         if len(frames) < int(relocalizer.config.required_frames):
             return False
         frozen = relocalizer.freeze_anchor(
-            landmark_id,
+            key,
             floor=int(door.floor_index),
             world_xy=(float(door.x), float(door.y)),
             outward_yaw=float(door.yaw),
             width=float(door.width),
             frames=frames,
             floor_height=float(self.mapper.floor_height),
+            overwrite=bool(overwrite),
         )
         if frozen:
             self._log_structured(
@@ -1053,12 +1131,17 @@ class MissionManager:
                     "door_id": str(door_id),
                     "floor": int(door.floor_index),
                     "frame_count": len(frames),
+                    "overwrite": bool(overwrite),
                 }
             )
         return bool(frozen)
 
     def _freeze_available_landmark_anchors(self) -> None:
         """注册当刻帧数不足时，在后续新点云到达后补冻结一次。"""
+        # 注意：高层电梯锚点必须由 PostExitElevatorObservationTask 在物理闭门实测确认、纠偏完成并停稳后冻结
+        # 严禁在探索阶段随意自动补冻结高层电梯锚点
+        if self.current_floor != 0:
+            return
         relocalizer = getattr(self, "_landmark_relocalizer", None)
         if relocalizer is None:
             return
@@ -1873,6 +1956,11 @@ class MissionManager:
             getattr(pose_sample, "stamp", None) if pose_sample is not None else None
         )
 
+        now = get_time()
+        self._poll_post_exit_drift_ack(now)
+        if self.state in (WRITE_RESULT, FINISH, MISSION_FAILED):
+            return
+
         self._last_xyz = xyz
         self._update_pose_progress(pose)
         self._record_initial_entry_trace_pose(pose)
@@ -1902,6 +1990,7 @@ class MissionManager:
             if self.state in {WRITE_RESULT, FINISH, MISSION_FAILED}:
                 return
             if status in (DONE, FAILED):
+                completed_task = self.current_task
                 completed_task_name = getattr(self.current_task, "name", type(self.current_task).__name__)
                 completed_task_phase = getattr(self.current_task, "phase", None)
                 completed_task_failure_reason = getattr(
@@ -1976,11 +2065,13 @@ class MissionManager:
                             door_center = (pose[0], pose[1])
                         if outward_yaw is None:
                             outward_yaw = pose[2]
+                        close_door_task = getattr(completed_take_elevator, "last_async_close_door_task", None)
                         self.current_task = PostExitElevatorObservationTask(
                             completed_take_elevator.elevator_id,
                             self.current_floor,
                             door_center=door_center,
                             outward_yaw=outward_yaw,
+                            close_door_task=close_door_task,
                         )
                         return
                 elif isinstance(self.current_task, TakeElevator) and status == FAILED:
@@ -2014,11 +2105,23 @@ class MissionManager:
                         self._record_failure(failure_text)
                         self._mission_success_eligible = False
                         transition_guard = getattr(self, "_floor_transition_guard", None)
-                        if transition_guard is not None:
-                            # 运输已经开始但楼层尚未可靠闭环时，不能猜测所在楼层
-                            # 并继续导航；保持零速并明确结束本轮。
+                        in_cabin = bool(getattr(completed_task, "in_cabin_transit", False))
+                        if (
+                            transition_guard is not None
+                            or in_cabin
+                            or completed_task_failure_reason
+                            in (
+                                "post_exit_drift_correction_failed",
+                                "post_exit_drift_correction_timeout",
+                            )
+                        ):
+                            # 运输已经开始但楼层尚未可靠闭环、机器人在轿厢内或出梯纠偏事务失败时，
+                            # 不能猜测所在楼层或在轿厢内发起走廊导航；保持零速并明确结束本轮。
+                            self.controller.stop(reason="in_cabin_or_drift_correction_failure")
                             next_state = WRITE_RESULT
-                            destination = "floor_alignment_unconfirmed"
+                            destination = "cabin_transit_failed" if in_cabin else (
+                                completed_task_failure_reason or "floor_alignment_unconfirmed"
+                            )
                         else:
                             next_state = WRITE_RESULT if self.return_after_floor_change else RETURN_HOME
                     else:
@@ -2179,6 +2282,8 @@ class MissionManager:
         pose_sample: PoseSample | None = None,
     ) -> bool:
         """更新换层锁存，并返回当前 tick 是否应暂停楼层相关点云处理。"""
+        if getattr(self, "_post_exit_drift_correction_op", None) is not None:
+            return True
         current_floor = int(self.current_floor)
         current_task = getattr(self, "current_task", None)
         if not self._floor_transition_runtime.active and not (
@@ -5573,6 +5678,11 @@ class MissionManager:
         floor_index: int,
         door_id: str,
         pose: tuple[float, float, float],
+        *,
+        start_time: float | None = None,
+        epoch: int | None = None,
+        timeout: float | None = None,
+        **kwargs,
     ) -> str:
         result = self._elevator_observation.registration.refresh_geometry(
             now=get_time(),
@@ -5585,6 +5695,9 @@ class MissionManager:
             config=self._elevator_registration_config(),
             landmark_monitor=getattr(self, "_landmark_drift_monitor", None),
             elapsed=self._elapsed(),
+            start_time=start_time,
+            epoch=epoch,
+            timeout=timeout,
         )
         return self._apply_elevator_refresh_result(result)
 
@@ -6003,13 +6116,20 @@ class MissionManager:
         )
         target_x, target_y = 0.0, -3.3
         speed = 0.35  # m/s 匀速直线推进
-        timeout_limit = 8.0  # 秒：物理安全刹车上限（以 0.35m/s 足够前推 2.8m，大门到判定线需 1.35m）
+        timeout_limit = 10.0  # 秒：物理安全刹车上限（以 0.35m/s 足够前推 3.5m，留足 2s 启动与微调裕度）
         tolerance = float(getattr(self, "home_tolerance", 0.6))  # 动态读取全局配置 (0.6m)
 
         # 首次进入时初始化基准位姿与参数
         if not getattr(self, "_outdoor_return_started", False):
             self._outdoor_return_started = True
             self._outdoor_return_start_time = now
+            self._outdoor_return_last_dr_time = now
+            self._outdoor_dr_pose = [
+                float(pose[0]),
+                float(pose[1]),
+                float(pose[2]) if len(pose) >= 3 else -1.57,
+            ]
+            self._outdoor_last_observed_pose = (float(pose[0]), float(pose[1]))
             self._outdoor_return_start_pose = (
                 float(pose[0]),
                 float(pose[1]),
@@ -6050,11 +6170,44 @@ class MissionManager:
         start_time = getattr(self, "_outdoor_return_start_time", now)
         elapsed = max(0.0, now - start_time)
 
-        # 1. 计算真实定位距离（唯一到达判据基准）
-        real_dist_to_home = math.hypot(pose[0] - home_xy[0], pose[1] - home_xy[1])
+        # 1. 航位推算（Dead Reckoning）与定位断流融合：
+        last_dr_time = getattr(self, "_outdoor_return_last_dr_time", now)
+        dr_dt = max(0.0, min(0.5, now - last_dr_time))
+        self._outdoor_return_last_dr_time = now
 
-        # 条件一：真实到达出发点容差范围内 -> 成功完成
-        if real_dist_to_home <= tolerance:
+        last_observed = getattr(self, "_outdoor_last_observed_pose", (float(pose[0]), float(pose[1])))
+        pose_changed = (math.hypot(pose[0] - last_observed[0], pose[1] - last_observed[1]) > 1e-4)
+
+        if pose_changed:
+            # 真实定位推进中：同步校准推演位姿基准
+            self._outdoor_last_observed_pose = (float(pose[0]), float(pose[1]))
+            self._outdoor_dr_pose = [
+                float(pose[0]),
+                float(pose[1]),
+                float(pose[2]) if len(pose) >= 3 else self._outdoor_dr_pose[2],
+            ]
+        elif dr_dt > 0.0 and elapsed > 0.15:
+            # 真实定位停更/断流：使用控制器已知直推速度积分推演位移
+            dr_speed = speed  # 0.35 m/s
+            dr_yaw = self._outdoor_dr_pose[2] if len(self._outdoor_dr_pose) >= 3 else -1.57
+            self._outdoor_dr_pose[0] += dr_speed * math.cos(dr_yaw) * dr_dt
+            self._outdoor_dr_pose[1] += dr_speed * math.sin(dr_yaw) * dr_dt
+
+        # 2. 综合真实定位与推演定位，计算有效到达距离
+        real_dist_to_home = math.hypot(pose[0] - home_xy[0], pose[1] - home_xy[1])
+        dr_dist_to_home = math.hypot(
+            self._outdoor_dr_pose[0] - home_xy[0],
+            self._outdoor_dr_pose[1] - home_xy[1],
+        )
+        effective_dist = min(real_dist_to_home, dr_dist_to_home)
+        active_arrival_pose = (
+            self._outdoor_dr_pose
+            if dr_dist_to_home < real_dist_to_home
+            else [float(p) for p in pose]
+        )
+
+        # 条件一：真实或推演到达出发点容差范围内 -> 成功完成
+        if effective_dist <= tolerance:
             set_direct = getattr(self.controller, "set_outdoor_direct_drive", None)
             if callable(set_direct):
                 set_direct(False)
@@ -6065,19 +6218,23 @@ class MissionManager:
                 getattr(self, "_mission_success_eligible", True)
             )
             MissionReportingRuntime.loginfo(
-                "[MissionManager] 🏁 真实成功到达出发点！当前位姿=[%.2f, %.2f], 距出发点=%.2fm <= %.2fm (耗时=%.1fs)",
-                pose[0],
-                pose[1],
-                real_dist_to_home,
+                "[MissionManager] 🏁 真实成功到达出发点！到达位姿=[%.2f, %.2f], 距出发点=%.2fm <= %.2fm (实测=%.2fm, 推演=%.2fm, 耗时=%.1fs)",
+                active_arrival_pose[0],
+                active_arrival_pose[1],
+                effective_dist,
                 tolerance,
+                real_dist_to_home,
+                dr_dist_to_home,
                 elapsed,
             )
             self._log_structured(
                 {
                     "event": "outdoor_direct_return_completed",
                     "elapsed": round(float(self._elapsed()), 3),
-                    "final_pose": [round(float(p), 3) for p in pose[:2]],
-                    "final_dist_to_home": round(float(real_dist_to_home), 3),
+                    "final_pose": [round(float(p), 3) for p in active_arrival_pose[:2]],
+                    "final_dist_to_home": round(float(effective_dist), 3),
+                    "real_dist_to_home": round(float(real_dist_to_home), 3),
+                    "dr_dist_to_home": round(float(dr_dist_to_home), 3),
                     "tolerance": round(float(tolerance), 3),
                     "push_duration": round(float(elapsed), 3),
                     "success": True,
@@ -6106,19 +6263,22 @@ class MissionManager:
             self._mission_success_eligible = False
             self._record_failure("outdoor_direct_return_timeout")
             MissionReportingRuntime.logwarn(
-                "[MissionManager] ⚠️ 室外直达返航超时 (%.1fs) 仍未进入出发点容差范围！当前位姿=[%.2f, %.2f], 距出发点=%.2fm > %.2fm",
+                "[MissionManager] ⚠️ 室外直达返航超时 (%.1fs) 仍未进入出发点容差范围！当前位姿=[%.2f, %.2f], 距出发点=%.2fm > %.2fm (推演=%.2fm)",
                 elapsed,
                 pose[0],
                 pose[1],
                 real_dist_to_home,
                 tolerance,
+                dr_dist_to_home,
             )
             self._log_structured(
                 {
                     "event": "outdoor_direct_return_timeout_failed",
                     "elapsed": round(float(self._elapsed()), 3),
-                    "final_pose": [round(float(p), 3) for p in pose[:2]],
-                    "final_dist_to_home": round(float(real_dist_to_home), 3),
+                    "final_pose": [round(float(p), 3) for p in active_arrival_pose[:2]],
+                    "final_dist_to_home": round(float(effective_dist), 3),
+                    "real_dist_to_home": round(float(real_dist_to_home), 3),
+                    "dr_dist_to_home": round(float(dr_dist_to_home), 3),
                     "tolerance": round(float(tolerance), 3),
                     "push_duration": round(float(elapsed), 3),
                     "success": False,
@@ -6615,6 +6775,8 @@ class MissionManager:
             return
         guard = getattr(self, "_floor_transition_guard", None)
         if guard is not None:
+            return
+        if getattr(self, "_post_exit_drift_correction_op", None) is not None:
             return
         floor_index = int(self.current_floor)
         traces = getattr(self, "_floor_navigation_traces", None)

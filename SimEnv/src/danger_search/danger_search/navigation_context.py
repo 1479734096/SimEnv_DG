@@ -136,10 +136,10 @@ class NavigationTaskContext:
             return None
         return self.observe_post_exit_door_fn(*args, **kwargs)
 
-    def freeze_landmark_anchor(self, landmark_id: str, door_id: str) -> bool:
+    def freeze_landmark_anchor(self, landmark_id: str, door_id: str, *, overwrite: bool = False) -> bool:
         if self.freeze_landmark_anchor_fn is None:
             return False
-        return bool(self.freeze_landmark_anchor_fn(landmark_id, door_id))
+        return bool(self.freeze_landmark_anchor_fn(landmark_id, door_id, overwrite=overwrite))
 
     def current_landmark_frames(self) -> list:
         if self.current_landmark_frames_fn is None:

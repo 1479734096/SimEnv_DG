@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from threading import Lock, Thread
 
 from danger_search.interface_policy import require_allowed_service
@@ -106,6 +106,10 @@ class ElevatorInfo:
     """由传感器注册的各楼层电梯厅姿态，不包含服务权限。"""
     elevator_id: str
     lobby_poses: dict[int, tuple[float, float, float]]  # floor -> (x, y, yaw)
+    observed_floors: set[int] = field(default_factory=set)  # 经本层物理传感器确认的楼层集合
+    reference_door_center: tuple[float, float] | None = None  # 0层黄金基准门中心 (x, y)
+    reference_door_yaw: float | None = None
+    reference_door_width: float | None = None
 
     def __post_init__(self) -> None:
         self.elevator_id = str(self.elevator_id).strip()
@@ -120,6 +124,16 @@ class ElevatorInfo:
         if not self.elevator_id or not resolved:
             raise ValueError("运行时电梯 ID 和厅姿态不能为空")
         self.lobby_poses = resolved
+        self.observed_floors = {int(f) for f in self.observed_floors}
+        if self.reference_door_center is not None:
+            self.reference_door_center = (
+                float(self.reference_door_center[0]),
+                float(self.reference_door_center[1]),
+            )
+        if self.reference_door_yaw is not None:
+            self.reference_door_yaw = float(self.reference_door_yaw)
+        if self.reference_door_width is not None:
+            self.reference_door_width = float(self.reference_door_width)
 
 
 class BuildingControlClient:

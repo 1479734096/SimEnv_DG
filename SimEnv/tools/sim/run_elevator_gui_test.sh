@@ -831,7 +831,12 @@ while (( SECONDS - started < ELEVATOR_TEST_WALL_TIMEOUT )); do
 
   if grep -Fq '"event": "mission_result_written"' "$MISSION_LOG" || \
      grep -Fq "换层任务失败" "$MISSION_LOG"; then
-    fail "任务在完成所需电梯闭环前进入失败结果"
+    term_reason="$(grep -oE '"terminal_reason": *"[^"]+"' "$MISSION_LOG" 2>/dev/null | tail -1 | sed -E 's/.*"terminal_reason": *"([^"]+)".*/\1/' || true)"
+    if [[ -n "$term_reason" ]]; then
+      fail "任务进入失败结果: $term_reason"
+    else
+      fail "任务在完成所需电梯闭环前进入失败结果"
+    fi
     exit $?
   fi
 

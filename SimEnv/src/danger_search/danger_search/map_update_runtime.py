@@ -334,15 +334,21 @@ class MapUpdateRuntime:
         now: float | None = None,
         robot_floor: int | None = None,
         robot_xy: tuple[float, float] | None = None,
+        target_floors: tuple[int, ...] | None = None,
     ) -> DangerObstacleSyncResult:
-        """在定位节点回执后同步平移轨迹，并重建全部已实例化楼层的语义 OCC。"""
+        """在定位节点回执后同步平移轨迹，并重建全部或指定楼层的语义 OCC。"""
         map_runtime = getattr(self.mapper, "transform_planar", None)
         if callable(map_runtime):
-            map_runtime(float(dx), float(dy), float(correction_yaw))
+            map_runtime(float(dx), float(dy), float(correction_yaw), target_floors=target_floors)
+        floor_height = float(getattr(self.mapper, "floor_height", 3.0))
         if abs(float(correction_yaw)) > 1e-12:
-            translated = self.tracker.transform_planar(dx, dy, correction_yaw)
+            translated = self.tracker.transform_planar(
+                dx, dy, correction_yaw, target_floors=target_floors, floor_height=floor_height
+            )
         else:
-            translated = self.tracker.translate_planar(dx, dy)
+            translated = self.tracker.translate_planar(
+                dx, dy, target_floors=target_floors, floor_height=floor_height
+            )
         synchronized = self.synchronize_confirmed_danger_obstacles(
             now=now,
             robot_floor=robot_floor,

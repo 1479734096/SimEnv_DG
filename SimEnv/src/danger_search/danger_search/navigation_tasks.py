@@ -1182,6 +1182,8 @@ class TakeElevator(NavigationTask):
         self._retry_relocalization_completed = False
         self.last_exit_door_center: tuple[float, float] | None = None
         self.last_exit_outward_yaw: float | None = None
+        self.in_cabin_transit: bool = False
+        self.last_async_close_door_task = None
 
 
     def tick(self, context: NavigationTaskContext, pose: tuple[float, float, float]) -> str:
@@ -1522,6 +1524,7 @@ class TakeElevator(NavigationTask):
             self._current_crossing_geometry = result.geometry
             context.clear_elevator_crossing_area(result.geometry)
             self._reset_cabin_transit()
+            self.in_cabin_transit = True
             self.phase = "ENTER_CABIN"
             return RUNNING
 
@@ -1823,9 +1826,10 @@ class TakeElevator(NavigationTask):
                 outward_dy = float(target_wait[1] - cabin_center[1])
                 self.last_exit_outward_yaw = math.atan2(outward_dy, outward_dx)
                 self._reset_cabin_transit()
+                self.in_cabin_transit = False
                 if getattr(context, "elevator_async_target_door_close_enabled", True):
                     try:
-                        client.close_door(target_door_id)
+                        self.last_async_close_door_task = client.close_door(target_door_id)
                         context.log_structured(
                             {
                                 "event": "elevator_target_door_close_requested",
@@ -3410,11 +3414,13 @@ class PostExitElevatorObservationTask(NavigationTask):
     调头面向电梯门，通过 RGB-D 确认闭门几何并注册当前层候梯点/门信息，
     随后静止采集点云并冻结当前层的 Livox 稀疏重定位锚点。
     """
-    _TOTAL_TIMEOUT = 36.0
+    _TOTAL_TIMEOUT = 75.0
+    _WALL_TIMEOUT = 450.0
     _SETTLE_DURATION = 1.5
-    _CONFIRM_TIMEOUT = 17.5
+    _REFRESH_TIMEOUT = 17.5
     _ANCHOR_TIMEOUT = 5.0
     _ALIGN_TIMEOUT = 8.0
+    _MOVE_TIMEOUT = 8.0
 
     def __init__(
         self,
@@ -3423,6 +3429,7 @@ class PostExitElevatorObservationTask(NavigationTask):
         door_center: tuple[float, float],
         outward_yaw: float,
         standoff_distance: float = 1.2,
+        close_door_task=None,
     ):
         super().__init__(f"PostExitElevatorObservationTask({elevator_id}, floor={floor})")
         self.elevator_id = str(elevator_id)
@@ -3430,8 +3437,9 @@ class PostExitElevatorObservationTask(NavigationTask):
         self.door_center = (float(door_center[0]), float(door_center[1]))
         self.outward_yaw = float(outward_yaw)
         self.standoff_distance = float(standoff_distance)
+        self.close_door_task = close_door_task
 
-        # 走廊安全观测点：沿朝向走廊方向外移 standoff_distance
+        # 走廊观察目标点：距门 standoff_distance（约 1.2m）
         self.safe_point_xy = (
             self.door_center[0] + self.standoff_distance * math.cos(self.outward_yaw),
             self.door_center[1] + self.standoff_distance * math.sin(self.outward_yaw),
@@ -3441,15 +3449,19 @@ class PostExitElevatorObservationTask(NavigationTask):
 
         self.phase = "MOVE_TO_SAFE_POINT"
         self._start_time: float | None = None
+        self._start_wall_time: float | None = None
         self._phase_start_time: float | None = None
+        self._align_started = False
         self._door_confirmed = False
         self._anchor_frozen = False
         self.failure_reason: str | None = None
 
     def tick(self, context: NavigationTaskContext, pose: tuple[float, float, float]) -> str:
         now = get_time()
+        wall_now = time.monotonic()
         if self._start_time is None:
             self._start_time = now
+            self._start_wall_time = wall_now
             self._phase_start_time = now
             if rospy is not None:
                 rospy.loginfo(
@@ -3461,13 +3473,26 @@ class PostExitElevatorObservationTask(NavigationTask):
                     self.door_center[1],
                 )
 
-        # 总超时保护：平滑放行至探索
-        if now - self._start_time > self._TOTAL_TIMEOUT:
+        # 共享总预算保护：仿真时间 75s，墙钟时间 450s
+        if (now - self._start_time > self._TOTAL_TIMEOUT) or (
+            self._start_wall_time is not None and wall_now - self._start_wall_time > self._WALL_TIMEOUT
+        ):
+            if self.phase == "CORRECT_DRIFT":
+                if rospy is not None:
+                    rospy.logerr(
+                        "[%s] 出梯后纠偏事务进行中达到总预算上限，坐标系不确定，立即终止任务",
+                        self.name,
+                    )
+                context.controller.stop(reason="drift_correction_timeout_failed")
+                self.failure_reason = "post_exit_drift_correction_timeout"
+                self.phase = "FAILED"
+                return FAILED
             if rospy is not None:
                 rospy.logwarn(
-                    "[%s] 出梯后重新观察建锚总耗时达到 %.1fs 保护上限，平滑放行至后续任务",
+                    "[%s] 出梯后重新观察建锚总耗时达到预算上限 (sim=%.1fs, wall=%.1fs)，平滑放行至后续任务",
                     self.name,
-                    self._TOTAL_TIMEOUT,
+                    now - self._start_time,
+                    wall_now - (self._start_wall_time or wall_now),
                 )
             context.controller.stop(reason="post_exit_observation_timeout")
             self.phase = "DONE"
@@ -3478,7 +3503,7 @@ class PostExitElevatorObservationTask(NavigationTask):
                 self.safe_point_xy[0] - pose[0],
                 self.safe_point_xy[1] - pose[1],
             )
-            # 接近观测点（容差 0.25m）或移动超时
+            # 接近观测点（容差 0.25m）
             if dist_to_safe <= 0.25:
                 context.controller.clear_path(reason="reached_observation_safe_point")
                 self.phase = "DOOR_CLOSE_SETTLE"
@@ -3494,12 +3519,20 @@ class PostExitElevatorObservationTask(NavigationTask):
                         reason="post_exit_move_to_safe_point",
                     )
                 else:
-                    if rospy is not None:
-                        rospy.logwarn(
-                            "[%s] 安全观测点路径规划未连通，在当前位置原地进入沉降与观察",
-                            self.name,
-                        )
                     context.controller.stop(reason="safe_point_unreachable")
+                    # 安全点不可达：检查全向净空，若不足则放弃观察平滑放行，不在原地强制转身
+                    radial_dist = getattr(context.controller, "_nearest_radial_obstacle_distance", None)
+                    if radial_dist is not None and radial_dist < 0.40:
+                        if rospy is not None:
+                            rospy.logwarn(
+                                "[%s] 安全点路径未连通且当前全向净空不足 (%.2fm < 0.40m)，放弃就地旋转扫视并平滑放行",
+                                self.name,
+                                radial_dist,
+                            )
+                        self.phase = "DONE"
+                        return DONE
+                    if rospy is not None:
+                        rospy.logwarn("[%s] 安全观测点未连通但在原地具备净空 (%.2fm)，就地进入沉降", self.name, radial_dist or 0.0)
                     self.phase = "DOOR_CLOSE_SETTLE"
                     self._phase_start_time = now
                     return RUNNING
@@ -3509,69 +3542,124 @@ class PostExitElevatorObservationTask(NavigationTask):
                 context.controller.clear_path(reason="reached_observation_safe_point")
                 self.phase = "DOOR_CLOSE_SETTLE"
                 self._phase_start_time = now
-            elif ctrl_status == STUCK or (now - self._phase_start_time > 8.0):
+            elif ctrl_status == STUCK or (now - self._phase_start_time > self._MOVE_TIMEOUT):
                 context.controller.stop(reason="move_to_safe_point_timeout_or_stuck")
+                radial_dist = getattr(context.controller, "_nearest_radial_obstacle_distance", None)
+                if radial_dist is not None and radial_dist < 0.40:
+                    if rospy is not None:
+                        rospy.logwarn(
+                            "[%s] 移动到安全点受阻/超时且净空不足 (%.2fm < 0.40m)，放弃就地旋转扫视并平滑放行",
+                            self.name,
+                            radial_dist,
+                        )
+                    self.phase = "DONE"
+                    return DONE
                 self.phase = "DOOR_CLOSE_SETTLE"
                 self._phase_start_time = now
             return RUNNING
 
         if self.phase == "DOOR_CLOSE_SETTLE":
             context.controller.stop(reason="door_close_settle")
-            if now - self._phase_start_time >= self._SETTLE_DURATION:
-                self.phase = "ROTATE_CW_TOWARDS_DOOR"
-                self._phase_start_time = now
+            # 1. 优先等待异步关门服务调用完成
+            if self.close_door_task is not None:
+                if not self.close_door_task.done():
+                    if now - self._phase_start_time > 25.0:
+                        if rospy is not None:
+                            rospy.logwarn("[%s] 等待电梯异步关门服务超时，放弃本次观察", self.name)
+                        self.phase = "DONE"
+                        return DONE
+                    return RUNNING
+                if not self.close_door_task.ok():
+                    if rospy is not None:
+                        rospy.logwarn("[%s] 电梯关门服务调用失败 (%s)，放弃本次观察", self.name, self.close_door_task.message())
+                    self.phase = "DONE"
+                    return DONE
+
+            # 2. 关门服务确认后再沉降 1.5s，确保物理门板完全闭合并消除本体晃动
+            if now - self._phase_start_time < self._SETTLE_DURATION:
+                return RUNNING
+
+            # 3. 转身前检查全向旋转净空包络
+            radial_dist = getattr(context.controller, "_nearest_radial_obstacle_distance", None)
+            if radial_dist is not None and radial_dist < 0.38:
+                if rospy is not None:
+                    rospy.logwarn("[%s] 沉降完成但全向净空不足 (%.2fm < 0.38m)，放弃原地转身", self.name, radial_dist)
+                self.phase = "DONE"
+                return DONE
+
+            self.phase = "ROTATE_CW_TOWARDS_DOOR"
+            self._phase_start_time = now
             return RUNNING
 
         if self.phase == "ROTATE_CW_TOWARDS_DOOR":
-            # 强制写死顺时针旋转（以负角速度 -0.6 rad/s 原地自转）面向电梯门
-            # 机器狗从出梯朝向顺时针转 180° 到达电梯门朝向的过程中，深度相机与激光雷达自然扫视整条走廊
             target_yaw = math.atan2(
                 self.door_center[1] - pose[1],
                 self.door_center[0] - pose[0],
             )
             heading_err = _angle_wrap(target_yaw - pose[2])
             if abs(heading_err) <= 0.35 or (now - self._phase_start_time > 6.0):
+                context.controller.stop(reason="finish_cw_rotation")
                 self.phase = "ALIGN_TO_DOOR"
                 self._phase_start_time = now
-                context.controller.begin_heading_alignment(
-                    self.door_center,
-                    max_angular=0.65,
-                )
+                self._align_started = False
             else:
                 context.controller.rotate_in_place(-0.6)
             return RUNNING
 
         if self.phase == "ALIGN_TO_DOOR":
-            context.controller.begin_heading_alignment(
-                self.door_center,
-                max_angular=0.65,
-            )
+            if not self._align_started:
+                self._align_started = True
+                context.controller.begin_heading_alignment(
+                    self.door_center,
+                    max_angular=0.65,
+                )
             res = context.controller.poll_result()
             if res.status == DONE and res.reason == "alignment_done":
                 self.phase = "RGBD_CONFIRM_DOOR"
                 self._phase_start_time = now
                 context.controller.stop(reason="align_to_door_done")
-            elif now - self._phase_start_time > self._ALIGN_TIMEOUT:
+            elif res.status in {FAILED, STUCK} or (now - self._phase_start_time > self._ALIGN_TIMEOUT):
                 if rospy is not None:
-                    rospy.logwarn("[%s] 对准电梯门超时，直接进入视觉与几何确认", self.name)
-                context.controller.stop(reason="align_to_door_timeout")
-                self.phase = "RGBD_CONFIRM_DOOR"
-                self._phase_start_time = now
+                    rospy.logwarn("[%s] 对准电梯门失败或超时 (status=%s)，安全结束观察", self.name, res.status)
+                context.controller.stop(reason="align_to_door_abort")
+                self.phase = "DONE"
+                return DONE
             return RUNNING
 
         if self.phase == "RGBD_CONFIRM_DOOR":
             context.controller.stop(reason="rgbd_confirm_door")
-            confirmed = context.observe_post_exit_door(pose)
-            if confirmed or (now - self._phase_start_time > self._CONFIRM_TIMEOUT):
-                self._door_confirmed = bool(confirmed)
+            try:
+                door_id = context.building_client.elevator_door_id(self.floor)
+            except (AttributeError, ValueError):
+                door_id = None
+            if door_id is None:
+                self.phase = "DONE"
+                return DONE
+
+            status = context.refresh_elevator_geometry(
+                self.elevator_id,
+                self.floor,
+                door_id,
+                pose,
+                start_time=self._phase_start_time,
+                timeout=self._REFRESH_TIMEOUT,
+            )
+            if status == RUNNING:
+                return RUNNING
+            if status == DONE:
+                self._door_confirmed = True
                 if rospy is not None:
                     rospy.loginfo(
-                        "[%s] RGB-D 闭门重新观察确认完成 (confirmed=%s)，进入竖井基准纠偏阶段",
+                        "[%s] RGB-D 闭门物理几何实测确认成功，进入竖井基准纠偏阶段",
                         self.name,
-                        self._door_confirmed,
                     )
                 self.phase = "CORRECT_DRIFT"
                 self._phase_start_time = now
+            else:
+                if rospy is not None:
+                    rospy.logwarn("[%s] RGB-D 闭门物理几何刷新未通过 (status=%s)，平滑放行至探索", self.name, status)
+                self.phase = "DONE"
+                return DONE
             return RUNNING
 
         if self.phase == "CORRECT_DRIFT":
@@ -3580,9 +3668,17 @@ class PostExitElevatorObservationTask(NavigationTask):
                 self.elevator_id,
                 self.floor,
             )
-            if drift_status == "done" or (now - self._phase_start_time > 3.0):
+            if drift_status == "running":
+                return RUNNING
+            if drift_status == "done":
                 self.phase = "FREEZE_LIVOX_ANCHOR"
                 self._phase_start_time = now
+            elif drift_status == "failed":
+                # 纠偏请求已发出但回执超时或失败，死守坐标系一致性，停止任务并进入 WRITE_RESULT
+                if rospy is not None:
+                    rospy.logerr("[%s] 跨楼层竖井纠偏事务失败，立即终止任务", self.name)
+                self.failure_reason = "post_exit_drift_correction_failed"
+                return FAILED
             return RUNNING
 
         if self.phase == "FREEZE_LIVOX_ANCHOR":
@@ -3594,7 +3690,7 @@ class PostExitElevatorObservationTask(NavigationTask):
 
             if door_id is not None:
                 canonical_id = f"elevator:{self.elevator_id}:floor:{self.floor}"
-                frozen = context.freeze_landmark_anchor(canonical_id, door_id)
+                frozen = context.freeze_landmark_anchor(canonical_id, door_id, overwrite=True)
                 if frozen:
                     self._anchor_frozen = True
                     if rospy is not None:

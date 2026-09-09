@@ -291,6 +291,9 @@ class ElevatorRegistrationRuntime:
         config: ElevatorRegistrationConfig,
         landmark_monitor=None,
         elapsed: float = 0.0,
+        start_time: float | None = None,
+        epoch: int | None = None,
+        timeout: float | None = None,
     ) -> ElevatorRefreshResult:
         context = (str(elevator_id), int(floor_index), str(door_id))
         if context != self.refresh_context:
@@ -299,7 +302,8 @@ class ElevatorRegistrationRuntime:
             self.refresh_started_at = now
         if self.refresh_started_at is None:
             self.refresh_started_at = now
-        if now - float(self.refresh_started_at) > config.refresh_timeout:
+        effective_timeout = float(timeout) if timeout is not None else config.refresh_timeout
+        if now - float(self.refresh_started_at) > effective_timeout:
             event = {
                 "event": "elevator_geometry_refresh_unavailable",
                 "elevator_id": str(elevator_id),
@@ -353,6 +357,8 @@ class ElevatorRegistrationRuntime:
             )
         stamp = self.latest_rgbd_door_stamp
         if stamp is None or stamp == self.refresh_last_stamp:
+            return ElevatorRefreshResult(RUNNING)
+        if start_time is not None and float(stamp) < float(start_time):
             return ElevatorRefreshResult(RUNNING)
         self.refresh_last_stamp = stamp
         candidates = []
@@ -500,7 +506,23 @@ class ElevatorRegistrationRuntime:
         lobby_poses = (
             dict(existing_elevator.lobby_poses) if existing_elevator is not None else {}
         )
-        # 为尚未注册的楼层播种初始竖井先验（垂直竖井），已有楼层的独立坐标予以保留
+        observed_floors = (
+            set(existing_elevator.observed_floors) if existing_elevator is not None else set()
+        )
+        ref_center = existing_elevator.reference_door_center if existing_elevator is not None else None
+        ref_yaw = existing_elevator.reference_door_yaw if existing_elevator is not None else None
+        ref_width = existing_elevator.reference_door_width if existing_elevator is not None else None
+
+        # 标记当前层为物理观测确认
+        observed_floors.add(int(current_floor))
+
+        # 0 层黄金基准参考门中心单独冻结为跨层参考对象，不直接引用后续可能被修改的 lobby_poses[0]
+        if int(current_floor) == 0 and ref_center is None:
+            ref_center = (float(world_xy[0]), float(world_xy[1]))
+            ref_yaw = float(outward_yaw)
+            ref_width = float(width)
+
+        # 为尚未注册的楼层播种初始竖井先验（垂直竖井），已有楼层的独立坐标予以保留；注意播种不等于实测注册
         for floor in elevator_feature.served_floors:
             fid = int(floor)
             if fid not in lobby_poses:
@@ -509,7 +531,7 @@ class ElevatorRegistrationRuntime:
                     float(world_xy[1]),
                     float(outward_yaw),
                 )
-        # 当前层始终更新为本次观测/确认的最新几何
+        # 当前层始终更新为本次观测/确认的最新实测几何
         lobby_poses[int(current_floor)] = (
             float(world_xy[0]),
             float(world_xy[1]),
@@ -518,6 +540,10 @@ class ElevatorRegistrationRuntime:
         building_client.elevators[elevator_feature.elevator_id] = ElevatorInfo(
             elevator_id=elevator_feature.elevator_id,
             lobby_poses=lobby_poses,
+            observed_floors=observed_floors,
+            reference_door_center=ref_center,
+            reference_door_yaw=ref_yaw,
+            reference_door_width=ref_width,
         )
         # 门几何同理：为未初始化的服务楼层门建立先验，确保到达目标层时开门确认具备门几何上下文
         for floor in elevator_feature.served_floors:

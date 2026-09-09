@@ -109,10 +109,13 @@ class SparseLandmarkRelocalizer:
         width: float,
         frames: Iterable[Iterable[tuple[float, float, float]]],
         floor_height: float,
+        overwrite: bool = False,
     ) -> bool:
-        """冻结地标首次有效关键帧；语义几何刷新不得覆盖。"""
+        """冻结地标首次有效关键帧；语义几何刷新不得覆盖（显式 overwrite 除外，且仅在成功构建后原子替换）。"""
         key = str(landmark_id).strip()
-        if not self.config.enabled or not key or key in self.anchors:
+        if not self.config.enabled or not key:
+            return False
+        if not overwrite and key in self.anchors:
             return False
         values = (*world_xy, outward_yaw, width, floor_height)
         if (

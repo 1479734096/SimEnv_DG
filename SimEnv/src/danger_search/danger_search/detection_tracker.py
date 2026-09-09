@@ -434,24 +434,51 @@ class DetectionTracker:
             for track in self.confirmed_tracks(now=now)
         ]
 
-    def translate_planar(self, dx: float, dy: float) -> int:
-        """原子平移全部历史轨迹，保持纠偏后的输出与后续观测同坐标。"""
+    def translate_planar(
+        self,
+        dx: float,
+        dy: float,
+        *,
+        target_floors: tuple[int, ...] | None = None,
+        floor_height: float = 3.0,
+    ) -> int:
+        """平移历史轨迹；若指定 target_floors，则仅平移属于目标楼层的轨迹。"""
         offset_x = float(dx)
         offset_y = float(dy)
         if not math.isfinite(offset_x) or not math.isfinite(offset_y):
             raise ValueError("检测轨迹平移量必须为有限数")
+        count = 0
         for track in self._tracks:
+            if target_floors is not None:
+                track_floor = max(0, int(round(float(track.mean_position[2]) / max(0.1, float(floor_height)))))
+                if track_floor not in target_floors:
+                    continue
             track.translate_planar(offset_x, offset_y)
-        return len(self._tracks)
+            count += 1
+        return count
 
-    def transform_planar(self, dx: float, dy: float, yaw: float) -> int:
-        """原子变换全部历史轨迹，保持输出与后续观测同坐标。"""
+    def transform_planar(
+        self,
+        dx: float,
+        dy: float,
+        yaw: float,
+        *,
+        target_floors: tuple[int, ...] | None = None,
+        floor_height: float = 3.0,
+    ) -> int:
+        """原子变换历史轨迹；若指定 target_floors，则仅变换属于目标楼层的轨迹。"""
         values = (float(dx), float(dy), float(yaw))
         if not all(math.isfinite(value) for value in values):
             raise ValueError("检测轨迹 SE(2) 变换量必须为有限数")
+        count = 0
         for track in self._tracks:
+            if target_floors is not None:
+                track_floor = max(0, int(round(float(track.mean_position[2]) / max(0.1, float(floor_height)))))
+                if track_floor not in target_floors:
+                    continue
             track.transform_planar(*values)
-        return len(self._tracks)
+            count += 1
+        return count
 
     def get_pending_inspection_target(
         self,
