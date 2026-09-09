@@ -76,7 +76,7 @@ class GroundSupportCoordinator:
         self.last_cloud_stamp: float | None = None
         self._last_hole_scope_revision = -1
         self._negative_obstacle_commit_count = 0
-        self._committed_drop_regions: list[tuple[float, float]] = []
+        self._committed_drop_regions: list[dict[str, object]] = []
         if not params["production_gate_enabled"]:
             self.components = GroundSupportComponents(None, None)
             return
@@ -429,6 +429,13 @@ class GroundSupportCoordinator:
             return
         if pose_provider is None:
             return
+
+        if self._committed_drop_regions and pose is not None:
+            px, py = float(pose[0]), float(pose[1])
+            for region in self._committed_drop_regions:
+                center = region.get("center")
+                if center is not None and math.hypot(px - center[0], py - center[1]) >= 1.5:
+                    region["count"] = 0
         with _controller_command_transaction(controller):
             if gate.hole_detection_exempt:
                 return
@@ -720,21 +727,27 @@ class GroundSupportCoordinator:
             else:
                 centroid_x, centroid_y = 0.0, 0.0
 
-            is_new_region = True
-            for rx, ry in self._committed_drop_regions:
-                if math.hypot(centroid_x - rx, centroid_y - ry) < 1.0:
-                    is_new_region = False
+            matched_region = None
+            for region in self._committed_drop_regions:
+                center = region.get("center")
+                if center is not None and math.hypot(centroid_x - center[0], centroid_y - center[1]) < 1.0:
+                    matched_region = region
                     break
 
             maximum = max(
                 0, int(params.get("maximum_negative_obstacle_replans", 3))
             )
-            allow_new = (not is_new_region) or (
-                self._negative_obstacle_commit_count < maximum
+            current_count = (
+                int(matched_region.get("count", 0)) if matched_region is not None else 0
             )
+            if current_count >= maximum:
+                # 同一区域达到 maximum_negative_obstacle_replans 后，拒绝继续落图
+                # 拒绝后外层将降级走备用流程：_trigger_step_back_safe() 并拉黑目标与落差点
+                return None
+
             commit = mapper.persist_negative_clusters_atomic(
                 records,
-                allow_new=allow_new,
+                allow_new=True,
             )
             if not commit.committed:
                 return None
@@ -749,9 +762,15 @@ class GroundSupportCoordinator:
             if not gate.reset_negative_obstacle_after_replan(ack):
                 return None
             self.feedback.synchronize_gate_state(gate.state)
-            if commit.reason_code == "committed" and is_new_region:
-                self._committed_drop_regions.append((centroid_x, centroid_y))
-                self._negative_obstacle_commit_count += 1
+            if commit.reason_code == "committed":
+                if matched_region is not None:
+                    matched_region["count"] = current_count + 1
+                else:
+                    self._committed_drop_regions.append({
+                        "center": (centroid_x, centroid_y),
+                        "count": 1,
+                    })
+                    self._negative_obstacle_commit_count += 1
             return NegativeClusterPersistResult(
                 floor=active_scope[0],
                 cluster_ids=commit.cluster_ids,

@@ -3151,7 +3151,7 @@ class MissionManager:
             return False
 
         reset_progress = getattr(self.controller, "reset_progress_timer", None)
-        if callable(reset_progress):
+        if callable(reset_progress) and action == GROUND_SUPPORT_ACTION_HOLD:
             reset_progress(pose)
         # 临时 hold 和停车过程都在任务 tick 之前截断，普通 STUCK/recover 无法接管。
         if action == GROUND_SUPPORT_ACTION_HOLD:
