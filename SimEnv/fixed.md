@@ -967,4 +967,5 @@ Stage15～17 当前结论：
   - 测试准备阶段的关节调整由 `STARTUP_CALF_POSITION` 控制，默认 -2.0 rad 并显式记录 `[AUDIT]` 隔离日志，同时支持 `STARTUP_CALF_POSITION=none` 恢复原生启动姿态。
   - 按键 8 历史修改不迁移，随 FSM 恢复官方行为。
   - 直接手动执行 `./auto.sh` 恢复 100% 赛方原生行为。
+  - 启动等待超时鲁棒性修复：针对 `run_elevator_gui_test.sh` 启动等待计时在 `auto.sh` 刚拉起时即开始倒计时、可能因包含场景生成与 Gazebo 加载（官方 `ROBOT_SPAWN_TIMEOUT=120`）而误杀正常慢启动的问题，遵循 KISS 原则将 `SPAWN_CONFIG_SETTLE_TIMEOUT` 默认总预算由 30s 放宽至 150s（120s 启动加载 + 30s 延迟配置）；循环内置 `! kill -0 $AUTO_PID` 保证异常秒退，配置就绪即走，消除慢启动误杀风险。
 

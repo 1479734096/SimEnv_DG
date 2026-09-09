@@ -50,7 +50,7 @@ ELEVATOR_TEST_LOCALIZATION_MAX_RANGE="${ELEVATOR_TEST_LOCALIZATION_MAX_RANGE:-15
 ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED="${ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED:-false}"
 ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED="${ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED:-true}"
 STARTUP_CALF_POSITION="${STARTUP_CALF_POSITION:--2.0}"
-SPAWN_CONFIG_SETTLE_TIMEOUT="${SPAWN_CONFIG_SETTLE_TIMEOUT:-30}"
+SPAWN_CONFIG_SETTLE_TIMEOUT="${SPAWN_CONFIG_SETTLE_TIMEOUT:-150}"
 CONTROLLER_READY_TIMEOUT="${CONTROLLER_READY_TIMEOUT:-45}"
 DEFAULT_EVIDENCE_ROOT="/home/xbh/tzb26/evidence/simenv"
 if [ ! -d "$DEFAULT_EVIDENCE_ROOT" ]; then
@@ -105,7 +105,7 @@ usage() {
   ELEVATOR_TEST_ADAPTIVE_RGBD_LOCALIZATION_ENABLED=false  是否让 RGB-D 参与共享地图定位
   ELEVATOR_TEST_LOCAL_CROSSING_GEOMETRY_ENABLED=true  是否启用开门后的 Livox 穿越几何刷新
   STARTUP_CALF_POSITION=-2.0           测试准备阶段 calf 初始角，设为 none 恢复赛方原生
-  SPAWN_CONFIG_SETTLE_TIMEOUT=30       等待 spawn 延迟配置超时（秒）
+  SPAWN_CONFIG_SETTLE_TIMEOUT=150      等待环境启动与 spawn 延迟配置总超时（秒）
   CONTROLLER_READY_TIMEOUT=45          等待控制器首帧与关节反馈超时（秒）
   ELEVATOR_TEST_KEEP_RUNNING=1         成功后保留 GUI，按 Ctrl-C 清理
   ELEVATOR_TEST_LOG_DIR=/path/...      证据目录，默认 /home/xbh/tzb26/evidence/simenv/seed...
@@ -403,10 +403,10 @@ wait_for_log() {
 wait_for_spawn_configuration_settle() {
   local deadline=$((SECONDS + SPAWN_CONFIG_SETTLE_TIMEOUT))
   local gazebo_log="$WORKSPACE_ROOT/logs/competition_gazebo.log"
-  log "等待 spawn_model 完成延迟关节配置……"
+  log "等待仿真环境启动与 spawn_model 延迟关节配置完成……"
   while (( SECONDS < deadline )); do
     if ! kill -0 "$AUTO_PID" 2>/dev/null; then
-      log "等待延迟关节配置时 auto.sh 已退出。"
+      log "等待仿真环境与延迟关节配置时 auto.sh 已退出。"
       return 1
     fi
     if [[ -f "$gazebo_log" ]] && grep -a -q "Set model configuration status: SetModelConfiguration: success" "$gazebo_log" 2>/dev/null; then
@@ -415,7 +415,7 @@ wait_for_spawn_configuration_settle() {
     fi
     sleep 0.2
   done
-  log "等待 spawn_model 延迟关节配置超时（${SPAWN_CONFIG_SETTLE_TIMEOUT}s）。"
+  log "等待仿真环境启动与 spawn_model 延迟关节配置超时（${SPAWN_CONFIG_SETTLE_TIMEOUT}s）。"
   if [[ -f "$gazebo_log" ]]; then
     tail -n 40 "$gazebo_log" >&2 || true
   fi

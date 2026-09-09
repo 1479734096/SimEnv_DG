@@ -27,7 +27,7 @@
 - 下一次 `0→1→0→home` 闭环必须检查 `sparse_landmark_anchor_frozen`、
   `sparse_landmark_relocalization_evaluated`、`sparse_landmark_correction_applied`、
   `elevator_door_confirmation_retry_started/exhausted` 事件，并确认目标层显式开门、新 Livox 帧屏障和回执 epoch 均生效。
-- 官方文件哈希检查：6 个历史不一致项（`auto.sh`、`docs/doors-and-elevator.md`、`docs/quick-start.md`、`FSM.h`、`FSM.cpp`、`gazebo.xacro`）已 100% 恢复为官方 ZIP 基线版本，`sha256sum -c OFFICIAL_FILES.sha256` 达成 0 不匹配（100% 合规）。启动协调逻辑已完整迁移至测试套件 `tools/sim/run_elevator_gui_test.sh`。
+- 官方文件哈希检查：6 个历史不一致项（`auto.sh`、`docs/doors-and-elevator.md`、`docs/quick-start.md`、`FSM.h`、`FSM.cpp`、`gazebo.xacro`）已 100% 恢复为官方 ZIP 基线版本，`sha256sum -c OFFICIAL_FILES.sha256` 达成 0 不匹配（100% 合规）。启动协调逻辑已完整迁移至测试套件 `tools/sim/run_elevator_gui_test.sh`（等待延迟配置总超时已放宽至 150s 覆盖场景生成与仿真加载，消除慢启动误杀隐患）。
 - 控制发送事务、传感器时间/frame 契约、内部话题精确白名单和正式启动确认继续保留；
   原 `ControlledSupportPermit` 及 publish generation 丢弃评估机制已因真实运行阻塞撤销。
 - 同 seed 三轮中一轮完成 `0→1→0→home`，一轮在返回电梯目标刷新后 A* 不可达，一轮受
