@@ -76,6 +76,12 @@ class ElevatorRegistrationRuntime:
         self.refresh_confirmations = 0
         self.refresh_rejections.clear()
 
+    def reset_visual_candidate(self) -> None:
+        self.visual_candidate = None
+        self.visual_candidate_stamp = None
+        self.visual_confirmations = 0
+        self.visual_last_stamp = None
+
     def record_refresh_rejection(self, reason: str) -> None:
         key = str(reason)
         self.refresh_rejections[key] = int(self.refresh_rejections.get(key, 0)) + 1
@@ -490,29 +496,54 @@ class ElevatorRegistrationRuntime:
                     "source": anchor.source,
                 }
             )
-        lobby_poses = {
-            int(floor): (
-                float(world_xy[0]),
-                float(world_xy[1]),
-                float(outward_yaw),
-            )
-            for floor in elevator_feature.served_floors
-        }
+        existing_elevator = building_client.elevators.get(elevator_feature.elevator_id)
+        lobby_poses = (
+            dict(existing_elevator.lobby_poses) if existing_elevator is not None else {}
+        )
+        # 为尚未注册的楼层播种初始竖井先验（垂直竖井），已有楼层的独立坐标予以保留
+        for floor in elevator_feature.served_floors:
+            fid = int(floor)
+            if fid not in lobby_poses:
+                lobby_poses[fid] = (
+                    float(world_xy[0]),
+                    float(world_xy[1]),
+                    float(outward_yaw),
+                )
+        # 当前层始终更新为本次观测/确认的最新几何
+        lobby_poses[int(current_floor)] = (
+            float(world_xy[0]),
+            float(world_xy[1]),
+            float(outward_yaw),
+        )
         building_client.elevators[elevator_feature.elevator_id] = ElevatorInfo(
             elevator_id=elevator_feature.elevator_id,
             lobby_poses=lobby_poses,
         )
+        # 门几何同理：为未初始化的服务楼层门建立先验，确保到达目标层时开门确认具备门几何上下文
         for floor in elevator_feature.served_floors:
-            door_id = building_client.elevator_door_id(floor)
-            building_client.doors[door_id] = DoorInfo(
-                door_id=door_id,
-                kind="elevator",
-                floor_index=int(floor),
-                x=float(world_xy[0]),
-                y=float(world_xy[1]),
-                yaw=float(outward_yaw),
-                width=float(width),
-            )
+            fid = int(floor)
+            door_id = building_client.elevator_door_id(fid)
+            if door_id not in building_client.doors:
+                building_client.doors[door_id] = DoorInfo(
+                    door_id=door_id,
+                    kind="elevator",
+                    floor_index=fid,
+                    x=float(world_xy[0]),
+                    y=float(world_xy[1]),
+                    yaw=float(outward_yaw),
+                    width=float(width),
+                )
+        # 当前层门信息更新为最新确认几何
+        current_door = str(current_door_id)
+        building_client.doors[current_door] = DoorInfo(
+            door_id=current_door,
+            kind="elevator",
+            floor_index=int(current_floor),
+            x=float(world_xy[0]),
+            y=float(world_xy[1]),
+            yaw=float(outward_yaw),
+            width=float(width),
+        )
         return ElevatorRegistrationResult(
             registered=True,
             active_elevator_id=elevator_feature.elevator_id,

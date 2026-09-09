@@ -29,8 +29,8 @@ from danger_search.door_observation_runtime import (
     DoorObservationRuntime,
 )
 from danger_search.door_navigation_runtime import DoorNavigationRuntime
-from danger_search.navigation_tasks import NavigationTask, TakeElevator, OpenDoorAndPass, NavigateToPose, FAILED
-from danger_search.sparse_landmark_relocalizer import LandmarkRelocalizationOutcome
+from danger_search.navigation_tasks import NavigationTask, TakeElevator, OpenDoorAndPass, NavigateToPose, PostExitElevatorObservationTask, FAILED
+from danger_search.sparse_landmark_relocalizer import LandmarkRelocalizationOutcome, make_elevator_landmark_id
 from danger_search.frontier import Frontier, FrontierSelectionContext
 from danger_search.frontier_planning_runtime import (
     MODE_NORMAL,
@@ -456,6 +456,7 @@ class MissionManager:
         self._landmark_drift_monitor = components.landmark_drift_monitor
         self._landmark_relocalizer = components.landmark_relocalizer
         self._landmark_relocalization_operations: dict[str, dict[str, object]] = {}
+        self._post_exit_drift_correction_op: dict[str, object] | None = None
         self._reporting = components.reporting
         self._perception_runtime = components.perception
         self.pose_provider = components.pose_provider
@@ -628,6 +629,10 @@ class MissionManager:
                 getattr(self, "elevator_lateral_search_speed", 0.15)
             ),
             pose_stamp=resolved_pose_stamp,
+            observe_post_exit_door_fn=self._observe_post_exit_elevator_door,
+            freeze_landmark_anchor_fn=self._freeze_landmark_anchor,
+            current_landmark_frames_fn=self._current_landmark_frames,
+            correct_post_exit_elevator_drift_fn=self._correct_post_exit_elevator_drift,
         )
 
     def _planning_constraints(self):
@@ -836,7 +841,179 @@ class MissionManager:
                 door_id = self.building_client.elevator_door_id(self.current_floor)
             except ValueError:
                 return
-            self._freeze_landmark_anchor("elevator", door_id)
+            elevator_id = getattr(self, "_active_elevator_id", "elevator_main")
+            canonical_id = make_elevator_landmark_id(elevator_id, self.current_floor)
+            self._freeze_landmark_anchor(canonical_id, door_id)
+            if self.current_floor == 0:
+                self._freeze_landmark_anchor("elevator", door_id)
+
+    def _observe_post_exit_elevator_door(self, pose: tuple[float, float, float]) -> bool:
+        """在出梯面向电梯门期间，驱动 RGB-D / 局部传感器重新观察与注册当前层门几何。"""
+        elevator_scan = self._elevator_observation.tick_visual_scan(
+            now=get_time(),
+            pose=pose,
+            current_floor=self.current_floor,
+            current_task_present=False,
+            building_features=self.building_features,
+            building_client=self.building_client,
+            rgbd_detector=self.rgbd_door_detector,
+            controller=self.controller,
+            last_door_id=self._door_navigation.last_door_id,
+            last_door_xy=self._door_navigation.last_door_xy,
+            post_door_context_satisfied=self._post_door_context_satisfied(pose),
+            config=self._elevator_visual_scan_config(),
+        )
+        self._apply_elevator_visual_scan_result(elevator_scan)
+
+        registration_result = self._elevator_observation.registration.try_register(
+            pose=pose,
+            current_floor=self.current_floor,
+            max_floor=self.max_floor,
+            current_task_present=False,
+            building_features=self.building_features,
+            building_client=self.building_client,
+            local_detector=self.local_detector,
+            cloud_stamp=self._map_runtime.last_cloud_stamp,
+            cloud_points=self._map_runtime.latest_cloud_points,
+            floor_height=self.mapper.floor_height,
+            entrance_xy=self.main_entrance_xy,
+            config=self._elevator_registration_config(),
+            landmark_monitor=getattr(self, "_landmark_drift_monitor", None),
+            elapsed=self._elapsed(),
+        )
+        self._apply_elevator_registration_result(registration_result)
+
+        elevator = self.building_client.elevators.get(
+            getattr(self, "_active_elevator_id", "elevator_main")
+        )
+        if elevator is not None and self.current_floor in elevator.lobby_poses:
+            return True
+        return bool(registration_result.registered)
+
+    def _correct_post_exit_elevator_drift(self, elevator_id: str, floor: int) -> str:
+        """根据 0 层黄金基准竖井坐标，对当前层出梯后的定位进行平移纠偏并对齐竖井世界坐标。"""
+        if int(floor) == 0:
+            return "done"
+        elevator = self.building_client.elevators.get(str(elevator_id))
+        if elevator is None:
+            return "done"
+        base_pose = elevator.lobby_poses.get(0)
+        current_pose = elevator.lobby_poses.get(int(floor))
+        if base_pose is None or current_pose is None:
+            return "done"
+
+        op = getattr(self, "_post_exit_drift_correction_op", None)
+        now = get_time()
+        if op is not None and op.get("sequence") is not None:
+            sequence = int(op["sequence"])
+            ack = self.pose_provider.correction_ack(sequence)
+            if ack is not None:
+                self._post_exit_drift_correction_op = None
+                correction_runtime = getattr(self._map_runtime, "apply_planar_correction", None)
+                if callable(correction_runtime):
+                    corrected_xy = self._corrected_robot_xy((0.0, 0.0, 0.0), ack)
+                    danger_sync = correction_runtime(
+                        float(ack[0]),
+                        float(ack[1]),
+                        now=now,
+                        robot_floor=int(floor),
+                        robot_xy=corrected_xy,
+                    )
+                    self._log_danger_obstacle_sync(
+                        danger_sync,
+                        event="post_exit_danger_obstacle_reprojected",
+                        floor=int(floor),
+                        correction_xy=(float(ack[0]), float(ack[1])),
+                        sequence=sequence,
+                    )
+                self.controller.clear_path(reason="post_exit_drift_correction_applied")
+                # 物理对齐：把当前层的门坐标与 0 层基准严格对齐
+                elevator.lobby_poses[int(floor)] = (
+                    float(base_pose[0]),
+                    float(base_pose[1]),
+                    float(base_pose[2]),
+                )
+                try:
+                    door_id = self.building_client.elevator_door_id(int(floor))
+                    door = self.building_client.doors.get(door_id)
+                    if door is not None:
+                        self.building_client.doors[door_id] = DoorInfo(
+                            door_id=door.door_id,
+                            kind=door.kind,
+                            floor_index=door.floor_index,
+                            x=float(base_pose[0]),
+                            y=float(base_pose[1]),
+                            yaw=float(base_pose[2]),
+                            width=door.width,
+                        )
+                except (AttributeError, ValueError, KeyError):
+                    pass
+                MissionReportingRuntime.loginfo(
+                    "出梯后电梯竖井对齐纠偏成功：应用偏移=(%.3f, %.3f)，当前层门坐标已对齐0层基准",
+                    float(ack[0]),
+                    float(ack[1]),
+                )
+                self._log_structured(
+                    {
+                        "event": "post_exit_elevator_drift_correction_applied",
+                        "elevator_id": str(elevator_id),
+                        "floor": int(floor),
+                        "sequence": sequence,
+                        "correction_xy": [float(ack[0]), float(ack[1])],
+                    }
+                )
+                return "done"
+            if now - float(op.get("started_at", 0.0)) > 2.5:
+                self._post_exit_drift_correction_op = None
+                MissionReportingRuntime.logwarn(
+                    "出梯后竖井对齐纠偏等待回执超时 (seq=%s)，跳过纠偏继续",
+                    sequence,
+                )
+                return "done"
+            return "running"
+
+        # 首次计算并请求纠偏
+        dx = float(base_pose[0]) - float(current_pose[0])
+        dy = float(base_pose[1]) - float(current_pose[1])
+        drift = math.hypot(dx, dy)
+        if drift < 0.03:
+            # 漂移小于 3cm，在噪声范围内，直接对齐坐标
+            elevator.lobby_poses[int(floor)] = (
+                float(base_pose[0]),
+                float(base_pose[1]),
+                float(base_pose[2]),
+            )
+            return "done"
+        if drift > 0.85:
+            MissionReportingRuntime.logwarn(
+                "出梯后测得门坐标与0层基准偏差 %.3fm 超过安全上限 0.85m，放弃纠偏",
+                drift,
+            )
+            return "done"
+
+        sequence = self.pose_provider.request_planar_correction(
+            (dx, dy),
+            maximum_correction=0.90,
+            maximum_linear_speed=0.15,
+            maximum_angular_speed=0.15,
+        )
+        if sequence is None:
+            MissionReportingRuntime.logwarn("出梯后竖井对齐纠偏请求被拒绝，跳过")
+            return "done"
+
+        self._post_exit_drift_correction_op = {
+            "sequence": int(sequence),
+            "started_at": now,
+            "correction_xy": (dx, dy),
+        }
+        MissionReportingRuntime.loginfo(
+            "出梯后触发竖井对齐纠偏：漂移量=(%.3f, %.3f), 距离=%.3fm, sequence=%d",
+            dx,
+            dy,
+            drift,
+            sequence,
+        )
+        return "running"
 
     def _current_landmark_frames(self) -> list[tuple[tuple[float, float, float], ...]]:
         """只返回当前楼层、当前定位连续段内的已配准 Livox 帧。"""
@@ -888,13 +1065,17 @@ class MissionManager:
         doors = getattr(self.building_client, "doors", {})
         if "main_entrance" not in relocalizer.anchors and "main_entrance" in doors:
             self._freeze_landmark_anchor("main_entrance", "main_entrance")
-        if "elevator" in relocalizer.anchors:
-            return
         try:
             door_id = self.building_client.elevator_door_id(self.current_floor)
         except (AttributeError, ValueError):
             return
-        if door_id in doors:
+        if door_id not in doors:
+            return
+        elevator_id = getattr(self, "_active_elevator_id", "elevator_main")
+        canonical_id = make_elevator_landmark_id(elevator_id, self.current_floor)
+        if canonical_id not in relocalizer.anchors:
+            self._freeze_landmark_anchor(canonical_id, door_id)
+        if self.current_floor == 0 and "elevator" not in relocalizer.anchors:
             self._freeze_landmark_anchor("elevator", door_id)
 
     def relocalize_landmark(
@@ -915,6 +1096,10 @@ class MissionManager:
             if relocalizer is not None
             else None
         )
+        if anchor is None and landmark == "elevator" and relocalizer is not None:
+            elevator_id = getattr(self, "_active_elevator_id", "elevator_main")
+            canonical_id = make_elevator_landmark_id(elevator_id, self.current_floor)
+            anchor = relocalizer.anchors.get(canonical_id)
         if anchor is None or int(anchor.floor) != int(self.current_floor):
             return LandmarkRelocalizationOutcome(IDLE, reason="anchor_unavailable")
 
@@ -1782,6 +1967,22 @@ class MissionManager:
                     )
                     self.floor_start_time = now
                     self._exploration.floor_timeout_logged = False
+                    self._elevator_observation.registration.reset_visual_candidate()
+                    if not self.return_after_floor_change:
+                        completed_take_elevator = self.current_task
+                        door_center = getattr(completed_take_elevator, "last_exit_door_center", None)
+                        outward_yaw = getattr(completed_take_elevator, "last_exit_outward_yaw", None)
+                        if door_center is None:
+                            door_center = (pose[0], pose[1])
+                        if outward_yaw is None:
+                            outward_yaw = pose[2]
+                        self.current_task = PostExitElevatorObservationTask(
+                            completed_take_elevator.elevator_id,
+                            self.current_floor,
+                            door_center=door_center,
+                            outward_yaw=outward_yaw,
+                        )
+                        return
                 elif isinstance(self.current_task, TakeElevator) and status == FAILED:
                     # 已发起过电梯任务不等于成功；摘要必须记录真实终态。
                     self._elevator_success = False
@@ -3177,12 +3378,21 @@ class MissionManager:
         """检查是否存在已发现且可用的换层设施（当前只有电梯）。"""
         if self.max_floor <= 1:
             return False
-        elevators = getattr(getattr(self, "building_client", None), "elevators", {})
+        building_client = getattr(self, "building_client", None)
+        elevators = getattr(building_client, "elevators", {})
         if not elevators:
             return False
-        for elevator in elevators.values():
+        public_elevators = getattr(building_client, "public_elevators", {})
+        for elevator_id, elevator in elevators.items():
             lobby_poses = getattr(elevator, "lobby_poses", {})
-            if target_floor in lobby_poses and self.current_floor in lobby_poses:
+            public_served = public_elevators.get(elevator_id, set())
+            served_floors = getattr(elevator, "served_floors", set())
+            target_usable = (
+                target_floor in lobby_poses
+                or target_floor in public_served
+                or target_floor in served_floors
+            )
+            if self.current_floor in lobby_poses and target_usable:
                 return True
         return False
 
@@ -3204,11 +3414,19 @@ class MissionManager:
         elevators = getattr(building_client, "elevators", {})
         target_floor = self.current_floor + 1
         elevator_id = None
+        public_elevators = getattr(building_client, "public_elevators", {})
         for elevator_id_candidate, elevator in elevators.items():
             lobby_poses = getattr(elevator, "lobby_poses", {})
-            if (
+            public_served = public_elevators.get(elevator_id_candidate, set())
+            served_floors = getattr(elevator, "served_floors", set())
+            target_usable = (
                 target_floor in lobby_poses
-                and self.current_floor in lobby_poses
+                or target_floor in public_served
+                or target_floor in served_floors
+            )
+            if (
+                self.current_floor in lobby_poses
+                and target_usable
             ):
                 elevator_id = elevator_id_candidate
                 break

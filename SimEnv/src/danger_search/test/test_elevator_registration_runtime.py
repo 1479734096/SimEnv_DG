@@ -79,6 +79,7 @@ class ElevatorRegistrationRuntimeTest(unittest.TestCase):
         self.assertTrue(result.registered)
         self.assertEqual(result.active_elevator_id, "lift")
         self.assertEqual(set(self.client.elevators["lift"].lobby_poses), {0, 1})
+        self.assertEqual(self.client.doors["lift_0"].kind, "elevator")
         self.assertEqual(self.client.doors["lift_1"].kind, "elevator")
 
     def test_refresh_timeout_preserves_registered_geometry(self):

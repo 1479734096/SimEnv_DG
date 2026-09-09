@@ -329,10 +329,14 @@ class BuildingControlClient:
         if elevator_id not in self.elevators:
             raise ValueError(f"Unknown elevator_id: {elevator_id}")
         elevator = self.elevators[elevator_id]
-        if floor not in elevator.lobby_poses:
-            raise ValueError(f"Elevator {elevator_id} does not serve floor {floor}")
-
-        ex, ey, eyaw = elevator.lobby_poses[floor]
+        if int(floor) not in elevator.lobby_poses:
+            public_floors = self.public_elevators.get(elevator_id, set())
+            if int(floor) in public_floors and elevator.lobby_poses:
+                ex, ey, eyaw = next(iter(elevator.lobby_poses.values()))
+            else:
+                raise ValueError(f"Elevator {elevator_id} does not serve floor {floor}")
+        else:
+            ex, ey, eyaw = elevator.lobby_poses[int(floor)]
         try:
             offset_out = float(offset_out)
             offset_in = float(offset_in)

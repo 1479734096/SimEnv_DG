@@ -385,3 +385,9 @@ class SparseLandmarkRelocalizer:
                 residuals.extend(chosen[valid])
                 distances.extend(np.sqrt(nearest_squared[valid]))
         return np.asarray(residuals, dtype=float), np.asarray(distances, dtype=float)
+
+
+def make_elevator_landmark_id(elevator_id: str, floor: int) -> str:
+    """生成按楼层隔离的标准电梯锚点 ID。"""
+    return f"elevator:{str(elevator_id).strip()}:floor:{int(floor)}"
+

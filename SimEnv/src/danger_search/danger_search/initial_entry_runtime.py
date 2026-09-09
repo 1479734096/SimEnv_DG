@@ -167,7 +167,7 @@ class InitialEntryRuntime:
 
         yaw_rate = abs(float(angular_xyz[2]))
         planar_speed = math.hypot(float(linear_xyz[0]), float(linear_xyz[1]))
-        if yaw_rate >= 0.08 or planar_speed > 0.05:
+        if yaw_rate >= 0.15 or planar_speed > 0.05:
             self._reset_settle_evidence()
             return False
 

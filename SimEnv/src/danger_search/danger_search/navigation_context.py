@@ -55,6 +55,10 @@ class NavigationTaskContext:
     elevator_lateral_search_extra_overshoot: float = 0.15
     elevator_lateral_search_speed: float = 0.15
     pose_stamp: float | None = None
+    observe_post_exit_door_fn: Callable[..., object] | None = None
+    freeze_landmark_anchor_fn: Callable[[str, str], bool] | None = None
+    current_landmark_frames_fn: Callable[[], list] | None = None
+    correct_post_exit_elevator_drift_fn: Callable[..., str] | None = None
 
     def clear_opened_door_area(self, door_id: str) -> None:
         self.clear_opened_door_area_fn(door_id)
@@ -126,3 +130,24 @@ class NavigationTaskContext:
         if self.entrance_geometry_correction_fn is None:
             return None
         return self.entrance_geometry_correction_fn(*args, **kwargs)
+
+    def observe_post_exit_door(self, *args, **kwargs):
+        if self.observe_post_exit_door_fn is None:
+            return None
+        return self.observe_post_exit_door_fn(*args, **kwargs)
+
+    def freeze_landmark_anchor(self, landmark_id: str, door_id: str) -> bool:
+        if self.freeze_landmark_anchor_fn is None:
+            return False
+        return bool(self.freeze_landmark_anchor_fn(landmark_id, door_id))
+
+    def current_landmark_frames(self) -> list:
+        if self.current_landmark_frames_fn is None:
+            return []
+        return self.current_landmark_frames_fn()
+
+    def correct_post_exit_elevator_drift(self, elevator_id: str, floor: int) -> str:
+        if self.correct_post_exit_elevator_drift_fn is None:
+            return "done"
+        return str(self.correct_post_exit_elevator_drift_fn(elevator_id, floor))
+
