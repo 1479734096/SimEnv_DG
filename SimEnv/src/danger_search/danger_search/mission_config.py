@@ -57,6 +57,31 @@ def effective_max_runtime(
     return configured
 
 
+def effective_floor_timeout(
+    configured_floor_timeout: float,
+    max_floor: int,
+    floor_timeout_by_floor: object,
+) -> float:
+    """按公开楼层数采用单层超时配置：楼层映射优先，全局值兜底。"""
+    configured = float(configured_floor_timeout)
+    if configured <= 0.0:
+        raise ValueError("单层时间预算必须为正")
+
+    limits: dict[int, float] = {}
+    for item in floor_timeout_by_floor if isinstance(floor_timeout_by_floor, (list, tuple)) else ():
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("mission/floor_timeout_by_floor 每项必须是 [楼层数, 秒数]")
+
+        floor_count = int(item[0])
+        limit = float(item[1])
+        if floor_count <= 0 or limit <= 0.0 or floor_count in limits:
+            raise ValueError("mission/floor_timeout_by_floor 包含非法或重复楼层数")
+
+        limits[floor_count] = limit
+
+    return limits.get(int(max_floor), configured)
+
+
 def validate_summary_output_path(path: str | Path, public_result: Path) -> Path:
     """限制 mission summary 只能写入公开结果目录下的运行归档目录。"""
     summary_path = Path(path)
@@ -316,6 +341,7 @@ _CONFIG_GROUP_FIELDS = {
         {
             "frontier_params",
             "floor_timeout",
+            "floor_timeout_by_floor",
             "floor_finish_time_ratio",
             "route_check_ratio",
             "explore_coverage_ratio",
@@ -550,7 +576,16 @@ class _MissionConfigBuilder:
             max_floor=self.max_floor,
             runtime_by_floor=runtime_by_floor,
         )
-        self.floor_timeout = float(_param("mission/floor_timeout", 360.0))
+        configured_floor_timeout = float(_param("mission/floor_timeout", 370.0))
+        floor_timeout_by_floor = _param(
+            "mission/floor_timeout_by_floor",
+            [[1, 370.0], [2, 420.0], [3, 450.0]],
+        )
+        self.floor_timeout = effective_floor_timeout(
+            configured_floor_timeout,
+            max_floor=self.max_floor,
+            floor_timeout_by_floor=floor_timeout_by_floor,
+        )
         self.last_floor_uses_global_budget = bool(
             _param("mission/last_floor_uses_global_budget", True)
         )

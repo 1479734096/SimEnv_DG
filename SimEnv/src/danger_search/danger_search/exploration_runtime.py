@@ -212,6 +212,11 @@ def decide_exploration_budget(
         )
 
     has_next_floor = facts.current_floor + 1 < facts.maximum_floor
+    if not has_next_floor and facts.last_floor_uses_global_budget:
+        return ExplorationBudgetDecision(
+            "CONTINUE", "last_floor_uses_global_budget"
+        )
+
     if facts.floor_elapsed >= facts.floor_timeout:
         if has_next_floor:
             if (
@@ -226,17 +231,9 @@ def decide_exploration_budget(
             return ExplorationBudgetDecision(
                 "RETURN_HOME", "floor_timeout_return_home"
             )
-        if not facts.last_floor_uses_global_budget:
-            return ExplorationBudgetDecision(
-                "RETURN_HOME", "floor_timeout_return_home"
-            )
-        known_growth = (
-            facts.known_cells_growth * facts.exploration_progress_window
+        return ExplorationBudgetDecision(
+            "RETURN_HOME", "floor_timeout_return_home"
         )
-        if known_growth < facts.minimum_progress_cells:
-            return ExplorationBudgetDecision(
-                "RETURN_HOME", "floor_low_progress_return_home"
-            )
 
     if (
         facts.floor_elapsed
@@ -263,10 +260,6 @@ def decide_exploration_budget(
                 "RETURN_HOME", "floor_low_progress_return_home"
             )
 
-    if facts.floor_elapsed >= facts.floor_timeout and not has_next_floor:
-        return ExplorationBudgetDecision(
-            "CONTINUE", "last_floor_uses_global_budget"
-        )
     return ExplorationBudgetDecision("CONTINUE", "budget_allows_continue")
 
 

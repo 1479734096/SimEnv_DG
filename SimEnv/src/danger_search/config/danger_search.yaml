@@ -67,10 +67,11 @@ mission:
   manual_goal_enabled: false
   # 正式总预算上限，由 effective_max_runtime() 按公开 served_floors 楼层数
   # 与 min(max_runtime, runtime_by_floor[楼层数]) 共同裁决。设为 1440.0 可保证
-  # 1/2 层自动被 limits 截断为 520.0s/1000.0s，同时 3 层场景可完整生效 1440.0s 预算。
-  max_runtime: 1440.0
-  runtime_by_floor: [[1, 520.0], [2, 1000.0], [3, 1440.0]]
-  floor_timeout: 370.0
+  # 1/2/3 层自动由 runtime_by_floor 和 floor_timeout_by_floor 分档匹配生效。
+  max_runtime: 2000.0
+  runtime_by_floor: [[1, 520.0], [2, 1185.0], [3, 2000.0]]
+  floor_timeout: 450.0
+  floor_timeout_by_floor: [[1, 370.0], [2, 420.0], [3, 450.0]]
   # 非最后一层仍以 floor_timeout 保护后续楼层；最后一层由全局返航预算收口。
   # 设为 false 可立即恢复“所有楼层到时即结束”的旧语义。
   last_floor_uses_global_budget: true
@@ -94,12 +95,12 @@ mission:
   elevator_stuck_retry_limit: 4
   # 开门确认后以当前 Livox 连续重测本次穿越轴，吸收定位平移漂移；不改写注册地图。
   elevator_local_crossing_geometry_enabled: true
-  elevator_local_crossing_timeout: 4.0
-  # 目标层开门已确认后，连续空观测无需耗尽总超时；候选不稳定仍保留 4s 收敛窗口。
+  elevator_local_crossing_timeout: 5.0
+  # 目标层开门已确认后，连续空观测无需耗尽总超时；候选不稳定仍保留 5s 收敛窗口。
   elevator_exit_empty_fallback_timeout: 1.0
   elevator_exit_empty_fallback_frames: 10
   elevator_local_crossing_confirmations: 3
-  elevator_local_crossing_confirmation_max_gap: 0.5
+  elevator_local_crossing_confirmation_max_gap: 5.0
   elevator_local_crossing_center_tolerance: 0.15
   elevator_local_crossing_width_tolerance: 0.20
   elevator_local_crossing_yaw_tolerance: 0.15

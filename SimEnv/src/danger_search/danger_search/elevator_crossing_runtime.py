@@ -18,11 +18,11 @@ def _angle_diff(a: float, b: float) -> float:
 
 @dataclass(frozen=True)
 class ElevatorCrossingConfig:
-    timeout: float = 4.0
+    timeout: float = 5.0
     exit_empty_fallback_timeout: float = 1.0
     exit_empty_fallback_frames: int = 10
     confirmations: int = 3
-    confirmation_max_gap: float = 0.5
+    confirmation_max_gap: float = 5.0
     center_tolerance: float = 0.15
     width_tolerance: float = 0.20
     yaw_tolerance: float = 0.15
@@ -99,6 +99,11 @@ class ElevatorCrossingRuntime:
         self._candidate = None
         self._confirmations = 0
         self._empty_observation_count = 0
+        self._confirmed_stamps: list[float] = []
+        self._first_valid_stamp: float | None = None
+        self._last_valid_stamp: float | None = None
+        self._miss_count: int = 0
+        self._reset_reason: str | None = None
 
     def observe(
         self,
@@ -130,6 +135,7 @@ class ElevatorCrossingRuntime:
                 "door_id": str(door_id),
                 "mode": mode,
                 "confirmations": int(self._confirmations),
+                "miss_count": int(self._miss_count),
                 "elapsed": round(now - self._started_at, 3),
             }
             self.reset()
@@ -184,14 +190,13 @@ class ElevatorCrossingRuntime:
                 if config.min_door_width <= observation.width <= config.max_door_width:
                     observations.append(observation)
         if not observations:
-            self._candidate = None
-            self._confirmations = 0
-            self._last_confirmation_time = None
+            self._miss_count += 1
             if mode == "exit":
                 self._empty_observation_count += 1
             elapsed = now - self._started_at
             if (
                 mode == "exit"
+                and self._confirmations == 0
                 and self._empty_observation_count
                 >= config.exit_empty_fallback_frames
                 and elapsed >= config.exit_empty_fallback_timeout
@@ -204,6 +209,7 @@ class ElevatorCrossingRuntime:
                     "empty_frame_count": int(self._empty_observation_count),
                     "elapsed": round(elapsed, 3),
                     "cloud_stamp": float(cloud_stamp),
+                    "miss_count": int(self._miss_count),
                 }
                 self.reset()
                 return ElevatorCrossingResult(
@@ -219,6 +225,8 @@ class ElevatorCrossingRuntime:
                     "mode": mode,
                     "reason": "opening_not_observed",
                     "empty_frame_count": int(self._empty_observation_count),
+                    "miss_count": int(self._miss_count),
+                    "confirmations": int(self._confirmations),
                     "cloud_stamp": float(cloud_stamp),
                 },
             )
@@ -232,6 +240,7 @@ class ElevatorCrossingRuntime:
                 -int(item.evidence_count),
             ),
         )
+        current_stamp = float(cloud_stamp)
         consistent = self._candidate is not None and (
             math.hypot(
                 observation.world_xy[0] - self._candidate.world_xy[0],
@@ -245,7 +254,20 @@ class ElevatorCrossingRuntime:
             and self._last_confirmation_time is not None
             and now - self._last_confirmation_time <= config.confirmation_max_gap
         )
-        self._confirmations = self._confirmations + 1 if consistent else 1
+        if consistent:
+            if current_stamp not in self._confirmed_stamps:
+                self._confirmed_stamps.append(current_stamp)
+            self._last_valid_stamp = current_stamp
+        else:
+            if self._candidate is not None:
+                self._reset_reason = "geometry_diverged"
+            else:
+                self._reset_reason = None
+            self._confirmed_stamps = [current_stamp]
+            self._first_valid_stamp = current_stamp
+            self._last_valid_stamp = current_stamp
+
+        self._confirmations = len(self._confirmed_stamps)
         self._candidate = observation
         self._last_confirmation_time = float(now)
         diagnostic = {
@@ -262,6 +284,10 @@ class ElevatorCrossingRuntime:
             "crossing_yaw": round(float(observation.yaw), 3),
             "distance": round(float(observation.distance), 3),
             "width": round(float(observation.width), 3),
+            "miss_count": int(self._miss_count),
+            "first_valid_stamp": self._first_valid_stamp,
+            "last_valid_stamp": self._last_valid_stamp,
+            "reset_reason": self._reset_reason,
         }
         if self._confirmations < config.confirmations:
             return ElevatorCrossingResult(RUNNING, diagnostic=diagnostic)

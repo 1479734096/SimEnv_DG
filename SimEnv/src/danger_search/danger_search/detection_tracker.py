@@ -511,12 +511,13 @@ class DetectionTracker:
         min_observe_dist: float = 2.0,
         min_confidence: float = 0.70,
         floor_filter: Callable[[Track], bool] | None = None,
+        allow_tentative: bool = True,
     ) -> InspectionTarget | None:
-        """选择可抢占探索路径的当前楼层确认危险源。
+        """选择可抢占探索路径的当前楼层确认或高合格度可疑危险源。
 
         普通 ``get_pending_inspection_target`` 保留旧语义供兼容调用；主动抢占
-        必须额外要求确认、未过期、未在核验中且通过楼层过滤，避免旧楼层或
-        单帧候选反复打断探索。
+        优先选择已确认目标，或具备至少两帧有效命中的合格可疑候选，未过期、未在
+        核验中且通过楼层过滤。
         """
         timestamp = float(now if now is not None else get_time())
         if not math.isfinite(timestamp):
@@ -525,11 +526,10 @@ class DetectionTracker:
             raise ValueError("危险源核验查询时间不能早于最后观测")
         self._refresh_status(timestamp)
 
-        candidates: list[tuple[float, float, Track]] = []
+        candidates: list[tuple[int, float, float, Track]] = []
         for track in self._tracks:
             if (
-                track.status != CONFIRMED
-                or track.inspected
+                track.inspected
                 or track.track_id in self._inspection_in_progress
                 or timestamp < self._inspection_retry_after.get(track.track_id, -math.inf)
                 or timestamp - track.last_seen > self.stale_after
@@ -539,6 +539,20 @@ class DetectionTracker:
                 continue
             if floor_filter is not None and not floor_filter(track):
                 continue
+
+            if track.status == CONFIRMED:
+                status_priority = 0
+            elif allow_tentative and track.status == TENTATIVE:
+                if len(track.hit_times) < 2:
+                    continue
+                if track.average_rmse() > self.max_average_rmse * 1.5:
+                    continue
+                if track.position_std() > self.max_position_std * 1.5:
+                    continue
+                status_priority = 1
+            else:
+                continue
+
             distance = math.hypot(
                 float(track.mean_position[0]) - float(robot_xy[0]),
                 float(track.mean_position[1]) - float(robot_xy[1]),
@@ -546,12 +560,12 @@ class DetectionTracker:
             confidence = track.average_confidence()
             if distance < float(min_observe_dist) or confidence < float(min_confidence):
                 continue
-            candidates.append((distance, -confidence, track))
+            candidates.append((status_priority, distance, -confidence, track))
 
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (item[0], item[1], item[2].track_id))
-        _, _, track = candidates[0]
+        candidates.sort(key=lambda item: (item[0], item[1], item[2], item[3].track_id))
+        _, _, _, track = candidates[0]
         return InspectionTarget(
             track_id=int(track.track_id),
             position=tuple(float(value) for value in track.mean_position),
@@ -593,6 +607,7 @@ class DetectionTracker:
             self._inspection_in_progress.discard(parsed_id)
             return False
         target.inspected = True
+        target.status = CONFIRMED
         self._inspection_in_progress.discard(parsed_id)
         self._inspection_retry_after.pop(parsed_id, None)
         return True
@@ -633,7 +648,7 @@ class DetectionTracker:
         ):
             return False
         track = next((item for item in self._tracks if item.track_id == int(track_id)), None)
-        if track is None or track.status != CONFIRMED or track.inspected:
+        if track is None or track.status not in (CONFIRMED, TENTATIVE) or track.inspected:
             return False
         if timestamp - track.last_seen > self.stale_after:
             return False

@@ -3428,7 +3428,7 @@ class PostExitElevatorObservationTask(NavigationTask):
         floor: int,
         door_center: tuple[float, float],
         outward_yaw: float,
-        standoff_distance: float = 1.2,
+        standoff_distance: float = 1.5,
         close_door_task=None,
     ):
         super().__init__(f"PostExitElevatorObservationTask({elevator_id}, floor={floor})")
@@ -3439,7 +3439,7 @@ class PostExitElevatorObservationTask(NavigationTask):
         self.standoff_distance = float(standoff_distance)
         self.close_door_task = close_door_task
 
-        # 走廊观察目标点：距门 standoff_distance（约 1.2m）
+        # 走廊观察目标点：距门 standoff_distance（约 1.5m）
         self.safe_point_xy = (
             self.door_center[0] + self.standoff_distance * math.cos(self.outward_yaw),
             self.door_center[1] + self.standoff_distance * math.sin(self.outward_yaw),

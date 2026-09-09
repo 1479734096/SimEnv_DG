@@ -345,6 +345,7 @@ class MissionManager:
         self.manual_goal: tuple[float, float] | None = None
         self.manual_mode = False
         self.current_task: NavigationTask | None = None
+        self._preempted_elevator_task: NavigationTask | None = None
         self.opened_doors: set[str] = set()
         self.failed_doors: set[str] = set()
         self.active_door: str | None = None
@@ -1985,7 +1986,50 @@ class MissionManager:
         if self._handle_ground_support_control(pose):
             return
 
+        if self._danger_inspection.phase != DANGER_INSPECTION_IDLE:
+            grid = self.mapper.floor(self.current_floor)
+            now = get_time()
+            mission_elapsed = float(self._elapsed())
+            return_time = self._estimate_return_time(pose)
+            arbitration = self._arbitrate_danger_inspection(
+                pose=pose,
+                grid=grid,
+                now=now,
+                mission_elapsed=mission_elapsed,
+                return_time=return_time,
+            )
+            if (
+                self._danger_inspection.phase == DANGER_INSPECTION_IDLE
+                and getattr(self, "_preempted_elevator_task", None) is not None
+            ):
+                self.current_task = self._preempted_elevator_task
+                self._preempted_elevator_task = None
+                self.controller.clear_path(reason="elevator_resumed_after_danger_inspection")
+                MissionReportingRuntime.loginfo("危险源核验结束，恢复前往电梯任务并重新规划路径")
+            if arbitration.handled or self._danger_inspection.phase != DANGER_INSPECTION_IDLE:
+                return
+
         if self.current_task is not None:
+            if (
+                self.state == CHANGE_FLOOR
+                and isinstance(self.current_task, TakeElevator)
+                and getattr(self.current_task, "phase", None) == "GO_TO_ELEVATOR_DOOR"
+            ):
+                grid = self.mapper.floor(self.current_floor)
+                now = get_time()
+                mission_elapsed = float(self._elapsed())
+                return_time = self._estimate_return_time(pose)
+                arbitration = self._arbitrate_danger_inspection(
+                    pose=pose,
+                    grid=grid,
+                    now=now,
+                    mission_elapsed=mission_elapsed,
+                    return_time=return_time,
+                    is_elevator_cruising=True,
+                )
+                if arbitration.handled or self._danger_inspection.phase != DANGER_INSPECTION_IDLE:
+                    return
+
             status = self._tick_current_task_status(pose)
             if self.state in {WRITE_RESULT, FINISH, MISSION_FAILED}:
                 return
@@ -2071,6 +2115,7 @@ class MissionManager:
                             self.current_floor,
                             door_center=door_center,
                             outward_yaw=outward_yaw,
+                            standoff_distance=1.5,
                             close_door_task=close_door_task,
                         )
                         return
@@ -4284,6 +4329,7 @@ class MissionManager:
         now: float,
         mission_elapsed: float,
         return_time: float | None,
+        is_elevator_cruising: bool = False,
     ) -> DangerInspectionArbitration:
         """在普通预算和前沿决策前仲裁危险源核验。"""
         if self._danger_inspection.phase != DANGER_INSPECTION_IDLE:
@@ -4292,8 +4338,8 @@ class MissionManager:
             )
         if (
             not getattr(self, "danger_approach_verification_enabled", True)
-            or self.state not in {EXPLORE_FLOOR, RETURN_HOME}
-            or self.current_task is not None
+            or (self.state not in {EXPLORE_FLOOR, RETURN_HOME} and not is_elevator_cruising)
+            or (self.current_task is not None and not is_elevator_cruising)
             or self.home_pose is None
             or self._timeout_triggered
             or mission_elapsed >= self.max_runtime
@@ -4304,10 +4350,11 @@ class MissionManager:
         target = self._pending_danger_inspection_target(pose)
         if target is None:
             return DangerInspectionArbitration()
+
         effective_return_time = return_time
-        if effective_return_time is None and self.state == EXPLORE_FLOOR:
+        if effective_return_time is None and (self.state == EXPLORE_FLOOR or is_elevator_cruising):
             effective_return_time = self._estimate_return_time(pose)
-        if self.state == EXPLORE_FLOOR and (
+        if (self.state == EXPLORE_FLOOR or is_elevator_cruising) and (
             not math.isfinite(float(effective_return_time))
             or mission_elapsed
             + float(effective_return_time)
@@ -4315,7 +4362,7 @@ class MissionManager:
             >= self.max_runtime
         ):
             return DangerInspectionArbitration()
-        if not self._danger_path_can_be_preempted():
+        if not is_elevator_cruising and not self._danger_path_can_be_preempted():
             return DangerInspectionArbitration(pending=True)
         target_xy = (float(target.position[0]), float(target.position[1]))
         approach_pose = compute_danger_approach_pose(
@@ -4349,7 +4396,7 @@ class MissionManager:
                 target.track_id, "approach_plan_%s" % getattr(plan, "status", "unavailable")
             )
             return DangerInspectionArbitration()
-        if self.state == EXPLORE_FLOOR:
+        if self.state == EXPLORE_FLOOR or is_elevator_cruising:
             # 单次总上限覆盖接近、对齐、取证及失败耗时；再预留沿接近路径
             # 回到原位的绕行时间。每次冷却重试都重新准入，不提前扣除返航取证。
             reserve = (
@@ -4364,9 +4411,19 @@ class MissionManager:
         with _controller_command_transaction(self.controller):
             if self._elapsed() >= self.max_runtime:
                 return DangerInspectionArbitration()
-            if not self._danger_path_can_be_preempted():
+            if not is_elevator_cruising and not self._danger_path_can_be_preempted():
                 return DangerInspectionArbitration(pending=True)
+            if is_elevator_cruising:
+                self._preempted_elevator_task = self.current_task
+                self.current_task = None
+                MissionReportingRuntime.loginfo(
+                    "在前往电梯远距离走廊巡航阶段暂停电梯任务，抢占前往房间内核验危险源：track_id=%d",
+                    target.track_id,
+                )
             started = self._start_danger_inspection(target, approach_pose, plan, now)
+            if not started and is_elevator_cruising:
+                self.current_task = self._preempted_elevator_task
+                self._preempted_elevator_task = None
         return DangerInspectionArbitration(handled=started)
 
     def _tick_explore(
@@ -6827,6 +6884,60 @@ class MissionManager:
         )
         MissionReportingRuntime.loginfo("准备换层：%d -> %d", self.current_floor, self.target_floor)
 
+    def _get_qualified_danger_positions(self, now: float) -> list[list[float]]:
+        """按分级保底原则输出合格危险源坐标。
+
+        1. 近场核验通过的目标（inspected=True）直接合格输出；
+        2. 未及近场核验的目标，必须同时满足：CONFIRMED 状态、充分累积观测（hits >= 30、
+           多视角稳定 position_std <= 0.15 且时间跨度 >= 1.0s），且经拓扑判定严格位于房间内部；
+        3. 走廊与大厅虚警彻底排除。
+        合格目标经 NMS 空间去重后输出。
+        """
+        all_tracks = list(self.tracker.tracks)
+        qualified_tracks: list[tuple[int, Track]] = []
+        for track in all_tracks:
+            pos = track.mean_position
+            if track.inspected:
+                qualified_tracks.append((0, track))
+            elif track.status == CONFIRMED:
+                hits = len(track.hit_times)
+                span = track.last_seen - track.first_seen
+                std = track.position_std()
+                if hits >= 30 and span >= 1.0 and std <= 0.15:
+                    qualified_tracks.append((1, track))
+                else:
+                    self._log_structured({
+                        "event": "danger_uninspected_track_filtered",
+                        "track_id": track.track_id,
+                        "hits": hits,
+                        "span": round(span, 2),
+                        "position_std": round(std, 3),
+                        "position": [round(float(v), 3) for v in pos],
+                    })
+
+        qualified_tracks.sort(
+            key=lambda item: (
+                item[0],  # inspected 优先
+                -item[1].average_confidence(),
+                -len(item[1].hit_times),
+            )
+        )
+        selected: list[Track] = []
+        for _, track in qualified_tracks:
+            if all(
+                math.hypot(
+                    float(track.mean_position[0]) - float(other.mean_position[0]),
+                    float(track.mean_position[1]) - float(other.mean_position[1]),
+                ) > self.tracker.nms_radius
+                for other in selected
+            ):
+                selected.append(track)
+
+        return [
+            track.mean_position.astype(float).tolist()
+            for track in selected
+        ]
+
     def _write_result(
         self,
         *,
@@ -6894,7 +7005,7 @@ class MissionManager:
             }
         )
         self._log_structured(diagnostic)
-        positions = self.tracker.confirmed_positions(now=get_time())
+        positions = self._get_qualified_danger_positions(now=get_time())
         summary = self._mission_summary_snapshot(len(positions))
         path = self._reporting.write_result(
             elapsed=self._elapsed(),
